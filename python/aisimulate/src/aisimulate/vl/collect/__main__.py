@@ -21,7 +21,7 @@ import sys
 import time
 from pathlib import Path
 
-from ...config.common import load_yaml
+from ...config.common import _absolute_path, load_yaml
 from ...config.engine import FrontendMeasurementConfig, FrontendStageConfig
 from ..table import SGLANG_VERSION, load_table, update_table
 from .lower import STAGE_LABELS, environment, frontend_row
@@ -134,7 +134,7 @@ def main(argv=None) -> int:
         _from_config(args, parser)
     if args.table is None:
         parser.error("--table is required")
-    path = Path(args.table)
+    path = Path(_absolute_path(args.table))
     if args.show:
         return _show(path)
     for name in ("model", "frontend", "images"):

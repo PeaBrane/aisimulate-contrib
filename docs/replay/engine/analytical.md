@@ -148,9 +148,10 @@ static workers, and default op-level language timing. Rejected: traces,
 sessions, variable lengths, prefix sharing, rate or KV-relative load,
 whole-forward (FPM) timing, adapters, and `--capture-per-request`. Encoder CPU
 time and embedding transfer are not modeled, and no deployment artifacts are
-generated. Encoder pools of either mode build Qwen3-VL and Kimi K3 vision
-towers; Llama 4 and other families are rejected, while encoding on the worker
-keeps its Llama 4 tile geometry. The encoder model follows
+generated. Analytical encoder pools build Qwen3-VL and Kimi K3 vision towers;
+native pools build Qwen3-VL towers only, refusing Kimi K3 at the image geometry
+and Llama 4 at the encoder builder. Other families are rejected, while encoding
+on the worker keeps its Llama 4 tile geometry. The encoder model follows
 [AIC revision f8f2341](https://github.com/ai-dynamo/aiconfigurator/commit/f8f2341cb5761877bda694ab954cb6f5eff78fd4).
 
 <a id="native-encoder-pools"></a>

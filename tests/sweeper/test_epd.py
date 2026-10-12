@@ -534,11 +534,13 @@ def test_native_catalog_names_rejected_tps_and_propagates_invalid_data(monkeypat
     if isinstance(error, ValueError):
         assert caught.value is error
     else:
-        assert "tp=1: tp must divide" in str(caught.value) and "tp=2: tp must divide" in str(caught.value)
-        assert "native encoder: tp=2 skipped" in caplog.text
+        assert "tp=1 workers=1: tp must divide" in str(caught.value)
+        assert "tp=2 workers=1: tp must divide" in str(caught.value)
+        assert "native encoder: tp=2 workers=1 skipped" in caplog.text
 
 
-def test_native_catalog_prechecks_memory_on_the_processor_geometry(monkeypatch):
+@pytest.mark.parametrize("count,workers,images_per_part", [(1, [1], [1]), (5, [1, 8], [5, 1]), (1, [8], [1])])
+def test_native_catalog_prechecks_memory_on_the_processor_geometry(monkeypatch, count, workers, images_per_part):
     import aisimulate.sdk.sweep as aic_sweep
     from aisimulate.vl import table
     from aisimulate_core.sdk import perf_database
@@ -555,14 +557,24 @@ def test_native_catalog_prechecks_memory_on_the_processor_geometry(monkeypatch):
     monkeypatch.setattr(table, "resolve_frontend", lambda *a, **kw: (frontend, "digest"))
     monkeypatch.setattr(aic_sweep, "_get_encoder_worker_candidates", record)
     workload = dict(isl=128, osl=32, concurrency=8, num_request_ratio=2)
-    workload["images"] = dict(height=448, width=448, count=1, max_pixels=65536)
-    search_space = _config().search_space.model_dump() | {"encoder": _native_encoder()}
+    workload["images"] = dict(height=448, width=448, count=count, max_pixels=65536)
+    search_space = _config().search_space.model_dump() | {"encoder": _native_encoder(workers=workers)}
     config = _config(search_space=search_space, workload=workload)
     with pytest.raises(NoFeasibleConfigError, match="stop"):
         resolve_encoder_catalog(config)
-    # The memory precheck sees the pixel-budgeted geometry the replay encodes, not the raw image.
-    (runtime,) = recorded
-    assert runtime.image_height == 0 and runtime.num_image_tokens == 64
+    # The memory precheck sees the pixel-budgeted geometry the replay encodes, not the raw image,
+    # at the share of the request's images one of the pool's replicas batches.
+    assert all(runtime.image_height == 0 and runtime.num_image_tokens == 64 for runtime in recorded)
+    assert [runtime.num_images_per_request for runtime in recorded] == images_per_part
+
+
+def test_native_catalog_refuses_other_vision_families_before_the_host_table(tmp_path):
+    search_space = _config().search_space.model_dump() | {
+        "model_name": "meta-llama/Llama-4-Scout-17B-16E-Instruct",
+        "encoder": _native_encoder(host_profile={"path": str(tmp_path / "absent.json"), "frontend": "python"}),
+    }
+    with pytest.raises(ValueError, match="native encoder pools price Qwen3-VL vision towers"):
+        resolve_encoder_catalog(_config(search_space=search_space))
 
 
 @pytest.mark.parametrize("modes", [["agg", "disagg"], ["disagg", "agg"], ["agg"]])

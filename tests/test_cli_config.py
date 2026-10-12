@@ -122,11 +122,13 @@ def test_prediction_scheduler_defaults_are_role_aware() -> None:
     assert disaggregated.engine.workers.decode.scheduler.prefill_schedule_interval == 1
     assert disaggregated.engine.workers.decode.scheduler.prefill_decode_interval == 0
 
-    programmatic = WorkersPredictionConfig(prefill=HostWorkerPredictionConfig(), decode=WorkerPredictionConfig())
+    programmatic = WorkersPredictionConfig(prefill=WorkerPredictionConfig(), decode=WorkerPredictionConfig())
     assert programmatic.prefill is not None
     assert programmatic.decode is not None
     assert programmatic.prefill.scheduler.max_sequences == 1
     assert programmatic.decode.scheduler.max_sequences == 256
+    hosted = WorkersPredictionConfig(prefill=HostWorkerPredictionConfig(host_loop=True))
+    assert hosted.prefill is not None and hosted.prefill.host_loop is True
 
 
 def test_prediction_rejects_nonpositive_prefill_schedule_interval() -> None:

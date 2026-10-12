@@ -594,11 +594,20 @@ def _validate_encoder_mode(encoder: EncoderPredictionConfig | EncoderRecommendat
         raise ValueError("host_profile, frontend and transfer apply to encoder mode=native only")
 
 
+def _lift_plain_worker(value: Any) -> Any:
+    """A plain worker object stands in for the host-aware one; unset fields stay unset so role defaults apply."""
+    if type(value) in (WorkerPredictionConfig, WorkerRecommendationConfig):
+        return value.model_dump(exclude_unset=True)
+    return value
+
+
 class WorkersPredictionConfig(StrictModel):
     encoder: EncoderPredictionConfig | None = None
     aggregated: HostWorkerPredictionConfig | None = None
     prefill: HostWorkerPredictionConfig | None = None
     decode: WorkerPredictionConfig | None = None
+
+    _lift_plain_worker = field_validator("aggregated", "prefill", mode="before")(_lift_plain_worker)
 
     @model_validator(mode="after")
     def _apply_role_scheduler_defaults(self) -> WorkersPredictionConfig:
@@ -990,6 +999,8 @@ class WorkersRecommendationConfig(StrictModel):
     aggregated: HostWorkerRecommendationConfig | None = None
     prefill: HostWorkerRecommendationConfig | None = None
     decode: WorkerRecommendationConfig | None = None
+
+    _lift_plain_worker = field_validator("aggregated", "prefill", mode="before")(_lift_plain_worker)
 
 
 class EngineRecommendationConfig(EstimatorPolicyConfig):

@@ -16,6 +16,7 @@ import logging
 import math
 from collections.abc import Mapping
 from dataclasses import asdict, replace
+from itertools import product
 from typing import Any
 
 from .config import EncoderSearch, SmartSearchConfig, Workload
@@ -67,7 +68,7 @@ def resolve_encoder_pools(
     gpu_budget: int | None = None,
 ) -> dict[str, EncoderPoolSpec]:
     """Shared AIC resolution for search domains and one concrete CLI prediction."""
-    from aisimulate.sdk.sweep import _get_encoder_worker_candidates
+    from aisimulate.sdk.sweep import _get_encoder_worker_candidates, _vision_encoder_config
     from aisimulate_core.sdk.backends.base_backend import BaseBackend
     from aisimulate_core.sdk.config import RuntimeConfig
     from aisimulate_core.sdk.perf_database import get_database_view
@@ -91,6 +92,13 @@ def resolve_encoder_pools(
         geometry = image_geometry(
             model_name, images.height, images.width, min_pixels=images.min_pixels, max_pixels=images.max_pixels
         )
+        try:
+            # The timing model's family check precedes any host table lookup.
+            _vision_encoder_config(model_name)
+        except ValueError as exc:
+            raise ValueError(
+                f"native encoder pools price Qwen3-VL vision towers; {model_name!r} is not supported"
+            ) from exc
         visual_tokens = geometry.visual_tokens * images.count
         # The memory gate prices that geometry, not the raw dimensions.
         runtime = RuntimeConfig(
@@ -145,7 +153,8 @@ def resolve_encoder_pools(
             power = float(row.get("power_w", 0.0))
             if not math.isfinite(coverage) or not 0 <= coverage <= 1 or not math.isfinite(power) or power < 0:
                 raise ValueError("invalid encoder power evidence")
-            for workers in encoder.workers:
+            # A native row is gated at its own replica count; analytical rows cross every count.
+            for workers in [row["workers"]] if "workers" in row else encoder.workers:
                 point = EncoderPoolSpec(
                     model=model_name,
                     system=system,
@@ -177,13 +186,15 @@ def resolve_encoder_pools(
 
 
 def _native_encoder_rows(encoder, *, model_name, system, backend, version, database, runtime, images, geometry):
-    """One row per encoder tp at the loop's batch cap, with the terms the replay prices batches from.
+    """One row per encoder (tp, replicas) pair at the loop's batch cap, with the terms the replay prices batches from.
 
     The forward is priced at replay time by the canonical timing model at the pool's
     tensor width, the oracle a language rank uses for its vision tower; memory and
     power come from the analytical candidate helper at the cap, its gate sized at the
-    processor geometry the replay lays out rather than the raw image dimensions. The
-    CPU preprocessing extrapolates the tokenizer manager's measured `process` stage per
+    processor geometry the replay lays out rather than the raw image dimensions, and at
+    the per-instance batch: a request's images spread over the replicas, so one server
+    batches at most `cap` parts of `ceil(count / replicas)` images each. The CPU
+    preprocessing extrapolates the tokenizer manager's measured `process` stage per
     image: the encoder servers run the same image processor over the whole batch.
     """
     from aisimulate.sdk.errors import InsufficientMemoryError, NoFeasibleConfigError
@@ -205,25 +216,27 @@ def _native_encoder_rows(encoder, *, model_name, system, backend, version, datab
         frontend, digest = resolve_frontend(profile, model=model_name, images=images.model_dump(mode="json"))
     rows = []
     rejected = []
-    for tp in encoder.tp:
+    for tp, workers in product(encoder.tp, encoder.workers):
+        part = replace(runtime, num_images_per_request=math.ceil(images.count / workers))
         try:
             (point,) = _get_encoder_worker_candidates(
                 model_path=model_name,
                 tp_list=[tp],
                 b_list=[cap],
-                runtime_config=runtime,
+                runtime_config=part,
                 database=database,
                 backend_name=backend,
                 latency_correction=encoder.latency_correction,
             )
         except (InsufficientMemoryError, NoFeasibleConfigError) as exc:
-            # Infeasible at this tensor width only; invalid perf data or workload errors propagate.
-            logger.warning("native encoder: tp=%s skipped: %s", tp, exc)
-            rejected.append(f"tp={tp}: {exc}")
+            # Infeasible at this tensor width and replica count only; invalid perf data or workload errors propagate.
+            logger.warning("native encoder: tp=%s workers=%s skipped: %s", tp, workers, exc)
+            rejected.append(f"tp={tp} workers={workers}: {exc}")
             continue
         rows.append(
             {
                 **point,
+                "workers": workers,
                 "native": NativeEncoderTiming(
                     preprocess_ms_per_image=frontend.stages[0].service_ms / images.count,
                     preprocess_source="frontend_process_extrapolated",
@@ -244,7 +257,7 @@ def _native_encoder_rows(encoder, *, model_name, system, backend, version, datab
             }
         )
     if not rows:
-        raise NoFeasibleConfigError("native encoder: no feasible tp; " + "; ".join(rejected))
+        raise NoFeasibleConfigError("native encoder: no feasible tp/workers; " + "; ".join(rejected))
     return rows
 
 
