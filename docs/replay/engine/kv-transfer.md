@@ -85,3 +85,19 @@ for both roles.
 - Bandwidth applies to each transfer independently.
 - vLLM P/D can be combined with G2 host offload; see
   [KV cache](kv-cache.md#host-offload-g2). G3 offload is aggregated-only.
+
+## DSpark state
+
+With DSpark and automatic transfer geometry, the source prepares draft context
+KV during prefill. Handoff adds its rank-local footprint once:
+`min(prompt_tokens, draft_window) × draft_bytes_per_token` for windowed drafts,
+or the full context for full-attention drafts. Target-only prefix hits do not
+prove a draft-cache hit, so the full draft window is charged conservatively.
+The decode worker does not repeat prompt preparation. A numeric
+`bytes_per_token` is an explicit total-transfer override and must include any
+draft state; automatic draft bytes are not added to it.
+
+This models a connector that transfers prepared draft KV alongside target KV.
+Frameworks that rebuild draft state or transfer auxiliary hidden states require
+a different handoff contract and are not qualified by this approximation.
+The controlled 1P1D validation must establish the connector's actual contract.

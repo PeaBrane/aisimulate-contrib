@@ -75,6 +75,13 @@ pub struct HandoffTransferTiming {
     pub state_bytes: usize,
     /// Modeled transfer bandwidth in decimal gigabytes per second.
     pub bandwidth_gb_s: Option<f64>,
+    /// Additional prepared draft KV, sent once per handoff.
+    #[serde(default, skip_serializing_if = "is_zero_bytes")]
+    pub draft_cache_bytes: usize,
+}
+
+fn is_zero_bytes(value: &usize) -> bool {
+    *value == 0
 }
 
 impl HandoffTransferTiming {
@@ -97,7 +104,9 @@ impl HandoffTransferTiming {
             return None;
         }
 
-        let bytes = tokens as f64 * bytes_per_token as f64 + self.state_bytes as f64;
+        let bytes = tokens as f64 * bytes_per_token as f64
+            + self.state_bytes as f64
+            + self.draft_cache_bytes as f64;
         Some(bytes / (bandwidth_gb_s * 1e9) * 1000.0)
     }
 
@@ -131,6 +140,7 @@ pub fn prefill_handoff_delay_ms(
         kv_bytes_per_token,
         state_bytes: 0,
         bandwidth_gb_s,
+        draft_cache_bytes: 0,
     }
     .full_prompt_delay_ms()
 }
@@ -138,6 +148,20 @@ pub fn prefill_handoff_delay_ms(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn draft_state_is_transferred_once_even_with_target_prefix_hit() {
+        let timing = HandoffTransferTiming {
+            mode: TransferTimingMode::DestinationMissing,
+            full_prompt_tokens: 4096,
+            kv_bytes_per_token: Some(1000),
+            bandwidth_gb_s: Some(1.0),
+            draft_cache_bytes: 128 * 512 * 3,
+            state_bytes: 0,
+        };
+        assert_eq!(timing.delay_ms(0), Some(0.196608));
+        assert!((timing.delay_ms(100).unwrap() - 0.296608).abs() < 1e-12);
+    }
 
     #[test]
     fn handoff_id_round_trips_caller_owned_value() {
@@ -154,6 +178,7 @@ mod tests {
             kv_bytes_per_token: Some(1_000),
             state_bytes: 0,
             bandwidth_gb_s: Some(1.0),
+            draft_cache_bytes: 0,
         };
 
         assert_eq!(timing.delay_ms(20), Some(0.02));
@@ -167,6 +192,7 @@ mod tests {
             full_prompt_tokens: 100,
             kv_bytes_per_token: Some(1_000),
             state_bytes: 50_000,
+            draft_cache_bytes: 0,
             bandwidth_gb_s: Some(1.0),
         };
         let close = |value: Option<f64>, expected: f64| (value.unwrap() - expected).abs() < 1e-12;
@@ -183,12 +209,14 @@ mod tests {
             kv_bytes_per_token: None,
             state_bytes: 0,
             bandwidth_gb_s: Some(1.0),
+            draft_cache_bytes: 0,
         };
         assert_eq!(timing.delay_ms(0), None);
 
         let timing = HandoffTransferTiming {
             kv_bytes_per_token: Some(1_000),
             bandwidth_gb_s: Some(0.0),
+            draft_cache_bytes: 0,
             ..timing
         };
         assert_eq!(timing.delay_ms(0), None);

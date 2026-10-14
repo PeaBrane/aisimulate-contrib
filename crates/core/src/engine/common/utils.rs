@@ -13,6 +13,8 @@ pub fn prefill_handoff_transfer_timing(
     kv_bytes_per_token: Option<usize>,
     state_bytes: usize,
     mode: KvTransferTimingMode,
+    draft_bytes_per_token: usize,
+    draft_window: Option<usize>,
 ) -> HandoffTransferTiming {
     HandoffTransferTiming {
         mode: match mode {
@@ -23,6 +25,9 @@ pub fn prefill_handoff_transfer_timing(
         kv_bytes_per_token,
         state_bytes,
         bandwidth_gb_s: kv_transfer_bandwidth,
+        draft_cache_bytes: num_input_tokens
+            .min(draft_window.unwrap_or(usize::MAX))
+            .saturating_mul(draft_bytes_per_token),
     }
 }
 
