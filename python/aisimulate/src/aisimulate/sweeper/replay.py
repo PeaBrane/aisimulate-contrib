@@ -512,7 +512,10 @@ class RunnerCapabilities:
             if not self.supports_agentic_warmup:
                 raise ValueError("runner does not support agentic warmup")
         if agentic_snapshot is not None:
-            snapshot = AgenticSnapshotOptions.model_validate(agentic_snapshot)
+            try:
+                snapshot = AgenticSnapshotOptions.model_validate(agentic_snapshot)
+            except ValueError as error:
+                raise ValueError(f"agentic_snapshot: {error}") from error
             if agentic_lanes is None or spec.workload.get("load_type") != "trace_timestamps":
                 raise ValueError("agentic_snapshot requires trace_timestamps load with positive agentic_lanes")
             if snapshot.initial_selections is not None and len(snapshot.initial_selections) != agentic_lanes:
