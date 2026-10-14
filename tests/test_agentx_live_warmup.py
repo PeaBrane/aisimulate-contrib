@@ -66,9 +66,9 @@ def test_live_warmup_workload_serialization_keeps_the_policy_explicit():
 
 @pytest.mark.parametrize("stack,online", [("legacy", False), ("engine", True)])
 def test_supervisor_rejects_unsupported_live_warmup_before_overwrite(tmp_path, monkeypatch, capsys, stack, online):
-    from aisimulate import cli_args, output, supervision
+    from aisimulate import cli_args, supervision
 
-    prior = tmp_path / "results.json"
+    prior = tmp_path / "prediction.json"
     prior.write_bytes(b"previous valid results\n")
     raw = {
         "engine": {"model": "example/model", "hardware": "h200_sxm", "workers": {"aggregated": {}}},
@@ -78,11 +78,11 @@ def test_supervisor_rejects_unsupported_live_warmup_before_overwrite(tmp_path, m
     monkeypatch.setattr(supervision, "_installed_names", lambda _: ["legacy"])
     calls = []
 
-    def forbidden_prepare(*args, **kwargs):
+    def forbidden_run(*args, **kwargs):
         calls.append((args, kwargs))
-        pytest.fail("unsupported policy reached output cleanup")
+        pytest.fail("unsupported policy reached execution")
 
-    monkeypatch.setattr(output, "prepare_output_directory", forbidden_prepare)
+    monkeypatch.setattr(supervision, "run_process", forbidden_run)
     arguments = ["predict", "--config", "unused.yaml", "--stack", stack, "--output-dir", str(tmp_path), "--overwrite"]
     if online:
         arguments.append("--online")
@@ -94,8 +94,8 @@ def test_supervisor_rejects_unsupported_live_warmup_before_overwrite(tmp_path, m
     assert prior.read_bytes() == b"previous valid results\n"
 
 
-def test_supervisor_default_recommendation_without_traffic_keeps_existing_path(monkeypatch):
-    from aisimulate import cli_args, output, supervision
+def test_supervisor_default_recommendation_without_traffic_keeps_existing_path(tmp_path, monkeypatch):
+    from aisimulate import cli_args, supervision
 
     raw = {
         "engine": {
@@ -108,12 +108,14 @@ def test_supervisor_default_recommendation_without_traffic_keeps_existing_path(m
     }
     monkeypatch.setattr(cli_args, "_load_mapping", lambda _: raw)
 
-    class ReachedPreparation(Exception):
+    class ReachedExecution(Exception):
         pass
 
-    def observe_prepare(*args, **kwargs):
-        raise ReachedPreparation
+    def observe_run(*args, **kwargs):
+        raise ReachedExecution
 
-    monkeypatch.setattr(output, "prepare_output_directory", observe_prepare)
-    with pytest.raises(ReachedPreparation):
-        supervision.main(["recommend", "--config", "unused.yaml", "--stack", "engine", "--output-dir", "/unused"])
+    monkeypatch.setattr(supervision, "run_process", observe_run)
+    output = tmp_path / "output"
+    with pytest.raises(ReachedExecution):
+        supervision.main(["recommend", "--config", "unused.yaml", "--stack", "engine", "--output-dir", str(output)])
+    assert output.is_dir()
