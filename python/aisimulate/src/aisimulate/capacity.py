@@ -219,7 +219,13 @@ def materialize_aic_num_gpu_blocks(
             cp_size=lowered.get("aic_cp_size", 1),
         )
         if deployment.execution_profile is not None:
-            speculative_profile_kwargs["nextn"] = lowered.get("aic_nextn", 0)
+            depth = lowered.get("aic_nextn", 0)
+            if canonical_result is not None:
+                depth = lowered["timing_model"]["config"]["nextn"]
+                for name in ("aic_nextn", "nextn"):
+                    if name in lowered and lowered[name] != depth:
+                        raise ValueError(f"{name} conflicts with canonical timing configuration")
+            speculative_profile_kwargs["nextn"] = depth
 
     lowered["num_gpu_blocks"] = estimate_num_gpu_blocks(
         backend_name=backend,

@@ -212,6 +212,7 @@ def test_speculative_round_prediction_preserves_progress_identity_and_observed_c
 
     from aisimulate import _runtime
     from aisimulate.runner import EngineReplayRunnerFactory
+    from aisimulate.sweeper import ReplayOutputRequirements
     from aisimulate_core.sdk.fpm_identity import EXECUTION_COLUMNS
     from aisimulate_core.sdk.fpm_profile import load_fpm_profile
 
@@ -279,6 +280,14 @@ def test_speculative_round_prediction_preserves_progress_identity_and_observed_c
     assert materialized["num_gpu_blocks"] == 32768
     assert diagnostics["total_kv_size_bytes"] == 1024**3
     assert diagnostics["memory_breakdown"] is None
+    canonical_only = deepcopy(spec.backend_deployment.agg_engine_args)
+    canonical_only.pop("aic_nextn")
+    assert materialize_aic_num_gpu_blocks(canonical_only)["num_gpu_blocks"] == 32768
+    for legacy_name in ("aic_nextn", "nextn"):
+        conflicting_depth = deepcopy(canonical_only)
+        conflicting_depth[legacy_name] = 2
+        with pytest.raises(ValueError, match="conflicts with canonical"):
+            materialize_aic_num_gpu_blocks(conflicting_depth)
     seen = []
 
     class NativeCapture:
@@ -286,7 +295,11 @@ def test_speculative_round_prediction_preserves_progress_identity_and_observed_c
             seen.append(json.loads(serialized))
             return _runtime.run_replay_json(serialized)
 
-    report = EngineReplayRunnerFactory(runtime=NativeCapture()).create(0).run(spec)
+    report = (
+        EngineReplayRunnerFactory(runtime=NativeCapture())
+        .create(0)
+        .run(spec, output_requirements=ReplayOutputRequirements(include_raw_report=True, capture_per_request=True))
+    )
     rank = seen[0]["spec"]["engine"]["rank"]
     assert rank["aic_nextn"] == 3
     # 1.78 accepted drafts plus the mandatory base token means 2.78 output tokens per round.
@@ -294,6 +307,17 @@ def test_speculative_round_prediction_preserves_progress_identity_and_observed_c
     assert rank["num_gpu_blocks"] == 32768
     assert rank["timing_model"]["config"]["fpm_profile"]["deployments"][0]["execution_profile"] == execution
     assert report.metrics["completed_requests"] == 2
+    assert report.metrics["mean_ttft_ms"] == pytest.approx(7.0)
+    records = report.metadata["native_report"]["per_request"]
+    assert len(records) == 2
+    for record in records:
+        assert record["output_length"] == 7
+        assert record["ttft_ms"] == pytest.approx(7.0)
+        # One prefill token leaves six outputs: 2-3 tokens per round require
+        # two or three measured 11 ms rounds, with no extra draft charge.
+        rounds = (record["e2e_latency_ms"] - 7.0) / 11.0
+        assert rounds == pytest.approx(2.0) or rounds == pytest.approx(3.0)
+        assert record["itl_ms"] == pytest.approx(11.0 * rounds / 6.0)
 
 
 @pytest.mark.parametrize("memory_state", ["pending", "runtime"])
