@@ -263,7 +263,7 @@ traffic:
 | Control | Without it | With it |
 | --- | --- | --- |
 | `agentic_lanes` | Every play starts at its authored timestamp. | At most `N` plays run at once. |
-| `agentic_snapshot` | Each play starts at turn zero. | Each lane starts from a sampled point inside its play. |
+| `agentic_snapshot` | Each play starts at turn zero. | Each lane starts from a sampled or imported exact cut inside its play. |
 | `agentic_warmup` | Measurement starts with cold caches. | Caches are primed before measurement starts. |
 | `agentic_profile` | The run ends when the selected plays finish. | Lanes keep taking new plays until a deadline. |
 
@@ -334,6 +334,8 @@ agentic_snapshot:
   corpus_cursor: 1
 ```
 
+`initial_selections` and `corpus_cursor` must be supplied together, with exactly
+one selection per lane and a cursor at least as large as the selection count.
 Selections are in lane order. Each source ID must exist in the exact input
 corpus and each cut must lie within that play's request-start bounds. Cuts
 are in source milliseconds, before `speedup`; they are never re-sampled or
@@ -448,7 +450,7 @@ aisimulate predict --config examples/cli/agentic-profile.yaml \
 
 | Section | Contents |
 | --- | --- |
-| `agentic_snapshots` | Seed, sampled cut, history and remaining timers for each initial lane |
+| `agentic_snapshots` | Seed, sampled or imported exact cut, history and remaining timers for each initial lane |
 | `agentic_phases` | Preparation requests, barrier state and time (`profile_start_ms`) |
 | `agentic_play_outcomes` | Each play's terminal status (`completed`, `failed` or `incomplete`) and times |
 | `agentic_profile` | Resolved profile options, deadline, recycled plays, canceled and never-issued requests, unsettled server work |
