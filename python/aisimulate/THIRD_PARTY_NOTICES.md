@@ -1290,3 +1290,27 @@ vLLM commit `98dff2a81d747d1dba01a47f939f48c3526d4206` (v0.29.0).
 Copyright contributors to the vLLM project. Apache-2.0.
 Source: https://github.com/vllm-project/vllm/blob/98dff2a81d747d1dba01a47f939f48c3526d4206/examples/disaggregated/mooncake_connector/mooncake_connector_proxy.py
 License: https://github.com/vllm-project/vllm/blob/98dff2a81d747d1dba01a47f939f48c3526d4206/LICENSE
+
+## InferenceX AgentX P/D configuration evidence
+
+`benchmarks/evidence/dspark-fixed-20261014/agentx-pd-audit.json` contains modified
+extractions of configuration and measurement fields from InferenceX workflow
+`36425419107`, attempt 3, at commit
+`f4ad60fba73439cf4833a674e6a84feb2014bfaf`. Copyright SemiAnalysis and InferenceX
+contributors. Licensed under Apache-2.0; the full license is reproduced in the
+root `LICENSE`.
+
+Source recipe:
+https://github.com/SemiAnalysisAI/InferenceX/blob/f4ad60fba73439cf4833a674e6a84feb2014bfaf/inferencex-e2e/benchmarks/multi_node/srt-slurm-recipes/dsv4/vllm/gb200-fp4/agentx/disagg-1p1d-dep8-dep8-c32-dspark5.yaml
+
+Generated source artifacts:
+https://github.com/SemiAnalysisAI/InferenceX/actions/runs/36425419107/attempts/3
+Artifact IDs 11092304949, 11092647256 and 11092552440 contain the benchmark JSON,
+`conc_32/aiperf_artifacts/profile_export_aiperf.json`, per-request records,
+`sweep_26842.log`, worker `*_config.json` and `fingerprint_*_w0.json` files.
+The derived audit records their SHA-256 identities and extraction status. It
+also records selected fields from public sibling-point API responses, with
+source URLs and hashes. Raw archives and serving source code are not vendored.
+
+Upstream license:
+https://github.com/SemiAnalysisAI/InferenceX/blob/f4ad60fba73439cf4833a674e6a84feb2014bfaf/LICENSE
