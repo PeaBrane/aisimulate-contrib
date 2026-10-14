@@ -1658,6 +1658,48 @@ def test_agentic_snapshot_is_opt_in() -> None:
     assert "agentic_profile" not in prediction_to_replay_spec(config).workload
 
 
+def test_imported_agentic_snapshot_round_trips_without_changing_legacy_serialization():
+    from aisimulate.config.traffic import AgenticSnapshotOptions, TrafficPredictionConfig
+
+    snapshot = {
+        "seed": 42,
+        "initial_selections": [{"source_play_id": "reference-play", "t_star_ms": 40.56078627883167}],
+        "corpus_cursor": 2,
+    }
+    config = TrafficPredictionConfig.model_validate(
+        {
+            "source": {"type": "trace", "paths": ["corpus.jsonl"], "format": "weka"},
+            "load": {"type": "trace_timestamps", "agentic_lanes": 1, "agentic_snapshot": snapshot},
+        }
+    )
+    assert config.load.agentic_snapshot.model_dump() == snapshot
+    assert (
+        AgenticSnapshotOptions.model_validate(snapshot).model_dump_json()
+        == config.load.agentic_snapshot.model_dump_json()
+    )
+    assert AgenticSnapshotOptions(seed=42).model_dump() == {"seed": 42}
+
+
+@pytest.mark.parametrize(
+    "snapshot",
+    [
+        {"seed": 42, "initial_selections": []},
+        {"seed": 42, "corpus_cursor": 1},
+        {"seed": 42, "initial_selections": [{"source_play_id": "a", "t_star_ms": 5.0}]},
+        {"seed": 42, "initial_selections": [{"source_play_id": "", "t_star_ms": 5.0}], "corpus_cursor": 1},
+        {"seed": 42, "initial_selections": [{"source_play_id": "a", "t_star_ms": float("nan")}], "corpus_cursor": 1},
+        {"seed": 42, "initial_selections": [{"source_play_id": "a", "t_star_ms": -1.0}], "corpus_cursor": 1},
+        {"seed": 42, "initial_selections": [{"source_play_id": "a", "t_star_ms": 5.0}], "corpus_cursor": 0},
+        {"seed": 42, "initial_selections": [{"source_play_id": "a", "t_star_ms": 5.0}], "corpus_cursor": True},
+    ],
+)
+def test_imported_agentic_snapshot_rejects_invalid_metadata(snapshot):
+    from aisimulate.config.traffic import AgenticSnapshotOptions
+
+    with pytest.raises(ValidationError):
+        AgenticSnapshotOptions.model_validate(snapshot)
+
+
 @pytest.mark.parametrize("warmup", [False, True])
 @pytest.mark.parametrize("profile", [{}, {"duration_seconds": 2.0, "response_grace_seconds": 0.0}])
 def test_agentic_profile_roundtrip_and_compiler_preserve_controls(warmup: bool, profile: dict) -> None:
