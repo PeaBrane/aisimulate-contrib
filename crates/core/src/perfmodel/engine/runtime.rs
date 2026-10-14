@@ -3709,7 +3709,7 @@ mod tests {
 
     fn full_round_spec(tmp: &std::path::Path) -> EngineSpec {
         use crate::operators::fpm_forward::FpmInterpolation;
-        use crate::perf_database::fpm_forward::tests::{RowSpec, write_pair};
+        use crate::perf_database::fpm_forward::tests::{NativeCudaSampleSpec, RowSpec, write_pair};
         let binding = full_round_binding();
         let selector = binding.selector().unwrap();
         // The existing RowSpec fixture stores static strings. The few small
@@ -3734,6 +3734,11 @@ mod tests {
             latency_ms: latency,
             execution: Some(["", selector, "none", "text"]),
             kv_seed_regime: (kv > 0).then_some("real_kv"),
+            native_cuda: Some(NativeCudaSampleSpec {
+                scope: "model_step_cuda",
+                reduction: "single_sample",
+                source_sample_count: 1,
+            }),
             ..RowSpec::default()
         })
         .collect();
