@@ -3199,6 +3199,35 @@ mod tests {
     }
 
     #[test]
+    fn live_zero_time_warmup_does_not_poison_the_formal_progress_guard() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("mixed-duration.jsonl");
+        let rows = [("zero", 1), ("positive", 3)].into_iter().map(|(id, output)| serde_json::json!({
+            "id": id, "models": ["model"], "block_size": 4, "hash_id_scope": "local",
+            "requests": [{"t": 0.0, "type": "s", "model": "model", "in": 4, "out": output, "hash_ids": [1]}]
+        }).to_string()).collect::<Vec<_>>().join("\n");
+        std::fs::write(&path, rows).unwrap();
+        let payload = serde_json::json!({
+            "spec": {
+                "version": 1, "topology": {"kind": "aggregated", "workers": {"initial_workers": 1}},
+                "engine": {"rank": {"backend": "vllm", "block_size": 4, "num_gpu_blocks": 64,
+                    "timing_model": {"type": "fixed", "prefill_ms": 0.0, "decode_ms": 1.0}}},
+                "requests": []
+            },
+            "traffic": {"source_type": "trace", "load_type": "trace_timestamps", "trace_format": "weka",
+                "trace_path": path, "trace_block_size": 4, "execution_model": "model",
+                "agentic_lanes": 1, "agentic_snapshot": {"seed": 42}, "agentic_warmup": true,
+                "agentic_warmup_policy": "live_trajectory_v1", "agentic_profile": {"duration_seconds": 0.01}}
+        });
+        let report: serde_json::Value =
+            serde_json::from_str(&execute_json(&payload.to_string(), false).unwrap()).unwrap();
+        assert_eq!(report["agentic_phases"]["profile_start_ms"], 0.0);
+        assert_eq!(report["agentic_phases"]["lanes"][0]["warmup_completed"], 10);
+        assert!(report["duration_ms"].as_f64().unwrap() >= 10.0);
+        assert!(report["completed_requests"].as_u64().unwrap() >= 2);
+    }
+
+    #[test]
     fn public_agentic_json_rejects_unqualified_modes_without_restricting_standard_dynamo() {
         let directory = tempfile::tempdir().unwrap();
         let dynamo = serde_json::json!({

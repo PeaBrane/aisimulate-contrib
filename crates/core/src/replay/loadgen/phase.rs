@@ -275,6 +275,12 @@ impl AgenticPreparation {
             });
         }
         if policy == AgenticWarmupPolicy::LiveTrajectoryV1 {
+            ensure!(
+                this.lanes.len() == prepared.context().lane_count(),
+                "live warmup requires a complete initial lane cohort"
+            );
+            this.lanes
+                .sort_by_key(|lane| lane.snapshot.evidence.lane_id);
             let mut max_lead_ms = 0.0_f64;
             for lane in &mut this.lanes {
                 lane.primer_times_ms = lane
@@ -339,6 +345,7 @@ impl AgenticPreparation {
     ) {
         debug_assert!(self.lane_has_budget(lane));
         let index = self.requests.len();
+        self.lanes[lane].request_indices.push(index);
         self.index_by_uuid.insert(turn.request_uuid, index);
         self.live_requests.insert(turn.request_uuid);
         self.live_counts[lane] += 1;
@@ -375,7 +382,7 @@ impl AgenticPreparation {
     }
 
     pub(super) fn next_ready_time_ms(&self) -> Option<f64> {
-        if self.failure_request_id.is_some() || self.transition.is_some() {
+        if self.live_started || self.failure_request_id.is_some() || self.transition.is_some() {
             return None;
         }
         self.lanes
@@ -401,7 +408,7 @@ impl AgenticPreparation {
         limit: usize,
         emit_session_metadata: bool,
     ) -> Vec<CompactReadyTurn> {
-        if self.failure_request_id.is_some() || self.transition.is_some() {
+        if self.live_started || self.failure_request_id.is_some() || self.transition.is_some() {
             return Vec::new();
         }
         let mut ready = Vec::new();
@@ -769,10 +776,10 @@ impl AgenticPreparation {
                 .lanes
                 .iter()
                 .map(|lane| {
-                    let requests = self
-                        .requests
+                    let requests = lane
+                        .request_indices
                         .iter()
-                        .filter(|request| request.lane_id == lane.snapshot.evidence.lane_id)
+                        .map(|&index| &self.requests[index])
                         .collect::<Vec<_>>();
                     AgenticPhaseLane {
                         lane_id: lane.snapshot.evidence.lane_id,

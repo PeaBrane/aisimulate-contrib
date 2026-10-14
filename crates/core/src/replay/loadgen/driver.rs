@@ -967,6 +967,9 @@ impl WorkloadDriver {
             bail!("agentic profile deadline overflow at activation");
         }
         profile.start_ms = Some(now_ms);
+        // Warmup has a finite admission bound; the formal profile starts its
+        // own same-time progress window after measurement reset succeeds.
+        profile.replacements_at_ms = (None, 0);
         profile.last_advanced_ms = now_ms;
         profile.global_idle_since_ms = Some(now_ms);
         profile.tree_idle_since_ms.fill(Some(now_ms));
