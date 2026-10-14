@@ -21,5 +21,21 @@
     }
   ],
   "pro_checkpoint_found": false,
-  "gpu_measurements_collected": 0
+  "gpu_measurements_collected": 0,
+  "collection_acceptance_contract": {
+    "source": "https://github.com/vllm-project/vllm/blob/98dff2a81d747d1dba01a47f939f48c3526d4206/vllm/config/speculative.py",
+    "source_sha256": "cf8fcd342b6e863bac18415705a0ec2864c12b9def8e23ee84ea3ab4ede19847",
+    "synthetic_acceptance_length_includes_bonus": true,
+    "mean_committed_tokens": 3.77,
+    "mean_accepted_drafts": 2.77,
+    "minimum_variance_rates": [
+      1,
+      1,
+      0.77,
+      0,
+      0,
+      0
+    ],
+    "scope": "vLLM 0.29.0 collection image only; not evidence for the AgentX vLLM revision"
+  }
 }

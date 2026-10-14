@@ -66,17 +66,32 @@ def main():
         "build_profile": "release",
         "threads": 1,
         "trace_sha256": digest(harness / "fixtures/agentx.jsonl"),
+        "config_sha256": {name: digest(out / f"{name}.yaml") for name in configurations},
         "identities": {},
         "runs": [],
     }
     for label, root in roots.items():
         native = next((root / "python/aisimulate/src/aisimulate").glob("_runtime*.so"))
+        dependencies = subprocess.check_output(
+            [
+                str(root / "python/aisimulate/.venv/bin/python"),
+                "-c",
+                "import importlib.metadata,json; print(json.dumps({"
+                "d.metadata['Name'].lower():d.version for d in importlib.metadata.distributions()},sort_keys=True))",
+            ],
+            text=True,
+        )
         result["identities"][label] = {
             "revision": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip(),
             "diff_sha256": hashlib.sha256(subprocess.check_output(["git", "diff", "HEAD"], cwd=root)).hexdigest(),
             "native_sha256": digest(native),
             "uv_lock_sha256": digest(root / "python/aisimulate/uv.lock"),
+            "installed_dependencies_sha256": hashlib.sha256(dependencies.encode()).hexdigest(),
         }
+    assert (
+        result["identities"]["base"]["installed_dependencies_sha256"]
+        == result["identities"]["head"]["installed_dependencies_sha256"]
+    )
     # One discarded warmup per cell, then alternate base/head to reduce drift.
     for name in configurations:
         labels = ["head"] if name == "agentx-dspark" else ["base", "head"]

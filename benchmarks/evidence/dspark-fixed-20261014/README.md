@@ -53,6 +53,9 @@ be established. Kimi-K3 remains deferred.
 immutable image/tag identity and available Flash checkpoint. The inspected
 image supports `enable_adaptive_verification=false`. The Pro checkpoint was
 not found at its expected shared-cache path.
+The pinned v0.29.0 configuration source maps synthetic length 3.77 to 2.77
+accepted drafts using rates `[1, 1, 0.77, 0, 0, 0]`, matching Replay's
+adjacent-integer assumption. This does not qualify the older AgentX producer.
 
 `collect_pd.py` launches one TP4/EP4 producer and consumer, K=6, synthetic
 committed length 3.77, FP8 KV, eager execution, prefix caching, 8 GiB KV per GPU,
@@ -71,6 +74,10 @@ Target: `nv-prd-dgxc.teleport.sh-dynamo-nscale-dev-cluster`, namespace
 `spec-decoding-eval`. Resources: 8 B200, 32 CPU, 512 GiB RAM, read-only
 `shared-model-cache` and the task-owned `aisim-dspark-results-20261014` PVC.
 KAI queue `dynamo`; no dedicated-node tolerations or unrelated workloads changed.
+After 18 minutes without a GPU assignment, the task's inspection/collection Jobs
+and ConfigMap were deleted. The results PVC was retained. `collection-status.json`
+records the scheduler's resource-shortage events and resume action. No GPU
+measurement was produced, and no task GPU allocation remains.
 
 ```sh
 PY=python/aisimulate/.venv/bin/python
@@ -94,15 +101,20 @@ version. The existing B200 vLLM op data is 0.24.0; it is not vLLM 0.29.0 data.
 
 - Rust library: 1920 passed, 1 ignored.
 - Python DSpark/ngram/speculation suite: 313 passed.
-- Recommendation and affected Sweeper regression subset: 117 passed.
+- Final DSpark feature suite: 51 passed, including Pro TP8/EP1 vLLM/SGLang
+  construction and memory, and automatic draft-resolution round trips.
+- Final DSpark/ngram and affected Sweeper regression subset: 163 passed.
 - Earlier config/runner/Sweeper regression suite: 780 passed.
 - Final release parity: 386 passed in 197.59 seconds.
 - K=3/5/6/7, zero/full/fractional acceptance, repeatable seeds, short outputs,
   context limits, KV exhaustion, cancellation and rejection rollback covered.
+  The state-pressure test also exercises DSpark K=6/7 preemption and completion.
 - Aggregated/P/D AgentX with snapshot/warmup, saved recommendation round trips,
   real op-cost P/D with automatic transfer, draft memory, and window caps covered.
 - Actual op-level P/D smoke completed one request with all 19 output tokens.
   This is functional evidence, not a silicon accuracy result.
+- Ruff, Rust formatting, packaged legal-file checks and explicit ownership
+  coverage passed. CODEOWNERS tests: 107 passed.
 
 ```sh
 cargo test -p aisimulate-core --lib --no-default-features
@@ -117,7 +129,7 @@ python/aisimulate/.venv/bin/pytest -p no:timeout -q \
 ## Host cost
 
 `compare_host.py` measures complete release CLI wall time, with one discarded
-warmup and three alternating base/head repetitions. It fixes thread counts,
+warmup and alternating base/head repetitions. It fixes thread counts,
 checks completed request/token counts, records native binary/config/lockfile
 identity, and records peak RSS on macOS. The AgentX fixture is the repository's
 129-request, 114540-output-token play. A 128-request non-speculative control
@@ -125,11 +137,59 @@ checks ordinary execution. Candidate DSpark is a separate feature-cost cell;
 its reduced forward count is not a baseline implementation speedup.
 
 ```sh
+git worktree add --detach /tmp/aisim-dspark-base-cb71f236 cb71f236
+uv sync --project /tmp/aisim-dspark-base-cb71f236/python/aisimulate \
+  --extra dev --python "$PWD/python/aisimulate/.venv/bin/python"
+# Align the optional HTTP packages present in the measured candidate environment.
+uv pip install --python /tmp/aisim-dspark-base-cb71f236/python/aisimulate/.venv/bin/python \
+  certifi==2026.7.22 charset-normalizer==3.5.2 idna==3.20 requests==2.34.2 urllib3==2.8.0
+# Build the candidate from its Python package directory, which owns the module name.
+(cd python/aisimulate && VIRTUAL_ENV="$PWD/.venv" uv tool run maturin develop --release)
 python/aisimulate/.venv/bin/python \
   benchmarks/evidence/dspark-fixed-20261014/compare_host.py \
   --base /tmp/aisim-dspark-base-cb71f236 --head "$PWD" \
-  --output /tmp/aisim-dspark-host
+  --output /tmp/aisim-dspark-host --repeats 5
 ```
+
+The initial three-repetition run (`host-initial.json`) showed noisy control
+timing, including a 4.19 s baseline sample. A second five-repetition run
+(`host-stable.json`) used identical production code, binaries and workloads:
+
+| Full CLI case | Baseline median (range), s | Candidate median (range), s | Median RSS, MiB (base / head) |
+| --- | --- | --- | --- |
+| Non-speculative control | 2.470 (2.408–2.684) | 2.432 (2.339–2.573) | 197.27 / 197.58 |
+| Non-speculative AgentX | 3.848 (3.773–4.246) | 3.957 (3.670–4.182) | 196.80 / 197.00 |
+| DSpark AgentX | Unsupported | 4.011 (3.667–4.188) | — / 197.70 |
+
+Baseline is `cb71f236`; candidate is signed commit `9d841505`. Loaded native
+hashes match their release artifacts; common dependency versions and lockfile
+hashes match. A later audit found five extra HTTP packages in the candidate
+environment, so these two runs are preliminary. The baseline environment was
+then aligned for the final comparison. Candidate changes during the second run
+were ownership/evidence only. The preliminary samples vary: initial
+control median changed +7.8%, then -1.6%; AgentX changed -2.2%, then +2.8%.
+These short CLI samples do not establish performance at larger resident state.
+`host-semantic-comparison.json` confirms equal non-speculative completion/token
+counts and TTFT/TPOT/E2E predictions; AgentX lifecycle digests also match.
+
+Final dependency-matched results (`host-matched.json`, five repetitions):
+
+| Full CLI case | Baseline median (range), s | Candidate median (range), s | Median RSS, MiB (base / head) |
+| --- | --- | --- | --- |
+| Non-speculative control | 2.523 (2.432–2.659) | 2.529 (2.408–2.728) | 197.25 / 198.00 |
+| Non-speculative AgentX | 3.736 (3.681–3.942) | 3.896 (3.729–3.972) | 199.39 / 198.12 |
+| DSpark AgentX | Unsupported | 3.470 (3.418–3.583) | — / 199.27 |
+
+The final medians change +0.24% for the control and +4.29% for AgentX
+(+0.160 s). The ranges overlap, but these samples do not rule out a small
+host-cost regression. No numerical performance threshold was specified.
+The harness now rejects mismatched installed dependency sets before timing.
+
+Implementation cost: resolution and draft-capacity inversion occur during model
+construction. The scheduler reuses the existing sampler and reservation paths;
+there is no new per-round checkpoint read or draft-model construction.
+Ordinary mixed-step composition adds draft-name checks within its existing
+operation traversal; it adds no resident-state scan or new retained cache.
 
 ## Remaining causes and coverage gaps
 
@@ -148,3 +208,24 @@ python/aisimulate/.venv/bin/python \
    replay. Missing evidence must not be reported as successful validation.
 
 Phase 2 FPM design, collection planning and accuracy tests are deferred.
+
+## Playground diagnostic reproduction
+
+`diagnose_playground.py` retains separate SSE-gap and counter-derived round
+observations, plus their source hashes. It queries the canonical op model at
+the approximate start/end KV lengths of each wave, reporting predicted draft
+and verify components. These components were not measured independently.
+The difference percentages are diagnostic; eligible accuracy points remain zero.
+
+`playground-diagnostics.json` contains 18 batch/depth points. At batch 1, the
+predicted round ranges are 6.40–6.45 ms (K=3), 6.95–6.99 ms (K=5), and
+7.43–7.58 ms (K=7), versus SSE-gap medians 9.55/10.17/10.64 ms. The gaps are
+about -28.8% to -33.1%. Unmodeled host overhead, attention proxies and runtime
+identity differences remain possible causes; this evidence cannot isolate them.
+
+```sh
+python/aisimulate/.venv/bin/python \
+  benchmarks/evidence/dspark-fixed-20261014/diagnose_playground.py \
+  --playground /path/to/AISimPlayground/playground/dsv4flash-b200-specdec-validation \
+  --output benchmarks/evidence/dspark-fixed-20261014/playground-diagnostics.json
+```
