@@ -5,6 +5,13 @@ SPDX-License-Identifier: Apache-2.0
 
 # Python Replay API
 
+For native vLLM text replay, pass
+`ReplayOutputRequirements(stream_interval=20)` to request a separate modeled
+content-delivery view. This positive integer is opt-in; `None` keeps existing
+reports unchanged. Engine scheduling, SLA metrics and client-terminal causality
+are unchanged. With `capture_per_request=True`, records also include chunk
+observations. See [stream observation semantics](../../getting-started/understand-results.md#modeled-stream-observations).
+
 The Python API compiles public configuration into a data-only runner contract.
 Its `ReplaySpec` is not the native Rust JSON structure with the same name.
 Use the compiler rather than translating fields between them by hand.

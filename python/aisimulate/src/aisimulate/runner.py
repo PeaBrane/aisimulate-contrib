@@ -461,6 +461,12 @@ class EngineReplayRunner:
         output_requirements: ReplayOutputRequirements | None = None,
     ) -> ReplayReport:
         output_requirements = output_requirements or ReplayOutputRequirements()
+        if output_requirements.stream_interval is not None and (
+            spec.backend_deployment.backend != "vllm"
+            or spec.backend_deployment.deployment_mode in {"afd", "afd+pd"}
+            or spec.backend_deployment.encoder is not None
+        ):
+            raise InvalidRunnerError("stream_interval observations require native vLLM text replay")
         if self.determinism not in {"random", "canonical_v1"}:
             raise ValueError(f"unsupported replay determinism: {self.determinism!r}")
         if self.determinism != "random" and (
@@ -543,6 +549,10 @@ class EngineReplayRunner:
             record_per_request=output_requirements.capture_per_request,
             memory_diagnostics=memory_diagnostics,
         )
+        if output_requirements.stream_interval is not None:
+            if "spec" not in execution_spec:
+                execution_spec = {"spec": execution_spec}
+            execution_spec["stream_interval"] = output_requirements.stream_interval
         if output_requirements.capture_performance_diagnostics:
             if "spec" not in execution_spec:
                 execution_spec = {"spec": execution_spec}
@@ -605,6 +615,7 @@ class EngineReplayRunner:
                 or output_requirements.capture_per_request
                 or output_requirements.capture_memory_diagnostics
                 or output_requirements.capture_performance_diagnostics
+                or output_requirements.stream_interval is not None
             ),
         )
         if encoder is not None:

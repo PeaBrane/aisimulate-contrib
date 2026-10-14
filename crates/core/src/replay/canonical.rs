@@ -175,6 +175,21 @@ fn validate_report_finite(report: &ReplayReport) -> Result<()> {
     validate_distribution("/summary/ttst", &report.latency.ttst)?;
     validate_distribution("/summary/tpot", &report.latency.tpot)?;
     validate_distribution("/summary/itl", &report.latency.itl.distribution)?;
+    if let Some(stream) = &report.stream_observation {
+        for (name, metric) in [
+            ("ttft", &stream.ttft),
+            ("ttst", &stream.ttst),
+            ("e2e_latency", &stream.e2e_latency),
+            ("request_mean_itl", &stream.request_mean_itl),
+            ("token_gap_itl", &stream.token_gap_itl),
+            ("inter_chunk_latency", &stream.inter_chunk_latency),
+        ] {
+            validate_distribution(
+                &format!("/summary/stream_observation/{name}"),
+                &metric.distribution,
+            )?;
+        }
+    }
     ensure_finite("/summary/max_itl_ms", report.latency.itl.max_ms)?;
     validate_distribution("/summary/e2e", &report.latency.e2e)?;
     validate_distribution(
@@ -219,6 +234,26 @@ fn validate_distribution(path: &str, stats: &TraceDistributionStats) -> Result<(
 
 fn validate_per_request_finite(record: &PerRequestRecord) -> Result<()> {
     let path = format!("/per_request/{}", record.uuid);
+    if let Some(stream) = &record.stream_observation {
+        for (name, value) in [
+            ("first_content_ms", stream.first_content_ms),
+            ("last_content_ms", stream.last_content_ms),
+            ("ttft_ms", stream.ttft_ms),
+            ("ttst_ms", stream.ttst_ms),
+            ("e2e_latency_ms", stream.e2e_latency_ms),
+            ("request_mean_itl_ms", stream.request_mean_itl_ms),
+        ] {
+            if let Some(value) = value {
+                ensure_finite(&format!("{path}/stream_observation/{name}"), value)?;
+            }
+        }
+        for (index, chunk) in stream.chunks.iter().enumerate() {
+            ensure_finite(
+                &format!("{path}/stream_observation/chunks/{index}/at_ms"),
+                chunk.at_ms,
+            )?;
+        }
+    }
     for (field, value) in [
         ("arrival_time_ms", Some(record.arrival_time_ms)),
         ("first_admit_ms", record.first_admit_ms),

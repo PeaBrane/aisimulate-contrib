@@ -409,6 +409,7 @@ fn main() -> Result<()> {
         capture_lifecycle_evidence: true,
         capture_canonical_evidence: true,
         determinism: ReplayDeterminism::CanonicalV1,
+        ..Default::default()
     };
     let binary_sha256 = sha256_file(&env::current_exe()?)?;
 

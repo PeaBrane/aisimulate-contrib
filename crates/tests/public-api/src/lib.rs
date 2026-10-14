@@ -663,6 +663,7 @@ pub fn rebuild_replay_report_literals(
     use aisimulate_core::{ReplayReport, replay::PerRequestRecord};
     (
         ReplayReport {
+            stream_observation: report.stream_observation,
             kv_eviction_policy: report.kv_eviction_policy,
             kv_eviction_assumption: report.kv_eviction_assumption,
             committed_prefill_tokens: report.committed_prefill_tokens,
@@ -688,6 +689,7 @@ pub fn rebuild_replay_report_literals(
             runtime_evidence: report.runtime_evidence,
         },
         PerRequestRecord {
+            stream_observation: record.stream_observation,
             request_id: record.request_id,
             play_id: record.play_id,
             session_id: record.session_id,

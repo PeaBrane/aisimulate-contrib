@@ -48,6 +48,13 @@ def build_parser() -> argparse.ArgumentParser:
         child.add_argument("--overwrite", action="store_true")
         child.add_argument("--format", choices=("table", "json"), default="table")
     subparsers.choices["predict"].add_argument("--capture-per-request", action="store_true")
+    subparsers.choices["predict"].add_argument(
+        "--stream-interval",
+        type=_positive_int,
+        default=None,
+        metavar="N",
+        help="add modeled vLLM content-delivery metrics without host/network cost; engine metrics are unchanged",
+    )
     subparsers.choices["predict"].epilog = (
         "AgentX replay: use weka, agentic_mooncake, or agentic Dynamo traces with "
         "trace_timestamps and positive agentic_lanes. The offline engine stack supports "

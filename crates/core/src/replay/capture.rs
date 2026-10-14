@@ -34,6 +34,10 @@ impl ReplayDeterminism {
 /// Replay-owned controls for optional detailed capture.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ReplayCaptureOptions {
+    /// Optional modeled content-output batching. Does not delay engine work,
+    /// terminals, or load generation; the first output and final tail flush.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_interval: Option<std::num::NonZeroUsize>,
     #[serde(default)]
     pub capture_per_request: bool,
     #[serde(default)]
@@ -50,5 +54,34 @@ impl ReplayCaptureOptions {
     /// per-request JSONL file.
     pub const fn effective_per_request(self) -> bool {
         self.capture_per_request || self.capture_canonical_evidence
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_interval_is_positive_and_absent_by_default() {
+        let defaults = serde_json::to_value(ReplayCaptureOptions::default()).unwrap();
+        assert!(defaults.get("stream_interval").is_none());
+        for value in [
+            serde_json::json!(0),
+            serde_json::json!(-1),
+            serde_json::json!(true),
+            serde_json::json!(1.5),
+        ] {
+            assert!(
+                serde_json::from_value::<ReplayCaptureOptions>(serde_json::json!({
+                    "stream_interval": value,
+                }))
+                .is_err()
+            );
+        }
+        let options: ReplayCaptureOptions = serde_json::from_value(serde_json::json!({
+            "stream_interval": 20,
+        }))
+        .unwrap();
+        assert_eq!(options.stream_interval.unwrap().get(), 20);
     }
 }

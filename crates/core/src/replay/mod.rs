@@ -166,8 +166,10 @@ pub use report::{
     PerRequestRoutingRecord, ReplayOperationPowerDiagnostics, ReplayPhasePowerDiagnostics,
     ReplayPowerDiagnostics, ReplayReport, ReplayRequestPool, ReplayRoutingOutcome,
     ReplayTerminalStatus, ReplayTerminalStatus as RequestTerminalStatus, SlaThresholds,
-    TraceDistributionStats, TraceGoodputStats, TraceInterTokenLatencyStats, TraceLatencyStats,
-    TracePowerStats, TraceRequestCounts, TraceThroughputStats, TraceTrajectoryStats,
+    StreamContentChunk, StreamLatencyDistribution, StreamObservationReport,
+    StreamRequestObservation, TraceDistributionStats, TraceGoodputStats,
+    TraceInterTokenLatencyStats, TraceLatencyStats, TracePowerStats, TraceRequestCounts,
+    TraceThroughputStats, TraceTrajectoryStats,
 };
 pub use scaling::{NoScaling, ReplayScalingDecision, ReplayScalingPolicy, ReplayScalingSnapshot};
 #[cfg(test)]

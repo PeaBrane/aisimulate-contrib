@@ -207,8 +207,16 @@ class ReplayOutputRequirements:
     telemetry_sample_interval_ms: float = 1000.0
     capture_memory_diagnostics: bool = False
     capture_performance_diagnostics: bool = False
+    # Observation only: keep engine metrics and completion causality unchanged.
+    stream_interval: int | None = None
 
     def __post_init__(self) -> None:
+        if self.stream_interval is not None and (
+            isinstance(self.stream_interval, bool)
+            or not isinstance(self.stream_interval, int)
+            or self.stream_interval < 1
+        ):
+            raise ValueError("stream_interval must be a positive integer")
         interval = self.telemetry_sample_interval_ms
         if self.capture_telemetry and (
             isinstance(interval, bool)

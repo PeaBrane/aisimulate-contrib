@@ -46,6 +46,7 @@ illustrate the output format. Captured detail examples are simulation results, n
 | Option | Type | Default | Meaning |
 |---|---|---:|---|
 | `--capture-per-request` | flag | `false` | Write per-request prediction records to `requests.jsonl`. |
+| `--stream-interval N` | positive integer | omitted | Add a separate modeled vLLM content-delivery view; native offline `engine` text replay only. Does not replace engine metrics or add host/network latency. |
 | `--detail` | comma-separated selectors | omitted | Add `summary`, `memory`, `time`, `energy`, `source`, or `all`. See [prediction details](#prediction-details). |
 | `--online` | flag | `false` | Pace prediction against the real wall clock instead of virtual time. The selected stack must advertise online support. |
 
@@ -118,6 +119,11 @@ Core output controls are CLI-only. A selected output adapter owns its same-named
 section; that section configures artifact generation and is excluded from recommended prediction
 YAML files. Output adapters receive the prepared output directory directly and must preserve
 unrelated files.
+
+`--stream-interval 20` adds `stream_observation` to the native report and, with
+`--capture-per-request`, to each request record. It is an observation control,
+not an engine scheduling option or a YAML field. See the [delivery boundary and
+metric populations](../getting-started/understand-results.md#modeled-stream-observations).
 
 Recommendation output uses the schema-versioned `SweepResult` contract documented in
 [`docs/sweeper/results.md`](../sweeper/results.md). It preserves run metadata, a candidate-attempt

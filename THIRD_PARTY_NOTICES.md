@@ -1248,3 +1248,34 @@ https://github.com/alibaba/tair-kvcache/blob/85402f1a012fb4279be5bb4b57613bb0a06
 
 The AISimulate files are modified re-implementations, not verbatim copies.
 Both derived files carry the source URLs and revisions in their headers.
+
+
+## vLLM and AgentX streaming observation semantics
+
+The repository-root file `crates/core/src/replay/report/streaming.rs` and its
+hand-calculated unit tests are independent semantic adaptations of vLLM output
+batching and AgentX/AIPerf metric definitions. NVIDIA modified the semantics for
+a token-only offline observation model: no detokenization or HTTP code is
+copied, and engine resource completion remains unchanged. The documentation in
+`docs/getting-started/understand-results.md` describes these adapted boundaries.
+
+Upstream vLLM source and immutable revision:
+https://github.com/vllm-project/vllm/blob/b3563fc65ae0f5359802593d78e7ea097e1fed31/vllm/v1/engine/output_processor.py
+
+Copyright contributors to the vLLM project. Licensed under Apache-2.0.
+Upstream license:
+https://github.com/vllm-project/vllm/blob/b3563fc65ae0f5359802593d78e7ea097e1fed31/LICENSE
+
+Upstream AgentX/AIPerf source at immutable revision
+`754356e9a39acc6cc6afb242d123bb57c3fb6f75`:
+
+- https://github.com/SemiAnalysisAI/agentx-harness/blob/754356e9a39acc6cc6afb242d123bb57c3fb6f75/src/aiperf/metrics/types/inter_token_latency_metric.py
+- https://github.com/SemiAnalysisAI/agentx-harness/blob/754356e9a39acc6cc6afb242d123bb57c3fb6f75/src/aiperf/metrics/types/request_latency_metric.py
+- https://github.com/SemiAnalysisAI/agentx-harness/blob/754356e9a39acc6cc6afb242d123bb57c3fb6f75/src/aiperf/metrics/types/ttft_metric.py
+
+Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+Licensed under Apache-2.0. Upstream license:
+https://github.com/SemiAnalysisAI/agentx-harness/blob/754356e9a39acc6cc6afb242d123bb57c3fb6f75/LICENSE
+
+The full Apache-2.0 license is included at the repository root as `LICENSE`
+and in the Python distribution.

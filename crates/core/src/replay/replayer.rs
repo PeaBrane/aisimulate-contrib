@@ -369,6 +369,21 @@ impl<C: ReplayComposition> Replayer<C> {
         self.composition.set_determinism(self.capture.determinism)?;
         let engine_config = ReplayEngineConfig::parse(&self.spec.engine)?;
         engine_config.validate_topology(&self.spec.topology)?;
+        if self.capture.stream_interval.is_some() {
+            let stages: &[WorkerStage] = match self.spec.topology {
+                ReplayTopology::Aggregated { .. } => &[WorkerStage::Aggregated],
+                ReplayTopology::Disaggregated { .. } => {
+                    &[WorkerStage::Prefill, WorkerStage::Decode]
+                }
+            };
+            if stages.iter().any(|&stage| {
+                engine_config.role(stage).rank.backend != crate::engine::Backend::Vllm
+            }) {
+                return Err(ReplayError::InvalidSpec(
+                    "stream_interval observations require native vLLM text replay".to_string(),
+                ));
+            }
+        }
         validate_request_dp_ranks(&self.spec, &engine_config)?;
         let mut runtime_input = match self.runtime_input.take() {
             Some(mut input) => {
@@ -1040,6 +1055,73 @@ mod generated_replay_tests {
         .unwrap()
         .into_json_line()
         .unwrap()
+    }
+
+    #[test]
+    fn stream_observations_preserve_native_closed_loop_causality() {
+        for disagg in [false, true] {
+            for cap in [1, 4] {
+                for draft_tokens in [0, 3] {
+                    let mut spec = spec(Backend::Vllm, disagg, cap, true);
+                    for role in ["rank", "prefill", "decode"] {
+                        let rank = if role == "rank" {
+                            spec.engine.get_mut(role)
+                        } else {
+                            spec.engine
+                                .get_mut(role)
+                                .and_then(|role| role.get_mut("rank"))
+                        };
+                        if let Some(rank) = rank {
+                            rank["aic_nextn"] =
+                                serde_json::json!((draft_tokens > 0).then_some(draft_tokens));
+                        }
+                    }
+                    let capture = ReplayCaptureOptions {
+                        capture_per_request: true,
+                        capture_canonical_evidence: true,
+                        determinism: ReplayDeterminism::CanonicalV1,
+                        ..Default::default()
+                    };
+                    let run = |stream_interval| {
+                        Replayer::new(spec.clone(), ReplayEngineFactory::new())
+                            .unwrap()
+                            .with_runtime_input(ReplayRuntimeInput::GeneratedRequests(
+                                GeneratedRequests::new(11, |index| {
+                                    let mut request = request(index);
+                                    request.max_output_tokens = 25;
+                                    request.output_token_ids = Some((0..25).collect());
+                                    Ok(request)
+                                }),
+                            ))
+                            .with_capture_options(ReplayCaptureOptions {
+                                stream_interval,
+                                ..capture
+                            })
+                            .run()
+                            .unwrap()
+                    };
+                    let baseline = run(None);
+                    let mut observed = run(std::num::NonZeroUsize::new(20));
+                    assert_eq!(
+                        observed
+                            .stream_observation
+                            .take()
+                            .unwrap()
+                            .completed_requests_with_content,
+                        11
+                    );
+                    for request in &mut observed.per_request {
+                        let delivery = request.stream_observation.take().unwrap();
+                        assert_eq!(delivery.first_content_ms, request.first_token_ms);
+                        assert_eq!(delivery.last_content_ms, request.last_token_ms);
+                        assert_eq!(delivery.request_mean_itl_ms, request.itl_ms);
+                    }
+                    // Includes source arrivals, terminal callbacks, worker/cache
+                    // evidence and per-request accounting, not only final counts.
+                    assert_eq!(canonical(&baseline, capture), canonical(&observed, capture));
+                }
+            }
+        }
     }
 
     #[test]

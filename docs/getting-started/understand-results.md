@@ -77,6 +77,66 @@ The terminal table displays ITL. Aggregate SLA filtering uses mean TPOT for
 the `itl_ms` bound. Use the saved report's explicit field names when comparing
 with a benchmark; do not match columns solely by a similar label.
 
+In particular, the [pinned AgentX/AIPerf implementation](https://github.com/SemiAnalysisAI/agentx-harness/blob/754356e9a39acc6cc6afb242d123bb57c3fb6f75/src/aiperf/metrics/types/inter_token_latency_metric.py)
+calls the per-request mean **ITL**. Compare its distribution with native replay
+`tpot`, not the pooled native `itl` distribution. AIPerf uses first and last
+**content** response timestamps; usage-only chunks and HTTP completion are not
+part of that metric. Its separate full-response ITL includes HTTP completion.
+
+### Modeled stream observations
+
+For an additional vLLM-style content-delivery view:
+
+```bash
+aisimulate predict --stack engine --config prediction.yaml \
+  --stream-interval 20 --capture-per-request --output-dir prediction-output
+```
+
+This opt-in view implements the token batching boundary in
+[vLLM's pinned output processor](https://github.com/vllm-project/vllm/blob/b3563fc65ae0f5359802593d78e7ea097e1fed31/vllm/v1/engine/output_processor.py):
+
+- Send the first output immediately, including its whole speculative-decoding burst.
+- Send subsequent accumulated tokens once their count reaches the interval.
+  Check at an output boundary; do not split an SD burst at exactly 20 tokens.
+- Flush a remaining short tail on successful completion. Cancellation and
+  cutoff do not fabricate a successful final output.
+
+Native replay represents one output burst by its common completion timestamp.
+Equal-timestamp tokens stay together. Zero-duration synthetic forwards cannot
+distinguish separate bursts at the same timestamp; their chunk counts are not
+exact native output counts. The model does not emulate detokenization,
+empty-text/special-token filtering, server queueing, HTTP transport, or the
+client tokenizer's output-token count. No guessed latency offsets are added.
+Use the effective vLLM interval (the maximum of server and request settings).
+
+The report's optional `stream_observation` contains:
+
+| Field | Sample population |
+| --- | --- |
+| `ttft`, `ttst`, `e2e_latency` | Per completed, admitted request with the required delivered content. |
+| `request_mean_itl` | One `(last_content - first_content) / (delivered_tokens - 1)` scalar per qualifying request. This is the AIPerf-style population. |
+| `token_gap_itl` | All delivered-token gaps, including zero gaps inside a chunk. |
+| `inter_chunk_latency` | Gaps between content chunks, without token weighting. |
+
+Each distribution carries `samples`; quantiles use the existing bounded
+DDSketch with 0.1% relative accuracy. Per-request observations retain modeled
+content chunks and are rebased with the other timestamps in warmed profiles.
+Failed, canceled, and incomplete requests do not enter the completed-request
+aggregate. A canceled request's retained stream view may contain fewer tokens
+than the engine produced because its unsent tail is not flushed.
+
+For outputs at 1, 2, ..., 45 ms with interval 20, chunks arrive at 1, 21,
+41, and 45 ms, carrying 1, 20, 20, and 4 tokens. TTFT stays 1 ms and mean ITL
+stays 1 ms; chunk intervals and the delivered second-token time change.
+Thus `stream_interval=20` does **not** imply a 20-token TTFT wait or, by itself,
+explain a discrepancy in request-mean ITL.
+
+Existing engine timestamps, counts, SLA metrics, scheduling, and resource
+completion remain unchanged. Final flushing occurs at the existing terminal
+boundary, so closed-loop admission/dependencies are not delayed. Defaults omit
+all new fields. The initial CLI implementation rejects external/online runners,
+non-vLLM backends, and analytical image/AFD paths rather than ignoring the option.
+
 ## Completed and incomplete requests
 
 Native replay computes headline latency and throughput from completed requests.

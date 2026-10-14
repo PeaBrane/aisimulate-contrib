@@ -155,8 +155,16 @@ def _compile_prediction_adapters(
 
 
 def _predict(args: argparse.Namespace, raw: dict[str, Any], factory) -> int:
+    if args.stream_interval is not None and (args.stack != "engine" or args.online):
+        raise ValueError("--stream-interval requires offline --stack engine")
     core_raw, adapter_raw = split_config_sections(raw, command="predict")
     config = CorePredictionConfig.model_validate(core_raw)
+    if args.stream_interval is not None and (
+        config.engine.backend != "vllm"
+        or config.engine.workers.encoder is not None
+        or config.engine.mode in {"afd", "afd+pd"}
+    ):
+        raise ValueError("--stream-interval requires native vLLM text replay")
     if config.engine.speculation is not None and (args.stack != "engine" or args.online or adapter_raw):
         raise ValueError("ngram speculation requires offline --stack engine without adapters")
     plan = _resource_plan(args, config, factory)
@@ -186,6 +194,7 @@ def _predict(args: argparse.Namespace, raw: dict[str, Any], factory) -> int:
         output_requirements=ReplayOutputRequirements(
             include_raw_report=not epd,
             capture_per_request=args.capture_per_request,
+            stream_interval=args.stream_interval,
             capture_memory_diagnostics="memory" in args.detail,
             capture_performance_diagnostics=bool({"time", "source"}.intersection(args.detail)),
         ),

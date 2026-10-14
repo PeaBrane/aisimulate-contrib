@@ -1115,6 +1115,7 @@ where
     }
 
     pub(crate) fn with_capture_options(mut self, options: ReplayCaptureOptions) -> Self {
+        self.collector.set_stream_interval(options.stream_interval);
         self.evidence = ReplayEvidenceCollector::new(options);
         self
     }

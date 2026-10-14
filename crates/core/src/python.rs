@@ -45,6 +45,8 @@ enum ExecutionPayload {
         capture_performance_diagnostics: bool,
         #[serde(default)]
         determinism: ReplayDeterminism,
+        #[serde(default)]
+        stream_interval: Option<std::num::NonZeroUsize>,
     },
     Legacy(ReplaySpec),
 }
@@ -1768,6 +1770,7 @@ fn run_with_input(
     input: Option<ReplayRuntimeInput>,
     capture_artifacts: bool,
     determinism: ReplayDeterminism,
+    stream_interval: Option<std::num::NonZeroUsize>,
 ) -> crate::replay::ReplayResult<(crate::replay::ReplayReport, Option<ReplayArtifacts>)> {
     let replayer = match input {
         Some(input) => Replayer::new(spec, factory)?.with_runtime_input(input),
@@ -1775,6 +1778,7 @@ fn run_with_input(
     }
     .with_capture_options(ReplayCaptureOptions {
         determinism,
+        stream_interval,
         ..ReplayCaptureOptions::default()
     });
     if capture_artifacts {
@@ -2251,20 +2255,24 @@ fn replay_fpm_coverage(
 }
 
 fn execute_json(payload: &str, capture_artifacts: bool) -> Result<String> {
-    let (mut spec, mut traffic, capture_performance_diagnostics, determinism) =
+    let (mut spec, mut traffic, capture_performance_diagnostics, determinism, stream_interval) =
         match serde_json::from_str(payload).context("invalid AISimulate execution ReplaySpec")? {
             ExecutionPayload::Configured {
                 spec,
                 traffic,
                 capture_performance_diagnostics,
                 determinism,
+                stream_interval,
             } => (
                 spec,
                 traffic.map(|t| *t),
                 capture_performance_diagnostics,
                 determinism,
+                stream_interval,
             ),
-            ExecutionPayload::Legacy(spec) => (spec, None, false, ReplayDeterminism::default()),
+            ExecutionPayload::Legacy(spec) => {
+                (spec, None, false, ReplayDeterminism::default(), None)
+            }
         };
     ensure!(
         spec.max_sim_time_ms.is_none()
@@ -2362,7 +2370,7 @@ fn execute_json(payload: &str, capture_artifacts: bool) -> Result<String> {
                 ReplayEngineFactory::new,
                 ReplayEngineFactory::with_timing_model,
             );
-            run_with_input(spec, factory, input, capture_artifacts, determinism)
+            run_with_input(spec, factory, input, capture_artifacts, determinism, stream_interval)
                 .map(|(report, artifacts)| (report, artifacts, resolved_basis))
         }
         ReplayTopology::Disaggregated { .. } => {
@@ -2486,6 +2494,7 @@ fn execute_json(payload: &str, capture_artifacts: bool) -> Result<String> {
                 input,
                 capture_artifacts,
                 determinism,
+                stream_interval,
             )
             .map(|(report, artifacts)| (report, artifacts, resolved_basis))
         }

@@ -109,6 +109,12 @@ def run_prediction(
     Raises:
         PredictionExecutionError: If the runner fails while executing the spec.
     """
+    if (
+        output_requirements is not None
+        and output_requirements.stream_interval is not None
+        and (stack != "engine" or execution_mode != "offline")
+    ):
+        raise ValueError("stream_interval observations require offline engine prediction")
     adapter_configs = dict(adapter_configs or {})
     providers = dict(providers or {})
     epd = config.engine.workers.encoder is not None
@@ -134,6 +140,7 @@ def run_prediction(
         or output_requirements.capture_per_request
         or capture_memory_details
         or output_requirements.capture_performance_diagnostics
+        or output_requirements.stream_interval is not None
     )
     output_requirements = replace(output_requirements, capture_memory_diagnostics=True)
     runner = runner_factory.create(0)

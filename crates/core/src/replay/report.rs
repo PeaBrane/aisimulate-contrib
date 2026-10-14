@@ -2,6 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 mod bounded;
+mod streaming;
+
+use streaming::StreamObservationCollector;
+pub use streaming::{
+    StreamContentChunk, StreamLatencyDistribution, StreamObservationReport,
+    StreamRequestObservation,
+};
 
 use ddsketchy::DDSketch;
 use rustc_hash::FxHashMap;
@@ -39,6 +46,8 @@ pub struct G2DomainStats {
 /// Canonical replay result returned by [`crate::replay::Replayer`].
 #[derive(Debug, Clone)]
 pub struct ReplayReport {
+    /// Optional modeled output observations; never replaces engine metrics.
+    pub stream_observation: Option<StreamObservationReport>,
     pub kv_eviction_policy: crate::engine::KvEvictionPolicy,
     /// Versioned forecast contract, present only for a lookahead eviction policy.
     pub kv_eviction_assumption: Option<&'static str>,
@@ -264,7 +273,7 @@ impl TracePowerStats {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct TraceDistributionStats {
     pub mean_ms: f64,
     pub min_ms: f64,
@@ -516,6 +525,9 @@ impl Serialize for ReplayReport {
         serialize_distribution(&mut map, "ttst", &self.latency.ttst)?;
         serialize_distribution(&mut map, "tpot", &self.latency.tpot)?;
         serialize_distribution(&mut map, "itl", &self.latency.itl.distribution)?;
+        if let Some(observation) = &self.stream_observation {
+            map.serialize_entry("stream_observation", observation)?;
+        }
         map.serialize_entry("max_itl_ms", &self.latency.itl.max_ms)?;
         if let Some(trajectories) = &self.trajectories {
             map.serialize_entry("total_trajectories", &trajectories.total)?;
@@ -731,6 +743,7 @@ impl StreamingDistribution {
 
 #[derive(Debug, Default)]
 struct PerRequestDetail {
+    stream_observation: Option<StreamRequestObservation>,
     first_admission_cache_tier_attribution: Option<CacheTierAttribution>,
     prefill_reused_input_tokens: Option<usize>,
     prefill_admit_ms: Option<f64>,
@@ -819,6 +832,9 @@ pub enum ReplayTerminalStatus {
 /// classification, etc.).
 #[derive(Debug, Clone, Serialize)]
 pub struct PerRequestRecord {
+    /// Optional modeled content delivery; original fields remain engine time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_observation: Option<StreamRequestObservation>,
     /// Authored request identity from ReplaySpec. Legacy runtime inputs that
     /// only carry an internal UUID leave this unset.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -982,6 +998,7 @@ impl SlaThresholds {
 #[doc(hidden)]
 #[derive(Debug, Default)]
 pub struct TraceCollector {
+    stream_observation: Option<StreamObservationCollector>,
     pub(crate) g3_offload: Option<crate::engine::G3Stats>,
     pub(crate) g2_domains: Vec<G2DomainStats>,
     committed_prefill_tokens: u64,
@@ -1086,10 +1103,24 @@ impl TraceRequestStats {
         include_in_distributions: bool,
         itl_distribution: &mut StreamingDistribution,
         output_token_throughput_per_user: &mut StreamingDistribution,
+        stream_observation: Option<&mut StreamObservationCollector>,
     ) {
         let TokenTimeline::Recording(times) = &self.token_timeline else {
             return;
         };
+
+        if let Some(collector) = stream_observation {
+            let observation = collector.observe(
+                self.arrival_time_ms,
+                times,
+                self.terminal_time_ms
+                    .filter(|_| self.terminal_status == Some(ReplayTerminalStatus::Completed)),
+                include_in_distributions,
+            );
+            if let Some(detail) = &mut self.detail {
+                detail.stream_observation = Some(observation);
+            }
+        }
 
         if include_in_distributions {
             for window in times.windows(2) {
@@ -1173,6 +1204,7 @@ impl TraceCollector {
                     && stats.first_admit_ms.is_some(),
                 &mut self.itl_distribution,
                 &mut self.output_token_throughput_per_user,
+                self.stream_observation.as_mut(),
             );
             summary.add(&stats, self.sla).map_err(|error| {
                 crate::replay::ReplayError::ResourceLimited(format!("report storage: {error:#}"))
@@ -1205,6 +1237,11 @@ impl TraceCollector {
     /// default; the runtimes flip it on when the caller asks for JSONL output.
     pub fn set_capture_per_request(&mut self, value: bool) {
         self.capture_per_request = value;
+    }
+
+    /// Enable a separate, observational stream view before admitting requests.
+    pub fn set_stream_interval(&mut self, value: Option<std::num::NonZeroUsize>) {
+        self.stream_observation = value.map(StreamObservationCollector::new);
     }
 
     /// Set the SLA thresholds used to classify goodput in `finish()`. With no
@@ -1652,6 +1689,7 @@ impl TraceCollector {
             defer_token_timeline_finalization,
             bounded_summary,
             completed_to_retire,
+            stream_observation,
             ..
         } = self;
         if let Some(stats) = requests.get_mut(&uuid)
@@ -1667,6 +1705,7 @@ impl TraceCollector {
                     status == ReplayTerminalStatus::Completed && stats.first_admit_ms.is_some(),
                     itl_distribution,
                     output_token_throughput_per_user,
+                    stream_observation.as_mut(),
                 );
             }
         }
@@ -1717,6 +1756,10 @@ impl TraceCollector {
     pub(crate) fn take_report(&mut self, report_end_ms: f64) -> ReplayReport {
         debug_assert!(report_end_ms.is_finite() && report_end_ms >= self.report_start_ms);
         let mut next = Self {
+            stream_observation: self
+                .stream_observation
+                .as_ref()
+                .map(|collector| StreamObservationCollector::new(collector.interval)),
             report_start_ms: report_end_ms,
             defer_token_timeline_finalization: self.defer_token_timeline_finalization,
             capture_per_request: self.capture_per_request,
@@ -1766,6 +1809,7 @@ impl TraceCollector {
                     && stats.first_admit_ms.is_some(),
                 &mut self.itl_distribution,
                 &mut self.output_token_throughput_per_user,
+                self.stream_observation.as_mut(),
             );
         }
 
@@ -1818,6 +1862,10 @@ impl TraceCollector {
             });
         let itl_distribution = self.itl_distribution.finish();
         let output_token_throughput_per_user = self.output_token_throughput_per_user.finish();
+        let stream_observation = self
+            .stream_observation
+            .as_ref()
+            .map(StreamObservationCollector::finish);
         let requests = self.requests;
         let request_count = requests.len();
         let mut ttfts = Vec::with_capacity(request_count);
@@ -1944,6 +1992,7 @@ impl TraceCollector {
             output_throughput_tok_s: goodput_output_tokens as f64 / duration_s,
         });
         ReplayReport {
+            stream_observation,
             kv_eviction_policy: crate::engine::KvEvictionPolicy::Lru,
             kv_eviction_assumption: None,
             committed_prefill_tokens: self.committed_prefill_tokens,
@@ -2031,6 +2080,7 @@ impl TraceCollector {
             let first_token_ms = stats.first_token_ms();
             let last_token_ms = stats.last_token_ms();
             records.push(PerRequestRecord {
+                stream_observation: detail.stream_observation.clone(),
                 request_id: stats.authored_id.clone(),
                 play_id: stats.play_id.clone(),
                 session_id: stats.session_id.clone(),
@@ -2092,6 +2142,9 @@ impl TraceCollector {
             .and_then(|phases| phases.profile_start_ms)
         {
             for record in &mut records {
+                if let Some(observation) = &mut record.stream_observation {
+                    observation.rebase(origin);
+                }
                 record.arrival_time_ms -= origin;
                 record.terminal_time_ms -= origin;
                 for timestamp in [
@@ -2294,6 +2347,85 @@ fn std_dev(values: &[f64]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stream_observation_preserves_engine_report_and_terminal_boundaries() {
+        fn collect(
+            interval: Option<std::num::NonZeroUsize>,
+            bounded: bool,
+            deferred: bool,
+        ) -> ReplayReport {
+            let mut collector = TraceCollector::default();
+            collector.set_stream_interval(interval);
+            collector.set_capture_per_request(!bounded);
+            collector.set_defer_token_timeline_finalization(deferred);
+            collector.begin_batch_reporting();
+            let id = Uuid::from_u128(1);
+            collector.on_arrival(id, 0.0, 8, 45);
+            collector.on_admit(id, 0.0, 0);
+            for at in 1..=45 {
+                collector.on_token(id, at as f64);
+            }
+            collector.on_terminal(id, 45.0, ReplayTerminalStatus::Completed);
+            collector.prepare_batch_report().unwrap();
+            collector.finish()
+        }
+        for bounded in [false, true] {
+            for deferred in [false, true] {
+                let baseline = collect(None, bounded, deferred);
+                let observed = collect(std::num::NonZeroUsize::new(20), bounded, deferred);
+                let baseline_json = serde_json::to_value(&baseline).unwrap();
+                let mut observed_json = serde_json::to_value(&observed).unwrap();
+                assert!(baseline_json.get("stream_observation").is_none());
+                let observation = observed_json
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("stream_observation")
+                    .unwrap();
+                assert_eq!(observation["completed_requests_with_content"], 1);
+                assert_eq!(observation["content_chunks"], 4);
+                assert_eq!(baseline_json, observed_json);
+                for (baseline, observed) in baseline.per_request.iter().zip(&observed.per_request) {
+                    let mut observed_json = serde_json::to_value(observed).unwrap();
+                    let observation = observed_json
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("stream_observation")
+                        .unwrap();
+                    assert_eq!(
+                        observation["first_content_ms"],
+                        baseline.first_token_ms.unwrap()
+                    );
+                    assert_eq!(
+                        observation["last_content_ms"],
+                        baseline.last_token_ms.unwrap()
+                    );
+                    assert_eq!(observation["request_mean_itl_ms"], baseline.itl_ms.unwrap());
+                    assert_eq!(serde_json::to_value(baseline).unwrap(), observed_json);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn stream_observation_resets_samples_but_preserves_interval_between_epochs() {
+        let mut collector = TraceCollector::default();
+        collector.set_stream_interval(std::num::NonZeroUsize::new(20));
+        for epoch in 0..2 {
+            let id = Uuid::from_u128(epoch + 1);
+            let base = epoch as f64 * 100.0;
+            collector.on_arrival(id, base, 8, 2);
+            collector.on_admit(id, base, 0);
+            collector.on_token(id, base + 1.0);
+            collector.on_token(id, base + 2.0);
+            collector.on_terminal(id, base + 2.0, ReplayTerminalStatus::Completed);
+            let report = collector.take_report(base + 100.0);
+            let stream = report.stream_observation.unwrap();
+            assert_eq!(stream.stream_interval, 20);
+            assert_eq!(stream.completed_requests_with_content, 1);
+            assert_eq!(stream.request_mean_itl.distribution.mean_ms, 1.0);
+        }
+    }
 
     #[test]
     fn warmup_report_excludes_preparation_and_rebases_profile_timestamps() {

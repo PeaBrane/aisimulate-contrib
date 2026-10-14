@@ -80,6 +80,19 @@ aggregated replay with attention DP1 only; a single logical worker with DP2
 is still rejected. Multiworker/P/D/scaling consumers use normal reports
 and neutral observation contracts.
 
+`ReplayCaptureOptions.stream_interval: Option<NonZeroUsize>` opts native vLLM
+replay into a separate modeled content-delivery report. `None` preserves existing
+serialized reports. This control does not delay engine terminals or change
+load-generation causality; it adds `ReplayReport.stream_observation` and optional
+per-request chunk observations. See [stream observation semantics](../../getting-started/understand-results.md#modeled-stream-observations).
+
+Rust callers using exhaustive struct literals must add `stream_interval: None`
+to `ReplayCaptureOptions` (or use `..Default::default()`), and
+`stream_observation: None` to `ReplayReport` and `PerRequestRecord` when
+constructing unobserved reports. Preserving an existing report should preserve
+its observation field. These are Rust source migrations; default JSON fields
+remain absent.
+
 `with_telemetry_observer(interval_ms, observer)` requires a positive finite
 interval and returns `ReplayResult<Self>`. The observer receives a baseline,
 settled interval samples, and a final tail when needed. A sample coinciding
