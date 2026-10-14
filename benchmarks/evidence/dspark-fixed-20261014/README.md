@@ -126,6 +126,21 @@ python/aisimulate/.venv/bin/pytest -p no:timeout -q \
   crates/core/parity_tests/perfmodel/test_engine_step_parity.py
 ```
 
+## PR integration checks
+
+The draft PR rebases only the DSpark implementation/evidence commits onto
+`9666978555325f9caa4b816e8509527313f8e330`. It excludes the unrelated commits
+from the original development base. Conflict resolution preserves the newer
+KV memory module, uses engine-spec schema 29, and adds draft KV to the existing
+once-per-handoff `state_bytes` field.
+
+- Rebased Rust library: 1975 passed, 1 ignored, including a regression for
+  window-capped draft transfer alongside other request state.
+- Ruff, Rust formatting, packaged legal-file equality and CODEOWNERS regeneration
+  passed.
+- The host measurements and earlier parity counts below describe the recorded
+  pre-rebase implementation; they are not new measurements of current main.
+
 ## Host cost
 
 `compare_host.py` measures complete release CLI wall time, with one discarded

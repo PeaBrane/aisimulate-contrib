@@ -650,14 +650,12 @@ mod tests {
             kv_bytes_per_token: None,
             state_bytes: 0,
             bandwidth_gb_s: None,
-            draft_cache_bytes: 0,
         };
         assert_eq!(start_transfer_delay(missing, 7.5), 7.5);
 
         let zero_bandwidth = HandoffTransferTiming {
             kv_bytes_per_token: Some(1024),
             bandwidth_gb_s: Some(0.0),
-            draft_cache_bytes: 0,
             ..missing
         };
         validate_transfer_timing(zero_bandwidth).unwrap();
@@ -672,7 +670,6 @@ mod tests {
             kv_bytes_per_token: Some(1024),
             state_bytes: 0,
             bandwidth_gb_s: Some(-1.0),
-            draft_cache_bytes: 0,
         };
         assert!(validate_transfer_timing(timing).is_err());
     }

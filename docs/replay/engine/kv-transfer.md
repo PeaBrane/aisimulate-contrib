@@ -46,7 +46,8 @@ where `transferred_tokens` follows `timing_mode`. With
 receives the request sooner, so prefix reuse on the decode side can lower TTFT
 even when compute time does not change. `state_bytes` is the prefill role's
 `state_cache.bytes_per_request` for
-[hybrid-KV models](kv-cache.md#state-cache), and 0 otherwise.
+[hybrid-KV models](kv-cache.md#state-cache), plus any automatically resolved
+DSpark draft KV described below. It is 0 when neither applies.
 
 <a id="handoff"></a>
 
