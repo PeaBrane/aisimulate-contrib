@@ -329,6 +329,7 @@ class RunnerCapabilities:
     supports_agentic_speculative_decoding: bool = True
     supports_agentic_snapshots: bool = False
     supports_agentic_warmup: bool = False
+    supports_agentic_live_warmup: bool = False
     supports_cached_prefix_tokens: bool = False
     supported_engine_model_controls: tuple[str, ...] = ()
     supports_mtp_expected_acceptance: bool = False
@@ -511,6 +512,17 @@ class RunnerCapabilities:
                 raise ValueError("agentic_warmup requires agentic_snapshot")
             if not self.supports_agentic_warmup:
                 raise ValueError("runner does not support agentic warmup")
+        warmup_policy = spec.workload.get("agentic_warmup_policy", "repeated_prefixes")
+        if not isinstance(warmup_policy, str) or warmup_policy not in {"repeated_prefixes", "live_trajectory_v1"}:
+            raise ValueError("unknown agentic_warmup_policy")
+        if warmup_policy == "live_trajectory_v1":
+            if not agentic_warmup or agentic_profile is None:
+                raise ValueError("live_trajectory_v1 requires agentic_warmup and agentic_profile")
+            if not self.supports_agentic_live_warmup:
+                raise ValueError(
+                    "runner does not support live agentic warmup; "
+                    "update the adapter before selecting live_trajectory_v1"
+                )
         if agentic_snapshot is not None:
             snapshot = AgenticSnapshotOptions.model_validate(agentic_snapshot)
             if agentic_lanes is None or spec.workload.get("load_type") != "trace_timestamps":
