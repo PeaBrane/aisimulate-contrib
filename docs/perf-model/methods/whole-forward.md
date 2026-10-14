@@ -93,7 +93,10 @@ Raw mixed FPM, static multi-round generation, per-operation and ad-hoc operation
 queries fail explicitly. Ordinary replay retains its existing separate P/D
 phase composition; this is an approximation for mixed iterations, not a measured
 mixed-round model. Partial-width decode rounds still use the configured depth's
-timing. Enable query coverage to identify holes rather than extrapolating.
+timing. The existing replay prefill callback uses integer per-request mean
+lengths, so ragged batches can lose remainder tokens; raw FPM totals do not have
+that approximation. Enable query coverage to identify holes rather than
+extrapolating.
 
 The SD identity does not expand the guided `onboard` collector or its replay
 validation scope. Prepare and validate the measured table separately, then use
