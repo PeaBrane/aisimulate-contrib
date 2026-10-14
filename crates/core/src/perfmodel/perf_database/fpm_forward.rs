@@ -981,7 +981,7 @@ fn load_pair(
                 || get_int("dp")? != 1
                 || get_int("cp")? != 1
                 || get_int("moe_ep")? != 1
-                || get_int("moe_tp")? != get_int("tp")?
+                || (get_int("moe_tp")? != 1 && get_int("moe_tp")? != get_int("tp")?)
                 || match_identity[13] != "False"
                 || match_identity[14] != "False"
                 || match_identity[17] != "none"
@@ -1506,6 +1506,7 @@ pub(crate) mod tests {
         pub backend_version: &'static str,
         pub partition_policy: &'static str,
         pub tp: u32,
+        pub moe_tp: Option<u32>,
         /// Overrides the coordinate-derived cell_id (collision tests).
         pub cell_id: Option<&'static str>,
         pub system: &'static str,
@@ -1552,6 +1553,7 @@ pub(crate) mod tests {
                 backend_version: "0.25.1",
                 partition_policy: FPM_FORWARD_PARTITION_POLICY,
                 tp: 4,
+                moe_tp: None,
                 cell_id: None,
                 system: "b200_sxm",
                 backend: "vllm",
@@ -1716,7 +1718,13 @@ pub(crate) mod tests {
                 .expect("writer");
         let mut rg = writer.next_row_group().expect("row group");
 
-        let identity = |r: &RowSpec| default_identity(r.tp);
+        let identity = |r: &RowSpec| {
+            let mut values = default_identity(r.tp);
+            if let Some(moe_tp) = r.moe_tp {
+                values[8] = moe_tp.to_string();
+            }
+            values
+        };
         let str_col = |f: &dyn Fn(&RowSpec) -> String| -> Vec<ByteArray> {
             rows.iter()
                 .map(|r| ByteArray::from(f(r).as_str()))
@@ -2064,6 +2072,23 @@ pub(crate) mod tests {
         }
         write_pair(tmp.path(), &rows);
         assert_eq!(loaded_table(tmp.path()).cells().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn speculative_dense_tp_identity_allows_unused_moe_tp_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut rows = speculative_rows();
+        for row in &mut rows {
+            row.moe_tp = Some(1);
+        }
+        write_pair(tmp.path(), &rows);
+        let table = loaded_table(tmp.path());
+        let mut identity = default_identity(4);
+        identity[8] = "1".into();
+        identity[16] = rows[0].execution.unwrap()[1].to_owned();
+        assert!(table.select_cell(&identity, "org/model-a", None).is_ok());
+        identity[8] = "4".into();
+        assert!(table.select_cell(&identity, "org/model-a", None).is_err());
     }
 
     #[test]

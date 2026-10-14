@@ -238,7 +238,7 @@ class FpmDeploymentProfile(_ProfileModel):
     @model_validator(mode="after")
     def _deployment_identity(self) -> FpmDeploymentProfile:
         if self.execution_profile is not None and not (
-            self.dp == 1 and self.pp == 1 and self.cp == 1 and self.moe_ep == 1 and self.moe_tp == self.tp
+            self.dp == 1 and self.pp == 1 and self.cp == 1 and self.moe_ep == 1 and self.moe_tp in (1, self.tp)
         ):
             raise ValueError("speculative-round FPM identity currently requires vLLM pure TP with DP1/PP1/CP1")
         modes = {

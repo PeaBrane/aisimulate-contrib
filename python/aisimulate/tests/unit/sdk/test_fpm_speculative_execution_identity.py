@@ -11,7 +11,7 @@ from pydantic import ValidationError
 
 import aisimulate_core
 from aisimulate_core.fpm_profile import FpmModelProfile, FpmSpeculativeExecutionProfile
-from aisimulate_core.sdk import RustForwardPassPerfModel
+from aisimulate_core.sdk import RustForwardPassPerfModel, fpm_profile
 from aisimulate_core.sdk.fpm_identity import LEGACY_EXECUTION_IDENTITY, speculative_execution_identity
 
 pytestmark = pytest.mark.unit
@@ -30,7 +30,7 @@ def execution():
 
 def profile(*, speculative=True):
     deployment = {
-        "system": "test_gpu",
+        "system": "b200_sxm",
         "backend": "vllm",
         "backend_version": "0.28.0",
         "tp": 4,
@@ -138,22 +138,57 @@ def test_profile_rejects_attention_dp_or_expert_parallel_for_initial_contract():
         FpmModelProfile.model_validate(data)
 
 
-@pytest.mark.parametrize("nextn", [0, 3])
-@pytest.mark.parametrize("entry", ["normalize_config", "best_available"])
-def test_identity_publication_does_not_enable_unimplemented_execution(nextn, entry):
-    config = {
-        "model": "test/target",
-        "system": "b200_sxm",
-        "backend": "vllm",
-        "backend_version": "0.28.0",
+def test_dense_tp_profile_accepts_unused_moe_tp_one():
+    data = profile()
+    data["num_experts"] = 0
+    data["deployments"][0]["moe_tp"] = 1
+    deployment = FpmModelProfile.model_validate(data).deployments[0]
+    assert deployment.match_identity()[5:11] == ["4", "1", "1", "1", "1", "1"]
+    assert deployment.execution_identity(data["model_revision"])[1].startswith("speculative_round_v1:")
+
+
+def canonical_request(data, *, nextn=0):
+    selected = data["deployments"][0]
+    return {
+        "model": data["model"],
+        "system": selected["system"],
+        "backend": selected["backend"],
+        "backend_version": selected["backend_version"],
         "worker_type": "aggregated",
-        "tp": 4,
+        "tp": selected["tp"],
+        "moe_tp_size": selected["moe_tp"],
+        "moe_ep_size": selected["moe_ep"],
         "nextn": nextn,
-        "fpm_profile": profile(),
+        "fpm_profile": data,
         "estimation_mode": "fpm_interpolation",
         "fallback_policy": "deny",
         "estimator_config": {"fpm_interpolation": {"method": "direct"}},
     }
+
+
+def test_unrelated_speculative_deployment_does_not_block_selected_ar(monkeypatch):
+    monkeypatch.setattr(
+        fpm_profile, "_load_pinned_checkpoint_config", lambda *_: {"architectures": ["TestDecoderForCausalLM"]}
+    )
+    ar = profile(speculative=False)
+    before = RustForwardPassPerfModel.normalize_config(canonical_request(ar))
+    both = copy.deepcopy(ar)
+    other = profile()["deployments"][0]
+    other.update(tp=2, moe_tp=2)
+    both["deployments"].append(other)
+    after = RustForwardPassPerfModel.normalize_config(canonical_request(both))
+    assert after["nextn"] == before["nextn"] == 0
+    assert after["fpm_profile"]["deployments"][0] == before["fpm_profile"]["deployments"][0]
+    assert after["fpm_profile"]["deployments"][1]["execution_profile"] == execution()
+
+
+@pytest.mark.parametrize("nextn", [0, 3])
+@pytest.mark.parametrize("entry", ["normalize_config", "best_available"])
+def test_identity_publication_does_not_enable_unimplemented_execution(nextn, entry, monkeypatch):
+    monkeypatch.setattr(
+        fpm_profile, "_load_pinned_checkpoint_config", lambda *_: {"architectures": ["TestDecoderForCausalLM"]}
+    )
+    config = canonical_request(profile(), nextn=nextn)
     with pytest.raises(ValueError, match="identity-only|does not support MTP"):
         getattr(RustForwardPassPerfModel, entry)(config)
 

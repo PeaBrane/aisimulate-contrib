@@ -248,25 +248,6 @@ impl ForwardPassPerfModelConfig {
     pub(crate) fn resolve_with_registration(mut self) -> Result<(Self, Option<bool>), AicError> {
         self.estimator_config.resolve_defaults();
         self.validate()?;
-        // Identity publication precedes the consumer implementation. Do not let
-        // either nextn=0 or nextn>0 consume a full-round profile as AR timing.
-        if self
-            .fpm_profile
-            .as_ref()
-            .and_then(|profile| profile.get("deployments"))
-            .and_then(serde_json::Value::as_array)
-            .is_some_and(|deployments| {
-                deployments.iter().any(|deployment| {
-                    deployment
-                        .get("execution_profile")
-                        .is_some_and(|execution| !execution.is_null())
-                })
-            })
-        {
-            return Err(invalid_config(
-                "speculative-round FPM profiles are identity-only; execution is not enabled",
-            ));
-        }
         let registered = if self.fpm_profile.is_some() {
             self.estimator_config
                 .fpm_interpolation
