@@ -28,6 +28,9 @@ def main():
     parser.add_argument("--head", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--repeats", type=int, default=3)
+    parser.add_argument(
+        "--compare-dspark", action="store_true", help="Also compare DSpark when the baseline supports it"
+    )
     args = parser.parse_args()
     roots = {"base": args.base.resolve(), "head": args.head.resolve()}
     out = args.output.resolve()
@@ -94,7 +97,7 @@ def main():
     )
     # One discarded warmup per cell, then alternate base/head to reduce drift.
     for name in configurations:
-        labels = ["head"] if name == "agentx-dspark" else ["base", "head"]
+        labels = ["head"] if name == "agentx-dspark" and not args.compare_dspark else ["base", "head"]
         for repeat in range(-1, args.repeats):
             for label in labels:
                 root = roots[label]
@@ -145,7 +148,7 @@ def main():
             r["wall_seconds"] for r in result["runs"] if r["case"] == name and r["build"] == label and r["repeat"] >= 0
         )
         for name in configurations
-        for label in (["head"] if name == "agentx-dspark" else ["base", "head"])
+        for label in (["head"] if name == "agentx-dspark" and not args.compare_dspark else ["base", "head"])
     }
     (out / "host-results.json").write_text(json.dumps(result, indent=2) + "\n")
 

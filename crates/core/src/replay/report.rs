@@ -2314,6 +2314,7 @@ mod tests {
         collector.set_agentic_phases(AgenticPhaseEvidence {
             schema: super::super::loadgen::AGENTIC_PHASE_SCHEMA_V1,
             phase: AgenticReplayPhase::Profile,
+            warmup_policy: super::super::loadgen::AgenticWarmupPolicy::Primer,
             barrier_condition: "all_preparation_quiescent",
             profile_start_ms: Some(100.0),
             finished_at_ms: Some(100.0),

@@ -55,8 +55,13 @@ impl StoreSourceSnapshot<'_> {
 }
 
 impl DestinationReservation {
-    pub(crate) fn transferable_prompt_tokens(&self, block_size: usize) -> usize {
-        self.inner.transferable_prompt_tokens(block_size)
+    pub(crate) fn transferable_prompt_tokens(
+        &self,
+        block_size: usize,
+        source_prompt_tokens: Option<usize>,
+    ) -> usize {
+        self.inner
+            .transferable_prompt_tokens(block_size, source_prompt_tokens)
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -358,9 +363,15 @@ impl G1Manager {
         sequence: &RequestSequence,
         lease: &mut BlockRequestLease,
         reservation: DestinationReservation,
+        computed_tokens: usize,
     ) {
-        self.inner
-            .activate_destination_lease(owner, sequence, lease, reservation.inner);
+        self.inner.activate_destination_lease(
+            owner,
+            sequence,
+            lease,
+            reservation.inner,
+            computed_tokens,
+        );
     }
 
     pub(crate) fn cancel_destination(&mut self, reservation: DestinationReservation) {

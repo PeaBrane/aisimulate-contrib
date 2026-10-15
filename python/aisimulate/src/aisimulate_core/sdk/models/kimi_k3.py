@@ -27,12 +27,10 @@ class KimiK3Model(BaseModel):
     latent space, a replicated latent->hidden up projection, plus 2 shared
     experts in the full hidden space. AttnRes adds elementwise-only cost.
 
-    Speculative decoding (DSPARK): ``nextn`` is the dspark block size (draft
-    tokens proposed per step). The backend scales the generation batch by
-    (nextn + 1) to model the verify width; this class additionally adds the
-    5-layer dense draft-model ops and switches KDA generation kernels to the
-    target-verify tables. The classic MTP scale factor does NOT apply (the
-    draft is not made of target-shaped layers).
+    Canonical DSpark switches KDA generation to K+1 target verification while
+    its artifact-owned scheme adds draft operations and KV exactly once.
+    Legacy ``nextn`` retains its historical inline draft graph for compatibility.
+    Neither path uses classic MTP target-layer scaling.
     """
 
     # DSPARK draft model fixed geometry — sglang lane
@@ -354,10 +352,13 @@ class KimiK3Model(BaseModel):
         hk = cfg.kda_head_dim
         p_local = nk_local * hk
 
-        spec = self._nextn > 0
+        scheme_config = self.config.speculation
+        canonical_dspark = scheme_config is not None and scheme_config.kind == "dspark"
+        depth = scheme_config.params["num_draft_tokens"] if canonical_dspark else self._nextn
+        spec = depth > 0
         is_vllm = self._backend_name == "vllm"
         verify_kernel = "fused_recurrent_kda" if is_vllm else "fused_sigmoid_gating_delta_rule_update"
-        draft_tokens = self._nextn + 1 if spec else 0
+        draft_tokens = depth + 1 if spec else 0
         # Backend queries generation ops at batch * (nextn + 1); ops that run
         # once per step per request (not per verify token) scale down by this.
         per_step = 1.0 / draft_tokens if spec else 1.0
@@ -578,7 +579,7 @@ class KimiK3Model(BaseModel):
         # draft is priced through the same MLA-as-attention convention as the
         # main vllm MLA layers above; its output gate is disabled in the
         # checkpoint, so no gate ops.
-        if spec:
+        if spec and not canonical_dspark:
             inter = self.DRAFT_INTER_SIZE
             dc = self.DRAFT_NUM_LAYERS
             # Draft forwards gamma = nextn tokens per step while the op batch is
@@ -800,7 +801,7 @@ class KimiK3Model(BaseModel):
         cfg: common.KimiK3Config = self.extra_params
         n_mla = cfg.layer_types.count("full_attention")
         elements = n_mla * (cfg.kv_lora_rank + cfg.qk_rope_head_dim)
-        if self._nextn > 0:
+        if self.config.nextn > 0:
             if self._backend_name == "vllm":
                 # Inferact draft is MLA-style: latent KV, TP-replicated.
                 elements += self.DRAFT_NUM_LAYERS * (self.VLLM_DRAFT_KV_LORA_RANK + self.VLLM_DRAFT_QK_ROPE_DIM)
@@ -819,7 +820,9 @@ class KimiK3Model(BaseModel):
         n_kda = cfg.layer_types.count("linear_attention")
         heads_local = max(1, cfg.kda_num_heads // tp)
         ssm_bytes = heads_local * cfg.kda_head_dim * cfg.kda_head_dim * 4
-        conv_bytes = (cfg.kda_conv_kernel - 1) * 3 * heads_local * cfg.kda_head_dim * 2
+        scheme = self.config.speculation
+        depth = scheme.params["num_draft_tokens"] if scheme is not None and scheme.kind == "dspark" else 0
+        conv_bytes = (cfg.kda_conv_kernel - 1 + depth) * 3 * heads_local * cfg.kda_head_dim * 2
         return n_kda * (ssm_bytes + conv_bytes) * self.KDA_STATE_SLOTS_PER_REQUEST
 
     def get_kvcache_bytes_per_sequence(self, seq_len: int) -> float:

@@ -120,11 +120,22 @@ def test_replay_tail_is_bounded_per_actual_request(descriptor):
     assert stage_workloads(descriptor, "decoder_bounded", requests, 20) == full
 
 
-@pytest.mark.parametrize("backend", ["vllm", "trtllm"])
+@pytest.mark.parametrize("backend", ["trtllm"])
 def test_unverified_replay_backend_fails(backend):
     assert resolve_execution_profile(False, backend) == "full"
     with pytest.raises(NotImplementedError, match="not verified"):
         resolve_execution_profile(True, backend)
+
+
+@pytest.mark.parametrize("backend", ["sglang", "vllm"])
+def test_qualified_decoder_replay_trims_only_late_stages(backend):
+    import json
+
+    assert resolve_execution_profile(True, backend) == "decoder_bounded"
+    model = _build_model(replay=True, backend=backend)
+    stages = [json.loads(op._spec_json())["Dsv41Stage"] for op in model.context_ops if "v41_layer" in op._name]
+    assert len(stages) == 40
+    assert [i for i, stage in enumerate(stages) if stage["decoder_replay"] and stage["bounded"]] == list(range(21, 40))
 
 
 def _build_model(*, replay=False, backend="sglang", tp=4):

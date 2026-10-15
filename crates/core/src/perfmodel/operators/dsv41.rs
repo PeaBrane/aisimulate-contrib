@@ -1,5 +1,9 @@
+// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
+// Modified physical vLLM cache descriptions from
+// https://github.com/vllm-project/vllm/tree/ac9126e58aa7bbab1856ba6593ba4d5003fea516
+// vllm/models/deepseek_v41/attention.py and v1/attention/backends/mla/indexer.py.
 
 //! DeepSeek-V4.1 text AR operator and phase contracts.
 //!
@@ -106,6 +110,8 @@ pub enum Dsv41KvCacheLayout {
     #[default]
     LogicalFp4,
     SglangFp8Bf16,
+    VllmMxfp8,
+    VllmFp8Bf16,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -208,7 +214,9 @@ impl Dsv41AttentionOp {
         );
         let (window_entry_bytes, main_entry_bytes) = match self.kv_cache_layout {
             Dsv41KvCacheLayout::LogicalFp4 => (d, d * 0.5625),
-            Dsv41KvCacheLayout::SglangFp8Bf16 => {
+            Dsv41KvCacheLayout::SglangFp8Bf16
+            | Dsv41KvCacheLayout::VllmMxfp8
+            | Dsv41KvCacheLayout::VllmFp8Bf16 => {
                 // Only the pinned V4.1 low-ratio, 512-wide FlashMLA contract.
                 if self.head_dim != 512 || self.index_head_dim != 128 || self.compress_ratio > 2 {
                     return Err(AicError::ModelConfig(
@@ -216,7 +224,12 @@ impl Dsv41AttentionOp {
                             .into(),
                     ));
                 }
-                (584.0, 584.0)
+                let entry = if self.kv_cache_layout == Dsv41KvCacheLayout::VllmMxfp8 {
+                    528.0
+                } else {
+                    584.0
+                };
+                (entry, entry)
             }
         };
         let tokens = if self.is_context { batch * s } else { batch };
@@ -248,7 +261,7 @@ impl Dsv41AttentionOp {
                 bf16,
             ))
             .plus(mm(g * o, h, tokens, w8, gemm));
-        if self.kv_cache_layout == Dsv41KvCacheLayout::SglangFp8Bf16 {
+        if self.kv_cache_layout != Dsv41KvCacheLayout::LogicalFp4 {
             // Fused norm/RoPE/store reads the BF16 projection output and writes
             // one physical SWA row. Projection's own BF16 output write is above.
             result = result.plus(leaf(
@@ -277,7 +290,15 @@ impl Dsv41AttentionOp {
             result = result.plus(mm(d, ihd, batch * produced, 2.0, bf16));
             // Main FP4 rounding is temporary: SGLang persists only the 584-byte
             // FlashMLA row, not an additional packed main cache. Index stays FP4.
-            let packed = main_entry_bytes + ihd * 0.53125;
+            let index_width = if matches!(
+                self.kv_cache_layout,
+                Dsv41KvCacheLayout::VllmMxfp8 | Dsv41KvCacheLayout::VllmFp8Bf16
+            ) {
+                1.03125
+            } else {
+                0.53125
+            };
+            let packed = main_entry_bytes + ihd * index_width;
             result = result.plus(leaf(spec, 0.0, batch * produced * (d * 2.0 + packed), bf16));
         }
         if self.role == "full" || self.role == "reindex" {
@@ -297,6 +318,11 @@ impl Dsv41AttentionOp {
                 && spec.gpu.sm_version == Some(90)
             {
                 (bf16, 2.0)
+            } else if matches!(
+                self.kv_cache_layout,
+                Dsv41KvCacheLayout::VllmMxfp8 | Dsv41KvCacheLayout::VllmFp8Bf16
+            ) {
+                (fp8, 1.03125)
             } else {
                 (
                     quant_tc_flops(spec, GemmQuantMode::Nvfp4.mapping())?,
@@ -306,7 +332,17 @@ impl Dsv41AttentionOp {
             result = result.plus(leaf(
                 spec,
                 2.0 * tokens * inh * ihd * index_len,
-                batch * index_len * ihd * 0.53125
+                batch
+                    * index_len
+                    * ihd
+                    * if matches!(
+                        self.kv_cache_layout,
+                        Dsv41KvCacheLayout::VllmMxfp8 | Dsv41KvCacheLayout::VllmFp8Bf16
+                    ) {
+                        1.03125
+                    } else {
+                        0.53125
+                    }
                     + tokens * inh * ihd * query_bytes
                     + tokens * index_len * 4.0,
                 index_rate,
@@ -729,6 +765,25 @@ mod tests {
         let extra = 131_072.0 - 16_384.0;
         assert!((hi.math_ms - lo.math_ms - 16.0 * extra / 1e6).abs() < 1e-10);
         assert!((hi.mem_ms - lo.mem_ms - 9.0625 * extra / 1e3).abs() < 1e-10);
+    }
+
+    #[test]
+    fn vllm_swa_storage_tracks_device_record_width() {
+        let spec = unit_spec();
+        let mut op = attention("swa", 0);
+        op.is_context = false;
+        op.head_dim = 512;
+        op.index_head_dim = 128;
+        op.kv_cache_layout = Dsv41KvCacheLayout::VllmFp8Bf16;
+        let hopper = op.sol(&spec, 1.0, 128.0, 0.0).unwrap().sol.unwrap();
+        op.kv_cache_layout = Dsv41KvCacheLayout::VllmMxfp8;
+        let blackwell = op.sol(&spec, 1.0, 128.0, 0.0).unwrap().sol.unwrap();
+        // One newly stored row and 128 read rows; arithmetic is unchanged.
+        assert_eq!(hopper.math_ms, blackwell.math_ms);
+        assert!((hopper.mem_ms - blackwell.mem_ms - 129.0 * 56.0 / 1e3).abs() < 1e-9);
+        let json = serde_json::to_string(&op).unwrap();
+        assert_eq!(serde_json::from_str::<Dsv41AttentionOp>(&json).unwrap(), op);
+        assert!(json.contains("vllm_mxfp8"));
     }
 
     #[test]

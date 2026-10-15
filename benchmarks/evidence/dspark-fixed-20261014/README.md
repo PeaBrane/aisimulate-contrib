@@ -126,12 +126,24 @@ simulator comparisons, and the two throughput definitions are not interchanged.
 
 ### Why this point is not scored yet
 
-1. **Warmup is a concrete workload mismatch.** The pinned producer advances live
-   trajectories with zero idle delay and one-token outputs, then hands off 63
-   live streams to profiling. AISimulate's documented warmup repeats saved
-   primers and does not advance plays. Matching seed and request counts does not
-   match cache contents, fork/join state, or profiling inputs. Replaying recorded
-   arrival times would also replace the closed-loop concurrency controller.
+1. **Warmup needs matched qualification.** The pinned producer advances live
+   trajectories with zero idle delay and one-token outputs. After all issued
+   wire requests return, it persists 63 unfinished streams across 32 lanes.
+   These are live conversations, not 63 outstanding requests. The default
+   AISimulate `primer` policy repeats saved prefixes. The explicit
+   `live_trajectories` policy advances the DAG, retains pending joins and stream
+   positions, and restores the timestamped global spread. Its additional wait
+   for native server cleanup remains a validation difference. Matching seed
+   and request counts alone does not establish identical snapshots, cache
+   contents, or request payloads. Recorded arrival replay would also replace
+   the closed-loop concurrency controller.
+
+   Source anchors: attempt-3 `benchmark.log` lines 205–210 records quota stop,
+   wire return, then 63-stream handoff. Pinned `agentic_replay.py` implements
+   drained handoff in `finalize_phase` (952–972), timestamped offsets in
+   `_handoff_replay_offset_ms` (1196–1227), and global normalization in
+   `_profiling_phase_t0_offset_ms` (1387–1400). The timestamped implementation,
+   rather than the file's older generic full-delay comment, defines this path.
 2. **Fixed verification still needs proof.** Numeric K and AL are recovered,
    but exact runtime defaults and synthetic acceptance semantics remain unknown.
    AL minus one would be 2.61 accepted drafts if the pinned runtime uses the
@@ -374,3 +386,37 @@ python/aisimulate/.venv/bin/python \
   --playground /path/to/AISimPlayground/playground/dsv4flash-b200-specdec-validation \
   --output benchmarks/evidence/dspark-fixed-20261014/playground-diagnostics.json
 ```
+
+## Live warmup functional qualification
+
+`traffic.load.agentic_warmup_policy: live_trajectories` adds the pinned
+producer's one-token, zero-idle, ten-admissions-per-lane live DAG preparation.
+The default remains `primer`. The live policy requires `agentic_profile` for
+lane recycling and preserves its corpus cursor into profiling.
+
+- Six native regression cases cover quota admission with concurrent requests,
+  mandatory primer spread, cancellation, deterministic fork/join and recycling,
+  timestamped stream spread, aggregate vLLM/SGLang, and P/D vLLM/SGLang.
+- Profile request counters and play outcomes exclude preparation. Prepared
+  cache identities remain available, with actual admission reuse checked in
+  native runtime fixtures. Original profile output lengths return after warmup.
+- The functional server-cleanup fixtures deliberately hold cleanup after wire
+  completion: one case adds 20 ms (terminal 10 ms, cleanup 30 ms), another adds
+  4 ms (terminal 1 ms, cleanup 5 ms). Profiling waits for cleanup. These are
+  synthetic contract checks, not measured estimates of AgentX cleanup overhead.
+- The 444916 audit still has zero paired prediction/measurement points. Matching
+  this phase policy alone does not resolve snapshot, input identity, routing,
+  runtime acceptance, or transfer-contract qualification.
+
+```sh
+CARGO_TARGET_DIR=/tmp/aisim-dspark-warmup-tests CARGO_BUILD_JOBS=4 \
+  cargo test -p aisimulate-core --lib live_warmup --no-default-features
+python/aisimulate/.venv/bin/pytest -p no:timeout \
+  tests/test_cli_config.py -k agentic -q
+python/aisimulate/.venv/bin/pytest -p no:timeout \
+  tests/test_runner.py -k agentic -q
+```
+
+The focused Python runs passed 57 configuration tests and 276 runner tests.
+These tests use local fixtures and do not constitute DSpark timing accuracy
+measurements or an AgentX paired-record count.

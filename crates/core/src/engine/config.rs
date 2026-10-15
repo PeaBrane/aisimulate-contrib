@@ -562,6 +562,12 @@ pub struct EngineConfig {
     pub kv_transfer_draft_bytes_per_token: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kv_transfer_draft_window: Option<usize>,
+    /// Prompt suffix computed by the decode role after a partial prefill handoff.
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub kv_transfer_prefill_backoff_tokens: usize,
+    /// Minimum prompt suffix recomputed locally after receiving remote KV.
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub kv_transfer_decode_recompute_tokens: usize,
     /// Physical KV-cache bytes occupied by one token for host offload.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kv_cache_bytes_per_token: Option<usize>,
@@ -654,6 +660,10 @@ struct EngineConfigWire {
     kv_transfer_draft_bytes_per_token: usize,
     #[serde(default)]
     kv_transfer_draft_window: Option<usize>,
+    #[serde(default)]
+    kv_transfer_prefill_backoff_tokens: usize,
+    #[serde(default)]
+    kv_transfer_decode_recompute_tokens: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     kv_cache_bytes_per_token: Option<usize>,
     #[serde(default)]
@@ -723,6 +733,8 @@ impl<'de> Deserialize<'de> for EngineConfig {
             kv_transfer_bytes_per_token: wire.kv_transfer_bytes_per_token,
             kv_transfer_draft_bytes_per_token: wire.kv_transfer_draft_bytes_per_token,
             kv_transfer_draft_window: wire.kv_transfer_draft_window,
+            kv_transfer_prefill_backoff_tokens: wire.kv_transfer_prefill_backoff_tokens,
+            kv_transfer_decode_recompute_tokens: wire.kv_transfer_decode_recompute_tokens,
             kv_cache_bytes_per_token: wire.kv_cache_bytes_per_token,
             kv_cache_groups: wire.kv_cache_groups,
             kv_cache_capacity_bytes: wire.kv_cache_capacity_bytes,
@@ -769,6 +781,8 @@ impl Default for EngineConfig {
             kv_transfer_bytes_per_token: None,
             kv_transfer_draft_bytes_per_token: 0,
             kv_transfer_draft_window: None,
+            kv_transfer_prefill_backoff_tokens: 0,
+            kv_transfer_decode_recompute_tokens: 0,
             kv_cache_bytes_per_token: None,
             kv_cache_groups: Vec::new(),
             kv_cache_capacity_bytes: None,
@@ -848,6 +862,18 @@ impl EngineConfig {
     /// Validate rank configuration without constructing a scheduler or timing provider.
     pub fn validate(&self) -> Result<()> {
         self.validate_state_cache()?;
+        ensure!(
+            (self.kv_transfer_prefill_backoff_tokens == 0
+                && self.kv_transfer_decode_recompute_tokens == 0)
+                || (self.backend == Backend::Vllm && self.worker_type != WorkerType::Aggregated),
+            "KV transfer prefill backoff and decode recompute require vLLM P/D workers"
+        );
+        ensure!(
+            self.state_cache.is_none()
+                || self.kv_transfer_decode_recompute_tokens
+                    <= self.kv_transfer_prefill_backoff_tokens,
+            "recurrent-state handoff cannot rewind before the source state boundary"
+        );
         ensure!(self.num_gpu_blocks > 0, "num_gpu_blocks must be positive");
         ensure!(self.block_size > 0, "block_size must be positive");
         if matches!(self.backend, Backend::Vllm | Backend::Trtllm) {
@@ -897,6 +923,14 @@ impl EngineConfig {
                 self.aic_nextn_accept_rates.as_deref(),
                 self.aic_dspark,
             )?;
+            ensure!(
+                !self.aic_dspark
+                    || self.backend != Backend::Vllm
+                    || (self.kv_transfer_prefill_backoff_tokens == 0
+                        && self.kv_transfer_decode_recompute_tokens == 0)
+                    || self.max_num_batched_tokens > nextn,
+                "DSpark P/D startup requires max_num_batched_tokens >= K+1"
+            );
             ensure!(
                 self.decode_speedup_ratio == 1.0,
                 "aic_nextn requires decode_speedup_ratio=1.0 because MTP output acceleration is modeled by burst sampling"
@@ -1306,6 +1340,42 @@ mod tests {
                 serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
             assert_eq!(config, roundtrip);
         }
+    }
+
+    #[test]
+    fn dspark_transfer_startup_validates_budget_and_recurrent_boundary() {
+        let mut config = EngineConfig {
+            backend: Backend::Vllm,
+            worker_type: WorkerType::Decode,
+            aic_dspark: true,
+            aic_nextn: Some(6),
+            aic_nextn_accept_rates: Some("1,1,1,1,1,1".to_string()),
+            max_num_batched_tokens: 6,
+            kv_transfer_decode_recompute_tokens: 1,
+            ..EngineConfig::default()
+        };
+        let error = config.validate().unwrap_err();
+        assert!(error.to_string().contains("K+1"), "{error}");
+        config.max_num_batched_tokens = 7;
+        config.validate().unwrap();
+        let encoded = serde_json::to_value(&config).unwrap();
+        assert_eq!(encoded["kv_transfer_decode_recompute_tokens"], 1);
+        let decoded: EngineConfig = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, config);
+
+        let mut state: EngineConfig = serde_json::from_value(state_cache_config_json()).unwrap();
+        state.worker_type = WorkerType::Decode;
+        state.kv_transfer_prefill_backoff_tokens = 1;
+        state.kv_transfer_decode_recompute_tokens = 2;
+        assert!(
+            state
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("cannot rewind")
+        );
+        state.kv_transfer_decode_recompute_tokens = 1;
+        state.validate().unwrap();
     }
 
     #[test]

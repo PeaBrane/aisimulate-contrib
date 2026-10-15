@@ -18,9 +18,9 @@ use crate::replay::{
     ReplayOperationPowerDiagnostics, ReplayPhasePowerDiagnostics, ReplayPowerDiagnostics,
     ReplayRoleConfig, ReplayRuntimeInput, ReplaySpec, ReplayTopology, Replayer, TracePowerStats,
     loadgen::{
-        AgenticProfileOptions, AgenticSnapshotOptions, ArrivalSpec, DelaySpec, DynamoRequestTrace,
-        LengthSpec, SyntheticTraceSpec, Trace, ValidatedAgenticGraph, WekaImportOptions,
-        WekaNestedTimestampBasis, WekaResolvedTimestampBasis, WorkloadDriver,
+        AgenticProfileOptions, AgenticSnapshotOptions, AgenticWarmupPolicy, ArrivalSpec, DelaySpec,
+        DynamoRequestTrace, LengthSpec, SyntheticTraceSpec, Trace, ValidatedAgenticGraph,
+        WekaImportOptions, WekaNestedTimestampBasis, WekaResolvedTimestampBasis, WorkloadDriver,
         load_agentic_mooncake, load_weka_agentic_graph_cached,
     },
 };
@@ -82,6 +82,8 @@ struct RuntimeTraffic {
     agentic_snapshot: Option<AgenticSnapshotOptions>,
     #[serde(default)]
     agentic_warmup: bool,
+    #[serde(default)]
+    agentic_warmup_policy: AgenticWarmupPolicy,
     #[serde(default)]
     agentic_profile: Option<AgenticProfileOptions>,
     #[serde(default)]
@@ -1505,7 +1507,13 @@ fn build_agentic_driver(
         // Sample recorded time before applying speedup to remaining timers.
         let prepared = graph.into_prepared_snapshots(lanes, *options)?;
         let mut driver = if traffic.agentic_warmup {
-            WorkloadDriver::new_agentic_warmup(prepared, engine_block_size, true, speedup)
+            WorkloadDriver::new_agentic_warmup_with_policy(
+                prepared,
+                engine_block_size,
+                true,
+                speedup,
+                traffic.agentic_warmup_policy,
+            )
         } else {
             WorkloadDriver::new_agentic_snapshots(prepared, engine_block_size, true, speedup)
         }?;
@@ -1542,6 +1550,11 @@ fn build_runtime_input(
     ensure!(
         !traffic.agentic_warmup || traffic.agentic_snapshot.is_some(),
         "agentic_warmup requires agentic_snapshot"
+    );
+    ensure!(
+        traffic.agentic_warmup_policy == AgenticWarmupPolicy::Primer
+            || (traffic.agentic_warmup && traffic.agentic_profile.is_some()),
+        "live_trajectories requires agentic_warmup and agentic_profile"
     );
     if traffic.agentic_snapshot.is_some() {
         ensure!(

@@ -307,3 +307,43 @@ def test_reports_path_and_line_for_invalid_json(tmp_path):
 
     with pytest.raises(ValueError, match=r"invalid\.jsonl line 2 as JSON"):
         materialize_configured_traffic({"trace": str(trace)})
+
+
+def test_inline_output_plan_preserves_exact_uint32_ids():
+    request = {
+        "arrival_time_ms": 0,
+        "input_token_ids": [0, 2**32 - 1, 17],
+        "output_tokens": 3,
+        "output_token_ids": [2**32 - 1, 0, 17],
+    }
+    result = materialize_configured_traffic({"requests": [request]})[0]
+    assert result["input_token_ids"] == request["input_token_ids"]
+    assert result["output_token_ids"] == request["output_token_ids"]
+    assert result["input_tokens"] == 3
+    assert result["output_tokens"] == 3
+
+
+@pytest.mark.parametrize("field", ["input_token_ids", "output_token_ids"])
+@pytest.mark.parametrize("invalid", [-1, 2**32, True, 1.0, "1"])
+def test_inline_authored_tokens_require_uint32(field, invalid):
+    request = {
+        "arrival_time_ms": 0,
+        "input_token_ids": [1],
+        "output_tokens": 1,
+        "output_token_ids": [2],
+        field: [invalid],
+    }
+    with pytest.raises(ValueError, match=rf"{field} must contain unsigned 32-bit integers"):
+        materialize_configured_traffic({"requests": [request]})
+
+
+@pytest.mark.parametrize("output_ids", [None, [], [1], [1, 2, 3], "12", (1, 2)])
+def test_inline_output_plan_length_must_equal_requested_output(output_ids):
+    with pytest.raises(ValueError, match="output_token_ids must match output_tokens"):
+        materialize_configured_traffic(
+            {
+                "requests": [
+                    {"arrival_time_ms": 0, "input_tokens": 1, "output_tokens": 2, "output_token_ids": output_ids}
+                ]
+            }
+        )

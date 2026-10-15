@@ -73,6 +73,7 @@ the current SA convention.
 | `traffic.load.agentic_lanes` | `null` | `x` | `-` | Positive integer; `weka`, `agentic_mooncake`, or agentic `dynamo` timestamp replay only. |
 | `traffic.load.agentic_snapshot` | `null` (unset) | `x` | `-` | Optional object `{seed: u64}`; required `seed` is an unsigned 64-bit integer (`0` through `2^64 - 1`). Requires `traffic.load.type: trace_timestamps` and positive `agentic_lanes`; supported formats are `weka`, `agentic_mooncake`, and agentic `dynamo`. Unset preserves turn-zero execution. See [snapshot](#agentic-snapshot). |
 | `traffic.load.agentic_warmup` | `false` | `x` | `-` | Optional boolean; `true` requires `agentic_snapshot` and positive `agentic_lanes`. Primes caches before measurement; see [warmup](#agentic-warmup). |
+| `traffic.load.agentic_warmup_policy` | `primer` | `x` | `-` | `primer` repeats saved prefixes; `live_trajectories` advances one-token live requests through the DAG. The live policy requires `agentic_warmup: true` and `agentic_profile`. |
 | `traffic.load.agentic_profile` | `null` (unset) | `x` | `-` | Optional object; `{}` enables continuous lane replenishment with the defaults below. Requires `trace_timestamps`, positive `agentic_lanes`, and `agentic_snapshot`; cannot be combined with `traffic.stop.max_virtual_time_seconds`. Unset preserves finite replay. See [continuous profile](#agentic-profile). |
 | `traffic.load.agentic_profile.duration_seconds` | `3600` when enabled | `x` | `-` | Positive finite admission duration, starting at the preparation barrier or simulation start without warmup. No new workload requests or replacement plays are issued after the deadline. |
 | `traffic.load.agentic_profile.response_grace_seconds` | `30` when enabled | `x` | `-` | Nonnegative finite time for already submitted requests to respond after the admission deadline; remaining client requests are then canceled. |
@@ -324,7 +325,8 @@ empty.
 
 ### Warmup
 
-`agentic_warmup: true` fills the caches before measurement, in three stages:
+`agentic_warmup: true` fills the caches before measurement. The default
+`agentic_warmup_policy: primer` has three stages:
 
 | Stage | Requests | Output |
 | --- | --- | --- |
@@ -339,7 +341,20 @@ barrier, worker caches and play identities are kept, and the measurement clock
 starts. If any preparation request fails, the run stops before profiling:
 `predict` exits with an error and `recommend` drops the candidate.
 
-Warmup repeats the saved prefixes and does not advance the plays. Primed
+With `agentic_warmup_policy: live_trajectories`, mandatory primers run first,
+spread by their recorded distance from the sampled cut. The global idle cap
+bounds this spread. Next, each lane issues ten live requests with one output
+token and no idle delays. Dependencies, forks, joins, and completed-play recycling
+advance normally. `agentic_profile` is required to supply the shared recycle
+cursor. Requests already issued must finish and release their server state;
+paused live conversations and their cache identities remain for profiling.
+For timestamped traces, the first pending turn of each live conversation uses
+its recorded timestamp relative to its play's sampled origin. Subtracting the
+minimum dispatchable offset starts the earliest stream at profile time zero
+while preserving spacing between streams. Later turns retain ordinary causal
+delays. Warmup requests and completed warmup plays do not enter profile counts.
+
+The default `primer` policy repeats saved prefixes without advancing plays. Primed
 prefixes can still be evicted or placed on another worker, so warmup does not
 guarantee cache hits. See [agentic warmup](agentic/warmup.md) for the full
 preparation, barrier and reporting contract.

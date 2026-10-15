@@ -119,6 +119,39 @@ window-capped KV remain separate inside compiled execution. Provenance lists
 measurements. Acceptance is a
 Replay progress assumption and never reduces current-round cost.
 
+On vLLM, prefill includes one K-token draft proposal after context preparation;
+its cost scales with request count rather than prompt length. It emits one
+initial output, without an extra target verification pass. Later rounds use
+the K+1 target verification graph. A P/D source also pays for its proposal
+before transferring prepared state. Destination suffix replay uses the
+configured transfer boundary; sentinel-padded one-token startup pays one
+verification-width round but accepts no placeholder drafts. See
+[P/D transfer](../replay/engine/kv-transfer.md) for the separate source backoff
+and destination recompute settings.
+P/D configurations that replay a suffix must allow at least K+1 scheduled
+tokens, so a padded startup can make progress. Partial prefill chunks also
+pay for a proposal, matching the pinned runner even when its drafts are unused.
+Replay exposes outputs at pass completion; the runtime can overlap output
+copy with proposal execution. This output-visibility approximation can affect
+TTFT and is reported separately from operation cost error.
+
+Bundled DeepSeek-V4.1 drafts resolve their nested `text_config`, including the
+draft's own expert count and top-k. For vLLM, the canonical system identifies
+the physical default `fp8_ds_mla` layout: 528-byte MXFP8 records on B200/B300
+and GB200/GB300, or 584-byte records on H100/H200; the default FP8 indexer
+uses 132-byte records. Engram CPU weight offload is unsupported. Native cache
+page padding and allocation groups remain approximations.
+
+Kimi-K3 accepts the separate `Inferact/Kimi-K3-DSpark` MLA draft on vLLM.
+Supply its immutable `draft_revision` or full `draft_config`; `K` is always
+explicit because that checkpoint has no `block_size` default. The draft's
+BF16 geometry, shared target embedding/head, replicated latent KV and context
+projection are resolved independently of the target's quantization. The
+RadixArk GQA draft is a different execution contract and is rejected here.
+KDA verification uses K+1 queries and reserves the extended convolution
+rollback window. Recurrent cache-slot count and exact runtime scratch remain
+separate capacity approximations. FPM remains unsupported for both families.
+
 
 ### Estimator controls
 

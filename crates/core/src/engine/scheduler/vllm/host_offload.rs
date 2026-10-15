@@ -489,7 +489,13 @@ impl VllmHostOffloadAdapter {
                 .is_empty(),
             "H2D completed before its destination dependencies"
         );
-        kv_manager.activate_native_destination(uuid, sequence, lease, load.reservation);
+        kv_manager.activate_native_destination(
+            uuid,
+            sequence,
+            lease,
+            load.reservation,
+            sequence.num_input_tokens(),
+        );
         request.load = Some(LoadState::Activated(ActivatedPrefix {
             original_g1_tokens: load.original_g1_tokens,
             loaded_prefix_blocks: load.loaded_prefix_blocks,

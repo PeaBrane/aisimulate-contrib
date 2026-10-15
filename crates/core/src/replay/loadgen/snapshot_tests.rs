@@ -687,3 +687,198 @@ fn historical_request_cannot_depend_on_a_request_not_started_at_the_cut() {
             .contains("historical request's unresolved dependency")
     );
 }
+
+fn live_warmup_chain() -> WorkloadDriver {
+    let rows = (0..24)
+        .map(|index| {
+            let mut next = row(
+                &format!("turn-{index:02}"),
+                "main",
+                index as f64 * 200.0,
+                Some(1.0),
+            );
+            if index > 0 {
+                next.dependencies.push(edge(
+                    &format!("turn-{:02}", index - 1),
+                    AgenticDependencyRelation::Sequence,
+                    AgenticDependencyTrigger::Completion,
+                    100.0,
+                ));
+            }
+            next
+        })
+        .collect();
+    let graph = graph(rows);
+    let play = prepare(&graph, 0.0);
+    let mut driver = WorkloadDriver::new_agentic_warmup_with_policy(
+        PreparedAgenticSnapshots::from_plays(vec![play]).unwrap(),
+        64,
+        true,
+        1.0,
+        AgenticWarmupPolicy::LiveTrajectories,
+    )
+    .unwrap();
+    driver
+        .enable_agentic_profile(AgenticProfileOptions::default())
+        .unwrap();
+    driver.finish_agentic_preparation(0.0).unwrap();
+    driver
+}
+
+#[test]
+fn live_warmup_advances_frontier_and_waits_for_final_server_cleanup() {
+    let mut driver = live_warmup_chain();
+    let mut last = None;
+    for index in 0..10 {
+        let ready = driver.pop_ready_compact(index as f64, 100);
+        assert_eq!(ready.len(), 1);
+        let turn = &ready[0];
+        assert_eq!(
+            turn.authored_request_id.as_deref(),
+            Some(format!("turn-{index:02}").as_str())
+        );
+        assert_eq!(turn.request.metadata().max_output_tokens, 1);
+        assert_eq!(
+            turn.request
+                .metadata()
+                .output_token_ids
+                .as_ref()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            turn.replay_hashes
+                .as_ref()
+                .unwrap()
+                .local_block_hashes
+                .len(),
+            2
+        );
+        driver.on_output_token(turn.request_uuid, 0).unwrap();
+        driver
+            .on_causal_terminal(
+                turn.request_uuid,
+                index as f64 + 1.0,
+                crate::replay::ReplayTerminalStatus::Completed,
+            )
+            .unwrap();
+        if index < 9 {
+            driver
+                .on_quiescent(turn.request_uuid, index as f64 + 1.0)
+                .unwrap();
+        } else {
+            last = Some(turn.request_uuid);
+        }
+    }
+    assert!(driver.pop_ready_compact(10.0, 100).is_empty());
+    assert_eq!(driver.finish_agentic_preparation(10.0).unwrap(), None);
+    assert!(driver.is_agentic_preparing());
+    assert_eq!(driver.agentic_profile_report().unwrap().issued_requests, 0);
+    driver.on_quiescent(last.unwrap(), 30.0).unwrap();
+    assert_eq!(
+        driver.finish_agentic_preparation(30.0).unwrap(),
+        Some(AgenticPreparationTransition::OpenProfile)
+    );
+    // Timestamped handoff subtracts the earliest surviving stream offset:
+    // the first profile request starts at the barrier, after server cleanup.
+    assert_eq!(driver.next_ready_time_ms(), Some(30.0));
+    let profile = driver.pop_ready_compact(30.0, 100).pop().unwrap();
+    assert_eq!(profile.authored_request_id.as_deref(), Some("turn-10"));
+    assert_eq!(profile.request.metadata().max_output_tokens, 3);
+    let report = driver.agentic_profile_report().unwrap();
+    assert_eq!(report.issued_requests, 1);
+    assert_eq!(report.successful_responses, 0);
+    assert_eq!(
+        driver.agentic_phase_evidence().unwrap().lanes[0].warmup_completed,
+        10
+    );
+}
+
+#[test]
+fn live_warmup_cancellation_aborts_without_profiling() {
+    let mut driver = live_warmup_chain();
+    let turn = driver.pop_ready_compact(0.0, 100).pop().unwrap();
+    driver
+        .on_causal_terminal(
+            turn.request_uuid,
+            1.0,
+            crate::replay::ReplayTerminalStatus::Canceled,
+        )
+        .unwrap();
+    assert_eq!(driver.finish_agentic_preparation(1.0).unwrap(), None);
+    assert!(driver.pop_ready_compact(1.0, 100).is_empty());
+    driver.on_quiescent(turn.request_uuid, 2.0).unwrap();
+    assert_eq!(
+        driver.finish_agentic_preparation(2.0).unwrap(),
+        Some(AgenticPreparationTransition::Aborted)
+    );
+    assert!(driver.is_drained());
+    assert_eq!(
+        driver.agentic_profile_report().unwrap().profile_start_ms,
+        None
+    );
+}
+
+#[test]
+fn live_warmup_restores_global_stream_spread_after_concurrent_quota_drain() {
+    let graph = graph(
+        (0..12)
+            .map(|index| {
+                row(
+                    &format!("stream-{index:02}"),
+                    &format!("conversation-{index:02}"),
+                    index as f64 * 10.0,
+                    Some(1.0),
+                )
+            })
+            .collect(),
+    );
+    let mut driver = WorkloadDriver::new_agentic_warmup_with_policy(
+        PreparedAgenticSnapshots::from_plays(vec![prepare(&graph, 0.0)]).unwrap(),
+        64,
+        true,
+        1.0,
+        AgenticWarmupPolicy::LiveTrajectories,
+    )
+    .unwrap();
+    driver
+        .enable_agentic_profile(AgenticProfileOptions::default())
+        .unwrap();
+    driver.finish_agentic_preparation(0.0).unwrap();
+    let issued = driver.pop_ready_compact(0.0, 100);
+    assert_eq!(
+        issued.len(),
+        10,
+        "quota counts admissions, including concurrent requests"
+    );
+    assert!(driver.pop_ready_compact(0.0, 100).is_empty());
+    for request in &issued {
+        driver.on_output_token(request.request_uuid, 0).unwrap();
+        driver
+            .on_causal_terminal(
+                request.request_uuid,
+                1.0,
+                crate::replay::ReplayTerminalStatus::Completed,
+            )
+            .unwrap();
+    }
+    assert_eq!(driver.finish_agentic_preparation(1.0).unwrap(), None);
+    for request in issued {
+        driver.on_quiescent(request.request_uuid, 5.0).unwrap();
+    }
+    driver.finish_agentic_preparation(5.0).unwrap();
+    let first = driver.pop_ready_compact(5.0, 100);
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].authored_request_id.as_deref(), Some("stream-10"));
+    assert_eq!(driver.next_ready_time_ms(), Some(15.0));
+    let second = driver.pop_ready_compact(15.0, 100);
+    assert_eq!(second.len(), 1);
+    assert_eq!(second[0].authored_request_id.as_deref(), Some("stream-11"));
+    assert!(
+        first
+            .iter()
+            .chain(&second)
+            .all(|request| request.request.metadata().max_output_tokens == 3)
+    );
+}

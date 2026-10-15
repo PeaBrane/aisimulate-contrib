@@ -286,6 +286,8 @@ def recommendation_to_sweeper(
         search_space["kv_transfer_bytes_per_token"] = transfer.get("bytes_per_token")
         search_space["kv_transfer_bandwidth"] = transfer.get("bandwidth_gb_per_second")
         search_space["kv_transfer_timing_mode"] = transfer.get("timing_mode", "destination_missing")
+        search_space["kv_transfer_prefill_backoff_tokens"] = transfer.get("prefill_backoff_tokens", 0)
+        search_space["kv_transfer_decode_recompute_tokens"] = transfer.get("decode_recompute_tokens", 0)
     (
         pinned_parallel,
         flat_modes,
@@ -732,6 +734,7 @@ def _recommendation_workload(raw: dict[str, Any] | None) -> dict[str, Any]:
                 result["agentic_snapshot"] = deepcopy(load["agentic_snapshot"])
             if load.get("agentic_warmup"):
                 result["agentic_warmup"] = True
+                result["agentic_warmup_policy"] = load.get("agentic_warmup_policy", "primer")
             if load.get("agentic_profile") is not None:
                 result["agentic_profile"] = deepcopy(load["agentic_profile"])
         if isinstance(stop, dict) and stop.get("max_virtual_time_seconds") is not None:

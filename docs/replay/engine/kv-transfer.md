@@ -31,6 +31,8 @@ YAML above always resolves the bytes.
 | `engine.kv_transfer.bytes_per_token` | `auto` | fixed | Positive integer or `auto`. Bytes moved per prompt token. `auto` derives it from the model and the prefill role's TP/PP/MoE shape. It can differ from either worker's `kv_cache.bytes_per_token`. With `state_cache`, `auto` uses the prefill role's resolved `kv_cache.bytes_per_token`. |
 | `engine.kv_transfer.bandwidth_gb_per_second` | `null` | fixed | Positive, in decimal GB/s. `null` means no transfer delay, not a zero-bandwidth link. |
 | `engine.kv_transfer.timing_mode` | `destination_missing` | fixed | `destination_missing` charges only the prompt KV the chosen decode worker does not already hold in its cache. `full_prompt` charges the whole prompt. |
+| `engine.kv_transfer.prefill_backoff_tokens` | `0` | fixed | Nonnegative prompt suffix length left for decode-side computation. vLLM P/D only. Set from the pinned connector contract; both roles receive the same value. A prompt must be longer than a positive backoff. |
+| `engine.kv_transfer.decode_recompute_tokens` | `0` | fixed | Minimum prompt suffix recomputed on decode, capped at prompt length. vLLM P/D only. The effective suffix is the larger of this value and `prefill_backoff_tokens`; it does not shorten source computation or transfer. With recurrent `state_cache`, it cannot exceed the source backoff. |
 
 All fields accept only concrete values; `recommend` does not search them.
 `kv_transfer` is rejected in `aggregated` and `afd` modes.
@@ -53,14 +55,18 @@ DSpark draft KV described below. It is 0 when neither applies.
 
 ## Request flow
 
-1. The prefill worker runs the prompt and produces the first token.
+1. The prefill worker runs the prompt (minus `prefill_backoff_tokens`) and
+   produces a source-side sample. Replay does not count that sample as client
+   output.
 2. The request is handed to a decode worker at the same virtual time. KV
    transfer starts, and the prefill worker's copy stays reserved until the
    transfer finishes.
-3. After the transfer completes, the decode worker admits the request and
-   generates the remaining tokens.
+3. After the transfer completes, the decode worker admits the original request,
+   computes any remaining prompt suffix, and generates all requested client
+   output tokens.
 
-The reported TTFT includes prefill queueing, prefill compute and the transfer.
+The reported TTFT includes prefill queueing, prefill compute, the transfer,
+decode admission and computation through the first client-visible token.
 Transfer events share one virtual clock with compute and arrivals.
 
 Backends order the handoff differently:
@@ -94,7 +100,8 @@ KV during prefill. Handoff adds its rank-local footprint once:
 `min(prompt_tokens, draft_window) × draft_bytes_per_token` for windowed drafts,
 or the full context for full-attention drafts. Target-only prefix hits do not
 prove a draft-cache hit, so the full draft window is charged conservatively.
-The decode worker does not repeat prompt preparation. A numeric
+The decode worker reuses the transferred prefix and prepares only its configured
+recomputed suffix. A numeric
 `bytes_per_token` is an explicit total-transfer override and must include any
 draft state; automatic draft bytes are not added to it.
 
@@ -102,3 +109,30 @@ This models a connector that transfers prepared draft KV alongside target KV.
 Frameworks that rebuild draft state or transfer auxiliary hidden states require
 a different handoff contract and are not qualified by this approximation.
 The controlled 1P1D validation must establish the connector's actual contract.
+
+For the campaign's pinned vLLM revision
+`ac9126e58aa7bbab1856ba6593ba4d5003fea516`, NIXL registers target and draft KV
+groups. Its DSpark prefill backoff is **1 for Kimi-K3's recurrent state** and
+**0 for V4/V4.1**. Configure Kimi with `prefill_backoff_tokens: 1`. Separately,
+the destination scheduler recomputes a prompt suffix to recover output logits
+or bounded decoder state: set `decode_recompute_tokens: 1` for V4/Kimi and
+`decode_recompute_tokens: 128` for V4.1 with decoder replay enabled. Replay does
+not infer a connector version from a model name. The transferred recurrent
+state and reusable blocks cover only the source-completed prefix. A block
+containing a suffix not computed on the source stays private until decode
+finishes it, so another request cannot reuse unfinished KV. Fully transferred
+blocks can remain reusable even when decode recomputes them for logits.
+Source preparation and transfer use the shortened
+prompt. Destination recomputation can extend farther back for stateless models,
+but never before the received recurrent-state boundary. These are separate
+controls because a transferred token can still require recomputation for logits.
+For short prompts, destination recomputation covers the entire prompt.
+For `destination_missing`, the target-KV payload excludes that suffix even
+when its destination block is newly allocated. Without speculation, the
+suffix forward produces the first output directly; ongoing decoders in a
+mixed step still contribute their own decode cost.
+
+These settings model prompt boundaries, not a complete connector simulator.
+Physical block transfer padding,
+heterogeneous-TP redistribution and transport overlap still require matched
+runtime evidence. See the [collection campaign](../../../benchmarks/evidence/dspark-e2e-20261014/COLLECTION.md).

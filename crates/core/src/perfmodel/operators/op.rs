@@ -202,6 +202,9 @@ pub struct TokenScaleOp {
     /// Bound draft attention to its resident window, including query positions.
     #[serde(default, deserialize_with = "positive_sequence_cap")]
     pub max_sequence_length: Option<u32>,
+    /// Context-side draft proposal: scale request count rather than prompt tokens.
+    #[serde(default)]
+    pub sequence_basis: bool,
 }
 
 fn positive_sequence_cap<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u32>, D::Error> {
@@ -591,10 +594,22 @@ impl Op {
             Op::Glm53Ffn(op) => op.query(db, ctx),
             Op::Glm53Primitive(op) => op.query(db, ctx),
             Op::TokenScale(op) => {
+                let s = if op.sequence_basis {
+                    ctx.s
+                        .saturating_add(ctx.prefix)
+                        .saturating_add(op.scale_tokens(1)?)
+                } else {
+                    ctx.s
+                };
                 let scaled = RuntimeContext {
                     batch_size: op.scale_tokens(ctx.batch_size)?,
-                    num_tokens: op.scale_tokens(ctx.num_tokens)?,
-                    s: op.max_sequence_length.map_or(ctx.s, |cap| ctx.s.min(cap)),
+                    num_tokens: op.scale_tokens(if op.sequence_basis {
+                        ctx.batch_size
+                    } else {
+                        ctx.num_tokens
+                    })?,
+                    s: op.max_sequence_length.map_or(s, |cap| s.min(cap)),
+                    prefix: if op.sequence_basis { 0 } else { ctx.prefix },
                     ..*ctx
                 };
                 op.op.query(db, &scaled)
@@ -805,6 +820,7 @@ mod tests {
                     numerator,
                     denominator,
                     max_sequence_length: None,
+                    sequence_basis: false,
                 });
                 let query = RuntimeContext {
                     batch_size: 32 * denominator,
@@ -831,6 +847,55 @@ mod tests {
     }
 
     #[test]
+    fn dspark_prefill_proposal_uses_request_count_and_full_context() {
+        use crate::common::enums::{DatabaseMode, KvCacheQuantMode, TransferPolicy};
+        let (_tmp, db) = one_row_gemm_db();
+        let db = db.with_mode(DatabaseMode::Sol, TransferPolicy::default());
+        for leaf in [
+            silicon_leaf(),
+            Op::GenerationAttention(GenerationAttentionOp::new(
+                "draft_attention",
+                8,
+                8,
+                128,
+                KvCacheQuantMode::Bfloat16,
+            )),
+        ] {
+            let proposal = Op::TokenScale(TokenScaleOp {
+                op: Box::new(leaf.clone()),
+                numerator: 3,
+                denominator: 1,
+                max_sequence_length: None,
+                sequence_basis: true,
+            });
+            // Equal total context, radically different extend lengths: proposal
+            // compute and attention must see the same two K-token drafts.
+            for (extend, prefix) in [(1024, 0), (1, 1023)] {
+                let context = RuntimeContext {
+                    batch_size: 2,
+                    num_tokens: 2 * extend,
+                    s: extend,
+                    prefix,
+                    ..ctx()
+                };
+                let expected = RuntimeContext {
+                    batch_size: 6,
+                    num_tokens: 6,
+                    s: 1027,
+                    prefix: 0,
+                    ..ctx()
+                };
+                assert_eq!(
+                    proposal.query(&db, &context).unwrap().latency_ms,
+                    leaf.query(&db, &expected).unwrap().latency_ms
+                );
+            }
+            let bytes = bincode::serialize(&proposal).unwrap();
+            assert_eq!(bincode::deserialize::<Op>(&bytes).unwrap(), proposal);
+        }
+    }
+
+    #[test]
     fn draft_token_scale_rejects_zero_and_overflow() {
         for (numerator, denominator) in [(0, 4), (1, 0)] {
             let wrapped = Op::TokenScale(TokenScaleOp {
@@ -838,6 +903,7 @@ mod tests {
                 numerator,
                 denominator,
                 max_sequence_length: None,
+                sequence_basis: false,
             });
             let json = serde_json::to_string(&wrapped).unwrap();
             assert!(
@@ -854,6 +920,7 @@ mod tests {
             numerator: u32::MAX,
             denominator: 1,
             max_sequence_length: None,
+            sequence_basis: false,
         };
         assert!(wrapped.scale_tokens(2).is_err());
         assert_eq!(wrapped.scale_tokens(1).unwrap(), u32::MAX);
@@ -876,6 +943,7 @@ mod tests {
             numerator: 1,
             denominator: 1,
             max_sequence_length: Some(134),
+            sequence_basis: false,
         });
         for length in [32, 134, 8192] {
             let query = RuntimeContext { s: length, ..ctx() };

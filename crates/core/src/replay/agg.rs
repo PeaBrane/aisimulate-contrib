@@ -1656,6 +1656,24 @@ mod agentic_warmup_tests {
         offload: bool,
         factory: ReplayEngineFactory,
     ) -> Runtime {
+        runtime_with_policy(
+            backend,
+            blocks,
+            prefill_ms,
+            offload,
+            factory,
+            crate::replay::loadgen::AgenticWarmupPolicy::Primer,
+        )
+    }
+
+    fn runtime_with_policy(
+        backend: Backend,
+        blocks: usize,
+        prefill_ms: f64,
+        offload: bool,
+        factory: ReplayEngineFactory,
+        policy: crate::replay::loadgen::AgenticWarmupPolicy,
+    ) -> Runtime {
         let row = |id: &str, start, input_length, hashes| AgenticMooncakeRow {
             request_id: id.into(),
             play_id: "play".into(),
@@ -1694,11 +1712,12 @@ mod agentic_warmup_tests {
             .prepare_snapshots(1, AgenticSnapshotOptions { seed: 42 })
             .unwrap();
         let play = prepared.context().prepare_play(0, 0, Some(50.0)).unwrap();
-        let driver = WorkloadDriver::new_agentic_warmup(
+        let driver = WorkloadDriver::new_agentic_warmup_with_policy(
             PreparedAgenticSnapshots::from_plays(vec![play]).unwrap(),
             64,
             true,
             1.0,
+            policy,
         )
         .unwrap();
         let config = ReplayEngineConfig {
@@ -1729,6 +1748,50 @@ mod agentic_warmup_tests {
         )
         .unwrap()
         .with_per_request_records(true)
+    }
+
+    #[test]
+    fn live_warmup_runtime_keeps_cache_and_excludes_preparation_metrics() {
+        for backend in [Backend::Vllm, Backend::Sglang] {
+            let mut replay = runtime_with_policy(
+                backend,
+                1024,
+                3.0,
+                false,
+                ReplayEngineFactory::new(),
+                crate::replay::loadgen::AgenticWarmupPolicy::LiveTrajectories,
+            );
+            replay
+                .admission
+                .enable_agentic_profile(crate::replay::loadgen::AgenticProfileOptions {
+                    duration_seconds: 0.25,
+                    response_grace_seconds: 0.03,
+                    ..Default::default()
+                })
+                .unwrap();
+            let report = replay.run().unwrap().0.finish();
+            let phases = report.agentic_phases.as_ref().unwrap();
+            let profile = report.agentic_profile.as_ref().unwrap();
+            assert_eq!(phases.lanes[0].warmup_completed, 10);
+            assert_eq!(phases.requests.len(), 11);
+            assert!(phases.requests.iter().all(
+                |request| request.quiescent_at_ms.unwrap() <= profile.profile_start_ms.unwrap()
+            ));
+            assert!(
+                phases
+                    .requests
+                    .iter()
+                    .any(|request| request.first_admission_reused_input_tokens.unwrap_or(0) > 0)
+            );
+            assert!(profile.successful_responses > 0);
+            assert_eq!(profile.successful_responses, report.per_request.len());
+            assert!(report.per_request.iter().all(|request| {
+                !phases
+                    .requests
+                    .iter()
+                    .any(|warmup| warmup.uuid.to_string() == request.uuid)
+            }));
+        }
     }
 
     #[test]

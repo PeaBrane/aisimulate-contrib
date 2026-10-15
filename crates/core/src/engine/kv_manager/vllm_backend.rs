@@ -100,7 +100,7 @@ struct PendingStore {
 }
 
 struct LeaseCommitOptions<'a> {
-    cache_fresh: bool,
+    cache_fresh_blocks: usize,
     sequence: Option<&'a RequestSequence>,
     write_dependencies: &'a [SourceReuseDependency],
 }
@@ -310,11 +310,17 @@ pub(crate) struct DestinationReservation {
 }
 
 impl DestinationReservation {
-    pub(crate) fn transferable_prompt_tokens(&self, block_size: usize) -> usize {
-        self.pool
-            .fresh_len()
-            .saturating_sub(self.state_blocks)
-            .saturating_mul(block_size)
+    pub(crate) fn transferable_prompt_tokens(
+        &self,
+        block_size: usize,
+        source_prompt_tokens: Option<usize>,
+    ) -> usize {
+        let fresh_blocks = self.pool.fresh_len().saturating_sub(self.state_blocks);
+        let fresh_tokens = fresh_blocks.saturating_mul(block_size);
+        source_prompt_tokens.map_or(fresh_tokens, |computed| {
+            let cached_tokens = self.block_count.saturating_sub(fresh_blocks) * block_size;
+            computed.saturating_sub(cached_tokens).min(fresh_tokens)
+        })
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -703,7 +709,7 @@ impl VllmKvManager {
             target_blocks,
             &mut reservation,
             LeaseCommitOptions {
-                cache_fresh: false,
+                cache_fresh_blocks: 0,
                 sequence: None,
                 write_dependencies: &dependencies,
             },
@@ -931,7 +937,7 @@ impl VllmKvManager {
             target_blocks,
             &mut reservation.pool,
             LeaseCommitOptions {
-                cache_fresh: false,
+                cache_fresh_blocks: 0,
                 sequence: None,
                 write_dependencies: &dependencies,
             },
@@ -1268,8 +1274,10 @@ impl VllmKvManager {
         sequence: &RequestSequence,
         lease: &mut BlockRequestLease,
         mut reservation: DestinationReservation,
+        computed_tokens: usize,
     ) {
         lease.debug_assert_owner(owner);
+        assert!(computed_tokens <= sequence.num_input_tokens());
         debug_assert_eq!(
             lease.resident_block_count(),
             0,
@@ -1297,15 +1305,16 @@ impl VllmKvManager {
             prompt_blocks,
             &mut reservation.pool,
             LeaseCommitOptions {
-                cache_fresh: self.enable_prefix_caching,
+                cache_fresh_blocks: computed_tokens / self.block_size,
                 sequence: Some(sequence),
                 write_dependencies: &[],
             },
         );
         lease.allocated_tokens = (prompt_blocks * self.block_size).min(sequence.num_input_tokens());
         if let Some(manager) = &self.state_cache {
-            // The transferred state already covers the prompt.
-            let prompt = sequence.num_input_tokens();
+            // A connector may leave a suffix for the decode role. The received
+            // recurrent state covers only the source's computed prefix.
+            let prompt = computed_tokens;
             let state = lease.state.get_or_insert_with(Default::default);
             state.working = (0..manager.blocks_per_state)
                 .map(|_| self.pool.allocate_private(&mut reservation.pool))
@@ -1388,7 +1397,7 @@ impl VllmKvManager {
         options: LeaseCommitOptions<'_>,
     ) {
         let LeaseCommitOptions {
-            cache_fresh,
+            cache_fresh_blocks,
             sequence,
             write_dependencies,
         } = options;
@@ -1400,8 +1409,8 @@ impl VllmKvManager {
         let mut pending_indices = fresh_write_pending
             .then(|| Vec::with_capacity((end - start).saturating_sub(prefix_len)));
         let materialize_store_events = self.materialize_store_events();
-        let mut stores =
-            (cache_fresh && materialize_store_events).then(|| Vec::with_capacity(end - start));
+        let mut stores = (cache_fresh_blocks > 0 && materialize_store_events)
+            .then(|| Vec::with_capacity(end - start));
 
         for (offset, position) in (start..end).enumerate() {
             let parent_hash = position
@@ -1442,7 +1451,7 @@ impl VllmKvManager {
                 }
                 continue;
             };
-            if cache_fresh && self.enable_prefix_caching {
+            if position < cache_fresh_blocks && self.enable_prefix_caching {
                 let (copy, became_visible) = self.pool.allocate_cached(reservation, hash);
                 entry.copy = Some(copy);
                 entry.pending_cache = false;
@@ -2182,7 +2191,13 @@ mod tests {
         assert_eq!(reservation.pool.fresh_len(), 1);
         assert_eq!(manager.num_active_blocks(), 2);
 
-        manager.activate_destination_lease(owner, &sequence, &mut lease, reservation);
+        manager.activate_destination_lease(
+            owner,
+            &sequence,
+            &mut lease,
+            reservation,
+            sequence.num_input_tokens(),
+        );
         assert_eq!(lease.resident_block_count(), 2);
         assert_eq!(lease.allocated_tokens(), 8);
         assert_eq!(lease.entries[0].copy, Some(prefix_copy));
@@ -2194,6 +2209,22 @@ mod tests {
                 .cached_tokens,
             8
         );
+    }
+
+    #[test]
+    fn partial_handoff_does_not_publish_uncomputed_suffix() {
+        let mut manager =
+            VllmKvManager::new_with_event_sink(3, 4, true, KvEventPublishers::default(), 0);
+        let owner = Uuid::from_u128(17);
+        let (mut sequence, mut lease) = request(owner, &[7, 8], false);
+        let reservation = ready(manager.reserve_external_prefix_lease(owner, &lease, 0, &[7, 8]));
+        manager.activate_destination_lease(owner, &sequence, &mut lease, reservation, 7);
+        assert!(manager.pool.prefix_hit(7).is_some());
+        assert!(manager.pool.prefix_hit(8).is_none());
+        manager.finalize_lease_computed_prefix(owner, &mut sequence, &mut lease, 7, 8);
+        assert!(manager.pool.prefix_hit(8).is_some());
+        manager.finish_lease(owner, lease);
+        assert_eq!(manager.num_active_blocks(), 0);
     }
 
     #[test]

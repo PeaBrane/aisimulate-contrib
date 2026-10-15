@@ -32,7 +32,8 @@ def _config(replay=False, backend="sglang"):
     }
 
 
-def test_native_builder_preserves_replay_and_backend_guard():
+@pytest.mark.parametrize("backend", ["sglang", "vllm"])
+def test_native_builder_preserves_replay_and_backend_guard(backend):
     sample = {
         "version": 1,
         "scheduled_requests": {
@@ -41,16 +42,16 @@ def test_native_builder_preserves_replay_and_backend_guard():
             "sum_prefill_kv_tokens": 0,
         },
     }
-    full = _native_model(_config(False))
-    bounded = _native_model(_config(True))
+    full = _native_model(_config(False, backend))
+    bounded = _native_model(_config(True, backend))
     assert 0 < bounded.estimate_forward_pass_time_ms(sample) < full.estimate_forward_pass_time_ms(sample)
     with pytest.raises(ValueError, match="decoder_replay requires"):
-        _native_model(_config(True, "vllm"))
+        _native_model(_config(True, "trtllm"))
 
 
 @pytest.mark.parametrize(
     ("model_path", "backend"),
-    [("example/model", "sglang"), (MODEL_PATH, "vllm")],
+    [("example/model", "sglang"), (MODEL_PATH, "trtllm")],
 )
 def test_compile_engine_rejects_unsupported_decoder_replay(model_path, backend):
     from aisimulate_core.sdk.engine import compile_engine

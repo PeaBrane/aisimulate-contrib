@@ -3163,6 +3163,51 @@ mod agentic_pd_qualification {
     }
 
     #[test]
+    fn live_warmup_pd_retains_frontier_after_handoff_cleanup() {
+        for backend in [EngineType::Vllm, EngineType::Sglang] {
+            let mut driver = WorkloadDriver::new_agentic_warmup_with_policy(
+                prepared(graph(true), 2),
+                64,
+                true,
+                1.0,
+                crate::replay::loadgen::AgenticWarmupPolicy::LiveTrajectories,
+            )
+            .unwrap();
+            driver
+                .enable_agentic_profile(crate::replay::loadgen::AgenticProfileOptions {
+                    duration_seconds: 0.35,
+                    response_grace_seconds: 0.1,
+                    ..Default::default()
+                })
+                .unwrap();
+            let mut options = config(backend, true).runtime_config(false).unwrap();
+            options.handoff_latency_ms = 5.0;
+            let runtime = RoundRobinDisaggRuntime::new_round_robin_workload(
+                &options,
+                driver,
+                ReplayMode::Trace,
+            )
+            .unwrap()
+            .with_per_request_records(true);
+            let report = finish(runtime);
+            let phases = report.agentic_phases.as_ref().unwrap();
+            let profile = report.agentic_profile.as_ref().unwrap();
+            assert!(phases.lanes.iter().all(|lane| lane.warmup_completed == 10));
+            assert!(phases.requests.iter().all(
+                |request| request.quiescent_at_ms.unwrap() <= profile.profile_start_ms.unwrap()
+            ));
+            assert!(profile.successful_responses > 0);
+            assert_eq!(profile.successful_responses, report.per_request.len());
+            assert!(report.per_request.iter().all(|request| {
+                !phases
+                    .requests
+                    .iter()
+                    .any(|warmup| warmup.uuid.to_string() == request.uuid)
+            }));
+        }
+    }
+
+    #[test]
     fn duration_profile_recycles_and_preserves_cross_cutoff_handoff() {
         for backend in [EngineType::Vllm, EngineType::Sglang] {
             for duration in [0.051, 0.35] {

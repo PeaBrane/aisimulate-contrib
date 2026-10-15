@@ -22,9 +22,13 @@ implementations require measurements and explicit execution identities.
 ## Decoder replay
 
 `ModelConfig(decoder_replay=False)` and `compile_engine(..., decoder_replay=False)`
-select `full`: every actual extend token traverses all 40 layers. The SGLang-only
-`decoder_replay=True` selects `decoder_bounded`, matching the inspected source at
-[`1aa0e962b206102b7c439a4a0c4981cfec6e87bc`](https://github.com/sgl-project/sglang/tree/1aa0e962b206102b7c439a4a0c4981cfec6e87bc).
+select `full`: every actual extend token traverses all 40 layers.
+`decoder_replay=True` selects `decoder_bounded` for SGLang and vLLM, matching
+the inspected [SGLang source](https://github.com/sgl-project/sglang/tree/1aa0e962b206102b7c439a4a0c4981cfec6e87bc)
+and [vLLM eager implementation](https://github.com/vllm-project/vllm/blob/ac9126e58aa7bbab1856ba6593ba4d5003fea516/vllm/models/deepseek_v41/nvidia/model.py).
+The pinned vLLM DSpark collection enables this behavior; its predictions must
+set `decoder_replay=True` explicitly. Sequence parallelism, context parallelism,
+microbatching, and drafts reading outside the target window are not qualified.
 Layers 0–20 process the complete actual extend; layers 21–39 process each
 request's last `min(extend_length, 128)` tokens. The absolute sequence endpoint
 and shared global KV remain unchanged. A three-token extend after a long cached

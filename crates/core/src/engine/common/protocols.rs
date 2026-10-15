@@ -213,6 +213,10 @@ pub(crate) struct MockEngineArgs {
     pub kv_transfer_draft_bytes_per_token: usize,
     #[builder(default = "None")]
     pub kv_transfer_draft_window: Option<usize>,
+    #[builder(default = "0")]
+    pub kv_transfer_prefill_backoff_tokens: usize,
+    #[builder(default = "0")]
+    pub kv_transfer_decode_recompute_tokens: usize,
     #[builder(default = "None")]
     pub kv_cache_bytes_per_token: Option<usize>,
     #[builder(default)]

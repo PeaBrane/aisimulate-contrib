@@ -40,7 +40,8 @@ def estimate_state_cache(
     byte rate overrides the model's rate, including caller-normalized geometry.
 
     State bytes include per-layer page padding, before pool-block rounding.
-    ``num_speculative_tokens`` is metadata: it does not change a KDA copy's shape.
+    ``num_speculative_tokens`` extends the KDA convolution's rollback window;
+    it does not multiply the recurrent state or choose runtime pool copies.
     """
     from ..models import _architecture_to_model_family, _get_model_info
     from .deepseek_v4 import BLOCK_SIZE, deepseek_v4_state_cache

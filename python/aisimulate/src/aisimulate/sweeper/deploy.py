@@ -217,6 +217,8 @@ def _engine_args_payload(
                 resolved["speculation"],
                 resolved.get("kvcache_quant_mode") or "bfloat16",
                 tp,
+                backend=backend,
+                system=_role_hardware_sku(sample, role),
             )
         )
     if host_offload is not None:
@@ -226,6 +228,10 @@ def _engine_args_payload(
             payload["kv_transfer_bandwidth"] = float(sample["kv_transfer_bandwidth"])
         if sample.get("kv_transfer_timing_mode") is not None:
             payload["kv_transfer_timing_mode"] = sample["kv_transfer_timing_mode"]
+        if sample.get("kv_transfer_prefill_backoff_tokens"):
+            payload["kv_transfer_prefill_backoff_tokens"] = sample["kv_transfer_prefill_backoff_tokens"]
+        if sample.get("kv_transfer_decode_recompute_tokens"):
+            payload["kv_transfer_decode_recompute_tokens"] = sample["kv_transfer_decode_recompute_tokens"]
     return payload
 
 

@@ -220,7 +220,11 @@ def workload_bounds(config: Any) -> dict[str, Any]:
             "trace_format": source["format"],
             "trace_block_size": source.get("block_size"),
             "agentic_lanes": load.get("agentic_lanes", 1),
-            **{key: load[key] for key in ("agentic_snapshot", "agentic_warmup", "agentic_profile") if key in load},
+            **{
+                key: load[key]
+                for key in ("agentic_snapshot", "agentic_warmup", "agentic_warmup_policy", "agentic_profile")
+                if key in load
+            },
         }
     session = source["type"] == "synthetic-session"
     count = stop.get("sessions" if session else "requests")

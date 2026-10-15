@@ -125,7 +125,8 @@ pub const ENGINE_CONFIG_SCHEMA_VERSION: u32 = 1;
 //   a tail-appended `measured` generic composition priced in SILICON/HYBRID.
 //   The serde default covers JSON only; schema-27 bincode payloads are rejected.
 // - 29: TokenScale carries a typed draft attention sequence-length cap.
-pub const ENGINE_SPEC_SCHEMA_VERSION: u32 = 29;
+// - 30: TokenScale distinguishes request-basis startup proposals from token scaling.
+pub const ENGINE_SPEC_SCHEMA_VERSION: u32 = 30;
 
 /// Static engine identity and setup information carried by an
 /// [`crate::perfmodel::engine::spec::EngineSpec`].

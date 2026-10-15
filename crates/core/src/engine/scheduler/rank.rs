@@ -440,6 +440,8 @@ fn core_args(config: &EngineConfig, timing: Arc<dyn TimingModel>) -> MockEngineA
         kv_transfer_bytes_per_token: config.kv_transfer_bytes_per_token,
         kv_transfer_draft_bytes_per_token: config.kv_transfer_draft_bytes_per_token,
         kv_transfer_draft_window: config.kv_transfer_draft_window,
+        kv_transfer_prefill_backoff_tokens: config.kv_transfer_prefill_backoff_tokens,
+        kv_transfer_decode_recompute_tokens: config.kv_transfer_decode_recompute_tokens,
         kv_cache_bytes_per_token: config.kv_cache_bytes_per_token,
         kv_cache_groups: config.kv_cache_groups.clone(),
         kv_cache_capacity_bytes: config.kv_cache_capacity_bytes,

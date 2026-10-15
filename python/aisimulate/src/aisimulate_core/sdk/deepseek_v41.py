@@ -1,5 +1,9 @@
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+# Modified physical vLLM cache descriptions from
+# https://github.com/vllm-project/vllm/tree/ac9126e58aa7bbab1856ba6593ba4d5003fea516
+# vllm/models/deepseek_v41/attention.py and v1/attention/backends/mla/indexer.py.
 
 """Shared DeepSeek-V4.1 text architecture and execution contract.
 
@@ -33,6 +37,8 @@ class DeepSeekV41KVCacheLayout(StrEnum):
 
     LOGICAL_FP4 = "logical_fp4"
     SGLANG_FP8_BF16 = "sglang_fp8_bf16"
+    VLLM_MXFP8 = "vllm_mxfp8"
+    VLLM_FP8_BF16 = "vllm_fp8_bf16"
 
 
 def resolve_kv_cache_layout(backend_name: str) -> DeepSeekV41KVCacheLayout:
@@ -45,10 +51,10 @@ def resolve_kv_cache_layout(backend_name: str) -> DeepSeekV41KVCacheLayout:
 
 
 def resolve_execution_profile(decoder_replay: bool, backend_name: str) -> DeepSeekV41ExecutionProfile:
-    """Only SGLang has a verified bounded-decoder execution contract."""
+    """Pinned SGLang and vLLM eager paths share the bounded decoder contract."""
     if not isinstance(decoder_replay, bool):
         raise ValueError("decoder_replay must be a boolean")
-    if decoder_replay and backend_name != "sglang":
+    if decoder_replay and backend_name not in ("sglang", "vllm"):
         raise NotImplementedError(f"DeepSeek-V4.1 decoder replay is not verified for {backend_name}")
     return DeepSeekV41ExecutionProfile.DECODER_BOUNDED if decoder_replay else DeepSeekV41ExecutionProfile.FULL
 
@@ -163,6 +169,14 @@ class DeepSeekV41Config:
             if (self.head_dim, self.qk_rope_head_dim, self.index_head_dim) != (512, 64, 128):
                 raise ValueError("pinned SGLang V4.1 KV storage requires head_dim=512, RoPE=64, index=128")
             return 584.0, 584.0, 68.0
+        if layout in (DeepSeekV41KVCacheLayout.VLLM_MXFP8, DeepSeekV41KVCacheLayout.VLLM_FP8_BF16):
+            # vLLM ac9126e58: fp8_ds_mla is 512 MXFP8 values + 16 scales
+            # on SM100; other devices retain the 584-byte FP8/BF16 record.
+            # Default indexer_kv_dtype resolves to FP8, not SGLang's MXFP4.
+            if (self.head_dim, self.qk_rope_head_dim, self.index_head_dim) != (512, 64, 128):
+                raise ValueError("pinned vLLM V4.1 cache requires head_dim=512, RoPE=64, index=128")
+            entry = 528.0 if layout == DeepSeekV41KVCacheLayout.VLLM_MXFP8 else 584.0
+            return entry, entry, 132.0
         if layout == DeepSeekV41KVCacheLayout.LOGICAL_FP4:
             return float(self.head_dim), self.compressed_entry_bytes, self.index_entry_bytes
         raise ValueError(f"unknown DeepSeek-V4.1 KV storage layout: {layout}")

@@ -2845,7 +2845,7 @@
   "blockers": [
     "Adaptive verification is absent from launch/config dumps; exact vLLM revision 20ebb2850 is not publicly resolvable.",
     "Synthetic AL=3.61 is observed; its bonus-token convention still needs the exact runtime source.",
-    "Producer warmup advances live trajectories and preserves 63 streams; Replay repeats primers without advancing plays.",
+    "Producer drains issued wire requests then preserves 63 unfinished streams across 32 lanes; the live_trajectories policy now models this DAG handoff, but snapshot/input identity and extra server-cleanup delay remain unqualified.",
     "Random routing with session affinity and the NIXL target/draft payload need matched-runtime qualification.",
     "Recorded token lengths do not establish token/prefix identity, exact session replay or completion policy."
   ]

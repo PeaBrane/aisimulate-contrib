@@ -789,6 +789,8 @@ def _worker_engine_args(
                     resolved["speculation"],
                     resolved.get("kvcache_quant_mode") or "bfloat16",
                     parallel.tensor,
+                    backend=engine.backend,
+                    system=worker.hardware or engine.hardware,
                 )
             )
     if host_offload is not None:
@@ -800,6 +802,10 @@ def _worker_engine_args(
         if transfer.bandwidth_gb_per_second is not None:
             payload["kv_transfer_bandwidth"] = transfer.bandwidth_gb_per_second
         payload["kv_transfer_timing_mode"] = transfer.timing_mode
+        if transfer.prefill_backoff_tokens:
+            payload["kv_transfer_prefill_backoff_tokens"] = transfer.prefill_backoff_tokens
+        if transfer.decode_recompute_tokens:
+            payload["kv_transfer_decode_recompute_tokens"] = transfer.decode_recompute_tokens
     return payload
 
 
@@ -866,6 +872,7 @@ def _traffic(
                 workload["agentic_snapshot"] = load.agentic_snapshot.model_dump(mode="json")
             if load.agentic_warmup:
                 workload["agentic_warmup"] = True
+                workload["agentic_warmup_policy"] = load.agentic_warmup_policy
             if load.agentic_profile is not None:
                 workload["agentic_profile"] = load.agentic_profile.model_dump(mode="json")
         if stop is not None and stop.max_virtual_time_seconds is not None:

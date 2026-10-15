@@ -71,12 +71,8 @@ def launches(text):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--raw-dir", type=Path, default=Path(__file__).parent / "raw/agentx-pd"
-    )
-    parser.add_argument(
-        "--output", type=Path, default=Path(__file__).parent / "agentx-pd-audit.json"
-    )
+    parser.add_argument("--raw-dir", type=Path, default=Path(__file__).parent / "raw/agentx-pd")
+    parser.add_argument("--output", type=Path, default=Path(__file__).parent / "agentx-pd-audit.json")
     parser.add_argument(
         "--download",
         action="store_true",
@@ -107,20 +103,21 @@ def main():
         receipts.append({"artifact_id": artifact_id, "sha256": observed})
 
     selected = {}
-    with zipfile.ZipFile(raw / "server-logs.zip") as archive:
-        with archive.open("multinode_server_logs.tar.gz") as compressed:
-            with tarfile.open(fileobj=compressed, mode="r|gz") as files:
-                for member in files:
-                    name = Path(member.name).name
-                    wanted = name in {"26842.json", "sweep_26842.log"} or (
-                        name.startswith(("watchtower-navy-", "fingerprint_"))
-                        and name.endswith(".json")
-                    )
-                    if not member.isfile() or not wanted or name in selected:
-                        continue
-                    content = files.extractfile(member).read()
-                    selected[name] = content
-                    (raw / f"archive-{name}").write_bytes(content)
+    with (
+        zipfile.ZipFile(raw / "server-logs.zip") as archive,
+        archive.open("multinode_server_logs.tar.gz") as compressed,
+        tarfile.open(fileobj=compressed, mode="r|gz") as files,
+    ):
+        for member in files:
+            name = Path(member.name).name
+            wanted = name in {"26842.json", "sweep_26842.log"} or (
+                name.startswith(("watchtower-navy-", "fingerprint_")) and name.endswith(".json")
+            )
+            if not member.isfile() or not wanted or name in selected:
+                continue
+            content = files.extractfile(member).read()
+            selected[name] = content
+            (raw / f"archive-{name}").write_bytes(content)
     configs = {}
     for name, content in selected.items():
         if not name.endswith("_config.json"):
@@ -162,24 +159,15 @@ def main():
     with zipfile.ZipFile(raw / "agentic.zip") as archive:
         prefix = "conc_32/aiperf_artifacts/"
         export = json.loads(archive.read(prefix + "profile_export_aiperf.json"))
-        rows = [
-            json.loads(line)
-            for line in archive.read(prefix + "profile_export.jsonl").splitlines()
-        ]
+        rows = [json.loads(line) for line in archive.read(prefix + "profile_export.jsonl").splitlines()]
         benchmark = archive.read("conc_32/benchmark.log").decode()
-    counts = Counter(
-        (row["metadata"]["benchmark_phase"], bool(row.get("error"))) for row in rows
-    )
+    counts = Counter((row["metadata"]["benchmark_phase"], bool(row.get("error"))) for row in rows)
     if counts["profiling", False] != metrics["num_requests_successful"]:
         raise ValueError("Pinned metrics and request records disagree")
 
-    siblings, receipt = api(
-        raw, "siblings.json", "benchmark-siblings", {"id": 444916}, args.download
-    )
+    siblings, receipt = api(raw, "siblings.json", "benchmark-siblings", {"id": 444916}, args.download)
     receipts.append(receipt)
-    api_names, receipt = api(
-        raw, "api-files-444916.json", "server-log-files", {"id": 444916}, args.download
-    )
+    api_names, receipt = api(raw, "api-files-444916.json", "server-log-files", {"id": 444916}, args.download)
     receipts.append(receipt)
     api_sweep = next(name for name in api_names if name.startswith("sweep_"))
     api_log, receipt = api(
@@ -205,9 +193,7 @@ def main():
                 "attempt": 3,
             }
         else:
-            names, receipt = api(
-                raw, f"files-{bid}.json", "server-log-files", {"id": bid}, args.download
-            )
+            names, receipt = api(raw, f"files-{bid}.json", "server-log-files", {"id": bid}, args.download)
             receipts.append(receipt)
             name = next(name for name in names if name.startswith("sweep_"))
             log, receipt = api(
@@ -224,18 +210,14 @@ def main():
                 "partial": log.get("nextOffset") is not None,
                 "attempt_alignment": "not_qualified",
             }
-        candidates.append(
-            {"metadata": point, "launches": commands, "launch_source": source}
-        )
+        candidates.append({"metadata": point, "launches": commands, "launch_source": source})
     result = {
         "benchmark_id": 444916,
         "workflow_url": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/36425419107/attempts/3",
         "workflow_revision": "f4ad60fba73439cf4833a674e6a84feb2014bfaf",
         "job_id": 26842,
         "source_receipts": receipts,
-        "archive_entries": {
-            name: hashlib.sha256(value).hexdigest() for name, value in selected.items()
-        },
+        "archive_entries": {name: hashlib.sha256(value).hexdigest() for name, value in selected.items()},
         "configs": configs,
         "fingerprints": {
             name: {k: json.loads(value)[k] for k in ("frameworks", "model")}
@@ -260,13 +242,9 @@ def main():
         },
         "published_measured": metrics["request_metrics"],
         "workload_observations": {
-            "dataset_revision": sorted(
-                set(re.findall(r"revision/([a-f0-9]{40})", benchmark))
-            ),
+            "dataset_revision": sorted(set(re.findall(r"revision/([a-f0-9]{40})", benchmark))),
             "accelerated_warmup": "replaying live trajectories" in benchmark,
-            "handoff_live_streams": re.findall(
-                r"handoff: persisted (\d+) live streams", benchmark
-            ),
+            "handoff_live_streams": re.findall(r"handoff: persisted (\d+) live streams", benchmark),
         },
         "eligible_paired_points": 0,
         "predictions": [],
@@ -280,13 +258,18 @@ def main():
             "selected_artifact_job": 26842,
             "selected_artifact_attempt": 3,
             "job_matches": api_job == 26842,
-            "action": "Use pinned attempt-3 artifacts for the selected point; do not combine API logs with its metrics.",
+            "action": "Use pinned attempt-3 artifacts for the selected point; "
+            "do not combine API logs with its metrics.",
         },
         "blockers": [
-            "Adaptive verification is absent from launch/config dumps; exact vLLM revision 20ebb2850 is not publicly resolvable.",
+            "Adaptive verification is absent from launch/config dumps; "
+            "exact vLLM revision 20ebb2850 is not publicly resolvable.",
             "Synthetic AL=3.61 is observed; its bonus-token convention still needs the exact runtime source.",
-            "Producer warmup advances live trajectories and preserves 63 streams; Replay repeats primers without advancing plays.",
-            "Random routing with session affinity and the NIXL target/draft payload need matched-runtime qualification.",
+            "Producer drains issued wire requests then preserves 63 unfinished streams across 32 lanes; "
+            "the live_trajectories policy now models this DAG handoff, but snapshot/input identity "
+            "and extra server-cleanup delay remain unqualified.",
+            "Random routing with session affinity and the NIXL target/draft payload "
+            "need matched-runtime qualification.",
             "Recorded token lengths do not establish token/prefix identity, exact session replay or completion policy.",
         ],
     }

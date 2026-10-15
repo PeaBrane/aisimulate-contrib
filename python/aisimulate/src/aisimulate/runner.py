@@ -83,6 +83,7 @@ _RUNTIME_TRAFFIC_FIELDS = frozenset(
         "agentic_lanes",
         "agentic_snapshot",
         "agentic_warmup",
+        "agentic_warmup_policy",
         "agentic_profile",
     }
 )
@@ -1087,6 +1088,8 @@ def _materialize_engine_execution_spec(
     else:
         raise ValueError(f"engine replay deployment_mode must be 'agg' or 'disagg', got {deployment_mode!r}")
 
+    if "requests" in spec.workload and set(spec.workload) - {"requests", "replay_concurrency"}:
+        raise ValueError("inline requests only support requests and replay_concurrency workload fields")
     use_workload_driver = spec.workload.get("source_type") is not None
     if use_workload_driver:
         requests: list[dict[str, JSONValue]] = []
@@ -1239,6 +1242,13 @@ def _startup_delay_ms(payload: Mapping[str, JSONValue]) -> float:
 
 def _materialize_requests(spec: ReplaySpec, trace_block_size: int) -> tuple[list[dict[str, JSONValue]], int | None]:
     workload = spec.workload
+    if "requests" in workload:
+        unexpected = set(workload) - {"requests", "replay_concurrency"}
+        if unexpected:
+            raise ValueError(f"inline replay requests cannot combine workload fields: {sorted(unexpected)}")
+        requests = materialize_configured_traffic({"requests": workload["requests"]})
+        cap = workload.get("replay_concurrency", spec.concurrency)
+        return requests, (_positive_int(cap, "replay_concurrency") if cap is not None else None)
     trace_path = workload.get("trace_path")
     if trace_path is not None:
         if not isinstance(trace_path, str) or not trace_path:

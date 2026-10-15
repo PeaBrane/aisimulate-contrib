@@ -109,7 +109,21 @@ pub(crate) fn op_sol_latency_ms(
             // serialized input (which validates the widths on deserialize).
             o.scale_tokens(0)?;
             let ratio = f64::from(o.numerator) / f64::from(o.denominator);
-            op_sol_latency_ms(&o.op, db, x * ratio, batch * ratio, s, prefix)
+            let x = if o.sequence_basis { batch } else { x } * ratio;
+            let s = if o.sequence_basis {
+                s + prefix + ratio
+            } else {
+                s
+            };
+            let s = o.max_sequence_length.map_or(s, |cap| s.min(f64::from(cap)));
+            op_sol_latency_ms(
+                &o.op,
+                db,
+                x,
+                batch * ratio,
+                s,
+                if o.sequence_basis { 0.0 } else { prefix },
+            )
         }
         Op::Gemm(o) => Ok(gemm_sol(o, spec, x)),
         Op::Embedding(o) => Ok(embedding_sol(o, spec, x)),

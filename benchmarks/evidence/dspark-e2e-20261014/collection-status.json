@@ -1,0 +1,214 @@
+{
+  "schema": "dspark-collection-status-v1",
+  "matrix": "matrix.json",
+  "measured_request_records": 0,
+  "eligible_paired_runs": 0,
+  "checkpoint_references": "checkpoint-references.json",
+  "gpu_jobs": [
+    {
+      "cluster": "nsc-svg-slurm-1",
+      "job_id": "2257073",
+      "model": "v41-flash",
+      "k": 5,
+      "gpus": 4,
+      "phase": "smoke",
+      "state": "CANCELLED",
+      "node": "nsc-svg-slurm-1-gpu-172",
+      "results": "results/dspark-e2e-20261014/smoke-v41-flash-k5-2257073",
+      "reason": "Cancelled by campaign after observed 256GB host memory pressure; replaced with larger host allocation and OMP/MKL threads=1."
+    },
+    {
+      "cluster": "aws-pdx-slurm-1",
+      "job_id": "790389",
+      "model": "kimi-k3",
+      "k": 2,
+      "gpus": 8,
+      "phase": "smoke",
+      "state": "CANCELLED",
+      "dependency": "790385",
+      "results": "results/dspark-e2e-20261014/smoke-kimi-k3-k2-790389",
+      "node": "pool0-0292",
+      "reason": "Cancelled by campaign after observed 256GB host memory pressure; replaced with larger host allocation and OMP/MKL threads=1."
+    },
+    {
+      "cluster": "nsc-svg-slurm-1",
+      "job_id": "2257131",
+      "model": "v41-flash",
+      "k": 5,
+      "gpus": 4,
+      "phase": "initial synthetic",
+      "synthetic_acceptance_length": 3.51,
+      "requests": 768,
+      "state": "CANCELLED",
+      "dependency": "2257073",
+      "results": "results/dspark-e2e-20261014/initial-v41-flash-k5-2257131",
+      "reason": "Cancelled by campaign after observed 256GB host memory pressure; replaced with larger host allocation and OMP/MKL threads=1."
+    },
+    {
+      "cluster": "aws-pdx-slurm-1",
+      "job_id": "790435",
+      "model": "kimi-k3",
+      "k": 2,
+      "gpus": 8,
+      "phase": "initial synthetic",
+      "synthetic_acceptance_length": 2.51,
+      "requests": 768,
+      "state": "CANCELLED",
+      "dependency": "790389",
+      "results": "results/dspark-e2e-20261014/initial-kimi-k3-k2-790435",
+      "reason": "Cancelled by campaign after observed 256GB host memory pressure; replaced with larger host allocation and OMP/MKL threads=1."
+    },
+    {
+      "cluster": "nsc-svg-slurm-1",
+      "job_id": "2257181",
+      "model": "v41-flash",
+      "k": 5,
+      "gpus": 4,
+      "host_memory_gb": 768,
+      "phase": "smoke",
+      "state": "pending dependency",
+      "dependency": "2257188",
+      "results": "results/dspark-e2e-20261014/smoke-v41-flash-k5-2257181",
+      "qos": "normal",
+      "time_limit": "01:00:00"
+    },
+    {
+      "cluster": "aws-pdx-slurm-1",
+      "job_id": "790490",
+      "model": "kimi-k3",
+      "k": 2,
+      "gpus": 8,
+      "host_memory_gb": 2048,
+      "phase": "smoke",
+      "state": "last observed running",
+      "dependency": null,
+      "results": "results/dspark-e2e-20261014/smoke-kimi-k3-k2-790490",
+      "node": "pool0-0061",
+      "time_limit": "01:00:00"
+    },
+    {
+      "cluster": "nsc-svg-slurm-1",
+      "job_id": "2257185",
+      "model": "v4-pro",
+      "k": 6,
+      "gpus": 8,
+      "host_memory_gb": 1200,
+      "phase": "smoke",
+      "state": "last observed running",
+      "dependency": null,
+      "results": "results/dspark-e2e-20261014/smoke-v4-pro-k6-2257185",
+      "qos": "interactive",
+      "time_limit": "01:00:00",
+      "memory_probe": "512GB did not improve queue estimate; restored1200GB",
+      "queue_note": "Short QoS reached global node cap; current user permits interactive QoS, used for one-hour startup qualification.",
+      "node": "nsc-svg-slurm-1-gpu-4"
+    },
+    {
+      "cluster": "aws-pdx-slurm-1",
+      "job_id": "790497",
+      "model": "kimi-k3",
+      "k": 2,
+      "gpus": 8,
+      "host_memory_gb": 2048,
+      "phase": "initial",
+      "state": "submitted",
+      "dependency": "790490",
+      "results": "results/dspark-e2e-20261014/initial-kimi-k3-k2-790497",
+      "time_limit": "02:00:00"
+    },
+    {
+      "cluster": "nsc-svg-slurm-1",
+      "job_id": "2257188",
+      "model": "v4-pro",
+      "k": 6,
+      "gpus": 8,
+      "host_memory_gb": 1200,
+      "phase": "initial synthetic",
+      "state": "submitted",
+      "dependency": "2257185",
+      "synthetic_acceptance_length": 3.77,
+      "requests": 768,
+      "results": "results/dspark-e2e-20261014/initial-v4-pro-k6-2257188",
+      "qos": "normal",
+      "time_limit": "02:00:00"
+    }
+  ],
+  "cpu_jobs": [
+    {
+      "cluster": "nsc-svg-slurm-1",
+      "job_id": "2256888",
+      "purpose": "image import",
+      "state": "FAILED",
+      "reason": "shell parameter-message quoting; no image import started",
+      "superseded_by": "2256914"
+    },
+    {
+      "cluster": "aws-pdx-slurm-1",
+      "job_id": "790331",
+      "purpose": "image import",
+      "state": "FAILED",
+      "reason": "shell parameter-message quoting; no image import started",
+      "superseded_by": "790345"
+    },
+    {
+      "cluster": "nsc-svg-slurm-1",
+      "job_id": "2256914",
+      "purpose": "image import",
+      "state": "COMPLETED",
+      "exit_code": "0:0",
+      "squashfs_sha256": "1d63705414f88bc376cf405bcb1c437b53d66fd839365e2f87ea489979390715"
+    },
+    {
+      "cluster": "aws-pdx-slurm-1",
+      "job_id": "790345",
+      "purpose": "image import",
+      "state": "COMPLETED",
+      "exit_code": "0:0",
+      "squashfs_sha256": "eb70d9ba4fd13645437afc677758f444da609e2e66c1f8a05ace6e3e401ad52d"
+    },
+    {
+      "cluster": "nsc-svg-slurm-1",
+      "job_id": "2257055",
+      "purpose": "runtime inspection",
+      "state": "FAILED",
+      "reason": "python alias absent from container PATH; retried with /usr/bin/python3",
+      "exit_code": "1:0"
+    },
+    {
+      "cluster": "aws-pdx-slurm-1",
+      "job_id": "790365",
+      "purpose": "runtime inspection",
+      "state": "FAILED",
+      "exit_code": "1:0",
+      "reason": "python alias absent from container PATH; retried with /usr/bin/python3"
+    },
+    {
+      "cluster": "nsc-svg-slurm-1",
+      "job_id": "2257070",
+      "purpose": "runtime inspection retry",
+      "state": "COMPLETED",
+      "exit_code": "0:0",
+      "receipt": "runtime-b200.json"
+    },
+    {
+      "cluster": "aws-pdx-slurm-1",
+      "job_id": "790385",
+      "purpose": "runtime inspection retry",
+      "state": "COMPLETED",
+      "exit_code": "0:0",
+      "receipt": "runtime-b300.json"
+    }
+  ],
+  "storage_root": "/lustre/fsw/portfolios/coreai/projects/coreai_comparch_inferencex/users/simonec",
+  "logs": "logs/dspark-e2e-20261014",
+  "results": "results/dspark-e2e-20261014",
+  "runtime": "vllm/vllm-openai:nightly-dev-x86_64-cu130-ac9126e58aa7@sha256:3d17635c5aa0340e2f2502c067ce4b587d8e7dc678195e90b71142490dc6d71c",
+  "pending": [
+    "runtime/container smoke",
+    "aggregated GPU smoke",
+    "P/D GPU smoke and connector qualification",
+    "fixed-length measured pilot and scoring",
+    "expanded matrix",
+    "AgentX pilots"
+  ]
+}

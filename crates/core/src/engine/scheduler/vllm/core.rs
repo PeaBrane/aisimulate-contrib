@@ -167,6 +167,8 @@ struct ScheduledWork {
     /// decode KV context in FPM. Captured here because completed requests are
     /// removed from state before `compute_fpm` runs.
     sequence_len: usize,
+    /// Sentinel draft rows pad D's one-token startup, without accepted progress.
+    padded_dspark_startup: bool,
 }
 
 enum ScheduleOutcome {
@@ -674,7 +676,12 @@ impl ReservedVllmDecode {
             .saturating_sub(self.kv.len())
     }
 
-    fn activate(self, kv_manager: &mut G1Manager) -> VllmRequestState {
+    fn activate(
+        self,
+        kv_manager: &mut G1Manager,
+        backoff_tokens: usize,
+        recompute_tokens: usize,
+    ) -> VllmRequestState {
         let Self { mut request, kv } = self;
         let prompt_len = request.sequence.num_input_tokens();
         let owner = request.sequence.lease.owner();
@@ -683,8 +690,10 @@ impl ReservedVllmDecode {
             &request.sequence.sequence,
             &mut request.sequence.lease,
             kv,
+            prompt_len - backoff_tokens,
         );
-        request.num_computed_tokens = prompt_len;
+        request.num_computed_tokens =
+            prompt_len.saturating_sub(backoff_tokens.max(recompute_tokens));
         request.status = RequestStatus::Waiting;
         request.is_decode_handoff = true;
         request
@@ -697,6 +706,12 @@ impl ReservedVllmDecode {
 }
 
 impl VllmCore {
+    fn models_prefill_compute(&self) -> bool {
+        self.args.worker_type != WorkerType::Decode
+            || self.args.kv_transfer_prefill_backoff_tokens > 0
+            || self.args.kv_transfer_decode_recompute_tokens > 0
+    }
+
     pub(crate) fn set_belady_oracle(&mut self, oracle: BeladyOracle) {
         self.kv_manager.set_belady_oracle(oracle.clone());
         self.belady_oracle = Some(oracle);
@@ -1005,6 +1020,16 @@ impl VllmCore {
                 handoff_id,
                 mut request,
             } => {
+                // Modified CPU model of NIXL's source backoff contract:
+                // vllm-project/vllm@ac9126e58aa7bbab1856ba6593ba4d5003fea516,
+                // vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_scheduler.py.
+                // Copyright contributors to vLLM. Apache-2.0.
+                let backoff = self.args.kv_transfer_prefill_backoff_tokens;
+                anyhow::ensure!(
+                    backoff == 0 || request.tokens.len() > backoff,
+                    "P/D prompt must contain more tokens than prefill backoff"
+                );
+                request.tokens.truncate(request.tokens.len() - backoff);
                 let uuid = request.uuid.unwrap_or_else(Uuid::new_v4);
                 request.uuid = Some(uuid);
                 self.validate_request_id(uuid)?;
@@ -1049,6 +1074,11 @@ impl VllmCore {
                 handoff_id,
                 mut request,
             } => {
+                anyhow::ensure!(
+                    self.args.kv_transfer_prefill_backoff_tokens == 0
+                        || request.tokens.len() > self.args.kv_transfer_prefill_backoff_tokens,
+                    "P/D prompt must contain more tokens than prefill backoff"
+                );
                 let uuid = request.uuid.unwrap_or_else(Uuid::new_v4);
                 request.uuid = Some(uuid);
                 self.validate_request_id(uuid)?;
@@ -1094,7 +1124,11 @@ impl VllmCore {
                     return Ok(SchedulerCommandEffects::new(SchedulerCommandResult::Noop));
                 };
                 let active_before = self.kv_manager.num_active_blocks();
-                let request = reservation.activate(&mut self.kv_manager);
+                let request = reservation.activate(
+                    &mut self.kv_manager,
+                    self.args.kv_transfer_prefill_backoff_tokens,
+                    self.args.kv_transfer_decode_recompute_tokens,
+                );
                 self.active_destination_handoffs.insert(handoff_id, uuid);
                 self.state.restore_waiting_in_order(uuid, request);
                 if self.kv_manager.num_active_blocks() < active_before {
@@ -1237,8 +1271,12 @@ impl VllmCore {
                 return Vec::new();
             }
         };
+        let source_prompt_tokens = (self.args.kv_transfer_prefill_backoff_tokens > 0).then(|| {
+            request.sequence.num_input_tokens() - self.args.kv_transfer_prefill_backoff_tokens
+        });
         self.pending_destinations.mark_front_attempted(generation);
-        let transferable_prompt_tokens = kv.transferable_prompt_tokens(self.args.block_size);
+        let transferable_prompt_tokens =
+            kv.transferable_prompt_tokens(self.args.block_size, source_prompt_tokens);
         let (handoff_id, request_id, request) = self
             .pending_destinations
             .pop_front()
@@ -2032,8 +2070,8 @@ impl VllmCore {
                             prefill_cost: PrefillCost {
                                 new_blocks: 0,
                                 new_tokens: 0,
-                                cached_tokens: request.sequence.num_input_tokens(),
-                                active_cached_tokens: request.sequence.num_input_tokens(),
+                                cached_tokens: request.num_computed_tokens,
+                                active_cached_tokens: request.num_computed_tokens,
                             },
                         },
                         AdmissionStage::PendingDestinationHead => {
@@ -2521,7 +2559,7 @@ impl VllmCore {
         wall_time_secs: f64,
     ) -> ForwardPassSnapshot {
         let scheduled_prefills = scheduled.values().filter_map(|work| {
-            (work.prompt_tokens > 0).then_some((
+            (work.prompt_tokens > 0 && !work.padded_dspark_startup).then_some((
                 work.prompt_len as u64,
                 work.prefix_tokens as u64,
                 work.total_tokens as u64,
@@ -2529,7 +2567,8 @@ impl VllmCore {
         });
 
         let scheduled_decodes = scheduled.values().filter_map(|work| {
-            (work.prompt_tokens == 0 && !work.terminal_after_schedule)
+            ((work.prompt_tokens == 0 || work.padded_dspark_startup)
+                && !work.terminal_after_schedule)
                 .then_some(work.sequence_len as u64)
         });
 
@@ -2660,6 +2699,32 @@ impl VllmCore {
             .len()
             .saturating_sub(effective_computed_before);
         let prompt_remaining = prompt_len.saturating_sub(prompt_before);
+        let padded_width = self.args.aic_nextn.unwrap_or(0).saturating_add(1);
+        // The pinned vLLM scheduler pads a resumed one-token decode with
+        // invalid draft IDs. These rows cost a full target/draft round but
+        // cannot contribute accepted tokens. The logical prompt stays intact.
+        let padded_dspark_startup = self.args.aic_dspark
+            && request.is_decode_handoff
+            && request.sequence.generated_tokens() == 0
+            && prompt_remaining == 1
+            && effective_computed_before > 0
+            && *batch_count == 0
+            && self.args.max_model_len.is_none_or(|limit| {
+                effective_computed_before
+                    .saturating_add(padded_width)
+                    .saturating_add(1)
+                    <= limit
+            })
+            && self.align_state_prefill(
+                effective_computed_before,
+                prompt_len,
+                request.sequence.len(),
+                padded_width,
+            ) == padded_width
+            && !policy::generation_complete(&request.sequence, self.args.max_model_len);
+        if padded_dspark_startup && *token_budget < padded_width {
+            return Ok(ScheduleOutcome::SkippedForAlignment);
+        }
         if prompt_remaining > 0
             && !self.args.enable_chunked_prefill
             && prompt_remaining > *token_budget
@@ -2762,7 +2827,10 @@ impl VllmCore {
             *preempted_any = true;
             if let Some(undone) = scheduled.remove(&preempted.uuid) {
                 *token_budget += undone.total_tokens;
-                if undone.prompt_tokens > 0 && self.args.worker_type != WorkerType::Decode {
+                if undone.prompt_tokens > 0
+                    && !undone.padded_dspark_startup
+                    && self.models_prefill_compute()
+                {
                     *batch_count = batch_count.saturating_sub(1);
                     *batch_total_isl =
                         batch_total_isl.saturating_sub(undone.prefix_tokens + undone.prompt_tokens);
@@ -2777,10 +2845,16 @@ impl VllmCore {
         if let Some(request) = self.state.requests.get(&uuid) {
             request.debug_assert_invariants(uuid);
         }
-        let tokens_used = actual_computed_after.saturating_sub(effective_computed_before);
-        if tokens_used == 0 && actual_computed_after < self.state.request_sequence_len(uuid) {
+        let logical_tokens = actual_computed_after.saturating_sub(effective_computed_before);
+        if logical_tokens == 0 && actual_computed_after < self.state.request_sequence_len(uuid) {
             return Ok(ScheduleOutcome::Blocked);
         }
+        let tokens_used = logical_tokens
+            + if padded_dspark_startup {
+                padded_width - 1
+            } else {
+                0
+            };
 
         // vLLM's allocate_slots() caches full blocks through this request's
         // newly scheduled token boundary before scheduling the next request.
@@ -2820,9 +2894,10 @@ impl VllmCore {
                 terminal_after_schedule,
                 prompt_len,
                 sequence_len,
+                padded_dspark_startup,
             },
         );
-        if prompt_tokens > 0 && self.args.worker_type != WorkerType::Decode {
+        if prompt_tokens > 0 && !padded_dspark_startup && self.models_prefill_compute() {
             *batch_count += 1;
             *batch_total_isl += prompt_before + prompt_tokens;
             *batch_total_prefix += prompt_before;
@@ -2909,7 +2984,10 @@ impl VllmCore {
             ready.push(uuid);
             // The final prefill forward already includes the output head. First
             // tokens sampled from it do not require a second full forward pass.
-            let first_token_from_prefill = self.args.worker_type == WorkerType::Aggregated
+            let first_token_from_prefill = (self.args.worker_type == WorkerType::Aggregated
+                || (self.args.worker_type == WorkerType::Decode
+                    && (self.args.kv_transfer_prefill_backoff_tokens > 0
+                        || self.args.kv_transfer_decode_recompute_tokens > 0)))
                 && self.speculative_sampler.is_none()
                 && request.sequence.generated_tokens() == 0
                 && scheduled
@@ -3087,10 +3165,16 @@ impl VllmCore {
                 .iter()
                 .filter_map(|uuid| self.state.requests.get(uuid).map(|r| (*uuid, r)))
                 .map(|(uuid, request)| {
-                    let burst = max_burst.min(policy::remaining_generation_tokens(
-                        &request.sequence,
-                        self.args.max_model_len,
-                    ));
+                    let first_prefill_sample = self.args.aic_dspark
+                        && scheduled.get(&uuid).is_some_and(|work| {
+                            work.prompt_tokens > 0 && !work.padded_dspark_startup
+                        });
+                    let burst = (if first_prefill_sample { 1 } else { max_burst }).min(
+                        policy::remaining_generation_tokens(
+                            &request.sequence,
+                            self.args.max_model_len,
+                        ),
+                    );
                     match self.kv_manager.decode_requirement(
                         &request.sequence.lease,
                         request.sequence.len(),
@@ -3154,26 +3238,34 @@ impl VllmCore {
             }
         };
 
-        let total_length = ready
+        let (decode_count, total_length) = ready
             .iter()
+            .filter(|uuid| {
+                !(self.args.aic_dspark
+                    && scheduled
+                        .get(uuid)
+                        .is_some_and(|work| work.prompt_tokens > 0 && !work.padded_dspark_startup))
+            })
             .filter_map(|uuid| self.state.requests.get(uuid))
-            .map(|request| request.sequence.len())
-            .sum::<usize>();
-        let (decode_time, decode_end_ms) = if self.args.worker_type == WorkerType::Prefill {
-            (Duration::ZERO, decode_start_ms)
-        } else {
-            let active_kv_tokens = total_length;
-            let total_kv_tokens = self.decode_kv_context_bound(active_kv_tokens);
-            let context_length = total_length / ready.len();
-            let decode_ms = self.args.perf_model.predict_decode_time(
-                ready.len(),
-                active_kv_tokens,
-                context_length,
-                total_kv_tokens,
-            )?;
-            let duration = scale_decode_time(decode_ms, &self.args)?;
-            (duration, decode_start_ms + duration.as_secs_f64() * 1000.0)
-        };
+            .fold((0, 0), |(count, length), request| {
+                (count + 1, length + request.sequence.len())
+            });
+        let (decode_time, decode_end_ms) =
+            if self.args.worker_type == WorkerType::Prefill || decode_count == 0 {
+                (Duration::ZERO, decode_start_ms)
+            } else {
+                let active_kv_tokens = total_length;
+                let total_kv_tokens = self.decode_kv_context_bound(active_kv_tokens);
+                let context_length = total_length / decode_count;
+                let decode_ms = self.args.perf_model.predict_decode_time(
+                    decode_count,
+                    active_kv_tokens,
+                    context_length,
+                    total_kv_tokens,
+                )?;
+                let duration = scale_decode_time(decode_ms, &self.args)?;
+                (duration, decode_start_ms + duration.as_secs_f64() * 1000.0)
+            };
 
         let sampled_bursts = {
             let sampler = self
@@ -3192,13 +3284,18 @@ impl VllmCore {
                         &request.sequence,
                         self.args.max_model_len,
                     );
-                    let accepted = if self.args.worker_type == WorkerType::Prefill {
-                        remaining.min(1)
-                    } else if remaining == 0 {
-                        0
-                    } else {
-                        sampler.sample_accepted_tokens()
-                    };
+                    let first_prefill_sample = self.args.aic_dspark
+                        && scheduled
+                            .get(uuid)
+                            .is_some_and(|work| work.prompt_tokens > 0);
+                    let accepted =
+                        if self.args.worker_type == WorkerType::Prefill || first_prefill_sample {
+                            remaining.min(1)
+                        } else if remaining == 0 {
+                            0
+                        } else {
+                            sampler.sample_accepted_tokens()
+                        };
                     // Record only surviving decode work, after reservation succeeds.
                     // FPM demand can still contain requests preempted above.
                     if accepted > 0
@@ -3327,7 +3424,11 @@ fn predict_prefill_duration(
     batch_total_prefix: usize,
     args: &MockEngineArgs,
 ) -> anyhow::Result<Duration> {
-    if batch_count == 0 || args.worker_type == WorkerType::Decode {
+    if batch_count == 0
+        || (args.worker_type == WorkerType::Decode
+            && args.kv_transfer_prefill_backoff_tokens == 0
+            && args.kv_transfer_decode_recompute_tokens == 0)
+    {
         return Ok(Duration::ZERO);
     }
 
@@ -3955,9 +4056,12 @@ mod state_cache_tests {
             );
             let mut core = VllmCore::new(config.clone());
             let id = submit(&mut core, 91_310, 6, 32);
-            for _ in 0..3 {
+            for iteration in 0..3 {
                 let pass = step(&mut core);
-                assert_eq!(pass.output_signals.len(), 2);
+                assert_eq!(
+                    pass.output_signals.len(),
+                    if iteration == 0 { 1 } else { 2 }
+                );
                 assert!(pass.output_signals.iter().all(|signal| !signal.rejected));
                 let request = &core.state.requests[&id];
                 assert_eq!(request.num_computed_tokens, request.sequence.len() - 1);
@@ -4289,6 +4393,316 @@ mod state_cache_tests {
             .apply_command(SchedulerCommand::ReleaseSource { handoff_id })
             .unwrap();
         assert_eq!(source.kv_manager.num_active_blocks(), 0);
+    }
+
+    #[test]
+    fn dspark_prefill_emits_one_then_verifies_fixed_width_rounds() {
+        for depth in [2, 3, 6, 7] {
+            for output in [1, 2, 11] {
+                for acceptance in ["0", "1", "0.5"] {
+                    let mut config = args(128, true, Some(depth));
+                    config.aic_dspark = true;
+                    config.aic_nextn_accept_rates = Some(vec![acceptance; depth].join(","));
+                    config.speedup_ratio = 1.0;
+                    let expected_prefill = predict_prefill_duration(1, 8, 0, &config).unwrap();
+                    let mut core = VllmCore::new(config);
+                    submit(&mut core, 95_040, 8, output);
+                    let first = step(&mut core);
+                    assert_eq!(first.output_signals.len(), 1);
+                    assert!(first.output_signals[0].token_id.is_some());
+                    assert_eq!(first.output_signals[0].completed, output == 1);
+                    assert!((first.end_ms - expected_prefill.as_secs_f64() * 1000.0).abs() < 1e-9);
+                    assert_eq!(first.decode_acceptance.forwards, 0);
+                    assert_eq!(1 + drain(&mut core, 64), output);
+                    assert_eq!(core.kv_manager.num_active_blocks(), 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pd_backoff_transfers_prefix_state_and_computes_suffix_once() {
+        for k in [2, 3, 6] {
+            let handoff_id = HandoffId::from(Uuid::from_u128(95_001));
+            let mut source_args = pd_args(64, WorkerType::Prefill);
+            source_args.kv_transfer_prefill_backoff_tokens = 1;
+            let mut source = VllmCore::new(source_args);
+            let transfer = hold_source(&mut source, handoff_id, 95_000, 8);
+            assert_eq!(transfer.full_prompt_tokens, 7);
+            assert_eq!(transfer.state_bytes, 64);
+
+            let mut destination_args = pd_args(64, WorkerType::Decode);
+            destination_args.kv_transfer_prefill_backoff_tokens = 1;
+            destination_args.aic_dspark = true;
+            destination_args.aic_nextn = Some(k);
+            destination_args.aic_nextn_accept_rates = Some(vec!["1"; k].join(","));
+            let mut destination = VllmCore::new(destination_args);
+            reserve(&mut destination, handoff_id, pd_request(95_000, 8, 11));
+            destination
+                .apply_command(SchedulerCommand::ActivateDestination { handoff_id })
+                .unwrap();
+            let id = Uuid::from_u128(95_000);
+            assert_eq!(destination.state.requests[&id].num_computed_tokens, 7);
+            assert_eq!(
+                destination.state.requests[&id]
+                    .sequence
+                    .lease
+                    .computed_state_tokens(),
+                Some(7)
+            );
+            let pass = step(&mut destination);
+            let first_outputs = pass
+                .output_signals
+                .iter()
+                .filter(|signal| signal.token_id.is_some())
+                .count();
+            assert_eq!(
+                destination.state.requests[&id]
+                    .sequence
+                    .lease
+                    .computed_state_tokens(),
+                Some(8 + first_outputs - 1)
+            );
+            assert_eq!(first_outputs + drain(&mut destination, 64), 11);
+            source
+                .apply_command(SchedulerCommand::ReleaseSource { handoff_id })
+                .unwrap();
+            assert_eq!(source.kv_manager.num_active_blocks(), 0);
+        }
+    }
+
+    #[test]
+    fn pd_backoff_rejects_empty_source_before_registering_handoff() {
+        let mut config = pd_args(64, WorkerType::Prefill);
+        config.kv_transfer_prefill_backoff_tokens = 1;
+        let mut source = VllmCore::new(config);
+        let handoff_id = HandoffId::from(Uuid::from_u128(95_010));
+        let error = source
+            .apply_command(SchedulerCommand::SubmitHandoffPrefill {
+                handoff_id,
+                request: pd_request(95_011, 1, 1),
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("prefill backoff"));
+        assert!(source.is_drained());
+        // The rejected request did not consume its handoff identity.
+        hold_source(&mut source, handoff_id, 95_011, 8);
+        source
+            .apply_command(SchedulerCommand::CancelSource { handoff_id })
+            .unwrap();
+        assert!(source.is_drained());
+    }
+
+    #[test]
+    fn pd_dspark_startup_prices_padded_and_replayed_suffixes_without_extra_verify() {
+        for (prompt, replay, near_limit) in [
+            (256, 1, false),
+            (256, 128, false),
+            (8, 128, false),
+            (8, 1, true),
+        ] {
+            let mut config = pd_args(512, WorkerType::Decode);
+            config.state_cache = None;
+            config.speedup_ratio = 1.0;
+            config.aic_dspark = true;
+            config.aic_nextn = Some(3);
+            config.aic_nextn_accept_rates = Some("1,1,1".into());
+            config.kv_transfer_decode_recompute_tokens = replay;
+            config.max_model_len = near_limit.then_some(prompt + 1);
+            let mut destination = VllmCore::new(config);
+            let handoff = HandoffId::from(Uuid::from_u128(95_050));
+            reserve(
+                &mut destination,
+                handoff,
+                pd_request(95_051, prompt as u32, 1),
+            );
+            destination
+                .apply_command(SchedulerCommand::ActivateDestination {
+                    handoff_id: handoff,
+                })
+                .unwrap();
+            let prefix = prompt.saturating_sub(replay);
+            assert_eq!(
+                destination.state.requests[&Uuid::from_u128(95_051)].num_computed_tokens,
+                prefix
+            );
+            let expected = if replay == 1 && !near_limit {
+                let ms = destination
+                    .args
+                    .perf_model
+                    .predict_decode_time(
+                        1,
+                        prompt,
+                        prompt,
+                        destination.decode_kv_context_bound(prompt),
+                    )
+                    .unwrap();
+                scale_decode_time(ms, &destination.args).unwrap()
+            } else {
+                predict_prefill_duration(1, prompt, prefix, &destination.args).unwrap()
+            };
+            let first = step(&mut destination);
+            assert!((first.end_ms - expected.as_secs_f64() * 1000.0).abs() < 1e-9);
+            assert_eq!(first.output_signals.len(), 1);
+            assert!(
+                first.output_signals[0].completed && first.output_signals[0].token_id.is_some()
+            );
+            assert_eq!(destination.kv_manager.num_active_blocks(), 0);
+        }
+    }
+
+    #[test]
+    fn pd_dspark_does_not_pad_startup_beside_an_existing_prefill() {
+        let mut config = pd_args(128, WorkerType::Decode);
+        config.state_cache = None;
+        config.speedup_ratio = 1.0;
+        config.aic_dspark = true;
+        config.aic_nextn = Some(3);
+        config.aic_nextn_accept_rates = Some("1,1,1".into());
+        config.kv_transfer_decode_recompute_tokens = 1;
+        let mut destination = VllmCore::new(config);
+        submit(&mut destination, 95_060, 8, 1);
+        let handoff = HandoffId::from(Uuid::from_u128(95_061));
+        reserve(&mut destination, handoff, pd_request(95_062, 8, 1));
+        destination
+            .apply_command(SchedulerCommand::ActivateDestination {
+                handoff_id: handoff,
+            })
+            .unwrap();
+        let expected = predict_prefill_duration(2, 16, 7, &destination.args).unwrap();
+        let pass = step(&mut destination);
+        assert_eq!(pass.output_signals.len(), 2);
+        assert!(
+            pass.output_signals
+                .iter()
+                .all(|s| s.completed && s.token_id.is_some())
+        );
+        assert!((pass.end_ms - expected.as_secs_f64() * 1000.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn pd_dspark_padded_startup_preserves_existing_decoder_acceptance() {
+        let mut config = pd_args(128, WorkerType::Decode);
+        config.state_cache = None;
+        config.speedup_ratio = 1.0;
+        config.aic_dspark = true;
+        config.aic_nextn = Some(3);
+        config.aic_nextn_accept_rates = Some("1,1,1".into());
+        config.kv_transfer_decode_recompute_tokens = 1;
+        let mut destination = VllmCore::new(config);
+        submit(&mut destination, 95_070, 8, 5);
+        assert_eq!(step(&mut destination).output_signals.len(), 1);
+        let handoff = HandoffId::from(Uuid::from_u128(95_071));
+        reserve(&mut destination, handoff, pd_request(95_072, 8, 1));
+        destination
+            .apply_command(SchedulerCommand::ActivateDestination {
+                handoff_id: handoff,
+            })
+            .unwrap();
+        let ms = destination
+            .args
+            .perf_model
+            .predict_decode_time(2, 17, 8, destination.decode_kv_context_bound(17))
+            .unwrap();
+        let expected = scale_decode_time(ms, &destination.args).unwrap();
+        let pass = step(&mut destination);
+        assert_eq!(pass.output_signals.len(), 5);
+        assert_eq!(
+            pass.output_signals.iter().filter(|s| s.completed).count(),
+            2
+        );
+        assert!((pass.end_ms - expected.as_secs_f64() * 1000.0).abs() < 1e-9);
+        assert_eq!(destination.kv_manager.num_active_blocks(), 0);
+    }
+
+    #[test]
+    fn pd_backoff_transfer_excludes_destination_only_suffix() {
+        for cached in [0, 4, 8] {
+            let mut config = pd_args(64, WorkerType::Decode);
+            config.state_cache = None;
+            config.kv_transfer_prefill_backoff_tokens = 1;
+            let mut destination = VllmCore::new(config);
+            if cached > 0 {
+                submit(&mut destination, 95_020, cached, 1);
+                step(&mut destination);
+            }
+            let transfer = reserve(
+                &mut destination,
+                HandoffId::from(Uuid::from_u128(95_021)),
+                pd_request(95_022, 9, 1),
+            );
+            // The ninth prompt token has no source KV. Even its freshly
+            // allocated destination block contributes no transfer payload.
+            assert_eq!(transfer, Some(8 - cached));
+        }
+    }
+
+    #[test]
+    fn pd_backoff_first_output_uses_suffix_forward_including_mixed_decode() {
+        for active_decoder in [false, true] {
+            let mut config = pd_args(64, WorkerType::Decode);
+            config.speedup_ratio = 1.0;
+            config.kv_transfer_prefill_backoff_tokens = 1;
+            let mut destination = VllmCore::new(config);
+            let mut expected_decode = Duration::ZERO;
+            if active_decoder {
+                let handoff = HandoffId::from(Uuid::from_u128(95_030));
+                reserve(&mut destination, handoff, pd_request(95_031, 16, 4));
+                destination
+                    .apply_command(SchedulerCommand::ActivateDestination {
+                        handoff_id: handoff,
+                    })
+                    .unwrap();
+                step(&mut destination);
+                let length = destination.state.requests[&Uuid::from_u128(95_031)]
+                    .sequence
+                    .len();
+                let decode_ms = destination
+                    .args
+                    .perf_model
+                    .predict_decode_time(
+                        1,
+                        length,
+                        length,
+                        destination.decode_kv_context_bound(length),
+                    )
+                    .unwrap();
+                expected_decode = scale_decode_time(decode_ms, &destination.args).unwrap();
+            }
+            let handoff = HandoffId::from(Uuid::from_u128(95_032));
+            reserve(&mut destination, handoff, pd_request(95_033, 8, 1));
+            destination
+                .apply_command(SchedulerCommand::ActivateDestination {
+                    handoff_id: handoff,
+                })
+                .unwrap();
+            let expected =
+                predict_prefill_duration(1, 8, 7, &destination.args).unwrap() + expected_decode;
+            let pass = step(&mut destination);
+            assert!((pass.end_ms - expected.as_secs_f64() * 1000.0).abs() < 1e-9);
+            let output = pass
+                .output_signals
+                .iter()
+                .filter(|s| s.uuid == Uuid::from_u128(95_033))
+                .collect::<Vec<_>>();
+            assert_eq!(output.len(), 1);
+            assert!(output[0].completed && output[0].token_id.is_some());
+            assert_eq!(pass.output_signals.len(), 1 + usize::from(active_decoder));
+        }
+    }
+
+    #[test]
+    fn pd_backoff_prices_decode_suffix_with_cached_prefix() {
+        let mut config = pd_args(64, WorkerType::Decode);
+        config.speedup_ratio = 1.0;
+        assert_eq!(
+            predict_prefill_duration(1, 1024, 1023, &config).unwrap(),
+            Duration::ZERO
+        );
+        config.kv_transfer_prefill_backoff_tokens = 1;
+        let suffix = predict_prefill_duration(1, 1024, 1023, &config).unwrap();
+        assert!(suffix > Duration::ZERO);
+        assert!(suffix < predict_prefill_duration(1, 1024, 0, &config).unwrap());
     }
 
     #[test]

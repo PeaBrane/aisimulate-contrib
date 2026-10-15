@@ -62,7 +62,9 @@ model's op names from colliding with the target's).
 from __future__ import annotations
 
 import copy
+import json
 
+import aisimulate_core._native as core
 from aisimulate_core.sdk.operations.attention import GenerationAttention
 from aisimulate_core.sdk.speculation.base import NullScheme, SpecSchemeBase, positive_integer
 from aisimulate_core.sdk.speculation.mtp import MTPScheme
@@ -120,6 +122,26 @@ def materialize_spec_scheme(model) -> None:
     # the scheme (some schemes cache a built draft model), and callers may
     # re-inspect build_draft_*_ops after materialization.
     for spec in generation_specs:
+        if type(spec.op) is core.Operation:
+            # Native composite operators have no Python attribute dictionary
+            # or pickle protocol. Clone and carry width in the typed wrapper.
+            child = json.loads(spec.op._spec_json())
+            next(iter(child.values()))["name"] = f"draft_{spec.op._name}"
+            model.generation_ops.append(
+                core.op_from_spec_json(
+                    json.dumps(
+                        {
+                            "TokenScale": {
+                                "op": child,
+                                "numerator": spec.tokens_per_request,
+                                "denominator": verify_width,
+                                "max_sequence_length": (spec.query_overrides or {}).get("s"),
+                            }
+                        }
+                    )
+                )
+            )
+            continue
         op = copy.copy(spec.op)
         op._name = f"draft_{op._name}"
         _fold_width(op, spec.tokens_per_request, verify_width)
@@ -130,11 +152,44 @@ def materialize_spec_scheme(model) -> None:
         model.generation_ops.append(op)
 
     for spec in context_specs:
+        if type(spec.op) is core.Operation:
+            child = json.loads(spec.op._spec_json())
+            next(iter(child.values()))["name"] = f"draft_{spec.op._name}"
+            model.context_ops.append(core.op_from_spec_json(json.dumps(child)))
+            continue
         op = copy.copy(spec.op)
         op._name = f"draft_{op._name}"
         # Context-phase draft precompute runs over the same prompt tokens as
         # the target prefill: no width folding.
         model.context_ops.append(op)
+
+    # A vLLM DSpark prefill samples one token and proposes K drafts. These
+    # proposal ops run once per request, independent of prompt/chunk length.
+    # The next pass, not this one, verifies the proposal against the target.
+    prefill_builder = getattr(scheme, "build_draft_prefill_ops", None)
+    for spec in prefill_builder(model) if prefill_builder is not None else ():
+        op = spec.op
+        if isinstance(op, GenerationAttention):
+            op = copy.copy(op)
+            op._scale_num_tokens = (op._scale_num_tokens or 1) * spec.tokens_per_request
+            op._verify_query_tokens = spec.tokens_per_request
+        child = json.loads(op._spec_json())
+        next(iter(child.values()))["name"] = f"draft_proposal_{op._name}"
+        model.context_ops.append(
+            core.op_from_spec_json(
+                json.dumps(
+                    {
+                        "TokenScale": {
+                            "op": child,
+                            "numerator": spec.tokens_per_request,
+                            "denominator": 1,
+                            "max_sequence_length": (spec.query_overrides or {}).get("s"),
+                            "sequence_basis": True,
+                        }
+                    }
+                )
+            )
+        )
 
     if verify_width > 1 and scheme.verify_attention_sequence_basis():
         # Target verify attention: the engine widens the decode batch by

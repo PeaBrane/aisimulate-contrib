@@ -14,12 +14,18 @@ forward of N query tokens per round; verify width N + 1.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from aisimulate_core.sdk import common, models
 from aisimulate_core.sdk import config as sdk_config
+from aisimulate_core.sdk.memory import KVCacheEstimator
+from aisimulate_core.sdk.memory.state import estimate_state_cache
+from aisimulate_core.sdk.rust_engine_step import RustForwardPassPerfModel
 from aisimulate_core.sdk.speculation import SpeculationConfig
-from aisimulate_core.sdk.speculation.dspark import DSparkScheme
+from aisimulate_core.sdk.speculation.dspark import DSparkScheme, draft_transfer_geometry
+from aisimulate_core.sdk.utils import _load_model_config_from_model_path
 
 pytestmark = pytest.mark.unit
 
@@ -168,3 +174,197 @@ class TestAccounting:
         assert capped_a == capped_b  # window cap
         # 3 layers x 128 window x head_dim 512 x 1 byte (fp8) minimum
         assert capped_a >= 3 * 128 * 512 * 1
+
+
+# Minimal physical facts, independently expressed from Inferact's published
+# cf6b8244620e7ea4b0651d214f28e89eac75bed6 checkpoint metadata.
+KIMI_DRAFT = {
+    "model_type": "k3_dspark",
+    "hidden_size": 7168,
+    "target_hidden_size": 7168,
+    "intermediate_size": 14336,
+    "num_hidden_layers": 5,
+    "num_attention_heads": 64,
+    "q_lora_rank": 1536,
+    "kv_lora_rank": 512,
+    "qk_nope_head_dim": 128,
+    "qk_rope_head_dim": 64,
+    "v_head_dim": 128,
+    "vocab_size": 163840,
+    "target_layer_ids": [2, 23, 47, 71, 89],
+    "markov_rank": 256,
+}
+
+
+def _kimi_model(depth=None):
+    cfg = _model_config(
+        None
+        if depth is None
+        else SpeculationConfig(kind="dspark", params={"num_draft_tokens": depth}, draft_config=KIMI_DRAFT)
+    )
+    cfg.language_only = True
+    return models.get_model("moonshotai/Kimi-K3", cfg, "vllm")
+
+
+@pytest.mark.parametrize("depth", [2, 3])
+def test_kimi_canonical_draft_has_distinct_width_and_target_only_kv(depth):
+    target, model = _kimi_model(), _kimi_model(depth)
+    assert model.verify_width == depth + 1
+    assert model.config.nextn == 0
+    verify = next(op for op in model.generation_ops if op._name == "generation_kda_verify")
+    assert json.loads(verify._spec_json())["Kda"]["draft_tokens"] == depth + 1
+    names = [op._name for op in model.generation_ops]
+    assert "draft_dspark_context_kv_proj" in names
+    assert "draft_attention" not in names  # legacy draft was not also injected
+    assert model.get_kvcache_elements_per_token() == target.get_kvcache_elements_per_token()
+    assert model.get_resident_weights_bytes() == target.get_resident_weights_bytes()
+    assert model.spec_scheme.draft_kv_bytes_per_sequence(model, 1024) == 5 * 576 * 1024
+    assert 0 < model.spec_scheme.draft_weights_bytes(model) < 4e9
+    context = {op._name for op in model.context_ops if op._name.startswith("draft_dspark_")}
+    assert context == {
+        "draft_dspark_main_proj",
+        "draft_dspark_main_norm",
+        "draft_dspark_context_kv_proj",
+        "draft_dspark_context_kv_store",
+    }
+    proposals = [
+        json.loads(op._spec_json())["TokenScale"] for op in model.context_ops if op._name.startswith("draft_proposal_")
+    ]
+    assert proposals
+    assert all(op["sequence_basis"] and op["denominator"] == 1 for op in proposals)
+    assert not any("context_kv" in json.dumps(op) or "main_proj" in json.dumps(op) for op in proposals)
+
+
+def test_kimi_draft_identity_rejects_wrong_geometry_and_quantization():
+    for override in (
+        {"kv_lora_rank": 256},
+        {"target_hidden_size": 4096},
+        {"torch_dtype": "float16"},
+        {"quantization_config": {"quant_method": "fp8"}},
+    ):
+        with pytest.raises(ValueError):
+            DSparkScheme.from_configs(
+                None,
+                SpeculationConfig(kind="dspark", params={"num_draft_tokens": 3}, draft_config=KIMI_DRAFT | override),
+            )
+
+
+@pytest.mark.parametrize("depth", [3, 5])
+def test_v41_nested_metadata_keeps_draft_moe_separate(depth):
+    raw = _load_model_config_from_model_path("deepseek-ai/DeepSeek-V4.1-Flash")
+    cfg = _model_config(SpeculationConfig(kind="dspark", params={"num_draft_tokens": depth}, draft_config=raw))
+    cfg.tp_size = cfg.moe_ep_size = 4
+    cfg.language_only = True
+    # SGLang's already-supported physical layout exercises the new draft graph
+    # without depending on a newly-built native vLLM storage-layout variant.
+    model = models.get_model("deepseek-ai/DeepSeek-V4.1-Flash", cfg, "sglang")
+    assert model.verify_width == depth + 1
+    draft_moe = [
+        json.loads(op._spec_json())["Moe"]
+        for op in model.generation_ops
+        if op._name.startswith("draft_dspark_moe_") and "dispatch" not in op._name
+    ]
+    assert len(draft_moe) == 3
+    assert {(op["num_experts"], op["topk"]) for op in draft_moe} == {(128, 3)}
+    assert model.spec_scheme.draft_kv_bytes_per_sequence(model, 8192) == 3 * 128 * 584
+    assert all("engram" not in op._name for op in model.generation_ops if op._name.startswith("draft_"))
+    attention = [
+        json.loads(op._spec_json())["TokenScale"]
+        for op in model.generation_ops
+        if op._name.startswith("draft_dspark_attention_") and "_attention_ar_" not in op._name
+    ]
+    assert len(attention) == 3
+    for wrapper in attention:
+        assert (wrapper["numerator"], wrapper["denominator"], wrapper["max_sequence_length"]) == (
+            depth,
+            depth + 1,
+            128 + depth,
+        )
+        assert wrapper["op"]["Dsv41Attention"]["role"] == "swa"
+        assert wrapper["op"]["Dsv41Attention"]["compress_ratio"] == 0
+
+
+@pytest.mark.parametrize(
+    "model_name,depth",
+    [
+        ("moonshotai/Kimi-K3", 2),
+        ("moonshotai/Kimi-K3", 3),
+        ("deepseek-ai/DeepSeek-V4.1-Flash", 3),
+        ("deepseek-ai/DeepSeek-V4.1-Flash", 5),
+    ],
+)
+def test_hybrid_canonical_constructor_and_memory(model_name, depth, monkeypatch):
+    draft = KIMI_DRAFT if "Kimi" in model_name else _load_model_config_from_model_path(model_name)
+    spec = {"kind": "dspark", "params": {"num_speculative_tokens": depth, "draft_config": draft}}
+    config = {
+        "model": model_name,
+        "system": "b200_sxm",
+        "backend": "vllm",
+        "backend_version": "0.24.0",
+        "worker_type": "aggregated",
+        "tp": 8,
+        "moe_tp_size": 8,
+        "moe_ep_size": 1,
+        "estimation_mode": "op_level",
+        "database_mode": "SOL",
+        "speculation": spec,
+        "kv_cache_dtype": "fp8",
+        "decoder_replay": "V4.1" in model_name,
+    }
+    model = RustForwardPassPerfModel.best_available(config)
+    assert model.predict_decode_latency_total(1, 1024) > 0
+    assert model.predict_prefill_latency(1, 1024) > 0
+    memory_request = dict(
+        max_num_tokens=128,
+        max_batch_size=4,
+        tp_size=8,
+        moe_tp_size=8,
+        moe_ep_size=1,
+        kvcache_quant_mode="fp8",
+        speculation=spec,
+    )
+    memory = KVCacheEstimator.from_request(
+        model_name,
+        "b200_sxm",
+        "vllm",
+        "0.24.0",
+        **memory_request,
+    ).breakdown
+    assert memory["weights_bytes"] > 0
+    assert memory["tokens_from_kv_bytes"](2e9) > 0
+    # Adding a second execution phase must not allocate a second set of the
+    # same draft weights. Compare the canonical capacity calculation with
+    # the proposal phase omitted, leaving the draft geometry unchanged.
+    monkeypatch.setattr(DSparkScheme, "build_draft_prefill_ops", lambda self, model: [])
+    without_proposal = KVCacheEstimator.from_request(
+        model_name, "b200_sxm", "vllm", "0.24.0", **memory_request
+    ).breakdown
+    assert memory["weights_bytes"] == without_proposal["weights_bytes"]
+    provenance = model.diagnostics()["provenance"]
+    assert provenance["modeling_assumptions"]
+    # Native restore must retain the distinct draft identity, including the
+    # nested V4.1 text config or Kimi artifact geometry.
+    normalized = RustForwardPassPerfModel.normalize_config(config)
+    assert normalized["speculation"]["params"]["draft_config"] == draft
+
+
+@pytest.mark.parametrize("depth", [2, 3])
+def test_kimi_rejection_window_is_reserved_without_multiplying_ssm(depth):
+    base = estimate_state_cache("moonshotai/Kimi-K3", tp_size=8)
+    spec = estimate_state_cache("moonshotai/Kimi-K3", tp_size=8, num_speculative_tokens=depth)
+    assert spec["raw_bytes_per_request"] - base["raw_bytes_per_request"] == 69 * 3 * 12 * 128 * 2 * depth
+
+
+@pytest.mark.parametrize(
+    "name,draft,expected,window",
+    [
+        ("moonshotai/Kimi-K3", KIMI_DRAFT, 5 * 576, None),
+        ("deepseek-ai/DeepSeek-V4.1-Flash", None, 3 * 528, 128),
+    ],
+)
+def test_prepared_draft_transfer_uses_family_physical_geometry(name, draft, expected, window):
+    draft = draft or _load_model_config_from_model_path(name)
+    result = draft_transfer_geometry(
+        name, {"params": {"draft_config": draft}}, "fp8", 8, backend="vllm", system="b200_sxm"
+    )
+    assert result == {"kv_transfer_draft_bytes_per_token": expected, "kv_transfer_draft_window": window}

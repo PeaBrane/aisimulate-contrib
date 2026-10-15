@@ -7,6 +7,7 @@ import json
 import math
 import pickle
 from dataclasses import replace
+from itertools import pairwise
 
 import pytest
 from pydantic import ValidationError
@@ -1764,7 +1765,7 @@ def test_public_replay_keeps_decoder_profile_and_database_policy(replay, worker_
 
 @pytest.mark.parametrize(
     ("model", "backend"),
-    [("example/model", "sglang"), (DEEPSEEK_V41_MODEL_PATH, "vllm")],
+    [("example/model", "sglang"), (DEEPSEEK_V41_MODEL_PATH, "trtllm")],
 )
 def test_public_replay_rejects_unsupported_model_or_backend(model, backend):
     with pytest.raises(ValueError, match="decoder_replay requires"):
@@ -2555,3 +2556,159 @@ def test_native_fixed_timing_provenance_without_diagnostics(retain_raw, polynomi
     assert ("native_report" in report.metadata) == retain_raw
     if retain_raw:
         assert report.metadata["native_report"]["prediction_provenance"]["aggregated"] == provenance
+
+
+@pytest.mark.parametrize("policy", [None, True, {}, "unknown"])
+def test_agentic_live_warmup_rejects_untyped_policy(policy):
+    runtime = RecordingRuntime()
+    with pytest.raises(ValueError, match="unknown agentic_warmup_policy"):
+        EngineReplayRunnerFactory(runtime=runtime).create(0).run(_spec(workload={"agentic_warmup_policy": policy}))
+    assert runtime.execution_spec is None
+
+
+def test_agentic_live_warmup_policy_reaches_native_boundary():
+    runtime = RecordingRuntime()
+    EngineReplayRunnerFactory(runtime=runtime).create(0).run(
+        _spec(
+            workload={
+                "source_type": "trace",
+                "load_type": "trace_timestamps",
+                "trace_path": "corpus",
+                "trace_format": "weka",
+                "agentic_lanes": 2,
+                "agentic_snapshot": {"seed": 42},
+                "agentic_warmup": True,
+                "agentic_warmup_policy": "live_trajectories",
+                "agentic_profile": {"duration_seconds": 10},
+            }
+        )
+    )
+    assert runtime.execution_spec["traffic"]["agentic_warmup_policy"] == "live_trajectories"
+
+
+def _inline_token_requests():
+    return [
+        {
+            "id": f"exact-{index}",
+            "arrival_time_ms": 10_000.0 + index * 10,
+            "input_token_ids": [0, 2**32 - 1, index],
+            "output_tokens": 2,
+            "output_token_ids": [index, 2**32 - 1],
+            "session_id": "correlation-only",
+            "metadata": {"record": index},
+        }
+        for index in range(3)
+    ]
+
+
+def _inline_token_deployment(mode, backend="vllm"):
+    if mode == "agg":
+        return BackendDeploymentSpec(
+            deployment_mode=mode,
+            backend=backend,
+            backend_version="test",
+            agg_engine_args=_engine_args(backend=backend),
+            num_workers=1,
+        )
+    return BackendDeploymentSpec(
+        deployment_mode=mode,
+        backend=backend,
+        backend_version="test",
+        prefill_engine_args=_engine_args(role="prefill", backend=backend),
+        decode_engine_args=_engine_args(role="decode", backend=backend),
+        num_prefill_workers=1,
+        num_decode_workers=1,
+    )
+
+
+@pytest.mark.parametrize("mode", ["agg", "disagg"])
+@pytest.mark.parametrize("inline_cap,spec_cap,expected", [(None, None, None), (2, None, 2), (None, 3, 3), (2, 3, 2)])
+def test_inline_token_runner_preserves_ids_and_explicit_concurrency(mode, inline_cap, spec_cap, expected):
+    requests = _inline_token_requests()
+    workload = {"requests": requests}
+    if inline_cap is not None:
+        workload["replay_concurrency"] = inline_cap
+    runtime = RecordingRuntime()
+    EngineReplayRunnerFactory(runtime=runtime).create(0).run(
+        _spec(deployment=_inline_token_deployment(mode), workload=workload, concurrency=spec_cap)
+    )
+    assert runtime.execution_spec["max_in_flight"] == expected
+    assert runtime.execution_spec["requests"] == [request | {"input_tokens": 3} for request in requests]
+
+
+@pytest.mark.parametrize("cap", [0, -1, True, 1.0, "1"])
+def test_inline_token_runner_rejects_invalid_concurrency_before_native(cap):
+    runtime = RecordingRuntime()
+    with pytest.raises((ValueError, TypeError), match="replay_concurrency"):
+        EngineReplayRunnerFactory(runtime=runtime).create(0).run(
+            _spec(workload={"requests": _inline_token_requests(), "replay_concurrency": cap})
+        )
+    assert runtime.execution_spec is None
+
+
+@pytest.mark.parametrize(
+    "extra", [{"isl": 1}, {"trace_path": "unused"}, {"source_type": "synthetic", "isl": 1, "osl": 1}]
+)
+def test_inline_token_runner_rejects_competing_workload_sources(extra):
+    runtime = RecordingRuntime()
+    with pytest.raises(ValueError, match="inline.*workload fields"):
+        EngineReplayRunnerFactory(runtime=runtime).create(0).run(
+            _spec(workload={"requests": _inline_token_requests(), **extra})
+        )
+    assert runtime.execution_spec is None
+
+
+@pytest.mark.parametrize(
+    "field,value", [("output_token_ids", [1]), ("output_token_ids", [-1, 2]), ("input_token_ids", [True])]
+)
+def test_inline_token_runner_rejects_bad_tokens_before_native(field, value):
+    runtime = RecordingRuntime()
+    requests = _inline_token_requests()
+    requests[0][field] = value
+    with pytest.raises(ValueError, match=field):
+        EngineReplayRunnerFactory(runtime=runtime).create(0).run(_spec(workload={"requests": requests}))
+    assert runtime.execution_spec is None
+
+
+@pytest.mark.parametrize("mode", ["agg", "disagg"])
+@pytest.mark.parametrize("backend", ["vllm", "sglang"])
+def test_inline_token_native_closed_loop_admits_after_completion(mode, backend):
+    pytest.importorskip("aisimulate._runtime")
+    report = (
+        EngineReplayRunnerFactory()
+        .create(0)
+        .run(
+            _spec(
+                deployment=_inline_token_deployment(mode, backend),
+                workload={"requests": _inline_token_requests(), "replay_concurrency": 1},
+            ),
+            output_requirements=ReplayOutputRequirements(include_raw_report=True, capture_per_request=True),
+        )
+    )
+    rows = sorted(report.metadata["native_report"]["per_request"], key=lambda row: row["arrival_time_ms"])
+    assert len(rows) == 3
+    assert rows[0]["arrival_time_ms"] == 0
+    assert [row["metadata"]["record"] for row in rows] == [0, 1, 2]
+    for previous, current in pairwise(rows):
+        assert current["arrival_time_ms"] == pytest.approx(previous["terminal_time_ms"])
+    assert all(row["input_length"] == 3 and row["output_length"] == 2 for row in rows)
+    assert all(row["terminal_status"] == "completed" for row in rows)
+
+
+def test_inline_token_native_open_loop_keeps_authored_arrivals():
+    pytest.importorskip("aisimulate._runtime")
+    requests = _inline_token_requests()
+    for index, request in enumerate(requests):
+        request["arrival_time_ms"] = 10.0 * (index + 1)
+    report = (
+        EngineReplayRunnerFactory()
+        .create(0)
+        .run(
+            _spec(deployment=_inline_token_deployment("agg"), workload={"requests": requests}),
+            output_requirements=ReplayOutputRequirements(include_raw_report=True, capture_per_request=True),
+        )
+    )
+    rows = sorted(report.metadata["native_report"]["per_request"], key=lambda row: row["arrival_time_ms"])
+    assert [row["arrival_time_ms"] for row in rows] == [10.0, 20.0, 30.0]
+    assert [row["metadata"]["record"] for row in rows] == [0, 1, 2]
+    assert all(row["output_length"] == 2 for row in rows)

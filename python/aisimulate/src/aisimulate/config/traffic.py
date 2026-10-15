@@ -151,6 +151,7 @@ class TrafficPredictionLoad(StrictModel):
     agentic_lanes: PositiveInt | None = None
     agentic_snapshot: AgenticSnapshotOptions | None = None
     agentic_warmup: bool = Field(default=False, strict=True)
+    agentic_warmup_policy: Literal["primer", "live_trajectories"] = "primer"
     agentic_profile: AgenticProfileOptions | None = None
 
     @model_validator(mode="before")
@@ -184,6 +185,7 @@ class TrafficRecommendationLoad(StrictModel):
     agentic_lanes: PositiveInt | None = None
     agentic_snapshot: AgenticSnapshotOptions | None = None
     agentic_warmup: bool = Field(default=False, strict=True)
+    agentic_warmup_policy: Literal["primer", "live_trajectories"] = "primer"
     agentic_profile: AgenticProfileOptions | None = None
 
     @model_validator(mode="before")
@@ -263,6 +265,10 @@ class _TrafficConfigBase(StrictModel):
                 raise ValueError("agentic_profile requires agentic_snapshot")
             if stop is not None and stop.max_virtual_time_seconds is not None:
                 raise ValueError("agentic_profile cannot be combined with max_virtual_time_seconds")
+        if load.agentic_warmup_policy == "live_trajectories" and (
+            not load.agentic_warmup or load.agentic_profile is None
+        ):
+            raise ValueError("live_trajectories requires agentic_warmup and agentic_profile")
         if load.agentic_warmup and load.agentic_snapshot is None:
             raise ValueError("agentic_warmup requires agentic_snapshot")
         if load.agentic_snapshot is not None and load.agentic_lanes is None:

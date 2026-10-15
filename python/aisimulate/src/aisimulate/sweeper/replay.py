@@ -504,6 +504,13 @@ class RunnerCapabilities:
                 raise ValueError("agentic_profile cannot be combined with max_sim_time_ms")
             if not self.supports_agentic_profile:
                 raise ValueError("runner does not support agentic profile")
+        policy = spec.workload.get("agentic_warmup_policy", "primer")
+        if not isinstance(policy, str) or policy not in {"primer", "live_trajectories"}:
+            raise ValueError("unknown agentic_warmup_policy")
+        if policy == "live_trajectories" and (
+            not spec.workload.get("agentic_warmup") or spec.workload.get("agentic_profile") is None
+        ):
+            raise ValueError("live_trajectories requires agentic_warmup and agentic_profile")
         agentic_warmup = spec.workload.get("agentic_warmup", False)
         if type(agentic_warmup) is not bool:
             raise ValueError("agentic_warmup must be a boolean")

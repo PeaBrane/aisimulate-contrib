@@ -99,10 +99,28 @@ impl ForwardPassSpeculationConfig {
             return Vec::new();
         };
         let mut assumptions = vec!["DSpark host sampling and launch overhead is unmodeled".into()];
-        if draft_config
-            .as_ref()
-            .is_some_and(|c| c.contains_key("dspark_block_size"))
-        {
+        let draft = draft_config.as_ref().map(|c| {
+            c.get("text_config")
+                .and_then(serde_json::Value::as_object)
+                .unwrap_or(c)
+        });
+        if draft.is_some_and(|c| {
+            c.get("model_type").and_then(serde_json::Value::as_str) == Some("k3_dspark")
+        }) {
+            assumptions.extend([
+                "Kimi DSpark uses the Inferact MLA draft and shares target embedding/head; RadixArk GQA is unsupported".into(),
+                "Kimi MLA draft verification retains token-basis pricing; noncausal wide-query measurements are missing".into(),
+                "Kimi KDA state capacity retains the documented cache-slot approximation; exact runtime scratch and page pools require collection".into(),
+            ]);
+        } else if draft.is_some_and(|c| {
+            c.get("model_type").and_then(serde_json::Value::as_str) == Some("deepseek_v41_text")
+        }) {
+            assumptions.extend([
+                "V4.1 DSpark uses checkpoint-specific SWA stages and draft expert geometry; target verify attention is token-basis".into(),
+                "V4.1 vLLM fp8_ds_mla payload uses SM100 MXFP8 records and default FP8 indexer; page padding and allocator grouping are approximate".into(),
+                "V4.1 Engram weights remain GPU-resident; CPU weight offload is not modeled".into(),
+            ]);
+        } else if draft.is_some_and(|c| c.contains_key("dspark_block_size")) {
             assumptions.extend([
                 "V4 draft SWA uses a window-capped HCA latency proxy".into(),
                 "V4 target verification uses token-basis attention; wide-query measurements are missing".into(),
@@ -530,6 +548,10 @@ impl ForwardPassPerfModelConfig {
                     ));
                 }
                 if draft_config.as_ref().is_some_and(|c| {
+                    let c = c
+                        .get("text_config")
+                        .and_then(serde_json::Value::as_object)
+                        .unwrap_or(c);
                     c.get("dspark_bonus_anchor")
                         .and_then(serde_json::Value::as_bool)
                         == Some(true)
@@ -932,6 +954,7 @@ mod tests {
                 serde_json::json!({"adaptive_verification": true}),
                 serde_json::json!({"num_speculative_tokens": 0}),
                 serde_json::json!({"draft_config": {}}),
+                serde_json::json!({"draft_config": {"text_config": {"dspark_bonus_anchor": true}}}),
             ] {
                 let mut changed = raw.clone();
                 changed["speculation"]["params"]

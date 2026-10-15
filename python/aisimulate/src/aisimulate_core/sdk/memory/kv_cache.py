@@ -361,6 +361,7 @@ class KVCacheEstimator:
             system, backend, backend_version, systems_paths=systems_path, allow_missing_data=True
         )
         resolve_sglang_mla_compute(model_config, model_path, backend, database.version, database.system_spec)
+        model_config.system = system
         model = get_model(model_path, model_config, backend)
         draft_scheme = model.spec_scheme if speculation and speculation["kind"] == "dspark" else None
         backend_obj = get_backend(backend)

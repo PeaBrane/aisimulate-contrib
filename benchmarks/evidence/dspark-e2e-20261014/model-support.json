@@ -1,0 +1,207 @@
+{
+  "status": "implemented_functionally_validated_silicon_comparison_pending",
+  "runtime_source": {
+    "repository": "https://github.com/vllm-project/vllm",
+    "revision": "ac9126e58aa7bbab1856ba6593ba4d5003fea516",
+    "paths": [
+      "vllm/models/kimi_k3/nvidia/dspark_mla.py",
+      "vllm/models/kimi_k3/nvidia/mla.py",
+      "vllm/models/kimi_k3/nvidia/model.py",
+      "vllm/model_executor/layers/mamba/mamba_utils.py",
+      "vllm/models/deepseek_v41/nvidia/dspark.py",
+      "vllm/models/deepseek_v41/nvidia/model.py",
+      "vllm/models/deepseek_v41/attention.py",
+      "vllm/v1/attention/backends/mla/indexer.py",
+      "vllm/v1/worker/gpu/model_runner.py",
+      "vllm/v1/worker/gpu/spec_decode/dflash/speculator.py",
+      "vllm/v1/worker/gpu/spec_decode/dspark/speculator.py",
+      "vllm/v1/worker/gpu/spec_decode/rejection_sampler.py",
+      "vllm/v1/core/sched/scheduler.py"
+    ]
+  },
+  "kimi": {
+    "draft": "Inferact/Kimi-K3-DSpark",
+    "draft_revision": "cf6b8244620e7ea4b0651d214f28e89eac75bed6",
+    "draft_layers": 5,
+    "draft_kind": "mla_bf16",
+    "draft_depths": [
+      2,
+      3
+    ],
+    "shared_target_embedding_head": true,
+    "draft_kv_bytes_per_token_per_rank_fp8": 2880,
+    "context_projection_is_resident_duplicate": true,
+    "kda_convolution_window": "kernel_size - 1 + K",
+    "kda_recurrent_shape_is_unchanged": true,
+    "remaining_approximations": [
+      "MLA target/draft token-basis pricing lacks noncausal query-width measurements",
+      "existing five-slot KDA cache model approximates runtime pool ownership",
+      "independent recurrent rollback scratch and runtime page grouping are not measured"
+    ]
+  },
+  "v41": {
+    "model": "deepseek-ai/DeepSeek-V4.1-Flash",
+    "inspected_revision": "5254448103b6254fc646dacbca1cbbf20e9216c1",
+    "draft_layers": 3,
+    "draft_depths": [
+      3,
+      5
+    ],
+    "draft_experts": 128,
+    "draft_top_k": 3,
+    "target_experts": 384,
+    "target_top_k": 6,
+    "shared_target_embedding_head": true,
+    "swa_window": 128,
+    "vllm_sm100_fp8_ds_mla_record_bytes": 528,
+    "vllm_hopper_fp8_ds_mla_record_bytes": 584,
+    "vllm_default_indexer_record_bytes": 132,
+    "engram_cpu_weight_offload_supported": false,
+    "remaining_approximations": [
+      "target verify uses token-basis attention",
+      "cache page padding and allocator grouping are approximate",
+      "new physical operator queries require a source-coverage audit before silicon scoring"
+    ],
+    "decoder_replay": {
+      "required_for_pinned_eager_runtime": true,
+      "late_layers": [
+        21,
+        39
+      ],
+      "query_window": 128,
+      "reference": "vllm/models/deepseek_v41/nvidia/model.py at ac9126e58aa7bbab1856ba6593ba4d5003fea516"
+    },
+    "draft_mxfp4_expert_scales_counted": true
+  },
+  "validation": {
+    "structural_and_legacy_regressions": {
+      "passed": 431
+    },
+    "expanded_structural_state_and_transfer_tests": {
+      "passed": 19,
+      "native_tests_pending": 0
+    },
+    "native_build": "coordinated schema30 release extension installed and tested",
+    "gpu_measurements": "separate_collection_agent",
+    "accuracy_claim": null,
+    "fpm_supported": false,
+    "legacy_v41_and_state_tests": {
+      "passed": 209,
+      "deselected": 43
+    },
+    "canonical_kimi_cost_memory": {
+      "passed": 2,
+      "native_build": "pre-existing release; no Kimi wire change"
+    },
+    "bounded_decoder_contract": {
+      "passed": 3,
+      "backends": [
+        "sglang",
+        "vllm"
+      ],
+      "unsupported_backend_rejected": "trtllm"
+    },
+    "v41_native_bridge": {
+      "passed": 17,
+      "native_build": "pre-existing release; bounded-stage wire format unchanged"
+    },
+    "v41_regression_after_bounded_gate": {
+      "passed": 98,
+      "deselected": 28
+    },
+    "canonical_kimi_v41_and_native_bridge": {
+      "passed": 40,
+      "dspark_tests": 23,
+      "native_bridge_tests": 17,
+      "kimi_K": [
+        2,
+        3
+      ],
+      "v41_K": [
+        3,
+        5
+      ],
+      "database_mode": "SOL",
+      "command": "python/aisimulate/.venv/bin/pytest -p no:timeout -q python/aisimulate/tests/unit/sdk/speculation/test_dspark_scheme.py python/aisimulate/tests/unit/sdk/test_v41_native_bridge.py"
+    },
+    "coordinated_rust_suite": {
+      "passed": 1992,
+      "ignored": 1,
+      "command": "CARGO_TARGET_DIR=/tmp/aisim-dspark-warmup-tests cargo test -p aisimulate-core --lib",
+      "note": "Before final narrow budget guard; guard/state boundary regression passed separately."
+    },
+    "startup_behavior": {
+      "dspark_tests_passed": 6,
+      "pd_tests_passed": 28,
+      "budget_and_state_boundary_tests_passed": 1,
+      "python_transfer_config_tests_passed": 15,
+      "canonical_native_rebuild": "schema30 installed and tested",
+      "mixed_decoder_and_padded_startup_tests_passed": 1,
+      "canonical_shape_memory_schema_tests_passed": 81,
+      "draft_weight_phase_parity_cases": 4
+    }
+  },
+  "coverage": {
+    "kimi_kda": {
+      "systems": [
+        "b200_sxm",
+        "gb200",
+        "b300_sxm"
+      ],
+      "table_version": "0.1.dev19262+gb6bbf29dd.d20260727",
+      "phase": "verify",
+      "rows_per_system": 216,
+      "query_widths": [
+        2,
+        4,
+        8
+      ],
+      "local_heads": [
+        12,
+        24,
+        48,
+        96
+      ],
+      "batch_sizes": [
+        1,
+        2,
+        4,
+        8,
+        16,
+        32,
+        64,
+        128,
+        256
+      ],
+      "kernel_sources": [
+        "causal_conv1d_update",
+        "fused_recurrent_kda"
+      ],
+      "K2": "verify width3 requires interpolation",
+      "K3": "verify width4 has matching shape rows",
+      "runtime_match": "not established for ac9126 FlashInfer fused KDA"
+    }
+  },
+  "host_cost_assessment": {
+    "scope": "model construction only",
+    "changes": "Canonical model materialization adds native request-basis draft proposal wrappers; replay distinguishes initial output, padded handoff and steady verification.",
+    "query_loop_changes": true,
+    "retained_size": "one frozen geometry descriptor and three V4.1 draft stage graphs per canonical model",
+    "measurement": "Parent reruns representative host benchmarks after coordinated schema30 release build."
+  },
+  "startup_contract": {
+    "backend": "vllm",
+    "prefill": "prepare each executed target context row once, propose K drafts per request, emit one initial output",
+    "partial_prefill": "proposal also executes for incomplete chunks; unused drafts still incur cost",
+    "prefill_handoff": "source computes its proposal before connector post_forward; source output is not user-visible",
+    "destination_recompute": "independent from source backoff, capped at prompt length",
+    "one_token_destination_padding": "K+1 target/context-preparation rows plus K draft rows; invalid placeholder drafts emit one output",
+    "unpadded_destination": "recompute prompt suffix and draft-only proposal, emit one output",
+    "resident_weights": "phase graphs share scheme-owned draft weights; target inventory excludes draft_* operations",
+    "state_cache_guard": "destination cannot rewind before transferred recurrent-state boundary",
+    "budget_guard": "DSpark P/D with suffix replay requires max_num_batched_tokens >= K+1",
+    "remaining_approximations": [
+      "Replay exposes output at pass completion; pinned runtime overlaps async output copy with draft proposal, which may affect TTFT."
+    ]
+  }
+}

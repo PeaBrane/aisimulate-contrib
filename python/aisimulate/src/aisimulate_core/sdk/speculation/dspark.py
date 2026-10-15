@@ -71,11 +71,12 @@ from aisimulate_core.sdk.speculation.dense_draft import (
     dense_block_ops,
     dense_kv_bytes_per_sequence,
 )
+from aisimulate_core.sdk.speculation.kimi_draft import KimiDraftGeometry
 from aisimulate_core.sdk.utils import _download_hf_json, _load_model_config_from_model_path
 
 # V4-family drafts derive geometry from the target model; dense-family
 # drafts carry their own geometry (draft_geometry is not None).
-_V4_FAMILIES = ("DEEPSEEKV4",)
+_V4_FAMILIES = ("DEEPSEEKV4", "DEEPSEEKV41")
 _DENSE_FAMILIES = ("LLAMA",)
 _SUPPORTED_BACKENDS = ("vllm", "sglang")
 # Ratio-0 (pure SWA) draft layers are approximated with the HCA module,
@@ -95,7 +96,15 @@ def resolve_draft_config(model_path: str, draft_model_path: str | None, revision
     return json.dumps(config, allow_nan=False)
 
 
-def draft_transfer_geometry(model_path: str, speculation: dict, kv_dtype: str, tp: int) -> dict:
+def draft_transfer_geometry(
+    model_path: str,
+    speculation: dict,
+    kv_dtype: str,
+    tp: int,
+    *,
+    backend: str | None = None,
+    system: str | None = None,
+) -> dict:
     """Prepared draft KV footprint for a source-owned P/D handoff.
 
     Full source window is sent once, even when target KV has a destination
@@ -103,8 +112,27 @@ def draft_transfer_geometry(model_path: str, speculation: dict, kv_dtype: str, t
     """
     params = speculation["params"]
     draft = params["draft_config"]
+    draft = draft.get("text_config", draft)
     dtype_bytes = common.KVCacheQuantMode[kv_dtype].value.memory
-    if "dspark_block_size" in draft:
+    if draft.get("model_type") == "k3_dspark":
+        if backend != "vllm":
+            raise ValueError("Inferact Kimi draft-KV transfer requires vllm")
+        geometry = KimiDraftGeometry.from_config(draft)
+        per_token = int(geometry.num_hidden_layers * geometry.latent_width * dtype_bytes)
+        window = None
+    elif draft.get("model_type") == "deepseek_v41_text":
+        if backend == "vllm" and system in ("b200_sxm", "b300_sxm", "gb200", "gb300"):
+            entry_bytes = 528
+        elif backend == "sglang" or (backend == "vllm" and system in ("h100_sxm", "h200_sxm")):
+            entry_bytes = 584
+        else:
+            raise ValueError("V4.1 draft-KV transfer requires a supported physical backend/system layout")
+        if kv_dtype != "fp8":
+            raise ValueError("V4.1 draft-KV transfer requires fp8 storage")
+        layers = draft.get("n_mtp_layers") or draft.get("num_nextn_predict_layers", 3)
+        per_token = positive_integer(layers, "num_draft_layers") * entry_bytes
+        window = int(draft["sliding_window"])
+    elif "dspark_block_size" in draft:
         target = _load_model_config_from_model_path(model_path)
         per_token = int(draft.get("n_mtp_layers", 3) * target["head_dim"] * dtype_bytes)
         window = int(target["sliding_window"])
@@ -129,6 +157,8 @@ class DSparkScheme(SpecSchemeBase):
         target_layer_ids: tuple[int, ...],
         markov_rank: int,
         draft_geometry: DenseDraftGeometry | None = None,
+        kimi_geometry: KimiDraftGeometry | None = None,
+        bundled_config: dict | None = None,
     ) -> None:
         self.num_draft_tokens = positive_integer(num_draft_tokens, "num_draft_tokens")
         self.num_draft_layers = positive_integer(num_draft_layers, "num_draft_layers")
@@ -137,6 +167,8 @@ class DSparkScheme(SpecSchemeBase):
         # None = V4-family draft (geometry derived from the target model);
         # set = dense-family draft with its own stack geometry.
         self.draft_geometry = draft_geometry
+        self.kimi_geometry = kimi_geometry
+        self.bundled_config = bundled_config or {}
         if draft_geometry is not None and self.num_draft_layers > draft_geometry.num_layers:
             raise ValueError("num_draft_layers cannot exceed the draft checkpoint's num_hidden_layers")
 
@@ -151,11 +183,23 @@ class DSparkScheme(SpecSchemeBase):
                 "the draft repo or inject the parsed config."
             )
         params = spec_config.params
+        draft_config = draft_config.get("text_config", draft_config)
+        if draft_config.get("model_type") == "k3_dspark":
+            geometry = KimiDraftGeometry.from_config(draft_config)
+            return cls(
+                num_draft_tokens=params.get("num_draft_tokens"),
+                num_draft_layers=geometry.num_hidden_layers,
+                target_layer_ids=tuple(draft_config["target_layer_ids"]),
+                markov_rank=draft_config.get("markov_rank", 256),
+                kimi_geometry=geometry,
+            )
         if draft_config.get("dspark_block_size") is not None:
             # V4-style draft config (fields prefixed, geometry from target).
             block_size = draft_config["dspark_block_size"]
             geometry = None
-            num_draft_layers = params.get("num_draft_layers", draft_config.get("n_mtp_layers", 3))
+            num_draft_layers = params.get(
+                "num_draft_layers", draft_config.get("n_mtp_layers", draft_config.get("num_nextn_predict_layers", 3))
+            )
             if not draft_config.get("dspark_target_layer_ids"):
                 # Required: these are the target hidden-state taps feeding
                 # main_proj — an empty default would silently price the
@@ -187,6 +231,7 @@ class DSparkScheme(SpecSchemeBase):
             target_layer_ids=target_layer_ids,
             markov_rank=markov_rank,
             draft_geometry=geometry,
+            bundled_config=draft_config if geometry is None else None,
         )
 
     def verify_attention_sequence_basis(self) -> bool:
@@ -198,7 +243,11 @@ class DSparkScheme(SpecSchemeBase):
     # ------------------------------------------------------------------
     def validate(self, model, backend_name: str) -> None:
         family = getattr(model, "model_family", None)
-        supported = _DENSE_FAMILIES if self.draft_geometry is not None else _V4_FAMILIES
+        supported = (
+            ("KIMIK3",)
+            if self.kimi_geometry is not None
+            else (_DENSE_FAMILIES if self.draft_geometry is not None else _V4_FAMILIES)
+        )
         if family not in supported:
             raise ValueError(
                 f"DSpark modeling supports model families {supported} for this draft style, got {family!r}. "
@@ -206,6 +255,20 @@ class DSparkScheme(SpecSchemeBase):
             )
         if backend_name not in _SUPPORTED_BACKENDS:
             raise ValueError(f"DSpark modeling supports backends {_SUPPORTED_BACKENDS}, got {backend_name!r}.")
+        if self.kimi_geometry is not None:
+            if backend_name != "vllm":
+                raise ValueError("Inferact Kimi MLA DSpark requires vllm; RadixArk GQA is a different draft")
+            if (self.kimi_geometry.hidden_size, self.kimi_geometry.vocab_size) != (
+                model._hidden_size,
+                model._vocab_size,
+            ):
+                raise ValueError("Kimi DSpark shared embedding/head must match the target geometry")
+        if family == "DEEPSEEKV41":
+            required = ("dspark_n_routed_experts", "dspark_num_experts_per_tok")
+            if any(name not in self.bundled_config for name in required):
+                raise ValueError("V4.1 DSpark requires checkpoint-specific draft expert count and top-k")
+            for name in required:
+                positive_integer(self.bundled_config[name], name)
         if self.draft_geometry is not None and self.draft_geometry.vocab_size != model._vocab_size:
             raise ValueError("dense DSpark draft vocab_size must match the target vocabulary")
         if self.draft_geometry is not None and self.draft_geometry.hidden_size != model._hidden_size:
@@ -228,6 +291,10 @@ class DSparkScheme(SpecSchemeBase):
 
     def _block_ops(self, model, *, is_context: bool) -> list:
         """One draft decoder-block stack (count = num_draft_layers)."""
+        if self.kimi_geometry is not None:
+            return self.kimi_geometry.block_ops(model)
+        if model.model_family == "DEEPSEEKV41":
+            return model.build_dspark_block_ops(self.bundled_config, self.num_draft_layers)
         if self.draft_geometry is not None:
             import dataclasses
 
@@ -352,7 +419,8 @@ class DSparkScheme(SpecSchemeBase):
 
         h = model._hidden_size
         # ReplicatedLinear(h * len(target_layer_ids) -> h) in vLLM.
-        return ops.GEMM("dspark_main_proj", 1, h, h * len(self.target_layer_ids), model.config.gemm_quant_mode)
+        quant = common.GEMMQuantMode.bfloat16 if self.kimi_geometry is not None else model.config.gemm_quant_mode
+        return ops.GEMM("dspark_main_proj", 1, h, h * len(self.target_layer_ids), quant)
 
     def build_draft_generation_ops(self, model) -> list[DraftOpSpec]:
         import aisimulate_core.sdk.operations as ops
@@ -363,7 +431,9 @@ class DSparkScheme(SpecSchemeBase):
         # dense drafts follow the target's sequence length (no override).
         # Dense attention carries window_size through its native operation.
         # The compiled TokenScale wrapper carries the V4 sequence-length cap.
-        window = None if self.draft_geometry is not None else self._sliding_window(model)
+        window = (
+            None if self.draft_geometry is not None or self.kimi_geometry is not None else self._sliding_window(model)
+        )
         kv_cap = window + n_tokens if window else None
         # vLLM pads context preparation to the complete target verify width,
         # including rejected positions, before the K-token parallel draft.
@@ -376,7 +446,7 @@ class DSparkScheme(SpecSchemeBase):
             else [DraftOpSpec(op=self._main_proj_op(model), tokens_per_request=1)]
         )
         for op in self._block_ops(model, is_context=False):
-            overrides = {"s": kv_cap} if kv_cap and op._name == "dspark_attention" else None
+            overrides = {"s": kv_cap} if kv_cap and op._name.startswith("dspark_attention") else None
             specs.append(DraftOpSpec(op=op, tokens_per_request=n_tokens, query_overrides=overrides))
         # Draft-logits head over the N positions (aliases the target head).
         specs.append(
@@ -408,6 +478,9 @@ class DSparkScheme(SpecSchemeBase):
 
     def build_draft_context_ops(self, model) -> list[DraftOpSpec]:
         specs = [DraftOpSpec(op=self._main_proj_op(model), tokens_per_request=1)]
+        if self.kimi_geometry is not None:
+            specs.extend(DraftOpSpec(op=op, tokens_per_request=1) for op in self.kimi_geometry.context_ops())
+            return specs
         if self.draft_geometry is not None:
             specs.extend(DraftOpSpec(op=op, tokens_per_request=1) for op in self._block_ops(model, is_context=True))
             return specs
@@ -432,6 +505,19 @@ class DSparkScheme(SpecSchemeBase):
         specs.extend(DraftOpSpec(op=op, tokens_per_request=1) for op in context_ops)
         return specs
 
+    def build_draft_prefill_ops(self, model) -> list[DraftOpSpec]:
+        """One K-token proposal after prefill, without target verification.
+
+        vLLM ac9126 GPUModelRunner samples the first output before proposing;
+        DFlashSpeculator (the DSpark base) runs proposal before post_forward.
+        Context preparation is already in build_draft_context_ops and must
+        not be repeated at the steady-state K+1 padded width here.
+        """
+        if model._backend_name != "vllm":
+            return []
+        preparation_count = len(self.build_draft_context_ops(model)) if self.draft_geometry is None else 1
+        return self.build_draft_generation_ops(model)[preparation_count:]
+
     # ------------------------------------------------------------------
     # Memory accounting
     # ------------------------------------------------------------------
@@ -439,7 +525,7 @@ class DSparkScheme(SpecSchemeBase):
         import aisimulate_core.sdk.operations as ops
         from aisimulate_core.sdk import common
 
-        weight_ops = list(self._block_ops(model, is_context=False))
+        weight_ops = [] if self.kimi_geometry is not None else list(self._block_ops(model, is_context=False))
         weight_ops.append(self._main_proj_op(model))
         # Markov head: embed (markov_w1) + bias (markov_w2), each vocab x rank,
         # replicated.
@@ -460,9 +546,34 @@ class DSparkScheme(SpecSchemeBase):
                     common.GEMMQuantMode.bfloat16,
                 )
             )
-        return float(sum(op.get_weights() for op in weight_ops))
+        weights = float(sum(op.get_weights() for op in weight_ops))
+        if (
+            model.model_family == "DEEPSEEKV41"
+            and model.config.moe_quant_mode.name.startswith("w4")
+            and "mxfp4" in model.config.moe_quant_mode.name
+        ):
+            # The generic MoE inventory counts packed values; the native
+            # draft owns one UE8M0 scale per 32 expert weights as well.
+            mtp, ep = model.config.resolve_moe_parallelism()
+            expert_elements = (
+                self.num_draft_layers
+                * 3
+                * model._hidden_size
+                * model._moe_inter_size
+                * int(self.bundled_config["dspark_n_routed_experts"])
+                / (mtp * ep)
+            )
+            weights += expert_elements / 32
+        if self.kimi_geometry is not None:
+            g = self.kimi_geometry
+            weights += g.resident_block_bytes(model.config.tp_size)
+            weights += sum(op.get_weights() for op in g.context_ops())
+            weights += 4 * g.hidden_size  # context and final RMSNorm
+        return weights
 
     def draft_kv_bytes_per_sequence(self, model, seq_len: int) -> float:
+        if self.kimi_geometry is not None:
+            return self.kimi_geometry.kv_bytes(model, seq_len)
         if self.draft_geometry is not None:
             from dataclasses import replace
 
@@ -472,5 +583,9 @@ class DSparkScheme(SpecSchemeBase):
         # Mirrors DeepSeekV4Model.get_kvcache_bytes_per_sequence's ratio-0
         # (pure SWA) branch: window-capped entries, no compressed stream.
         window = self._sliding_window(model)
-        entry_bytes = model.extra_params.head_dim * model.config.kvcache_quant_mode.value.memory
+        entry_bytes = (
+            model.extra_params.kv_entry_bytes(model.kv_cache_layout)[0]
+            if model.model_family == "DEEPSEEKV41"
+            else model.extra_params.head_dim * model.config.kvcache_quant_mode.value.memory
+        )
         return float(self.num_draft_layers * min(max(seq_len, 0), window) * entry_bytes)

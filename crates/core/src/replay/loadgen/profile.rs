@@ -7,6 +7,7 @@
 //! timing/phase/runner.py and timing/strategies/agentic_replay.py (Apache-2.0).
 
 use anyhow::{Result, bail};
+use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -110,6 +111,7 @@ pub struct AgenticProfileReport {
 
 #[derive(Debug)]
 pub(super) struct AgenticProfileState {
+    pub preparation_completed_plays: FxHashSet<usize>,
     pub options: AgenticProfileOptions,
     pub start_ms: Option<f64>,
     pub last_advanced_ms: f64,

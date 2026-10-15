@@ -1282,6 +1282,64 @@ License: https://github.com/vllm-project/vllm/blob/c227aaa3f8edd02dae4583e272464
 The adaptation estimates operation costs and does not vendor serving kernels.
 The same revision's padded context preparation informs the round width.
 
+The Kimi-K3 draft operation model in
+`python/aisimulate/src/aisimulate_core/sdk/speculation/kimi_draft.py` and the
+V4.1 draft/cache adaptations in
+`python/aisimulate/src/aisimulate_core/sdk/speculation/dspark.py`,
+`python/aisimulate/src/aisimulate_core/sdk/models/deepseek_v41.py`,
+`python/aisimulate/src/aisimulate_core/sdk/deepseek_v41.py`, and
+`crates/core/src/perfmodel/operators/dsv41.rs` derive from vLLM commit
+`ac9126e58aa7bbab1856ba6593ba4d5003fea516`. They are modified CPU cost and
+capacity models, not copies of serving kernels. Copyright contributors to the
+vLLM project. Licensed under Apache-2.0.
+
+Original paths at that revision:
+
+- `vllm/models/kimi_k3/nvidia/dspark_mla.py` and `mla.py`
+- `vllm/models/deepseek_v41/nvidia/dspark.py` and `model.py`
+- `vllm/models/deepseek_v41/attention.py`
+- `vllm/v1/attention/backends/mla/indexer.py`
+- `vllm/model_executor/models/utils.py`
+- `vllm/model_executor/layers/mamba/mamba_utils.py`
+- `vllm/models/kimi_k3/nvidia/model.py`
+
+The modified recurrent convolution state sizing in
+`python/aisimulate/src/aisimulate_core/sdk/memory/kimi_k3.py` also follows those
+pinned Mamba and Kimi state contracts. The partial-prefill handoff in
+`crates/core/src/engine/scheduler/vllm/core.rs` is an independent CPU-model
+adaptation of `vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_scheduler.py`
+and the lookahead property in `vllm/config/vllm.py` at the same revision.
+The startup proposal and destination replay behavior in that scheduler,
+`python/aisimulate/src/aisimulate_core/sdk/speculation/dspark.py`,
+`python/aisimulate/src/aisimulate_core/sdk/speculation/materialize.py`, and their
+tests also adapt these original paths at the same immutable revision:
+
+- `vllm/v1/worker/gpu/model_runner.py`
+- `vllm/v1/worker/gpu/spec_decode/dflash/speculator.py`
+- `vllm/v1/worker/gpu/spec_decode/dspark/speculator.py`
+- `vllm/v1/worker/gpu/spec_decode/rejection_sampler.py`
+- `vllm/v1/core/sched/scheduler.py`
+
+These modified CPU models separate the initial proposal and sentinel-padded
+resume from steady verification; serving implementations are not vendored.
+
+The independently authored native observation adapters
+`python/aisimulate/collector/vllm/collect_dsv41_native.py`,
+`dsv41_native_contract.py`, and `dsv41_native_observer.py`, together with
+`dsv41_native_sources.json` and `README.dsv41-native.md` in that directory,
+follow the pinned V4.1 model, draft and attention execution contracts above.
+They observe actual serving inputs and timings instead of copying kernels.
+The source hashes and ownership boundaries are recorded alongside the adapters;
+derived contract documentation is modified for collection. Copyright contributors
+to the vLLM project and NVIDIA CORPORATION & AFFILIATES. Apache-2.0.
+Additional original paths are `vllm/models/deepseek_v41/common/engram.py`,
+`vllm/models/deepseek_v41/nvidia/flashmla.py`,
+`vllm/v1/attention/backends/mla/sparse_swa.py`,
+`vllm/v1/worker/worker_base.py`, and `vllm/entrypoints/llm.py`.
+
+Source: https://github.com/vllm-project/vllm/tree/ac9126e58aa7bbab1856ba6593ba4d5003fea516
+License: https://github.com/vllm-project/vllm/blob/ac9126e58aa7bbab1856ba6593ba4d5003fea516/LICENSE
+
 The P/D collection client
 `benchmarks/evidence/dspark-fixed-20261014/collect_pd.py` adapts (modified) the
 Mooncake HTTP handshake from
@@ -1314,3 +1372,16 @@ source URLs and hashes. Raw archives and serving source code are not vendored.
 
 Upstream license:
 https://github.com/SemiAnalysisAI/InferenceX/blob/f4ad60fba73439cf4833a674e6a84feb2014bfaf/LICENSE
+
+## AIPerf live AgentX warmup lifecycle
+
+The `live_trajectories` policy in `crates/core/src/replay/loadgen/driver.rs`,
+`phase.rs`, and `profile.rs`, with its explanation in
+`docs/replay/agentic/warmup.md`, is an independent, modified implementation of
+the producer lifecycle in `src/aiperf/timing/strategies/agentic_replay.py` at
+SemiAnalysisAI/aiperf commit `754356e9a39acc6cc6afb242d123bb57c3fb6f75`.
+Copyright NVIDIA CORPORATION & AFFILIATES and AIPerf contributors.
+Licensed under Apache-2.0. No upstream async runtime code is vendored.
+
+Source: https://github.com/SemiAnalysisAI/aiperf/blob/754356e9a39acc6cc6afb242d123bb57c3fb6f75/src/aiperf/timing/strategies/agentic_replay.py
+License: https://github.com/SemiAnalysisAI/aiperf/blob/754356e9a39acc6cc6afb242d123bb57c3fb6f75/LICENSE

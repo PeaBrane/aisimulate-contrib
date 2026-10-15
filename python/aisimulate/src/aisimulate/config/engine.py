@@ -454,6 +454,8 @@ class KvTransferConfig(StrictModel):
     bytes_per_token: KvBytesPerToken = "auto"
     bandwidth_gb_per_second: PositiveFloat | None = None
     timing_mode: Literal["full_prompt", "destination_missing"] = "destination_missing"
+    prefill_backoff_tokens: NonNegativeInt = 0
+    decode_recompute_tokens: NonNegativeInt = 0
 
 
 class EstimatorPolicyConfig(StrictModel):
@@ -613,8 +615,10 @@ class EnginePredictionConfig(EstimatorPolicyConfig):
             # requested, rather than importing aisimulate_core for every CLI.
             from aisimulate_core.sdk.deepseek_v41 import MODEL_PATH as DEEPSEEK_V41_MODEL_PATH
 
-            if self.model != DEEPSEEK_V41_MODEL_PATH or self.backend != "sglang":
-                raise ValueError(f"decoder_replay requires model={DEEPSEEK_V41_MODEL_PATH!r} and backend='sglang'")
+            if self.model != DEEPSEEK_V41_MODEL_PATH or self.backend not in {"sglang", "vllm"}:
+                raise ValueError(
+                    f"decoder_replay requires model={DEEPSEEK_V41_MODEL_PATH!r} and backend vllm or sglang"
+                )
         _validate_worker_hardware(modes={self.mode}, workers=self.workers)
         if self.mode == "afd":
             _validate_prediction_afd(self)
@@ -631,6 +635,7 @@ class EnginePredictionConfig(EstimatorPolicyConfig):
         _validate_backend_block_sizes(backends={self.backend}, modes={self.mode}, workers=self.workers)
         _validate_prediction_scheduler_backend(self)
         _validate_speculation(self, modes={self.mode}, backends={self.backend})
+        _validate_transfer_backoff(self, {self.mode}, {self.backend})
         return self
 
 
@@ -843,8 +848,27 @@ class EngineRecommendationConfig(EstimatorPolicyConfig):
                 raise ValueError(f"backend_version contains unconfigured backend(s): {unknown}")
         _validate_recommendation_host_offload(self)
         _validate_speculation(self, modes=modes, backends=backends)
+        _validate_transfer_backoff(self, modes, backends)
         _validate_backend_block_sizes(backends=backends, modes=modes, workers=self.workers)
         return self
+
+
+def _validate_transfer_backoff(engine, modes: set[str], backends: set[str]) -> None:
+    transfer = engine.kv_transfer
+    if transfer is None:
+        return
+    for field in ("prefill_backoff_tokens", "decode_recompute_tokens"):
+        if getattr(transfer, field) and (modes != {"disaggregated"} or backends != {"vllm"}):
+            raise ValueError(f"kv_transfer.{field} requires vLLM disaggregated workers")
+    if transfer.decode_recompute_tokens > transfer.prefill_backoff_tokens:
+        for role in ("prefill", "decode"):
+            worker = getattr(engine.workers, role)
+            if (
+                worker is not None
+                and isinstance(worker.kv_cache, KvCachePredictionConfig)
+                and worker.kv_cache.state_cache is not None
+            ):
+                raise ValueError("state_cache requires decode_recompute_tokens <= prefill_backoff_tokens")
 
 
 def _validate_fpm_profile(engine, modes: set[str], backends: set[str]) -> None:

@@ -281,6 +281,7 @@ class Workload(BaseModel):
     agentic_lanes: int | None = Field(default=None, strict=True, gt=0)
     agentic_snapshot: AgenticSnapshotOptions | None = None
     agentic_warmup: bool = Field(default=False, strict=True)
+    agentic_warmup_policy: Literal["primer", "live_trajectories"] = "primer"
     agentic_profile: AgenticProfileOptions | None = None
     # Closed-loop replay over a *trace*: cap in-flight requests at this many (the
     # trace's timestamps are ignored; a new request starts as one finishes). For a
@@ -400,6 +401,10 @@ class Workload(BaseModel):
             self.trace_path is None or self.source_type != "trace" or self.trace_format != "weka"
         ):
             raise ValueError("weka_nested_timestamp_basis requires Weka trace input")
+        if self.agentic_warmup_policy == "live_trajectories" and (
+            not self.agentic_warmup or self.agentic_profile is None
+        ):
+            raise ValueError("live_trajectories requires agentic_warmup and agentic_profile")
         if self.agentic_warmup and self.agentic_snapshot is None:
             raise ValueError("agentic_warmup requires agentic_snapshot")
         if self.agentic_snapshot is not None and self.agentic_lanes is None:
@@ -630,6 +635,8 @@ class SearchSpace(BaseModel):
     kv_transfer_bytes_per_token: int | str | None = None
     kv_transfer_bandwidth: float | None = None
     kv_transfer_timing_mode: str = "destination_missing"
+    kv_transfer_prefill_backoff_tokens: int = Field(default=0, ge=0, strict=True)
+    kv_transfer_decode_recompute_tokens: int = Field(default=0, ge=0, strict=True)
     engine_float_ranges: dict[str, list[float]] = Field(default_factory=dict)
     engine_log_ranges: list[str] = Field(default_factory=list)
     engine_log_discrete: list[str] = Field(default_factory=list)

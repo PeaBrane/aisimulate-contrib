@@ -20,6 +20,10 @@
 # vllm/model_executor/models/kimi_linear.py, vllm/model_executor/layers/kda.py,
 # vllm/platforms/interface.py, vllm/v1/kv_cache_interface.py,
 # vllm/v1/attention/backends/mla/triton_mla.py.
+# Speculative convolution window updated from vLLM
+# ac9126e58aa7bbab1856ba6593ba4d5003fea516,
+# vllm/model_executor/layers/mamba/mamba_utils.py and
+# vllm/models/kimi_k3/nvidia/model.py (same Apache-2.0 license).
 
 """Resolve Kimi K3 token and KDA state cache geometry without loading GPU weights."""
 
@@ -29,7 +33,7 @@ from typing import Any
 
 from .state import _integer
 
-VLLM_REVISION = "a474da28131f61684849b31e29af0eebaaedc383"
+VLLM_REVISION = "ac9126e58aa7bbab1856ba6593ba4d5003fea516"
 _WIDTH = {"float16": 2, "bfloat16": 2, "float32": 4}
 
 
@@ -90,7 +94,12 @@ def kimi_k3_state_cache(
     heads = geometry.kda_num_heads // tp_size
     dim = geometry.kda_head_dim
     # One state, with no legacy five-slot budget multiplier.
-    raw_page = heads * (3 * dim * (geometry.kda_conv_kernel - 1) * _WIDTH[conv_dtype] + dim * dim * 4)
+    # The verification convolution keeps K extra positions so rejection can
+    # restore the accepted prefix. The recurrent state's shape stays fixed;
+    # runtime pool ownership determines how many independent copies are kept.
+    raw_page = heads * (
+        3 * dim * (geometry.kda_conv_kernel - 1 + num_speculative_tokens) * _WIDTH[conv_dtype] + dim * dim * 4
+    )
     requested_page = block_size * (kv_bytes_per_token // attention_layers)
     block_size *= (raw_page + requested_page - 1) // requested_page
     _integer("block_bytes", block_size * kv_bytes_per_token, 1)

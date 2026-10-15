@@ -1,11 +1,16 @@
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+# Modified DSpark op/cache descriptions from vLLM
+# https://github.com/vllm-project/vllm/tree/ac9126e58aa7bbab1856ba6593ba4d5003fea516
+# vllm/models/deepseek_v41/nvidia/dspark.py, model.py, and ../attention.py.
 
 """DeepSeek-V4.1 text AR, with independently scoped prefill decoder stages.
 
 Architecture source: deepseek-ai/DeepSeek-V4.1-Flash at
 fb2764a5cf321eaa5070ca8f9e892818f477c16d. See sdk/deepseek_v41.py and
-THIRD_PARTY_NOTICES.md. Vision and DSpark are deliberately separate capabilities.
+THIRD_PARTY_NOTICES.md. Vision and DSpark are independently scoped capabilities;
+DSpark adds checkpoint-owned draft stages through the canonical scheme API.
 """
 
 from __future__ import annotations
@@ -17,6 +22,7 @@ import aisimulate_core.sdk.operations as ops
 from aisimulate_core.sdk import common
 from aisimulate_core.sdk.deepseek_v41 import (
     DeepSeekV41Config,
+    DeepSeekV41KVCacheLayout,
     resolve_execution_profile,
     resolve_kv_cache_layout,
 )
@@ -88,6 +94,16 @@ class DeepSeekV41Model(BaseModel):
         self.text_config = self.raw_config["text_config"]
         self.execution_profile = resolve_execution_profile(model_config.decoder_replay, backend_name).value
         self.kv_cache_layout = resolve_kv_cache_layout(backend_name)
+        dspark = model_config.speculation is not None and model_config.speculation.kind == "dspark"
+        if dspark and backend_name == "vllm":
+            if model_config.kvcache_quant_mode != common.KVCacheQuantMode.fp8:
+                raise ValueError("vLLM V4.1 DSpark requires the pinned fp8_ds_mla cache layout")
+            if model_config.system in ("b200_sxm", "b300_sxm", "gb200", "gb300"):
+                self.kv_cache_layout = DeepSeekV41KVCacheLayout.VLLM_MXFP8
+            elif model_config.system in ("h100_sxm", "h200_sxm"):
+                self.kv_cache_layout = DeepSeekV41KVCacheLayout.VLLM_FP8_BF16
+            else:
+                raise ValueError("vLLM V4.1 DSpark requires an explicit supported system for physical KV layout")
         # Validate physical dimensions before constructing any native operators.
         d.kv_entry_bytes(self.kv_cache_layout)
         self.engram_residency = "hbm_tp_sharded"
@@ -268,6 +284,96 @@ class DeepSeekV41Model(BaseModel):
         if model_config.moe_quant_mode.name.startswith("w4") and "mxfp4" in model_config.moe_quant_mode.name:
             expert_elements = d.num_hidden_layers * 3 * h * self._moe_inter_size * self._num_experts / (mtp * ep)
             self._resident_weight_bytes += expert_elements / 32
+
+    def build_dspark_block_ops(self, draft_config: dict, num_layers: int) -> list:
+        """SWA-only draft stages; the smaller draft MoE is checkpoint-owned.
+
+        Independently adapted from vLLM ac9126e58aa7bbab1856ba6593ba4d5003fea516,
+        vllm/models/deepseek_v41/nvidia/dspark.py and model.py (Apache-2.0,
+        copyright contributors to the vLLM project). No Engram or compressed
+        KV owner appears in the draft stages.
+        """
+        d, c = self.extra_params, self.config
+        h, tp = self._hidden_size, c.tp_size
+        experts = int(draft_config["dspark_n_routed_experts"])
+        topk = int(draft_config["dspark_num_experts_per_tok"])
+        mtp, ep = c.resolve_moe_parallelism()
+        if experts < 1 or not 1 <= topk <= experts or experts % ep:
+            raise ValueError("V4.1 draft expert count/top-k must be valid and divisible by EP")
+        local_inter = self._moe_inter_size * d.n_shared_experts // tp
+        result = []
+        for layer in range(num_layers):
+            suffix = str(layer)
+            result.extend(
+                [
+                    _native(
+                        "Dsv41Mhc",
+                        name=f"dspark_mhc_{suffix}",
+                        hidden_size=h,
+                        hc_mult=d.hc_mult,
+                        sinkhorn_iters=d.hc_sinkhorn_iters,
+                    ),
+                    _native(
+                        "Dsv41Attention",
+                        name=f"dspark_attention_{suffix}",
+                        is_context=False,
+                        role="swa",
+                        compress_ratio=0,
+                        hidden_size=h,
+                        num_heads=d.num_attention_heads // tp,
+                        head_dim=d.head_dim,
+                        q_lora_rank=d.q_lora_rank,
+                        o_lora_rank=d.o_lora_rank,
+                        o_groups=d.o_groups // tp,
+                        index_n_heads=d.index_n_heads,
+                        index_head_dim=d.index_head_dim,
+                        index_topk=d.index_topk,
+                        window_size=d.sliding_window,
+                        candidate_limit=0,
+                        is_candidate_source=False,
+                        bounded_prefill=False,
+                        gemm_quant_mode=c.gemm_quant_mode.name,
+                        fmha_quant_mode=c.fmha_quant_mode.name,
+                        kv_cache_layout=self.kv_cache_layout.value,
+                    ),
+                    ops.CustomAllReduce(f"dspark_attention_ar_{suffix}", 1, h, tp),
+                    ops.ElementWise(f"dspark_ffn_norm_{suffix}", 1, h, h, 0.8),
+                    ops.GEMM(f"dspark_shared_gate_up_{suffix}", 1, 2 * local_inter, h, c.gemm_quant_mode),
+                    ops.ElementWise(f"dspark_shared_act_gate_{suffix}", 1, 2 * local_inter, local_inter, 0.8),
+                    ops.GEMM(f"dspark_shared_down_{suffix}", 1, h, local_inter, c.gemm_quant_mode),
+                    ops.GEMM(f"dspark_router_{suffix}", 1, experts, h, common.GEMMQuantMode.bfloat16),
+                    ops.MoE(
+                        f"dspark_moe_{suffix}",
+                        1,
+                        h,
+                        self._moe_inter_size,
+                        topk,
+                        experts,
+                        mtp,
+                        ep,
+                        c.moe_quant_mode,
+                        "power_law_1.01" if c.workload_distribution == "power_law" else c.workload_distribution,
+                        c.attention_dp_size,
+                        moe_kernel_source=c.moe_kernel_source,
+                    ),
+                    ops.MoEDispatch(
+                        f"dspark_moe_post_dispatch_{suffix}",
+                        1,
+                        h,
+                        topk,
+                        experts,
+                        mtp,
+                        ep,
+                        c.attention_dp_size,
+                        False,
+                        quant_mode=c.moe_quant_mode,
+                        backend=self._backend_name,
+                        is_context=False,
+                        attn_ar_modeled=True,
+                    ),
+                ]
+            )
+        return result
 
     def get_additional_activation_bytes(self, num_tokens: int) -> float:
         d = self.extra_params

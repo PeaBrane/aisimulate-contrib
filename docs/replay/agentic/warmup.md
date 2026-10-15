@@ -8,10 +8,11 @@ SPDX-License-Identifier: Apache-2.0
 The warmup run fills
 the same native engine cache that will serve the measured suffix. Its input is
 a prepared snapshot, its original prompt identity context, and the selected
-engine configuration. Its output is retained KV state, an unchanged logical
-snapshot frontier, and separate preparation evidence.
+engine configuration. Its output is retained KV state and separate preparation
+evidence. The default `agentic_warmup_policy: primer` preserves the snapshot
+frontier. The explicit `live_trajectories` policy advances its live DAG.
 
-## Request inputs and outputs
+## Default primer policy
 
 | Stage | Input tokens | Output tokens | Completion condition |
 | --- | --- | --- | --- |
@@ -30,6 +31,42 @@ delay. Lanes can prepare concurrently. A lane finishes its primers before its
 ten warmup requests. No profile request can dispatch while any lane is still
 preparing.
 
+## Live trajectory policy
+
+Set `traffic.load.agentic_warmup_policy: live_trajectories` alongside
+`agentic_warmup: true`, `agentic_snapshot`, and `agentic_profile`. The profile
+supplies the recycle cursor and global idle cap. Mandatory one-token primers
+are spread across lanes by their recorded lead before the sampled cut; the
+global idle cap bounds each lead. Primers within one lane may overlap.
+
+After every primer settles, each lane admits ten live requests. Requests emit
+one token and ignore idle delays, while the native DAG still enforces dispatch,
+completion, fork, and join dependencies. Completed plays draw new plays from
+the same source cursor that profiling will continue. Reaching a lane's quota
+pauses further admission on that lane. The quota counts admitted requests,
+not completions, and does not include mandatory primers.
+
+After issued requests drain, profiling retains pending conversations, joins,
+cache identities, and source output plans. For timestamped traces, each live
+conversation's first pending request carries its recorded timestamp minus the
+play's sampled origin. The earliest dispatchable offset is subtracted globally;
+other streams keep their relative spacing. A gated parent also keeps this
+recorded deadline and waits for its children. Later requests use normal causal
+delays. No warmup response count enters profile metrics. Completed warmup plays
+are excluded from profile play counts.
+
+This behavior follows the timestamped path in AIPerf
+[`agentic_replay.py`](https://github.com/SemiAnalysisAI/aiperf/blob/754356e9a39acc6cc6afb242d123bb57c3fb6f75/src/aiperf/timing/strategies/agentic_replay.py)
+at `754356e9a39acc6cc6afb242d123bb57c3fb6f75` (Apache-2.0, NVIDIA copyright):
+`_admit_cache_warmup_turn`, `_start_accelerated_warmup`, `finalize_phase`,
+`_handoff_replay_offset_ms`, and `_profiling_phase_t0_offset_ms`. Its persisted
+“live streams” are unfinished conversations, not outstanding wire requests.
+The producer waits for wire responses. AISimulate additionally waits for native
+server cleanup, including P/D transfers; that extra cleanup interval remains a
+separate validation limitation. This policy does not establish identical source
+snapshot sampling, routing, or request payloads by itself. Timestamp-less
+producer fallback and burst phase starts are not claimed.
+
 ## The barrier
 
 The barrier opens only after every preparation request has succeeded **and**
@@ -41,8 +78,9 @@ than a client terminal event and leaves no preparation request in flight at the
 transition.
 
 At the transition the runtime retains its engine, router, workers, KV cache,
-and play identities. The saved frontier starts from this instant, preserving
-remaining timers, joins, spawns, and speedup. Profile duration, request counts,
+and play identities. The selected policy's frontier starts from this instant, preserving
+joins, spawns, and speedup. Primer mode preserves remaining timers; live mode
+restores the timestamped stream spread described above. Profile duration, request counts,
 latencies, reuse ratios, and worker time exclude preparation. Request IDs retain
 their original phase so late preparation events cannot become profile events.
 
@@ -62,7 +100,8 @@ the existing cold snapshot behavior. The built-in Engine runner supports offline
 vLLM and SGLang replay with either aggregated workers or separate prefill/decode
 pools and HBM-only KV cache. vLLM also supports local or shared
 [G2 host offload](../engine/kv-cache.md#agentic-g2) on a static single aggregated worker or 1P1D,
-with attention DP1 on every role. Speculative decoding remains disabled. For example:
+with attention DP1 on every role and speculation disabled. HBM-only replay
+supports fixed-length DSpark. For example:
 
 ```yaml
 traffic:
@@ -85,12 +124,12 @@ it remains resident on every worker.
 
 Weka, Agentic Mooncake, and agentic Dynamo trace inputs use this same offline
 path. Reading a Dynamo trace does not require the Dynamo integration. Agentic
-TensorRT-LLM, G3 offload, speculative decoding, and online P/D are rejected;
+TensorRT-LLM, G3 offload, non-DSpark speculation, and online P/D are rejected;
 the built-in runner does not silently change the requested configuration.
 Dynamo-owned routing and online integration require separate downstream
 qualification.
 
-`agentic_phases` records per-lane completion, request phase/source identity,
+`agentic_phases` records the selected `warmup_policy`, per-lane completion, request phase/source identity,
 input length, cacheable complete-block tokens (`expected_full_block_tokens`),
 actual first-admission reuse, terminal and settlement times, and barrier state.
 The cacheable token count describes full prompt blocks, not expected admission
@@ -191,9 +230,8 @@ The [retained source audit](../../../benchmarks/evidence/accuracy/replay-evidenc
 records the original comparison and review boundary.
 
 AISimulate uses its native dependency graph, a versioned BLAKE3-based snapshot
-sample, and disjoint per-play token identities. Warmup repeats saved primer
-inputs and preserves the frontier; the reference executor's warmup advances
-its live trajectory. Matching preparation request counts does not establish
+sample, and disjoint per-play token identities. The default primer policy repeats saved prefixes; the explicit live policy
+advances the frontier. Matching preparation request counts does not establish
 full AgentX parity. Qualification must cover exact inputs, one output token,
 ten requests per lane, barrier ordering, failure handling, timer preservation,
 cache reuse with caching enabled/disabled, and deterministic cold/warm runs.

@@ -2076,3 +2076,50 @@ def test_recommendation_declares_default_context_budget(monkeypatch, caplog, con
         assert "are excluded from the search" in caplog.text
     else:
         assert declared not in caplog.text
+
+
+@pytest.mark.parametrize("policy", ["primer", "live_trajectories"])
+def test_agentic_warmup_policy_survives_prediction_and_recommendation(policy):
+    from aisimulate.compiler import prediction_to_replay_spec
+    from aisimulate.recommend import _recommendation_workload
+    from aisimulate.sweeper.config import Workload
+
+    traffic = {
+        "source": {"type": "trace", "format": "weka", "paths": ["corpus"]},
+        "load": {
+            "type": "trace_timestamps",
+            "agentic_lanes": 2,
+            "agentic_snapshot": {"seed": 42},
+            "agentic_warmup": True,
+            "agentic_warmup_policy": policy,
+            "agentic_profile": {"duration_seconds": 10},
+        },
+    }
+    config = CorePredictionConfig.model_validate({"engine": _engine() | {"context_length": 1024}, "traffic": traffic})
+    assert prediction_to_replay_spec(config).workload["agentic_warmup_policy"] == policy
+    recommended = _recommendation_workload(traffic)
+    assert recommended["agentic_warmup_policy"] == policy
+    assert Workload.model_validate(recommended).agentic_warmup_policy == policy
+    restored = CorePredictionConfig.model_validate(config.model_dump(mode="json"))
+    assert restored.traffic.load.agentic_warmup_policy == policy
+
+
+@pytest.mark.parametrize("missing", ["agentic_warmup", "agentic_profile"])
+def test_live_warmup_requires_preparation_and_recycling(missing):
+    from aisimulate.config import TrafficPredictionConfig, TrafficRecommendationConfig
+
+    traffic = {
+        "source": {"type": "trace", "format": "weka", "paths": ["corpus"]},
+        "load": {
+            "type": "trace_timestamps",
+            "agentic_lanes": 2,
+            "agentic_snapshot": {"seed": 42},
+            "agentic_warmup": True,
+            "agentic_warmup_policy": "live_trajectories",
+            "agentic_profile": {"duration_seconds": 10},
+        },
+    }
+    del traffic["load"][missing]
+    for schema in (TrafficPredictionConfig, TrafficRecommendationConfig):
+        with pytest.raises(ValidationError, match="live_trajectories requires"):
+            schema.model_validate(traffic)

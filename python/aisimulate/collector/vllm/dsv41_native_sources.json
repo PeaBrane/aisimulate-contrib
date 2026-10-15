@@ -1,0 +1,7 @@
+{
+  "vllm.models.deepseek_v41.nvidia.model": "6e8a5b8b4ab07118f9d1f91a78c707b02a536e92d6b86c3126188bd7028410d5",
+  "vllm.models.deepseek_v41.nvidia.dspark": "30e5362e96491a2b7c99b03998de3bf359e053f2d189bbffc250084e17678326",
+  "vllm.models.deepseek_v41.attention": "44b870805c1c796715d13029604428aa38a74dd1eebafbe1cc6879817b66d957",
+  "vllm.models.deepseek_v41.common.engram": "7866f9cc58dd55a08e508f71a75d584584c3780aaf6e427accca9b00f22c1ef1",
+  "vllm.v1.attention.backends.mla.sparse_swa": "3585df3b635ac26ce6820e202bfd4e619eaa7142c84929bd445dd12e2090aafb"
+}

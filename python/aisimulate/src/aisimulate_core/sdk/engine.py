@@ -496,9 +496,9 @@ def compile_engine(
     """
     if not isinstance(decoder_replay, bool):
         raise InvalidEngineConfigurationError("decoder_replay must be a boolean")
-    if decoder_replay and (model_path != DEEPSEEK_V41_MODEL_PATH or backend != "sglang"):
+    if decoder_replay and (model_path != DEEPSEEK_V41_MODEL_PATH or backend not in {"vllm", "sglang"}):
         raise InvalidEngineConfigurationError(
-            f"decoder_replay requires model={DEEPSEEK_V41_MODEL_PATH!r} and backend='sglang'"
+            f"decoder_replay requires model={DEEPSEEK_V41_MODEL_PATH!r} and backend vllm or sglang"
         )
     # Before any model construction: the profile and op-level paths both read it.
     validate_parallel_size("cp_size", cp_size)
@@ -651,6 +651,7 @@ def compile_engine(
     except (ValueError, TypeError, KeyError) as exc:
         raise InvalidEngineConfigurationError(str(exc)) from exc
     model_config.decoder_replay = decoder_replay
+    model_config.system = system
     try:
         resolve_dsv4_moe_arch(model_config, model_path, system_name=system, backend_name=backend)
     except (ValueError, TypeError, KeyError) as exc:

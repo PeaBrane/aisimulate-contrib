@@ -723,6 +723,7 @@ mod tests {
                 numerator: 5,
                 denominator: 6,
                 max_sequence_length: None,
+                sequence_basis: false,
             }),
             OpSpec::Dsv41Attention(Dsv41AttentionOp {
                 name: "v41_attention".into(),
@@ -974,6 +975,7 @@ mod tests {
                 numerator: 5,
                 denominator: 6,
                 max_sequence_length: None,
+                sequence_basis: false,
             })),
             TOKEN_SCALE_INDEX,
             "TokenScale index moved"

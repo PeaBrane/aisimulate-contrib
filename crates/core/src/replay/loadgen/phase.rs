@@ -1,8 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Preparation traffic is separate from the saved graph frontier. Warmup repeats
-//! full snapshot prefixes; it never advances a source request or its output RNG.
+//! Preparation defaults to repeated snapshot prefixes. The explicit live policy
+//! advances the native dependency frontier with one-token requests. Behavioral
+//! reference: SemiAnalysisAI/aiperf at 754356e9a39acc6cc6afb242d123bb57c3fb6f75,
+//! src/aiperf/timing/strategies/agentic_replay.py (Apache-2.0, NVIDIA copyright).
 //!
 //! Methodology reference for one-token primers and ten warmups per lane:
 //! https://github.com/SemiAnalysisAI/InferenceX-app/blob/9bb7b13eb4985217a6282f340459fd5948613276/packages/app/src/components/datasets/agentx-methodology-article.tsx
@@ -13,7 +15,7 @@
 
 use anyhow::{Context, Result, ensure};
 use rustc_hash::{FxHashMap, FxHashSet};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::driver::{AgenticRuntimeFeedback, deferred_request_with_hashes};
@@ -24,6 +26,15 @@ use crate::replay::{AgenticRuntimeIdentity, ReplayTerminalStatus};
 pub const AGENTIC_PHASE_SCHEMA_V1: &str = "aisimulate.agentic.phases.v1";
 pub const AGENTIC_WARMUP_REQUESTS_PER_LANE: usize = 10;
 const PREPARATION_UUID_BASE: u128 = 1_u128 << 127;
+
+/// `Primer` retains the historical AISimulate preparation contract.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgenticWarmupPolicy {
+    #[default]
+    Primer,
+    LiveTrajectories,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -79,6 +90,7 @@ pub struct AgenticPhaseLane {
 pub struct AgenticPhaseEvidence {
     pub schema: &'static str,
     pub phase: AgenticReplayPhase,
+    pub warmup_policy: AgenticWarmupPolicy,
     pub barrier_condition: &'static str,
     pub profile_start_ms: Option<f64>,
     pub finished_at_ms: Option<f64>,
@@ -100,6 +112,10 @@ struct PreparationLane {
 
 #[derive(Debug)]
 pub(super) struct AgenticPreparation {
+    pub(super) policy: AgenticWarmupPolicy,
+    pub(super) live_started: bool,
+    live_issued: Vec<usize>,
+    primer_ready_at_ms: Vec<f64>,
     lanes: Vec<PreparationLane>,
     requests: Vec<AgenticPhaseRequest>,
     index_by_uuid: FxHashMap<Uuid, usize>,
@@ -113,16 +129,21 @@ pub(super) struct AgenticPreparation {
 }
 
 impl AgenticPreparation {
-    pub(super) fn new(
+    pub(super) fn with_policy(
         prepared: &PreparedAgenticSnapshots,
         engine_block_size: u32,
         include_replay_hashes: bool,
+        policy: AgenticWarmupPolicy,
     ) -> Result<Self> {
         ensure!(
             engine_block_size > 0,
             "warmup engine block size must be positive"
         );
         let mut this = Self {
+            policy,
+            live_started: false,
+            live_issued: vec![0; prepared.plays.len()],
+            primer_ready_at_ms: Vec::new(),
             lanes: Vec::new(),
             requests: Vec::new(),
             index_by_uuid: FxHashMap::default(),
@@ -165,10 +186,12 @@ impl AgenticPreparation {
                 primers.clone()
             };
             let mut source_indices = primers.clone();
-            source_indices.extend(
-                (0..AGENTIC_WARMUP_REQUESTS_PER_LANE)
-                    .map(|ordinal| warmup_sources[ordinal % warmup_sources.len()]),
-            );
+            if policy == AgenticWarmupPolicy::Primer {
+                source_indices.extend(
+                    (0..AGENTIC_WARMUP_REQUESTS_PER_LANE)
+                        .map(|ordinal| warmup_sources[ordinal % warmup_sources.len()]),
+                );
+            }
             let mut request_indices = Vec::with_capacity(source_indices.len());
             for (ordinal, &source_index) in source_indices.iter().enumerate() {
                 let index = this.requests.len();
@@ -226,7 +249,113 @@ impl AgenticPreparation {
                 ready_at_ms: 0.0,
             });
         }
+        this.configure_primer_spread(f64::INFINITY);
         Ok(this)
+    }
+
+    pub(super) fn configure_primer_spread(&mut self, cap_ms: f64) {
+        if self.policy != AgenticWarmupPolicy::LiveTrajectories {
+            return;
+        }
+        self.primer_ready_at_ms = vec![0.0; self.requests.len()];
+        let mut max_lead: f64 = 0.0;
+        for lane in &self.lanes {
+            for &index in &lane.request_indices {
+                let source = &self.requests[index].source_request_id;
+                let start = lane
+                    .snapshot
+                    .evidence
+                    .requests
+                    .iter()
+                    .find(|request| &request.source_request_id == source)
+                    .unwrap()
+                    .recorded_start_ms;
+                let lead = (lane.snapshot.evidence.t_star_ms - start)
+                    .max(0.0)
+                    .min(cap_ms);
+                self.primer_ready_at_ms[index] = lead;
+                max_lead = max_lead.max(lead);
+            }
+        }
+        for at in &mut self.primer_ready_at_ms {
+            *at = max_lead - *at;
+        }
+        for lane in &mut self.lanes {
+            let mut pairs = lane
+                .request_indices
+                .iter()
+                .copied()
+                .zip(lane.source_indices.iter().copied())
+                .collect::<Vec<_>>();
+            pairs.sort_by(|a, b| {
+                self.primer_ready_at_ms[a.0].total_cmp(&self.primer_ready_at_ms[b.0])
+            });
+            lane.request_indices = pairs.iter().map(|pair| pair.0).collect();
+            lane.source_indices = pairs.iter().map(|pair| pair.1).collect();
+            lane.ready_at_ms = lane
+                .request_indices
+                .first()
+                .map_or(0.0, |&index| self.primer_ready_at_ms[index]);
+        }
+    }
+
+    pub(super) fn live_active(&self) -> bool {
+        self.live_started && self.transition.is_none()
+    }
+
+    pub(super) fn can_issue_live(&self, lane: usize) -> bool {
+        self.failure_request_id.is_none()
+            && self.live_issued[lane] < AGENTIC_WARMUP_REQUESTS_PER_LANE
+    }
+
+    pub(super) fn live_request(&self, uuid: Uuid) -> bool {
+        self.policy == AgenticWarmupPolicy::LiveTrajectories
+            && self
+                .index_by_uuid
+                .get(&uuid)
+                .is_some_and(|&index| self.requests[index].phase == AgenticReplayPhase::Warmup)
+    }
+
+    pub(super) fn ready_for_live(&self) -> bool {
+        self.policy == AgenticWarmupPolicy::LiveTrajectories
+            && !self.live_started
+            && self.failure_request_id.is_none()
+            && self
+                .requests
+                .iter()
+                .all(|request| request.quiescent_at_ms.is_some())
+    }
+
+    pub(super) fn record_live(
+        &mut self,
+        uuid: Uuid,
+        identity: AgenticRuntimeIdentity,
+        source_request_id: String,
+        input_length: usize,
+        lane_id: usize,
+        now_ms: f64,
+    ) {
+        assert!(self.can_issue_live(lane_id));
+        self.live_issued[lane_id] += 1;
+        self.index_by_uuid.insert(uuid, self.requests.len());
+        self.requests.push(AgenticPhaseRequest {
+            uuid,
+            phase: AgenticReplayPhase::Warmup,
+            lane_id,
+            identity,
+            source_request_id,
+            input_length,
+            max_output_tokens: 1,
+            expected_full_block_tokens: input_length / self.engine_block_size as usize
+                * self.engine_block_size as usize,
+            dispatched_at_ms: Some(now_ms),
+            terminal_status: None,
+            causal_terminal_at_ms: None,
+            quiescent_at_ms: None,
+            first_admit_ms: None,
+            first_admission_reused_input_tokens: None,
+            observed_output_tokens: 0,
+        });
     }
 
     pub(super) fn contains(&self, uuid: Uuid) -> bool {
@@ -247,7 +376,10 @@ impl AgenticPreparation {
         }
         self.lanes
             .iter()
-            .filter(|lane| lane.in_flight.is_none() && lane.next < lane.request_indices.len())
+            .filter(|lane| {
+                (self.policy == AgenticWarmupPolicy::LiveTrajectories || lane.in_flight.is_none())
+                    && lane.next < lane.request_indices.len()
+            })
             .map(|lane| lane.ready_at_ms)
             .min_by(f64::total_cmp)
     }
@@ -266,7 +398,7 @@ impl AgenticPreparation {
             if ready.len() == limit {
                 break;
             }
-            if lane.in_flight.is_some()
+            if (self.policy == AgenticWarmupPolicy::Primer && lane.in_flight.is_some())
                 || lane.next == lane.request_indices.len()
                 || lane.ready_at_ms > now_ms
             {
@@ -311,7 +443,9 @@ impl AgenticPreparation {
                 self.include_replay_hashes.then_some(self.engine_block_size),
             );
             evidence.dispatched_at_ms = Some(now_ms);
-            lane.in_flight = Some(evidence.uuid);
+            if self.policy == AgenticWarmupPolicy::Primer {
+                lane.in_flight = Some(evidence.uuid);
+            }
             lane.next += 1;
             ready.push(CompactReadyTurn {
                 request_uuid: evidence.uuid,
@@ -327,6 +461,12 @@ impl AgenticPreparation {
                 synthetic_session_id: false,
                 request,
             });
+            if self.policy == AgenticWarmupPolicy::LiveTrajectories {
+                lane.ready_at_ms = lane
+                    .request_indices
+                    .get(lane.next)
+                    .map_or(now_ms, |&index| self.primer_ready_at_ms[index]);
+            }
         }
         ready
     }
@@ -343,7 +483,7 @@ impl AgenticPreparation {
         Ok(request)
     }
 
-    fn validate_time(&self, now_ms: f64) -> Result<()> {
+    pub(super) fn validate_time(&self, now_ms: f64) -> Result<()> {
         ensure!(
             now_ms.is_finite() && now_ms >= self.last_event_at_ms,
             "preparation feedback timestamp must be finite and nondecreasing"
@@ -449,13 +589,14 @@ impl AgenticPreparation {
                     Some("preparation request completed without exactly one output token".into());
             }
         }
-        let lane = self
+        if let Some(lane) = self
             .lanes
             .iter_mut()
             .find(|lane| lane.in_flight == Some(uuid))
-            .expect("dispatched preparation request retains its lane until terminal");
-        lane.in_flight = None;
-        lane.ready_at_ms = now_ms;
+        {
+            lane.in_flight = None;
+            lane.ready_at_ms = now_ms;
+        }
         Ok(())
     }
 
@@ -493,10 +634,19 @@ impl AgenticPreparation {
         if self.failure_request_id.is_some() {
             return Ok(Some(AgenticPreparationTransition::Aborted));
         }
+        if self.policy == AgenticWarmupPolicy::LiveTrajectories
+            && (!self.live_started
+                || self
+                    .live_issued
+                    .iter()
+                    .any(|&count| count < AGENTIC_WARMUP_REQUESTS_PER_LANE))
+        {
+            return Ok(None);
+        }
         if self
             .lanes
             .iter()
-            .all(|lane| lane.next == lane.request_indices.len())
+            .all(|lane| lane.next == lane.source_indices.len())
         {
             return Ok(Some(AgenticPreparationTransition::OpenProfile));
         }
@@ -551,6 +701,7 @@ impl AgenticPreparation {
         AgenticPhaseEvidence {
             schema: AGENTIC_PHASE_SCHEMA_V1,
             phase,
+            warmup_policy: self.policy,
             barrier_condition: "all_preparation_succeeded_and_server_quiescent",
             profile_start_ms: (self.transition == Some(AgenticPreparationTransition::OpenProfile))
                 .then_some(self.finished_at_ms)
@@ -562,10 +713,10 @@ impl AgenticPreparation {
                 .lanes
                 .iter()
                 .map(|lane| {
-                    let requests = lane
-                        .request_indices
+                    let requests = self
+                        .requests
                         .iter()
-                        .map(|&i| &self.requests[i])
+                        .filter(|request| request.lane_id == lane.snapshot.evidence.lane_id)
                         .collect::<Vec<_>>();
                     AgenticPhaseLane {
                         lane_id: lane.snapshot.evidence.lane_id,
@@ -688,6 +839,118 @@ mod tests {
                 .collect(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn live_warmup_recycles_fork_join_plays_deterministically() {
+        fn run() -> (Vec<u8>, usize) {
+            let mut driver = WorkloadDriver::new_agentic_warmup_with_policy(
+                prepared(2, 50.0),
+                64,
+                true,
+                1.0,
+                AgenticWarmupPolicy::LiveTrajectories,
+            )
+            .unwrap();
+            driver
+                .enable_agentic_profile(crate::replay::loadgen::AgenticProfileOptions::default())
+                .unwrap();
+            let mut now: f64 = 0.0;
+            for _ in 0..100 {
+                driver.finish_agentic_preparation(now).unwrap();
+                driver.advance_agentic_profile(now).unwrap();
+                if !driver.is_agentic_preparing() {
+                    break;
+                }
+                now = now.max(
+                    driver
+                        .next_ready_time_ms()
+                        .expect("preparation must have a runnable frontier"),
+                );
+                let batch = driver.pop_ready_compact(now, 100);
+                assert!(!batch.is_empty());
+                for request in &batch {
+                    assert_eq!(request.request.metadata().max_output_tokens, 1);
+                    driver.on_output_token(request.request_uuid, 0).unwrap();
+                }
+                for request in &batch {
+                    driver
+                        .on_causal_terminal(
+                            request.request_uuid,
+                            now + 1.0,
+                            ReplayTerminalStatus::Completed,
+                        )
+                        .unwrap();
+                }
+                // Even the final quota cannot open the barrier while any
+                // issued branch still owns server state.
+                assert_eq!(driver.finish_agentic_preparation(now + 1.0).unwrap(), None);
+                for request in batch {
+                    driver
+                        .on_quiescent(request.request_uuid, now + 2.0)
+                        .unwrap();
+                }
+                now += 2.0;
+            }
+            assert!(!driver.is_agentic_preparing());
+            let phase = driver.agentic_phase_evidence().unwrap();
+            assert_eq!(phase.requests.len(), 24);
+            let mut primer_times = phase
+                .requests
+                .iter()
+                .filter(|request| request.phase == AgenticReplayPhase::Primer)
+                .map(|request| request.dispatched_at_ms.unwrap())
+                .collect::<Vec<_>>();
+            primer_times.sort_by(f64::total_cmp);
+            assert_eq!(primer_times, [0.0, 0.0, 20.0, 20.0]);
+            assert!(
+                phase
+                    .lanes
+                    .iter()
+                    .all(|lane| lane.warmup_completed == 10 && lane.primers_completed == 2)
+            );
+            let report = driver.agentic_profile_report().unwrap();
+            assert_eq!(report.issued_requests, 0);
+            assert_eq!(report.successful_responses, 0);
+            assert_eq!(report.client_completed_plays, 0);
+            assert_eq!(report.plays_started, 2);
+            let outcomes = driver.agentic_play_outcomes().unwrap();
+            assert_eq!(outcomes.len(), 2);
+            assert!(
+                outcomes
+                    .iter()
+                    .all(|play| play.causal_terminal_ms.is_none())
+            );
+            assert!(
+                report.corpus_cursor > 2,
+                "warmup must recycle completed plays"
+            );
+            // Each join follows both source branches, including recycled plays.
+            let events = &driver.agentic_lifecycle_transcript().unwrap().events;
+            let joins = events
+                .iter()
+                .filter(|event| {
+                    event.request_id.as_deref() == Some("join")
+                        && event.event
+                            == crate::replay::loadgen::AgenticLifecycleEventKind::Dispatch
+                })
+                .collect::<Vec<_>>();
+            assert!(!joins.is_empty());
+            for join in joins {
+                assert!(
+                    events
+                        .iter()
+                        .filter(|event| event.play_id == join.play_id
+                            && event.event
+                                == crate::replay::loadgen::AgenticLifecycleEventKind::CausalTerminal
+                            && event.at_ms <= join.at_ms)
+                        .count()
+                        >= 2
+                );
+            }
+            (serde_json::to_vec(&phase).unwrap(), phase.requests.len())
+        }
+        assert_eq!(run(), run());
     }
 
     #[test]

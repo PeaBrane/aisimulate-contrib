@@ -54,7 +54,7 @@ def build_parser() -> argparse.ArgumentParser:
         "aggregated and P/D vLLM/SGLang with HBM-only KV cache, plus vLLM G2 on a static "
         "single aggregated worker or 1P1D, with DP1 on every role; fixed DSpark is supported "
         "with HBM-only cache, while other speculative methods remain unsupported. "
-        "agentic_snapshot selects seeded starts; agentic_warmup primes saved prefixes; "
+        "agentic_snapshot selects seeded starts; agentic_warmup prepares caches using the selected warmup policy; "
         "agentic_profile enables duration controls on the offline engine stack; "
         "legacy --stack dynamo does not support profiles. Results are functional_only; "
         "hardware accuracy and complete AgentX recipe parity are not qualified."

@@ -19,6 +19,7 @@ _INLINE_REQUEST_FIELDS = {
     "input_tokens",
     "input_token_ids",
     "output_tokens",
+    "output_token_ids",
     "dp_rank",
     "prefill_dp_rank",
     "session_id",
@@ -124,6 +125,13 @@ def _materialize_inline_requests(
             "output_tokens": _positive_int(raw.get("output_tokens"), f"{label}.output_tokens"),
             "metadata": raw.get("metadata"),
         }
+        if "output_token_ids" in raw:
+            output_ids = raw["output_token_ids"]
+            if not isinstance(output_ids, list) or len(output_ids) != request["output_tokens"]:
+                raise ValueError(f"{label}.output_token_ids must match output_tokens")
+            if any(not _is_uint(token, 32) for token in output_ids):
+                raise ValueError(f"{label}.output_token_ids must contain unsigned 32-bit integers")
+            request["output_token_ids"] = output_ids
         if has_ids:
             token_ids = raw["input_token_ids"]
             if not isinstance(token_ids, list) or not token_ids:
