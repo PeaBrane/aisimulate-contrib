@@ -2712,3 +2712,120 @@ def test_inline_token_native_open_loop_keeps_authored_arrivals():
     assert [row["arrival_time_ms"] for row in rows] == [10.0, 20.0, 30.0]
     assert [row["metadata"]["record"] for row in rows] == [0, 1, 2]
     assert all(row["output_length"] == 2 for row in rows)
+
+
+@pytest.mark.parametrize("versioned", [False, True])
+def test_agentic_exact_tokens_native_closed_loop_and_prefill_only(tmp_path, versioned):
+    pytest.importorskip("aisimulate._runtime")
+    rows = [
+        {
+            "request_id": "parent",
+            "session_id": "session",
+            "input_length": 5,
+            "input_token_ids": [10, 11, 12, 13, 14],
+            "output_length": 3,
+            "output_token_ids": [20, 21, 22],
+        },
+        {
+            "request_id": "child",
+            "session_id": "session",
+            "input_length": 8,
+            "input_token_ids": [10, 11, 12, 13, 14, 20, 21, 22],
+            "output_length": 0,
+            "output_token_ids": [],
+            "wait_for": ["parent"],
+            "tool_wait_ms": 7,
+        },
+    ]
+    if versioned:
+        for row in rows:
+            row.update(play_id="play", model="test-model", not_before_ms=0)
+        rows[1].pop("wait_for")
+        rows[1].pop("tool_wait_ms")
+        rows[1]["dependencies"] = [
+            {
+                "request_id": "parent",
+                "trigger": "completion",
+                "relation": "sequence",
+                "delay_ms": 7,
+            }
+        ]
+        rows.insert(
+            0,
+            {
+                "schema": "dynamo.agentic_mooncake",
+                "version": 2,
+                "block_size": 4,
+                "hash_id_scope": "local",
+                "source": {"format": "original-test", "digest": "exact-tokens-v1"},
+            },
+        )
+    path = tmp_path / "exact.jsonl"
+    path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+    report = (
+        EngineReplayRunnerFactory()
+        .create(0)
+        .run(
+            _spec(
+                deployment=_inline_token_deployment("agg"),
+                workload={
+                    "source_type": "trace",
+                    "load_type": "trace_timestamps",
+                    "trace_path": str(path),
+                    "trace_format": "agentic_mooncake",
+                    "trace_block_size": 4,
+                },
+            ),
+            output_requirements=ReplayOutputRequirements(include_raw_report=True, capture_per_request=True),
+        )
+    )
+    requests = sorted(
+        report.metadata["native_report"]["per_request"],
+        key=lambda row: row["arrival_time_ms"],
+    )
+    assert len(requests) == 2
+    assert [row["input_length"] for row in requests] == [5, 8]
+    assert [row["output_length"] for row in requests] == [3, 0]
+    assert requests[1]["arrival_time_ms"] == pytest.approx(requests[0]["terminal_time_ms"] + 7)
+    assert all(row["terminal_status"] == "completed" for row in requests)
+
+
+@pytest.mark.parametrize(
+    "patch,message",
+    [
+        ({"input_length": 3}, "input_length 3 does not match input_token_ids length 2"),
+        ({"input_token_ids": [True, 1]}, "invalid type: boolean `true`, expected u32"),
+        ({"input_token_ids": [2**32, 1]}, "invalid value: integer `4294967296`, expected u32"),
+        ({"hash_ids": [1]}, "requires exactly one of input_token_ids or hash_ids"),
+        ({"output_token_ids": []}, "output_length 1 does not match output_token_ids length 0"),
+    ],
+)
+def test_agentic_exact_tokens_native_rejects_ambiguous_or_invalid_rows(tmp_path, patch, message):
+    pytest.importorskip("aisimulate._runtime")
+    path = tmp_path / "bad.jsonl"
+    path.write_text(
+        json.dumps(
+            {
+                "request_id": "request",
+                "session_id": "session",
+                "input_length": 2,
+                "input_token_ids": [10, 11],
+                "output_length": 1,
+                "output_token_ids": [20],
+                **patch,
+            }
+        )
+        + "\n"
+    )
+    with pytest.raises(RuntimeError, match=message):
+        EngineReplayRunnerFactory().create(0).run(
+            _spec(
+                workload={
+                    "source_type": "trace",
+                    "load_type": "trace_timestamps",
+                    "trace_path": str(path),
+                    "trace_format": "agentic_mooncake",
+                    "trace_block_size": 4,
+                }
+            )
+        )

@@ -1,7 +1,7 @@
 {
   "schema": "dspark-collection-status-v1",
   "matrix": "matrix.json",
-  "measured_request_records": 130,
+  "measured_request_records": 131,
   "eligible_paired_runs": 1,
   "checkpoint_references": "checkpoint-references.json",
   "gpu_jobs": [
@@ -72,7 +72,7 @@
       "qos": "interactive",
       "time_limit": "01:00:00",
       "queue_note": "Active supervised qualification campaign; permitted interactive QoS, one B200 job at a time.",
-      "reason": "Await graph smoke and per-window production time budget; dependency unchanged until replacement selected."
+      "reason": "Held while Pro P/D qualification has B200 priority. The old eager wrapper will be replaced by a CPU-qualified current bundle/native-stage collection plan; do not release this stale job."
     },
     {
       "cluster": "aws-pdx-slurm-1",
@@ -269,13 +269,78 @@
       "cluster": "nsc-svg-slurm-1",
       "job_id": "2257733",
       "purpose": "Pro P/D joint16B200 graph smoke",
-      "state": "RUNNING",
+      "state": "FAILED",
       "nodes": [
         "nsc-svg-slurm-1-gpu-136",
         "nsc-svg-slurm-1-gpu-185"
       ],
       "results": "results/dspark-e2e-20261014/pd-smoke-v4-pro-k6-2257733",
-      "launch_identity": "K6 real acceptance, adaptive off, prefix off, TP1/DP8/EP8 prefill and TP8/EP1 decode, runtime-default graphs; immutable source+JSON snapshot"
+      "launch_identity": "K6 real acceptance, adaptive off, prefix off, TP1/DP8/EP8 prefill and TP8/EP1 decode, runtime-default graphs; immutable source+JSON snapshot",
+      "elapsed": "00:09:09",
+      "exit_code": "1:0",
+      "measured_requests": 0,
+      "reason": "Prefill graph reservation10.70GiB leaves6.65GiB KV atutil0.90; context16384 needs8.99GiB. Decoder stopped promptly. Same-topology retry increasesP budget to0.92.",
+      "local_artifacts": "raw/pd-2257733"
+    },
+    {
+      "cluster": "nsc-svg-slurm-1",
+      "job_id": "2257933",
+      "purpose": "Pro P/D joint16B200 graph smoke, explicit prefill memorybudget0.92",
+      "state": "COMPLETED",
+      "results": "results/dspark-e2e-20261014/pd-smoke-v4-pro-k6-2257933",
+      "bundle": "jobs/dspark-e2e-20261014/pd-budget92-bundle",
+      "preflight_job_id": "2257929",
+      "launch_identity": "P TP1DP8EP8 gpu_memory_utilization0.92;D TP8EP1 utilization0.90;K6real,context16384,batch8192,runtime-default graphs,adaptiveoff,prefixoff",
+      "role_nodes": {
+        "prefill": "nsc-svg-slurm-1-gpu-50",
+        "decode": "nsc-svg-slurm-1-gpu-39"
+      },
+      "startup_note": "P0.92 passed16K cache admission with18,615tokens; PHTTPhealthy, Dautotuning. No request measurement yet.",
+      "exit_code": "0:0",
+      "elapsed": "00:15:27",
+      "measured_requests": 1,
+      "failed_requests": 0,
+      "local_artifacts": "raw/pd-2257933",
+      "reason": "Functional P/D smoke completed. One warmup and one measured request; measured request used a new prefill peer. Diagnostic only; transfer deltas preserved separately."
+    },
+    {
+      "cluster": "nsc-svg-slurm-1",
+      "job_id": "2258192",
+      "model": "v4-pro",
+      "k": 6,
+      "gpus": 16,
+      "phase": "initial real",
+      "state": "submitted",
+      "deployment": "disagg",
+      "requests": 128,
+      "warmup_requests": 8,
+      "concurrency": 1,
+      "repetition": 1,
+      "time_limit": "01:15:00",
+      "qos": "interactive",
+      "results": "results/dspark-e2e-20261014/pd-initial-v4-pro-k6-2258192",
+      "bundle": "jobs/dspark-e2e-20261014/pd-budget92-bundle",
+      "cpu_preflight_job": "2257929",
+      "prefill_gpu_memory_utilization": 0.92,
+      "decode_gpu_memory_utilization": 0.9,
+      "source_residency_evidence": "Absolute per-engine issued/success counters include warmup and measurement; qualification must audit all-issued conservative capacity bound."
+    },
+    {
+      "cluster": "aws-pdx-slurm-1",
+      "job_id": "791084",
+      "model": "kimi-k3",
+      "k": 2,
+      "gpus": 8,
+      "phase": "native MLA operator observation",
+      "state": "PENDING",
+      "dependency": "afterok:790797",
+      "cpu_preflight_job": "791053",
+      "time_limit": "02:00:00",
+      "host_memory_gb": 2048,
+      "results": "results/dspark-e2e-20261014/kimi-native-k2-791084",
+      "bundle": "jobs/dspark-e2e-20261014/kimi-native-explicit-bundle",
+      "draft_attention_backend": "FLASHINFER_MLA",
+      "purpose": "Collect native operation measurements before Kimi production pairing; not part of the 588 E2E runs."
     }
   ],
   "cpu_jobs": [
@@ -422,6 +487,24 @@
       "state": "COMPLETED",
       "exit_code": "0:0",
       "scope": "Both actual role commands and shared checkpoint lookup match the immutable2257733 source bundle. No GPU execution."
+    },
+    {
+      "cluster": "aws-pdx-slurm-1",
+      "job_id": "790888",
+      "purpose": "Updated Kimi native observer exact-image CPU import/sourcehash/eager-loader validation",
+      "state": "COMPLETED",
+      "exit_code": "0:0",
+      "elapsed": "00:03:27",
+      "scope": "Worker imported; all4 hashes and eager LoadConfig match. CPU-node CUDA extension warnings expected; noGPU execution."
+    },
+    {
+      "cluster": "nsc-svg-slurm-1",
+      "job_id": "2257929",
+      "purpose": "Immutable P/D budget92 bundle CPU role command/checkpoint preflight before GPU submission",
+      "state": "COMPLETED",
+      "exit_code": "0:0",
+      "elapsed": "00:00:27",
+      "local_artifacts": "raw/pd-budget92-preflight"
     }
   ],
   "storage_root": "/lustre/fsw/portfolios/coreai/projects/coreai_comparch_inferencex/users/simonec",
@@ -459,6 +542,14 @@
       "logs": [
         "logs/dspark-e2e-20261014/v41-native-installed-source-check-2257500.log"
       ]
+    }
+  ],
+  "submission_failures": [
+    {
+      "cluster": "aws-pdx-slurm-1",
+      "purpose": "Dependent Kimi native MLA collection",
+      "job_id": null,
+      "reason": "Slurm rejected dependency on completed CPUjob790888 after its live job record expired; no GPU allocation. Refresh explicit draft backend bundle before resubmission; gate CPUcheck by receipt and dependency only on active servingjob790797."
     }
   ]
 }

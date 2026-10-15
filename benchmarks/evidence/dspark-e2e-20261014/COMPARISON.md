@@ -92,9 +92,18 @@ loader against the pinned source config and requires the exact pinned
 `draft_config` in Replay YAML. A public model name alone is insufficient.
 The predictor also checks context and scheduler limits against frozen launch
 arguments. Qualified Pro aggregated runs require the cache adapter's matching
-workload, capacity, runtime receipt hash, and nonbinding-capacity proof. Other
-families and P/D need their own checked adapters before scoring. An approximate
-cache mapping cannot qualify a workload whose capacity may be binding.
+workload, capacity, runtime receipt hash, and nonbinding-capacity proof. Pro P/D
+uses its separate per-role adapter and checks both cache configurations; other
+families need their own checked adapters before scoring. The P/D cache
+adapter also binds its numeric transfer settings to Replay, including draft
+state already included in the byte count; automatic bytes cannot replace that
+contract. A missing bandwidth measurement remains an explicit timing limitation.
+P/D qualification checks both the Replay capacity bound and the native source
+residency bound. The latter includes active requests and completed requests whose
+blocks await connector cleanup; global concurrency alone does not bound them.
+An approximate cache mapping cannot qualify a workload whose capacity may be
+binding. Source contracts
+alone do not establish measured P/D cache capacities or transport performance.
 
 If runtime qualification finishes after collection, preserve the original
 `summary.json` and frozen `identity.json`. Write a separate

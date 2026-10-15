@@ -1006,6 +1006,7 @@ fn lower_trace(
                 // it as a prefill-only/KV-cache-warmup request. HTTP adapters
                 // may need a non-zero wire value, but that endpoint limitation
                 // must not change the canonical graph.
+                input_token_ids: None,
                 output_length: Some(request.request.output_length),
                 output_token_ids: None,
                 hash_ids: Some(hash_ids),

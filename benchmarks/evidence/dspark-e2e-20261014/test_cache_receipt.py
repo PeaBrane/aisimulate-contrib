@@ -3,8 +3,12 @@
 
 import copy
 import unittest
+from pathlib import Path
 
 from reconcile_pro_cache import reconcile, reconcile_pd
+
+from aisimulate.compiler import prediction_to_replay_spec
+from aisimulate.config.cli import CorePredictionConfig
 
 
 def receipt():
@@ -147,8 +151,10 @@ class CacheReceiptTests(unittest.TestCase):
         prefill, decode = result["roles"]["prefill"], result["roles"]["decode"]
         self.assertEqual(prefill["independent_request_pools"], 8)
         self.assertEqual(decode["independent_request_pools"], 1)
-        self.assertEqual(prefill["replay_kv_cache"]["capacity"]["blocks"], 9000)
-        self.assertEqual(decode["replay_kv_cache"]["capacity"]["blocks"], 10000)
+        self.assertEqual(prefill["replay_kv_cache"]["capacity"]["blocks"], 9000 - 431 * 4)
+        self.assertEqual(decode["replay_kv_cache"]["capacity"]["blocks"], 10000 - 846 * 4)
+        self.assertNotIn("state_cache", prefill["replay_kv_cache"])
+        self.assertNotIn("state_cache", decode["replay_kv_cache"])
         self.assertEqual(prefill["physical_pool_bytes_across_role"], (7 * 10000 + 9000) * 1025)
         self.assertEqual(decode["physical_pool_bytes_across_role"], 8 * 10000 * 1025)
         for pool in prefill["rank_pools"]:
@@ -189,6 +195,156 @@ class CacheReceiptTests(unittest.TestCase):
         result = run_pd(pd_receipt(), concurrency=64)
         self.assertFalse(result["roles"]["prefill"]["capacity_proven_nonbinding"])
         self.assertFalse(result["capacity_proven_nonbinding"])
+        self.assertIsNone(result["roles"]["prefill"]["replay_kv_cache"])
+        self.assertIsNone(result["roles"]["decode"]["replay_kv_cache"])
+
+    def test_pd_transfer_bound_includes_all_groups_once_without_fanout_multiplier(self):
+        result = run_pd(pd_receipt())
+        groups = result["transport"]["groups"]
+        self.assertEqual([g["block_count_bound"] for g in groups], [3, 3, 5, 17, 3])
+        expected = 32 * 3 * 2 + 91 * 5 + 31 * 17 + 60 * 3
+        self.assertEqual(result["transport"]["per_reader_page_payload_bound_bytes"], expected)
+        registered = (3 + 3 + 5 + 17 + 3) * 1025
+        self.assertEqual(result["transport"]["per_reader_registered_region_bound_bytes"], registered)
+        self.assertGreater(registered, expected)
+        self.assertEqual(result["replay_kv_transfer"]["bytes_per_token"], (registered + 1023) // 1024)
+        self.assertIsNone(result["replay_kv_transfer"]["bandwidth_gb_per_second"])
+        self.assertEqual(result["replay_kv_transfer"]["timing_mode"], "full_prompt")
+        names = [name for group in groups for name in group["layers"]]
+        self.assertEqual(len(names), len(set(names)))
+        self.assertIn("model.layers.63.attn.swa_cache", names)
+
+    def test_pd_bandwidth_requires_explicit_evidence_without_claiming_accuracy(self):
+        evidence = {"kind": "assumed", "gb_per_second": 50, "source": "test scenario; not measured"}
+        result = reconcile_pd(
+            pd_receipt(), k=6, concurrency=1, input_length=1024, output_length=1024, bandwidth_evidence=evidence
+        )
+        self.assertEqual(result["replay_kv_transfer"]["bandwidth_gb_per_second"], 50)
+        self.assertFalse(result["transport"]["bandwidth_qualified"])
+        with self.assertRaisesRegex(ValueError, "bandwidth evidence"):
+            reconcile_pd(
+                pd_receipt(),
+                k=6,
+                concurrency=1,
+                input_length=1024,
+                output_length=1024,
+                bandwidth_evidence={"kind": "measured", "gb_per_second": 50},
+            )
+
+    def test_pd_native_source_bound_is_separate_from_client_concurrency(self):
+        default = run_pd(pd_receipt())
+        self.assertTrue(default["replay_capacity_proven_nonbinding"])
+        self.assertFalse(default["native_capacity_proven_nonbinding"])
+        self.assertFalse(default["source_residency"]["native_bound_established"])
+        evidence = {
+            "kind": "conservative",
+            "max_resident_requests_per_pool": 10,
+            "includes_active_and_finished_holds": True,
+            "source": "test bound for complete run including warmup",
+        }
+        result = reconcile_pd(
+            pd_receipt(),
+            k=6,
+            concurrency=4,
+            input_length=1024,
+            output_length=1024,
+            source_residency_evidence=evidence,
+        )
+        self.assertTrue(result["native_capacity_proven_nonbinding"])
+        self.assertTrue(result["replay_capacity_proven_nonbinding"])
+        pool = result["roles"]["prefill"]["rank_pools"][0]
+        self.assertEqual(pool["static_rolling_reserve_blocks"], 431 * 10)
+        self.assertGreater(pool["native_conservative_peak_blocks"], pool["replay_peak_with_static_reserve_blocks"])
+        evidence["max_resident_requests_per_pool"] = 50
+        failed = reconcile_pd(
+            pd_receipt(),
+            k=6,
+            concurrency=4,
+            input_length=1024,
+            output_length=1024,
+            source_residency_evidence=evidence,
+        )
+        self.assertTrue(failed["capacity_proven_nonbinding"])  # Original C-request bound is retained.
+        self.assertFalse(failed["native_capacity_proven_nonbinding"])
+        self.assertFalse(failed["replay_capacity_proven_nonbinding"])
+        self.assertIsNone(failed["roles"]["prefill"]["replay_kv_cache"])
+        del evidence["includes_active_and_finished_holds"]
+        with self.assertRaisesRegex(ValueError, "active and finished"):
+            reconcile_pd(
+                pd_receipt(),
+                k=6,
+                concurrency=4,
+                input_length=1024,
+                output_length=1024,
+                source_residency_evidence=evidence,
+            )
+
+    def test_pd_storage_shape_mismatch_between_roles_is_rejected(self):
+        value = pd_receipt()
+        for rank in value["decode"]:
+            specs = rank["kv_cache_config"]["kv_cache_groups"][0]["kv_cache_spec"]["kv_cache_specs"]
+            next(iter(specs.values()))["page_size_bytes"] = 2
+        with self.assertRaisesRegex(ValueError, "storage geometries differ"):
+            run_pd(value)
+
+    def test_pd_cumulative_issued_bounds_remain_per_dp_pool(self):
+        evidence = {
+            "kind": "conservative",
+            "max_resident_requests_by_dp_rank": {str(i): i for i in range(8)},
+            "includes_active_and_finished_holds": True,
+            "source": "all issued requests since startup, including warmup, counted per DP engine",
+        }
+        result = reconcile_pd(
+            pd_receipt(),
+            k=6,
+            concurrency=1,
+            input_length=1024,
+            output_length=1024,
+            source_residency_evidence=evidence,
+        )
+        pools = result["roles"]["prefill"]["rank_pools"]
+        self.assertEqual([p["native_resident_requests_bound"] for p in pools], list(range(8)))
+        self.assertEqual([p["static_rolling_reserve_blocks"] for p in pools], [431 * max(1, i) for i in range(8)])
+        self.assertTrue(result["native_capacity_proven_nonbinding"])
+        del evidence["max_resident_requests_by_dp_rank"]["7"]
+        with self.assertRaisesRegex(ValueError, "eight DP-rank"):
+            reconcile_pd(
+                pd_receipt(),
+                k=6,
+                concurrency=1,
+                input_length=1024,
+                output_length=1024,
+                source_residency_evidence=evidence,
+            )
+
+    def test_pd_adapter_constructs_canonical_b0_r1_config_without_duplicate_transfer_state(self):
+        result = run_pd(pd_receipt())
+        base = CorePredictionConfig.from_yaml(Path(__file__).parent / "pro-initial-c1-r1/replay-config.yaml")
+        payload = base.model_dump(mode="json", exclude_none=True)
+        engine = payload["engine"]
+        template = engine["workers"]["aggregated"]
+        engine["mode"] = "disaggregated"
+        engine["kv_transfer"] = result["replay_kv_transfer"]
+        engine["workers"] = {}
+        for role, tp, dp, ep in (("prefill", 1, 8, 8), ("decode", 8, 1, 1)):
+            worker = copy.deepcopy(template)
+            worker["parallelism"].update(tensor=tp, attention_data=dp, moe_expert=ep, moe_tensor=tp)
+            worker["kv_cache"] = result["roles"][role]["replay_kv_cache"]
+            engine["workers"][role] = worker
+        config = CorePredictionConfig.model_validate(payload)
+        spec = prediction_to_replay_spec(config)
+        for role in ("prefill", "decode"):
+            args = getattr(spec.backend_deployment, f"{role}_engine_args")
+            self.assertEqual(args["kv_transfer_decode_recompute_tokens"], 1)
+            self.assertNotIn("state_cache", args)
+            self.assertNotIn("kv_transfer_draft_bytes_per_token", args)
+            self.assertEqual(args["kv_transfer_bytes_per_token"], result["replay_kv_transfer"]["bytes_per_token"])
+            self.assertEqual(args["num_gpu_blocks"], result["roles"][role]["replay_kv_cache"]["capacity"]["blocks"])
+        # The recurrent-state safety guard remains intact.
+        for role in ("prefill", "decode"):
+            engine["workers"][role]["kv_cache"]["state_cache"] = {"bytes_per_request": 100}
+        with self.assertRaisesRegex(ValueError, "state_cache requires decode_recompute_tokens"):
+            CorePredictionConfig.model_validate(payload)
 
 
 if __name__ == "__main__":

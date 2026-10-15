@@ -464,11 +464,33 @@ from session order. It adds these fields:
 
 | Field | Default | Semantics |
 |---|---:|---|
+| `input_token_ids` | Unset | Exact unsigned 32-bit input IDs, as an alternative to `hash_ids`. Its nonzero length must equal `input_length`; supplying both representations is rejected. |
+| `output_token_ids` | Unset | Exact output plan; length must equal `output_length`. An empty plan with zero output length is prefill-only. |
 | `wait_for` | `[]` | Request IDs that must all complete first. Unknown IDs, self-dependencies, and cycles are rejected. |
 | `delay` / `delay_ms` | `0` | Delay after the last dependency completes. |
 | `tool_wait_ms` | `0` | Additional tool wait after dependencies; scheduling delay is `delay + tool_wait_ms`. |
 | `timestamp` / `created_time` | `0` for roots | Ready time for a node with an empty `wait_for`; dependent-node timestamps do not control release. |
 | `request_kind`, `branches`, `prefix_reset`, `tool_events` | Empty | Producer metadata accepted by the format. Scheduling is controlled by `wait_for`, and cache identity is carried by `hash_ids`; these metadata fields do not independently change replay behavior. |
+
+Exact token arrays are also supported in canonical version-2 graph rows (with a
+`dynamo.agentic_mooncake` header, `play_id`, `model`, `not_before_ms` and typed
+`dependencies`). Both formats retain native dependency-driven scheduling. Output
+IDs describe the authored completion length; they do not add EOS detection or
+change cancellation/context-limit behavior. Requests still stop at the engine's
+applicable limits, and incomplete output must not be reported as the full plan.
+
+Exact prompts use native engine block hashing, including real partial-block
+continuations into later requests. They are not rewritten into synthetic hash
+IDs. A graph must use one input representation throughout: mixing exact and
+hash-only rows is rejected because synthetic token values can equal real IDs
+and invent cache hits. Snapshot preparation, warmup and recycling preserve exact
+IDs byte-for-byte;
+callers must include any intended per-session cache marker in the captured token
+arrays. Consequently, identical exact prompts can share cache across lanes or
+recycled plays. Hash-only input retains its existing synthetic token namespaces
+and compact representation. The optional exact field is omitted from saved
+rows/graph identity when absent, preserving historical hash-only identities.
+This extension does not restore an external producer snapshot or warmup frontier.
 
 A dependent node becomes ready after the latest request in `wait_for` completes, plus its `delay` and
 `tool_wait_ms`. `speedup` therefore scales both authored root arrivals and those post-dependency waits.

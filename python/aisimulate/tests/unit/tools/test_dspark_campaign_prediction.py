@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from aisimulate.config import CorePredictionConfig
+from aisimulate.config.engine import KvTransferConfig
 
 pytestmark = pytest.mark.unit
 ROOT = Path(__file__).resolve().parents[5]
@@ -208,6 +209,60 @@ def test_qualified_prediction_requires_cache_evidence(tmp_path):
     config, identity, _ = inputs()
     with pytest.raises(ValueError, match="verified cache reconciliation"):
         prediction.validate_cache(config, identity, {"qualification": {"eligible": True}}, tmp_path)
+
+
+def test_pd_cache_receipt_checks_both_role_capacities(tmp_path):
+    config, identity, _ = inputs()
+    identity["cell"].update(model_key="v4-pro", concurrency=1, deployment="disagg")
+    workers = config.engine.workers
+    workers.prefill = workers.aggregated.model_copy(deep=True)
+    workers.decode = workers.aggregated.model_copy(deep=True)
+    mapping = {
+        "schema": "dspark-pro-pd-cache-reconciliation-v1",
+        "workload": {"k": 3, "concurrency": 1, "input_length": 4, "output_length": 3},
+        "roles": {
+            role: {"replay_kv_cache": {"capacity": {"type": "fixed", "blocks": 128}}} for role in ("prefill", "decode")
+        },
+    }
+    path = tmp_path / "cache.json"
+    path.write_text(json.dumps(mapping))
+    receipt = {"cache_reconciliation_path": path.name, "cache_reconciliation_sha256": prediction.digest(path)}
+    prediction.validate_cache(config, identity, receipt, tmp_path)
+    workers.prefill.kv_cache.capacity.blocks = 1024
+    with pytest.raises(ValueError, match="prefill Replay cache capacity"):
+        prediction.validate_cache(config, identity, receipt, tmp_path)
+    workers.prefill.kv_cache.capacity.blocks = 128
+    mapping["replay_kv_transfer"] = {"bytes_per_token": 8192, "decode_recompute_tokens": 1}
+    path.write_text(json.dumps(mapping))
+    receipt["cache_reconciliation_sha256"] = prediction.digest(path)
+    config.engine.kv_transfer = KvTransferConfig(bytes_per_token=8192, decode_recompute_tokens=1)
+    prediction.validate_cache(config, identity, receipt, tmp_path)
+    config.engine.kv_transfer.bytes_per_token = "auto"
+    with pytest.raises(ValueError, match="reconciled target/draft state contract"):
+        prediction.validate_cache(config, identity, receipt, tmp_path)
+    config.engine.kv_transfer = None
+    with pytest.raises(ValueError, match="Replay transfer is missing"):
+        prediction.validate_cache(config, identity, receipt, tmp_path)
+    config.engine.kv_transfer = KvTransferConfig(bytes_per_token=8192, decode_recompute_tokens=1)
+    raw = tmp_path / "runtime.json"
+    raw.write_text('{"runtime": "cache"}')
+    receipt.update(qualification={"eligible": True}, runtime_cache_receipt_path=raw.name)
+    mapping.update(
+        runtime_receipt_sha256=prediction.digest(raw),
+        capacity_proven_nonbinding=True,
+        replay_capacity_proven_nonbinding=True,
+        native_capacity_proven_nonbinding=True,
+    )
+    for proof in ("replay_capacity_proven_nonbinding", "native_capacity_proven_nonbinding"):
+        mapping[proof] = False
+        path.write_text(json.dumps(mapping))
+        receipt["cache_reconciliation_sha256"] = prediction.digest(path)
+        with pytest.raises(ValueError, match="capacity-bound workload"):
+            prediction.validate_cache(config, identity, receipt, tmp_path)
+        mapping[proof] = True
+    path.write_text(json.dumps(mapping))
+    receipt["cache_reconciliation_sha256"] = prediction.digest(path)
+    prediction.validate_cache(config, identity, receipt, tmp_path)
 
 
 @pytest.mark.parametrize("scope", ["engine", "worker"])

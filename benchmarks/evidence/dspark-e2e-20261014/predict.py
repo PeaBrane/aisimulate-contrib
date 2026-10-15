@@ -215,7 +215,12 @@ def validate_cache(config, identity, receipt, receipt_dir):
     if digest(path) != receipt["cache_reconciliation_sha256"]:
         raise ValueError("cache reconciliation digest mismatch")
     mapping = json.loads(path.read_text())
-    if mapping["schema"] != "dspark-pro-cache-reconciliation-v1" or identity["cell"]["deployment"] != "agg":
+    deployment = identity["cell"]["deployment"]
+    schema = {
+        "agg": "dspark-pro-cache-reconciliation-v1",
+        "disagg": "dspark-pro-pd-cache-reconciliation-v1",
+    }.get(deployment)
+    if mapping["schema"] != schema:
         raise ValueError("cache reconciliation requires an adapter for this deployment")
     cell = identity["cell"]
     if cell["model_key"] != "v4-pro" or mapping["workload"] != {
@@ -229,16 +234,35 @@ def validate_cache(config, identity, receipt, receipt_dir):
         raw = receipt_dir / receipt["runtime_cache_receipt_path"]
         if digest(raw) != mapping["runtime_receipt_sha256"]:
             raise ValueError("runtime cache receipt digest mismatch")
-        if mapping["capacity_proven_nonbinding"] is not True:
-            raise ValueError("approximate cache mapping cannot qualify a capacity-bound workload")
-    actual = config.engine.workers.aggregated.kv_cache.model_dump(mode="json")
-    for key, expected in mapping["replay_kv_cache"].items():
-        value = actual[key]
-        matches = (
-            all(value.get(k) == v for k, v in expected.items()) if isinstance(expected, dict) else value == expected
+        proofs = (
+            ("replay_capacity_proven_nonbinding", "native_capacity_proven_nonbinding")
+            if deployment == "disagg"
+            else ("capacity_proven_nonbinding",)
         )
-        if not matches:
-            raise ValueError(f"Replay cache {key} differs from the reconciled runtime capacity")
+        if any(mapping.get(proof) is not True for proof in proofs):
+            raise ValueError("approximate cache mapping cannot qualify a capacity-bound workload")
+    roles = {"aggregated": mapping} if deployment == "agg" else mapping["roles"]
+    if deployment == "disagg" and set(roles) != {"prefill", "decode"}:
+        raise ValueError("P/D cache reconciliation must contain both roles")
+    for role, role_mapping in roles.items():
+        if role_mapping["replay_kv_cache"] is None:
+            raise ValueError(f"{role} cache mapping has no nonbinding-capacity proof")
+        actual = getattr(config.engine.workers, role).kv_cache.model_dump(mode="json")
+        for key, expected in role_mapping["replay_kv_cache"].items():
+            value = actual[key]
+            matches = (
+                isinstance(value, dict) and all(value.get(k) == v for k, v in expected.items())
+                if isinstance(expected, dict)
+                else value == expected
+            )
+            if not matches:
+                raise ValueError(f"{role} Replay cache {key} differs from the reconciled runtime capacity")
+    if deployment == "disagg" and "replay_kv_transfer" in mapping:
+        if config.engine.kv_transfer is None:
+            raise ValueError("Replay transfer is missing for the reconciled target/draft state contract")
+        actual = config.engine.kv_transfer.model_dump(mode="json")
+        if any(actual.get(key) != value for key, value in mapping["replay_kv_transfer"].items()):
+            raise ValueError("Replay transfer differs from the reconciled target/draft state contract")
 
 
 def main():

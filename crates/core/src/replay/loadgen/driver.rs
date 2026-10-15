@@ -337,6 +337,31 @@ pub(super) fn deferred_request_with_hashes(
     (request, replay_hashes)
 }
 
+/// Exact prompts use native token hashing; synthetic traces keep their compact path.
+pub(super) fn request_with_prompt(
+    mut metadata: DirectRequest,
+    input_length: usize,
+    input_token_ids: Option<Vec<u32>>,
+    hash_ids: Vec<u32>,
+    trace_block_size: usize,
+    engine_block_size: Option<u32>,
+) -> (ReplayRequestPayload, Option<ReplayRequestHashes>) {
+    if let Some(tokens) = input_token_ids {
+        debug_assert_eq!(tokens.len(), input_length);
+        let hashes = engine_block_size.map(|size| ReplayRequestHashes::from_tokens(&tokens, size));
+        metadata.tokens = tokens;
+        (ReplayRequestPayload::materialized(metadata), hashes)
+    } else {
+        deferred_request_with_hashes(
+            metadata,
+            input_length,
+            hash_ids,
+            trace_block_size,
+            engine_block_size,
+        )
+    }
+}
+
 #[derive(Debug)]
 struct TurnRuntime {
     request_id: Option<String>,
@@ -1847,11 +1872,13 @@ impl WorkloadDriver {
                 if dependencies == 0 {
                     root_nodes.push(index);
                 }
-                validate_synthesizable_prompt_len(
-                    source.input_length,
-                    source.hash_ids.len(),
-                    graph.block_size,
-                )?;
+                if source.input_token_ids.is_none() {
+                    validate_synthesizable_prompt_len(
+                        source.input_length,
+                        source.hash_ids.len(),
+                        graph.block_size,
+                    )?;
+                }
                 sessions.push(SessionRuntime {
                     session_id: request.identity.conversation_id.clone(),
                     turns: vec![TurnRuntime {
@@ -2163,8 +2190,11 @@ impl WorkloadDriver {
                 *hash_id = *prompt_hash_id;
             }
 
-            let prompt_tokens =
-                PromptTokens::deferred(node.input_length, hash_ids, trace_block_size)?;
+            let prompt_tokens = if let Some(tokens) = node.input_token_ids {
+                PromptTokens::Materialized(tokens)
+            } else {
+                PromptTokens::deferred(node.input_length, hash_ids, trace_block_size)?
+            };
             let output_token_ids = Some(planned_output_token_ids(
                 node.output_token_ids,
                 node.max_output_tokens,
@@ -2634,7 +2664,7 @@ impl WorkloadDriver {
             let arrival_timestamp_ms = self.policy.arrival_timestamp_ms(scheduled_ready_at_ms);
             let (request, replay_hashes) = match self.prompt_mode {
                 PromptMode::Full => {
-                    let (input_length, hash_ids, output_token_ids) =
+                    let (input_length, input_token_ids, hash_ids, output_token_ids) =
                         if let PromptTokens::Snapshot {
                             input_length,
                             source_index,
@@ -2647,12 +2677,20 @@ impl WorkloadDriver {
                                 .expect("snapshot turns retain their replay context");
                             (
                                 input_length,
+                                context.graph.nodes[source_index].input_token_ids.clone(),
                                 context.token_ids(slot, source_index),
                                 Some(context.outputs[source_index].clone()),
                             )
+                        } else if let PromptTokens::Materialized(tokens) = &mut turn.prompt_tokens {
+                            (
+                                tokens.len(),
+                                Some(std::mem::take(tokens)),
+                                Vec::new(),
+                                turn.output_token_ids.take(),
+                            )
                         } else {
                             let (input_length, hash_ids) = turn.prompt_tokens.take_deferred();
-                            (input_length, hash_ids, turn.output_token_ids.take())
+                            (input_length, None, hash_ids, turn.output_token_ids.take())
                         };
                     let request_metadata = DirectRequest {
                         tokens: Vec::new(),
@@ -2682,9 +2720,10 @@ impl WorkloadDriver {
                         policy_class: turn.policy_class.clone(),
                         replay_context: replay_context.clone(),
                     };
-                    deferred_request_with_hashes(
+                    request_with_prompt(
                         request_metadata,
                         input_length,
+                        input_token_ids,
                         hash_ids,
                         self.trace_block_size,
                         self.include_replay_hashes.then_some(self.engine_block_size),

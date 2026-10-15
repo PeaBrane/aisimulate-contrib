@@ -1361,7 +1361,8 @@ and native consumers `crates/core/src/perfmodel/operators/mla.rs`,
 these same pinned execution contracts. They preserve per-module ownership,
 query geometry and collective boundaries; no serving kernels are copied.
 Additional original paths are `vllm/model_executor/layers/attention/mla_attention.py`
-and `vllm/models/deepseek_v41/decoder_replay_layers.py`. These adapters and
+`vllm/v1/worker/gpu/spec_decode/dspark/utils.py`, and
+`vllm/models/deepseek_v41/decoder_replay_layers.py`. These adapters and
 their derived contract documentation are modified. Copyright contributors to
 the vLLM project and NVIDIA CORPORATION & AFFILIATES. Apache-2.0.
 
@@ -1462,3 +1463,37 @@ Licensed under Apache-2.0. No upstream async runtime code is vendored.
 
 Source: https://github.com/SemiAnalysisAI/aiperf/blob/754356e9a39acc6cc6afb242d123bb57c3fb6f75/src/aiperf/timing/strategies/agentic_replay.py
 License: https://github.com/SemiAnalysisAI/aiperf/blob/754356e9a39acc6cc6afb242d123bb57c3fb6f75/LICENSE
+
+The campaign entrypoints, context probes and capture adapters under
+`benchmarks/evidence/dspark-e2e-20261014/` (`agentx_phaseb.py`,
+`agentx_server.py`, `agentx_context_audit.py`, `agentx_capture.py`, their tests,
+and `agentx_corpus_pin/`) are original, modified adaptations of the same pinned
+producer's configuration, dataset, lifecycle and export contracts. Their adjacent
+manifests and documentation derive identity and lifecycle facts from those sources.
+Copyright NVIDIA CORPORATION & AFFILIATES and AIPerf contributors; Apache-2.0.
+No upstream producer implementation or corpus contents are vendored.
+
+Original paths at that revision, under `src/aiperf/`:
+
+- `dataset/loader/{base_hf_dataset,semianalysis_cc_traces_weka,weka_trace,weka_trace_models}.py`
+- `dataset/composer/public.py`
+- `timing/strategies/agentic_replay.py` and `timing/trajectory_source.py`
+- `common/models/{dataset_models,record_models}.py`
+- `post_processors/raw_record_writer_processor.py`
+- `records/record_processor_service.py`
+- `config/resolution/plan.py` and `config/flags/cli_config.py`
+- `plugin/plugins.yaml`
+
+The optional diagnostic token-echo contract and native Pro formatter probe also
+follow vLLM `ac9126e58aa7bbab1856ba6593ba4d5003fea516`, paths
+`vllm/entrypoints/openai/chat_completion/{protocol,serving}.py` and
+`vllm/tokenizers/deepseek_v4_encoding.py`. Copyright contributors to the vLLM
+project; Apache-2.0. These are modified contract adaptations; the native formatter
+is imported externally, not copied into this repository.
+Source: https://github.com/vllm-project/vllm/tree/ac9126e58aa7bbab1856ba6593ba4d5003fea516
+License: https://github.com/vllm-project/vllm/blob/ac9126e58aa7bbab1856ba6593ba4d5003fea516/LICENSE
+
+Corpus identity: `semianalysisai/cc-traces-weka-062126` at
+`23f152f6f0f9399a85901b89a6458def0ef16729`; its README declares Apache-2.0.
+Evidence stores hashes, counts and bounds, not the source dataset.
+Source: https://huggingface.co/datasets/semianalysisai/cc-traces-weka-062126/tree/23f152f6f0f9399a85901b89a6458def0ef16729

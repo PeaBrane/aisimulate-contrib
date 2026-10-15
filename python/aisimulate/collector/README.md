@@ -676,6 +676,10 @@ Kimi weights use the supported eager safetensors loading strategy, with a
 6000-second engine startup budget; both settings are retained in the receipt.
 Allow at least 120 minutes for the allocation, including collection and cleanup.
 This loader setting does not change the eager serving measurement policy.
+The draft explicitly selects `FLASHINFER_MLA`, matching the campaign serving
+configuration; the full public engine arguments are saved in the receipt.
+The pinned DSpark loader honors this selector rather than inheriting the target
+backend for Kimi. Observed module backend names remain part of each timing row.
 Query width, causal mode, sequence count, local heads, TP and precision are exact
 keys; only total KV length interpolates within the measured interval. Queries
 outside that interval fail explicitly. It is separate from historical partial

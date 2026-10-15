@@ -12,12 +12,23 @@ TP8/EP1, K6, synthetic AL3.77, 1024/1024 and concurrency1. All 128 requests
 completed, with zero failures. Measurements, frozen matching evidence, original
 and qualified summaries, source patches and raw records are retained.
 
-Two completed single-request Pro0813 diagnostics are available:
+Two aggregated single-request Pro0813 diagnostics are available:
 [`eager with real acceptance`](smoke-pro-eager/README.md) and
 [`graph with synthetic acceptance`](smoke-pro-graph/README.md). The graph smoke
 has measured/predicted TTFT 195.70/76.64 ms and TPOT 3.34/3.62 ms. Both are
 excluded from production MAPE. Their acceptance settings differ, so they do not
 establish an eager-versus-graph speedup.
+
+The first Pro P/D diagnostic (job2257933) also completed: 8P+8D B200, K6,
+real acceptance, 1024/1024, one drained warmup and one measured request.
+Measured TTFT is 631.20 ms, TPOT 1.87 ms and throughput 402.25 tokens/s.
+Both requests returned exactly 1024 client-visible output tokens. This is a
+functional smoke, excluded from production MAPE; the measured request used a
+different P engine from warmup, so cold-peer setup may affect its latency.
+All 16 rank cache receipts, requests, metrics and logs are preserved in
+`pd-smoke-2257933.tar.gz` (SHA256
+`7e055103aa13718e4fb837e64c5eee2d654a37a7d39ba4ac405acf6080a7c028`).
+Extract it at this directory to restore `raw/pd-2257933/`.
 
 ## Matrix and references
 
@@ -60,6 +71,8 @@ Three repetitions measure `max(128, 10 × concurrency)` requests each.
   affected Python tests, and 107 ownership checks. These are not serving samples.
   The production checkpoint adds 170 passing campaign/import tests and six cache
   subtests, including the Kimi legacy-import regression found by Full CI.
+  The AgentX/P-D checkpoint adds 198 loadgen checks, 491 Runner API checks,
+  44 campaign checks and 15 cache checks with six subtests.
 - [`op-coverage-schema31.json`](op-coverage-schema31.json) records current canonical `op_level` + `SILICON`
   + `fallback_policy: deny` construction/query checks. These CPU queries are
   predictions, not collected kernel or serving measurements.
@@ -96,6 +109,21 @@ vLLM `ac9126e58aa7bbab1856ba6593ba4d5003fea516`:
 `vllm/v1/core/sched/scheduler.py:637` (unclipped final speculative rounds).
 The mapping qualifies only the pinned prefix-disabled aggregated workload;
 it does not reproduce native sliding-block lifetimes or P/D transfers.
+
+The separate Pro P/D adapter preserves eight independent prefill pools and one
+TP8 decode pool. It reserves rolling groups conservatively and records the
+target-plus-draft transfer payload bound separately from physical network bytes.
+Source caches may remain allocated while NIXL completion notifications arrive;
+concurrency alone does not prove their native occupancy bound. P/D qualification
+therefore also needs source-residency evidence. Transfer bandwidth is unmodeled
+unless an explicit evidence-backed value is supplied.
+
+Canonical AgentX graph input now accepts exact `input_token_ids` as an alternative
+to synthetic `hash_ids`. Exact prompts retain native prefix identity through
+snapshot preparation, warmup and recycling. A graph cannot mix the two prompt
+representations because synthetic tokens could otherwise collide with real IDs.
+Producer capture retains selected trajectories and warmup boundaries; importing
+an external producer frontier remains separate work before AgentX scoring.
 
 Host regression comparisons use the frozen performance-gate trace and verify
 its hash and recursively counted requests against its manifest before timing.

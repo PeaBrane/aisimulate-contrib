@@ -18,7 +18,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::driver::{AgenticRuntimeFeedback, deferred_request_with_hashes};
+use super::driver::{AgenticRuntimeFeedback, request_with_prompt};
 use super::{AgenticPlaySnapshot, CompactReadyTurn, PreparedAgenticSnapshots};
 use crate::replay::protocol::{DirectRequest, ReplayPromptTokenSource, ReplayRequestContext};
 use crate::replay::{AgenticRuntimeIdentity, ReplayTerminalStatus};
@@ -211,11 +211,13 @@ impl AgenticPreparation {
                     "warmup"
                 };
                 let node = &snapshot.context.graph.nodes[source_index];
-                super::trace::validate_synthesizable_prompt_len(
-                    node.input_length,
-                    node.hash_ids.len(),
-                    snapshot.context.graph.block_size,
-                )?;
+                if node.input_token_ids.is_none() {
+                    super::trace::validate_synthesizable_prompt_len(
+                        node.input_length,
+                        node.hash_ids.len(),
+                        snapshot.context.graph.block_size,
+                    )?;
+                }
                 let mut identity = snapshot.identity_at(source_index);
                 identity.request_id =
                     format!("{}:{phase_name}:{ordinal}", snapshot.evidence.play_id);
@@ -435,9 +437,10 @@ impl AgenticPreparation {
                 }),
                 ..Default::default()
             };
-            let (request, replay_hashes) = deferred_request_with_hashes(
+            let (request, replay_hashes) = request_with_prompt(
                 metadata,
                 source.input_length,
+                source.input_token_ids.clone(),
                 lane.snapshot.token_ids(source_index),
                 lane.snapshot.context.graph.block_size,
                 self.include_replay_hashes.then_some(self.engine_block_size),

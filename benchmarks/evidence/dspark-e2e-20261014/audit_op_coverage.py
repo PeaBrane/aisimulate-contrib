@@ -41,6 +41,7 @@ def config_snapshot(value):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--pro-pd-prefill", action="store_true", help="Probe TP1/attention-DP8/EP8 Pro prefill only")
     parser.add_argument("--config-cache", type=Path, default=Path(tempfile.gettempdir()) / "dspark-op-coverage-configs")
     args = parser.parse_args()
     evidence = Path(__file__).resolve().parent
@@ -50,6 +51,8 @@ def main():
     pins = {ref["model"]: ref for ref in refs}
     paths = {}
     for ref in refs:
+        if args.pro_pd_prefill and ref["model"] != "deepseek-ai/DeepSeek-V4-Pro-0813":
+            continue
         path = args.config_cache / ref["model"].replace("/", "--") / ref["revision"] / "config.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         if not path.exists():
@@ -88,11 +91,29 @@ def main():
         "checkpoint_references": refs,
         "models": [],
     }
-    for key, model, system, tp, depth in [
+    cases = [
         ("v4-pro", "deepseek-ai/DeepSeek-V4-Pro-0813", "b200_sxm", 8, 6),
         ("v41-flash", "deepseek-ai/DeepSeek-V4.1-Flash", "b200_sxm", 4, 5),
         ("kimi-k3", "moonshotai/Kimi-K3", "b300_sxm", 8, 2),
-    ]:
+    ]
+    if args.pro_pd_prefill:
+        cases = [("v4-pro", "deepseek-ai/DeepSeek-V4-Pro-0813", "b200_sxm", 1, 6)]
+        result["policy"]["attention_dp_batch_semantics"] = {
+            "attention_dp": 8,
+            "batch_size": "local attention-DP rank sequence count",
+            "moe_tokens": "local batch_size * input_length * 8; equal DP workloads assumed",
+            "startup_draft": "one K-token proposal per completed local prefill, without target verification",
+            "replay": "Each active rank is timed separately; logical worker completion is the maximum rank time.",
+            "limitation": "Local batch 1/4 is not global concurrency 1/4; uneven DP loads are not reconstructed.",
+            "scheduler_limit": "Batch 4 with ISL8192 exceeds the campaign 8192-token step budget; cost query only.",
+            "kernel_limit": "Native serving source/table equivalence and draft SWA timing proxy remain unqualified.",
+            "source_paths": [
+                "crates/core/src/perfmodel/engine/runtime.rs:run_context_phase_with",
+                "crates/core/src/perfmodel/operators/moe.rs:MoeOp::query",
+                "crates/core/src/engine/generalized/engine.rs:execute_pass",
+            ],
+        }
+    for key, model, system, tp, depth in cases:
         draft = "Inferact/Kimi-K3-DSpark" if key == "kimi-k3" else model
         target_path = paths[model].parent
         target_identity = str(target_path)
@@ -114,10 +135,11 @@ def main():
             "model": target_identity,
             "system": system,
             "backend": "vllm",
-            "worker_type": "aggregated",
+            "worker_type": "prefill" if args.pro_pd_prefill else "aggregated",
             "tp": tp,
             "moe_tp_size": tp,
-            "moe_ep_size": 1,
+            "moe_ep_size": 8 if args.pro_pd_prefill else 1,
+            "attention_dp": 8 if args.pro_pd_prefill else 1,
             "estimation_mode": "op_level",
             "fallback_policy": "deny",
             "database_mode": "SILICON",
@@ -125,6 +147,10 @@ def main():
             "decoder_replay": key == "v41-flash",
             "speculation": {"kind": "dspark", "params": params},
         }
+        if args.pro_pd_prefill:
+            config.update(backend_version="0.24.0", gemm_quant_mode="fp8_block", moe_quant_mode="w4a8_mxfp4_mxfp8")
+            params["draft_revision"] = pins[model]["revision"]
+            result["policy"]["backend_version"] = "0.24.0 op-table identity, not pinned ac9126 serving runtime"
         record = {
             "model_key": key,
             "model": model,
@@ -142,6 +168,12 @@ def main():
                 "verify_width": depth + 1,
             },
         ]
+        if args.pro_pd_prefill:
+            record["phases"] = [
+                {"phase": "prefill", "sequence_count": batch, "input_tokens": length, "prefix_tokens": 0}
+                for batch in (1, 4)
+                for length in (1024, 8192)
+            ]
         try:
             perf = RustForwardPassPerfModel.best_available(config)
         except Exception as error:
@@ -155,16 +187,20 @@ def main():
             record["diagnostics"] = diagnostics
             for phase in record["phases"]:
                 prefill = phase["phase"] == "prefill"
+                batch = phase["sequence_count"]
+                length = phase.get("input_tokens", 1024)
                 try:
                     phase["latency_ms"] = (
-                        perf.predict_prefill_latency(1, 1024) if prefill else perf.predict_decode_latency_total(1, 1024)
+                        perf.predict_prefill_latency(batch, length)
+                        if prefill
+                        else perf.predict_decode_latency_total(batch, 1024)
                     )
                     phase["status"] = "query_succeeded"
                 except Exception as error:
                     phase.update(status="query_failed", error=error_record(error))
                 try:
                     ops = perf.static_phase_diagnostics(
-                        batch_size=1, context_length=1024 if prefill else 1023, prefill=prefill
+                        batch_size=batch, context_length=length if prefill else 1023, prefill=prefill
                     )
                     phase["operations"] = ops
                     latency = defaultdict(float)
@@ -184,7 +220,10 @@ def main():
         )
 
     result["relevant_table_inventory"] = []
-    for system, families in [("b200_sxm", ["dsv41", "sparse_attention"]), ("b300_sxm", ["mla", "kda"])]:
+    inventories = [("b200_sxm", ["dsv41", "sparse_attention"]), ("b300_sxm", ["mla", "kda"])]
+    if args.pro_pd_prefill:
+        inventories = [("b200_sxm", ["gemm", "sparse_attention", "mhc", "moe", "comm"])]
+    for system, families in inventories:
         for family in families:
             for path in sorted((systems / "data" / system / family).rglob("*.parquet")):
                 if "/vllm/" not in str(path) and family not in ("dsv41", "mla"):
@@ -261,9 +300,15 @@ def main():
     result["summary"] = {
         "models_constructed": sum(m["construction"]["status"] == "ready" for m in result["models"]),
         "queries_succeeded": sum(p["status"] == "query_succeeded" for m in result["models"] for p in m["phases"]),
-        "planned_phase_queries": 6,
+        "planned_phase_queries": sum(len(m["phases"]) for m in result["models"]),
         "paired_measurement_records": 0,
         "mape": None,
+        "missing_query_errors": [
+            {"model_key": m["model_key"], "query": {k: v for k, v in p.items() if k != "operations"}}
+            for m in result["models"]
+            for p in m["phases"]
+            if p["status"] != "query_succeeded"
+        ],
     }
     (args.output or evidence / "op-coverage.json").write_text(json.dumps(result, indent=2, allow_nan=False) + "\n")
 

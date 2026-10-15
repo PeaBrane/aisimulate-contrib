@@ -46,7 +46,10 @@ struct LegacyAgenticMooncakeRow {
     output_length: usize,
     #[serde(default)]
     output_token_ids: Option<Vec<u32>>,
-    hash_ids: Vec<u64>,
+    #[serde(default)]
+    input_token_ids: Option<Vec<u32>>,
+    #[serde(default)]
+    hash_ids: Option<Vec<u64>>,
     #[serde(default, alias = "created_time")]
     timestamp: Option<f64>,
     #[serde(default)]
@@ -121,7 +124,7 @@ pub fn load_agentic_mooncake(path: &Path, legacy_trace_block_size: usize) -> Res
             if raw.request_id.trim().is_empty() {
                 bail!("request_id must be nonempty");
             }
-            if raw.hash_ids.is_empty() {
+            if raw.hash_ids.as_ref().is_some_and(Vec::is_empty) {
                 bail!("hash_ids must be nonempty");
             }
             if !raw.tool_wait_ms.is_finite() || raw.tool_wait_ms < 0.0 {
@@ -158,9 +161,10 @@ pub fn load_agentic_mooncake(path: &Path, legacy_trace_block_size: usize) -> Res
                     .unwrap_or_else(|| "agentic-session".to_string()),
                 model: "unknown".to_string(),
                 input_length: raw.input_length,
+                input_token_ids: raw.input_token_ids,
                 output_length: Some(raw.output_length),
                 output_token_ids: raw.output_token_ids,
-                hash_ids: Some(raw.hash_ids),
+                hash_ids: raw.hash_ids,
                 not_before_ms: if dependencies.is_empty() {
                     raw.timestamp.unwrap_or(0.0)
                 } else {
@@ -1390,29 +1394,44 @@ impl AgenticTraceBuilder {
             );
         }
 
-        let hash_ids = raw
-            .hash_ids
-            .ok_or_else(|| anyhow!("trace line {} is missing hash_ids", line_idx + 1))?;
-        if hash_ids.is_empty() {
-            bail!("trace line {} has empty hash_ids", line_idx + 1);
-        }
         let input_length = raw
             .input_length
             .ok_or_else(|| anyhow!("trace line {} is missing input_length", line_idx + 1))?;
         if input_length == 0 {
             bail!("trace line {} has zero input_length", line_idx + 1);
         }
-        let expected_hashes = input_length.div_ceil(self.header.block_size);
-        if hash_ids.len() != expected_hashes {
-            bail!(
-                "trace line {} has input_length {} at block_size {} and requires exactly {} hash_ids, got {}",
-                line_idx + 1,
-                input_length,
-                self.header.block_size,
-                expected_hashes,
-                hash_ids.len()
-            );
-        }
+        let input_token_ids = raw.input_token_ids;
+        let hash_ids = match (&input_token_ids, raw.hash_ids) {
+            (Some(tokens), None) => {
+                if tokens.len() != input_length {
+                    bail!(
+                        "trace line {} input_length {} does not match input_token_ids length {}",
+                        line_idx + 1,
+                        input_length,
+                        tokens.len()
+                    );
+                }
+                Vec::new()
+            }
+            (None, Some(hashes)) => {
+                let expected_hashes = input_length.div_ceil(self.header.block_size);
+                if hashes.len() != expected_hashes {
+                    bail!(
+                        "trace line {} has input_length {} at block_size {} and requires exactly {} hash_ids, got {}",
+                        line_idx + 1,
+                        input_length,
+                        self.header.block_size,
+                        expected_hashes,
+                        hashes.len()
+                    );
+                }
+                hashes
+            }
+            _ => bail!(
+                "trace line {} requires exactly one of input_token_ids or hash_ids",
+                line_idx + 1
+            ),
+        };
         if raw.model.trim().is_empty() {
             bail!("trace line {} has an empty model", line_idx + 1);
         }
@@ -1486,6 +1505,15 @@ impl AgenticTraceBuilder {
                 line_idx,
             )
         });
+        // Synthetic hash IDs expand to uint32 values, which can equal actual
+        // token IDs. Mixing the two would invent cross-representation cache hits.
+        if self
+            .nodes
+            .first()
+            .is_some_and(|node| node.input_token_ids.is_some() != input_token_ids.is_some())
+        {
+            bail!("agentic graph cannot mix exact input_token_ids with synthetic hash_ids");
+        }
         let hash_ids = self.hash_ids.intern_all(hash_ids)?;
         // Graph IDs stay below u32::MAX, as the driver's numbering always has.
         if self.hash_ids.len() > u32::MAX as usize {
@@ -1499,6 +1527,7 @@ impl AgenticTraceBuilder {
             session_id: raw.session_id,
             model: raw.model,
             input_length,
+            input_token_ids,
             max_output_tokens: output_length,
             output_token_ids,
             hash_ids,
@@ -1878,6 +1907,8 @@ fn canonical_agentic_graph_digest(
         session_id: &'a str,
         model: &'a str,
         input_length: usize,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        input_token_ids: &'a Option<Vec<u32>>,
         max_output_tokens: usize,
         output_token_ids: &'a Option<Vec<u32>>,
         replay_key: &'a Option<String>,
@@ -1901,6 +1932,7 @@ fn canonical_agentic_graph_digest(
                 session_id,
                 model,
                 input_length,
+                input_token_ids,
                 max_output_tokens,
                 output_token_ids,
                 replay_key,
@@ -1920,6 +1952,7 @@ fn canonical_agentic_graph_digest(
                 session_id,
                 model,
                 input_length: *input_length,
+                input_token_ids,
                 max_output_tokens: *max_output_tokens,
                 output_token_ids,
                 replay_key,

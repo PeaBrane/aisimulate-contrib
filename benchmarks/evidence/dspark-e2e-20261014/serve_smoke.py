@@ -31,9 +31,12 @@ def server_command(
     load_strategy=None,
     startup_timeout_s=3600,
     context_length=16384,
+    gpu_memory_utilization=0.90,
 ):
     if type(context_length) is not int or context_length <= 0:
         raise ValueError("context length must be positive")
+    if not math.isfinite(gpu_memory_utilization) or not 0 < gpu_memory_utilization <= 1:
+        raise ValueError("GPU memory utilization must be within (0, 1]")
     model = MODELS[model_key]
     checkpoint = inspect_checkpoint(model["model"], model["revision"])
     speculation = {
@@ -66,7 +69,7 @@ def server_command(
         "--kv-cache-dtype",
         "fp8",
         "--gpu-memory-utilization",
-        "0.90",
+        str(gpu_memory_utilization),
         "--max-model-len",
         str(context_length),
         "--max-num-seqs",

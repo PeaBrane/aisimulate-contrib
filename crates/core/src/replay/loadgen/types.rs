@@ -171,6 +171,9 @@ pub struct AgenticMooncakeRow {
     pub model: String,
     #[serde(default, alias = "input_tokens")]
     pub input_length: Option<usize>,
+    /// Exact prompt tokens; mutually exclusive with synthetic hash_ids.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_token_ids: Option<Vec<u32>>,
     #[serde(default, alias = "output_tokens")]
     pub output_length: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -239,6 +242,8 @@ pub struct AgenticNode {
     pub(super) session_id: String,
     pub(super) model: String,
     pub(super) input_length: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) input_token_ids: Option<Vec<u32>>,
     pub(super) max_output_tokens: usize,
     pub(super) output_token_ids: Option<Vec<u32>>,
     pub(super) replay_key: Option<String>,

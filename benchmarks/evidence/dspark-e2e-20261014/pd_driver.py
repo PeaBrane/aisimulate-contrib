@@ -72,6 +72,9 @@ def main():
     parser.add_argument("--prefill-host", required=True)
     parser.add_argument("--decode-host", required=True)
     parser.add_argument("--proxy-script", type=Path, required=True)
+    parser.add_argument("--mode", choices=["smoke", "pilot", "initial"], default="smoke")
+    parser.add_argument("--concurrency", type=int, choices=[1, 4], action="append")
+    parser.add_argument("--repetition", type=int, choices=[1, 2, 3], action="append")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if hashlib.sha256(args.proxy_script.read_bytes()).hexdigest() != PROXY_SHA256:
@@ -117,6 +120,15 @@ def main():
             "reasons": ["P/D connector smoke; transfer and replay qualification pending"],
         },
     }
+    controls = [role.get("synthetic_control") for role in identity["roles"].values()]
+    if controls[0] != controls[1]:
+        raise ValueError("P/D acceptance controls must match")
+    acceptance = "synthetic" if controls[0] is not None else "real"
+    if args.mode == "pilot" and acceptance != "real":
+        raise ValueError("pilots require real acceptance")
+    identity["phase"] = args.mode
+    if controls[0] is not None:
+        identity["synthetic_control"] = controls[0]
     identity_path = args.output / "identity.json"
     identity_path.write_text(json.dumps(identity, indent=2) + "\n")
     proxy_command = [
@@ -144,52 +156,57 @@ def main():
                 "effective_config_path": str(cache_path),
                 "cache_capacity_by_role_rank": role_receipts,
                 "log_paths": [str(args.output / f"{role}.log") for role in ["prefill", "decode"]],
-                "cell_id": f"{args.model_key}-disagg-k{args.k}-i1024-o1024-c1-real",
+                "cell_id": f"{args.model_key}-disagg-k{args.k}-i1024-o1024-c1-{acceptance}",
                 "endpoint": "http://127.0.0.1:8030",
                 "metrics_urls": [prefill + "/metrics", decode + "/metrics"],
             }
             (args.output / "server-ready.json").write_text(json.dumps(ready, indent=2) + "\n")
-            subprocess.run(
-                [
-                    sys.executable,
-                    str(Path(__file__).with_name("collect_fixed.py")),
-                    "--matrix",
-                    str(Path(__file__).with_name("matrix.json")),
-                    "--cell-id",
-                    ready["cell_id"],
-                    "--identity",
-                    str(identity_path),
-                    "--endpoint",
-                    ready["endpoint"],
-                    "--tokenizer-endpoint",
-                    prefill,
-                    "--metrics-url",
-                    ready["metrics_urls"][0],
-                    "--metrics-url",
-                    ready["metrics_urls"][1],
-                    "--model",
-                    MODELS[args.model_key]["model"],
-                    "--output",
-                    str(args.output / "smoke"),
-                    "--repetition",
-                    "1",
-                    "--smoke",
-                ],
-                check=True,
-            )
-            subprocess.run(
-                [
-                    sys.executable,
-                    str(Path(__file__).with_name("acceptance.py")),
-                    "--run",
-                    str(args.output / "smoke"),
-                    "--k",
-                    str(args.k),
-                    "--endpoint",
-                    decode + "/metrics",
-                ],
-                check=True,
-            )
+            concurrencies = args.concurrency or ([1, 4] if args.mode == "initial" else [1])
+            repetitions = args.repetition or ([1, 2, 3] if args.mode == "initial" else [1])
+            for concurrency in concurrencies:
+                for repetition in repetitions:
+                    cell_id = f"{args.model_key}-disagg-k{args.k}-i1024-o1024-c{concurrency}-{acceptance}"
+                    run_output = args.output / f"{args.mode}-c{concurrency}-r{repetition}"
+                    client = [
+                        sys.executable,
+                        str(Path(__file__).with_name("collect_fixed.py")),
+                        "--matrix",
+                        str(Path(__file__).with_name("matrix.json")),
+                        "--cell-id",
+                        cell_id,
+                        "--identity",
+                        str(identity_path),
+                        "--endpoint",
+                        ready["endpoint"],
+                        "--tokenizer-endpoint",
+                        prefill,
+                        "--metrics-url",
+                        prefill + "/metrics",
+                        "--metrics-url",
+                        decode + "/metrics",
+                        "--model",
+                        MODELS[args.model_key]["model"],
+                        "--output",
+                        str(run_output),
+                        "--repetition",
+                        str(repetition),
+                    ]
+                    if args.mode == "smoke":
+                        client.append("--smoke")
+                    subprocess.run(client, check=True)
+                    subprocess.run(
+                        [
+                            sys.executable,
+                            str(Path(__file__).with_name("acceptance.py")),
+                            "--run",
+                            str(run_output),
+                            "--k",
+                            str(args.k),
+                            "--endpoint",
+                            decode + "/metrics",
+                        ],
+                        check=True,
+                    )
         finally:
             proxy.terminate()
             try:

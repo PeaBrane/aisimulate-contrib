@@ -22,6 +22,19 @@ producer/consumer prerequisites. It is a design receipt, not executable collecto
 cases or a submitted GPU job. Repeat this preflight after model/native changes;
 the snapshot includes the native-library and working-tree identities.
 
+For the asymmetric Pro prefill worker, run the same script with
+`--pro-pd-prefill --output benchmarks/evidence/dspark-e2e-20261014/op-coverage-pro-pd-prefill.json`.
+The TP1/attention-DP8/EP8, K6 probe includes initial draft proposal and answers all
+four SILICON/deny queries: local batch 1/4 at ISL1024/8192. Predicted milliseconds
+are respectively 120.141/894.171 and 409.579/3433.524. Each diagnostic contains
+24 silicon-source operations and nine built-in empirical primitives; there are
+no missing-query errors. These are CPU coverage queries, not serving records.
+Batch is per attention-DP rank: MoE multiplies local tokens by eight, assuming
+equal rank workloads. Global concurrency 1/4 is therefore not equivalent to
+these local batch sizes. The batch4/ISL8192 query also exceeds the campaign's
+8192-token scheduling budget and does not describe one actual Replay step.
+The existing attention proxy and runtime/table differences remain disclosed.
+
 The approved matrix has 196 configurations, 588 repetitions, and 153,600 measured
 requests. Its first gate is 48 configurations. Generate the matrix with:
 
@@ -152,9 +165,11 @@ payload, timing, or first-token behavior is declared measured before a GPU run.
   two nodes/eight GPUs per node. Each role uses `serve_role.py`; Pro prefill is
   TP1/attention-DP8/EP8, all other worker topologies follow the matrix. The client
   uses the original pinned NIXL proxy, with tokenization against P outside timing.
-  This launcher remains GPU-untested until its smoke is recorded.
+  It supports smoke, pilot and selected initial windows with matching controls
+  on both roles. Pro P/D GPU smoke is running after recorded startup failures;
+  source compatibility and cache admission do not yet prove a completed handoff.
 
-Aggregated smoke/pilot/initial collection and P/D smoke are implemented. Expanded
+Aggregated and P/D smoke/pilot/initial collection are implemented. Expanded
 sweeps and AgentX collection remain gated by matched initial results; no script
 silently launches those stages. Capture the exact Slurm submission arguments in
 execution receipts, including CPUs, memory, nodes, GPU count, and dependencies.
@@ -211,12 +226,22 @@ No serving forward path is changed.
 `reconcile_pro_cache.py --deployment disaggregated` validates these role receipts
 separately. P uses TP1/attention-DP8/EP8: each of its eight independent cache pools
 must pass the full-concurrency retention bound, without assuming evenly routed
-requests. The shared Replay P template uses the smallest measured pool capacity,
-applied independently to every DP rank. D uses TP8/EP1: all eight physical replicas
+requests. The adapter statically reserves a full-retention upper bound for all
+sliding groups, including draft windows and compressor state, in each pool.
+The shared Replay P template uses the smallest remaining pool capacity, applied
+independently to every DP rank. D uses TP8/EP1: all eight physical replicas
 must agree, and capacity is counted once per request set. P retains its prompt and
 hidden one-token response; D retains the requested output window. Both bounds
 include unsettled verification rounds and draft lookahead. Missing workers,
 missing draft layers, partial transfer groups, and unsupported geometry fail.
+For role token bound `T = ISL + role_OSL + 2*(K+1) + K`, the reserved blocks are
+`C * sum(ceil(T / group_block_size) + 1)` over sliding groups; `role_OSL` is one
+on P and the full requested OSL on D. Original physical capacities and all
+per-pool bounds remain in the report. A failed nonbinding-capacity proof returns
+no usable role cache configuration. This conservative mapping is restricted to
+the fixed-length, closed-loop, prefix-disabled workload. It omits dynamic
+`state_cache` because the Pro rolling windows must not be treated as a recurrent
+state boundary under B0/R1; the existing Kimi recurrent-state guard is unchanged.
 
 Replay preserves these independent pools: `compiler.py` passes attention-DP into
 the role configuration; `runner.py` validates its timing identity;
@@ -224,15 +249,58 @@ the role configuration; `runner.py` validates its timing identity;
 `engine/generalized/engine.rs::new_with_rank_factory` create a separate scheduler
 and allocator for each DP rank. Disaggregated placement addresses those ranks
 individually. This mapping establishes cache capacity only. It does not qualify
-runtime routing latency or NIXL transport. The P/D adapter has synthetic contract
-tests; validation against the first complete P/D runtime receipt remains pending.
+runtime routing latency or NIXL transport. Synthetic contract tests cover the
+adapter, and the complete 16-worker receipt from smoke `2257933` passes its
+physical checks. That smoke has 7640 blocks per P pool and 31426 per D replica.
+`pd-cache-smoke-2257933.json` records the mapping; the source-residency receipt
+accounts for both issued requests (one warmup, one measured), with one on each
+of P engines 0 and 1. The bounded cache proof applies to that smoke only.
+
+The adapter also emits `replay_kv_transfer`: explicit numeric `bytes_per_token`,
+`full_prompt`, source backoff zero and decode recomputation one. Its per-reader
+registered-payload bound includes every target, draft and compressor group once. For
+each group, it bounds block count by `ceil(T_prefill/block_size)` and caps sliding
+groups at `ceil(window/block_size)+1`, matching the pinned NIXL clipping contract.
+The report retains logical content from summed layer-page bytes separately.
+Packed MLA NIXL registration transfers a full shared storage row for every block,
+including padding: the transfer bound therefore multiplies the summed block
+counts by the physical block stride. Dividing by ISL and rounding up makes the
+existing scalar transfer field usable for this fixed input length. This is a
+per-reader registration bound, not measured payload or aggregate wire traffic.
+Numeric override disables automatic draft-byte addition, preventing
+double counting. No bandwidth is inferred: null leaves transfer delay unmodeled.
+An optional `--bandwidth-receipt` JSON must supply `kind` (`measured` or `assumed`),
+positive finite `gb_per_second`, and a nonempty `source`. Its provenance is saved;
+it does not automatically qualify transport timing or the overall comparison.
+
+Native source retention needs a separate bound. Global concurrency and
+`max_num_seqs` exclude completed requests still holding source blocks until
+connector cleanup. The adapter preserves the original C-request bound as
+`capacity_proven_nonbinding`, reports the generated mapping under
+`replay_capacity_proven_nonbinding`, and defaults
+`native_capacity_proven_nonbinding` to false. Diagnostic predictions remain
+possible without claiming a native source capacity proof.
+An optional `--source-residency-receipt` supplies `kind` (`measured` or
+`conservative`), `source`, `includes_active_and_finished_holds: true`, and exactly
+one of `max_resident_requests_per_pool` or `max_resident_requests_by_dp_rank`
+(all eight string keys `"0"` through `"7"`, nonnegative integer bounds).
+Bounds must cover all allocated P requests throughout the qualified window,
+including warmup and earlier windows since startup. Audited cumulative issued
+request counts per source engine provide a deterministic conservative bound,
+even if no completed source copy were released. Do not divide the global count
+by eight without per-engine routing evidence. Each pool's static reservation
+uses the larger of its source-resident bound and Replay concurrency. A native
+capacity proof is reported only if these bounds fit the actual role pools.
 
 Automatic simulator transfer bytes remain a rank-local logical payload. The
 Pro source sends replicated MLA to eight D ranks; these parallel reads do not
 imply eight times the latency. A measured effective per-handoff bandwidth may
 represent that fanout, while a shared-source NIC limit would require aggregate
-wire accounting. Physical block padding, auxiliary state and per-request wire
-bytes remain unmeasured until the NIXL smoke. The receipt labels these limits;
+wire accounting. The first P/D smoke now preserves NIXL histogram deltas in
+`pd-transfer-smoke-2257933.json`: one request produced eight rank observations,
+298,681,344 transferred bytes and 208 descriptors. Summed rank transfer time
+is not the request critical path; the measured request also used a cold prefill
+peer after warmup touched only engine 0. The receipt labels these limits;
 it never treats logical bytes as measured total wire traffic or inserts an
 unmeasured bandwidth. The original proxy streams D's token IDs unchanged and
 does not prepend P's discarded sampled token.
@@ -289,7 +357,9 @@ git clone https://github.com/SemiAnalysisAI/aiperf.git /work/aiperf-agentx
 git -C /work/aiperf-agentx checkout --detach 754356e9a39acc6cc6afb242d123bb57c3fb6f75
 uv venv /work/agentx-venv --python 3.12
 uv pip install --python /work/agentx-venv/bin/python -e /work/aiperf-agentx
-uv pip install --python /work/agentx-venv/bin/python -e ./agentx_corpus_pin
+cp -R ./agentx_corpus_pin /work/dspark-agentx-plugin
+mv /work/dspark-agentx-plugin/pyproject.toml.in /work/dspark-agentx-plugin/pyproject.toml
+uv pip install --python /work/agentx-venv/bin/python -e /work/dspark-agentx-plugin
 /work/agentx-venv/bin/aiperf plugins public_dataset_loader semianalysis_cc_traces_weka_062126
 ```
 
@@ -433,3 +503,117 @@ the qualified C1 window, completion is queued and counters are recorded without
 an intervening asynchronous yield. Final-round proposals can exceed client
 output after clipping; these counters describe sampled acceptance, not committed
 client output counts.
+
+`serve_role.py --preflight-only` performs checkpoint inspection and command
+construction, writes `<role>-preflight.json`, then returns without running
+`nvidia-smi` or starting a server. Execute it in the pinned image from the
+immutable bundle, mounted with the shared model path, for both roles. For example:
+
+```bash
+VLLM_NIXL_SIDE_CHANNEL_HOST=private-prefill-node \
+  VLLM_NIXL_SIDE_CHANNEL_PORT=5557 python serve_role.py \
+  --model-key v4-pro --role prefill --k 6 --port 8010 \
+  --graph-policy runtime-default --gpu-memory-utilization 0.92 \
+  --preflight-only --output /work/preflight
+```
+
+Repeat for decode with port8020, side-channel port5657 and memory utilization0.90.
+The allocation resolves private role hostnames. `DSPARK_BUNDLE_DIR` selects the
+CPU-checked immutable bundle for `pd-smoke.sh`; files are copied into the result
+so later uploads cannot change a running job.
+
+P/D supports `DSPARK_RUN_MODE=smoke|pilot|initial`, optional
+`DSPARK_CONCURRENCY=1|4` and `DSPARK_REPETITION=1|2|3`. Initial defaults cover
+C1/C4 and all three repetitions. Each completed window has separate raw records
+and acceptance evidence. `DSPARK_SYNTHETIC_AL` accepts only the verified
+reference K/AL; other K values require `DSPARK_SYNTHETIC_CONTROL` from the separate
+128-request real pilot. Both roles receive and record the same control. Real
+pilots reject synthetic settings. These selection flags do not expand the
+initial48-configuration boundary.
+
+Pro P/D attempt2257733 failed before requests: default graph capture reserved
+10.70GiB per prefill worker, leaving6.65GiB for KV at memory utilization0.90,
+below the8.99GiB required for16K context. The next configuration explicitly sets
+`DSPARK_PREFILL_GPU_MEMORY_UTILIZATION=0.92` and keeps decode at0.90. Model,
+topology, graph policy and context remain the same; the cache receipt is
+re-exported and the changed serving identity is retained.
+
+## AgentX capture adapter (CPU qualified; native graph import pending)
+
+The installed `aisim_agentx_pin` plugin also selects a read-only timing-strategy
+subclass. `agentx_phaseb.py` verifies its source hash and sets
+`DSPARK_AGENTX_CAPTURE_DIR`. The subclass delegates setup, finalization and trace
+recycling to the pinned producer, then exports the realized trajectories,
+snapshot `t_star_ms`, live stream/frontier states, root/parent identities,
+join-gate memberships, completed-prefix replay boundaries and session cache
+markers. Selected-tree metadata includes the original turn dependencies, branch
+structure, tool delays, source coordinates and output-length settings. Templates
+are written once per sampled source tree; ordinary request/token dispatch does
+not perform extra capture writes. Capture is inactive without this environment
+variable. The hook adds boundary/recycle serialization work; equivalence of host
+cost has not been measured.
+
+Warmup finalization exports the producer's **drained-wire/live-DAG** handoff.
+Profiling setup must contain the identical frontier. Live streams are not
+in-flight wire requests. Recycling records actual source selections and session
+IDs; the adapter does not regenerate producer RNG decisions. The native Replay
+clock must drive future completions and dependencies; measured client dispatch
+or response timestamps are never scheduling inputs.
+
+The existing `--export-level raw` writer preserves full request payloads, raw
+responses, phase/session/turn identities, inserted cache markers, cancellations
+and context-overflow records. In the pinned producer, record observers execute
+before the records manager skips context overflows from public metrics. Audit
+these raw records even when the public report shows no failures. Reconcile
+raw counts with completion barriers and the writer's `dropped_record_count`;
+missing or truncated records cannot qualify a window. Use either the per-process
+raw shards or the merged export, never both.
+
+```bash
+python agentx_capture.py --capture /work/agentx-run/capture \
+  --raw /work/agentx-run/aiperf/raw_records/raw_records_*.jsonl \
+  --output /work/agentx-run/replay-capture
+/work/agentx-venv/bin/python -m unittest discover \
+  -s agentx_corpus_pin -p test_capture.py
+python -m unittest test_agentx_capture
+```
+
+`requests.jsonl` retains phase/source/session mapping, canonical payload digest,
+stop settings, actual finish reason, errors and any native token IDs. The original
+payload remains at its raw-file/line reference. It does not infer IDs from text,
+lengths or hashes, and does not replace missing requests. Default Phase B commands
+preserve normal response payloads: exact input reconstruction still requires the
+pinned native formatter applied offline to each actual payload, with cache-prefix
+deduplication and usage checks. The current adapter intentionally leaves missing
+native token IDs explicit.
+
+`--diagnostic-token-echo` is an optional **unscored diagnostic**. It requests
+`return_token_ids:true`; pinned vLLM returns prompt IDs in the first chunk and
+output delta IDs in subsequent chunks. There is no independent output-only
+switch in this chat contract. Returning up to one million input IDs adds material
+serialization/network/export cost, so these metrics cannot silently replace a
+normal AgentX measurement. A paired overhead study is required before claiming
+metric equivalence. The adapter validates uint32 IDs and native usage, preserves
+cancelled/short output, and reports output-stop mismatches.
+
+`agentx-capture-preflight.json` records the actual pinned-environment command
+parse, external plugin resolution and CPU tests. The original fixtures cover a
+live fork/join handoff, dependency/marker preservation, missing and invalid IDs,
+context overflow, duplicate raw records and truncated JSONL. No GPU profile or
+paired AgentX result is claimed. Remaining native consumer work is explicit:
+AgenticMooncake now accepts exact input/output token arrays as well as hash-based
+prefixes, but not an externally supplied sampled frontier; captured dependencies/idle caps,
+recycling and stop/cancellation cohorts still need canonical graph lowering and
+integration tests. `capture-audit.json` therefore always remains unscored.
+
+Capture API anchors are
+[SemiAnalysisAI/aiperf@754356e9](https://github.com/SemiAnalysisAI/aiperf/tree/754356e9a39acc6cc6afb242d123bb57c3fb6f75/src/aiperf):
+`timing/strategies/agentic_replay.py`, `timing/trajectory_source.py`,
+`common/models/{dataset_models,record_models}.py`,
+`post_processors/raw_record_writer_processor.py`,
+`records/record_processor_service.py`, `plugin/plugins.yaml` and
+`config/flags/cli_config.py` (Apache-2.0, NVIDIA Corporation & Affiliates).
+Token echo is grounded in
+[vLLM@ac9126 chat completion](https://github.com/vllm-project/vllm/tree/ac9126e58aa7bbab1856ba6593ba4d5003fea516/vllm/entrypoints/openai/chat_completion)
+`protocol.py` and `serving.py` (Apache-2.0, vLLM contributors). All capture and
+fixture code here is original; upstream scheduling and serving code is unmodified.

@@ -305,10 +305,12 @@ import aiperf
 from aiperf.cli import app
 from aiperf.plugin import plugins
 loader = plugins.get_class("public_dataset_loader", "semianalysis_cc_traces_weka_062126")
+strategy = plugins.get_class("timing_strategy", "agentic_replay")
 app.parse_args(sys.argv[1:], exit_on_error=False)
 print(json.dumps({"producer_file": str(Path(aiperf.__file__).resolve()),
                   "loader_file": str(Path(inspect.getfile(loader)).resolve()),
                   "loader_revision": loader.hf_revision,
+                  "capture_file": str(Path(inspect.getfile(strategy)).resolve()),
                   "packages": {d.metadata["Name"]: d.version for d in importlib.metadata.distributions()}}))
 """
     proof = json.loads(subprocess.check_output([str(python), "-c", code, *command[1:]], text=True))
@@ -320,6 +322,10 @@ print(json.dumps({"producer_file": str(Path(aiperf.__file__).resolve()),
         or digest(proof["loader_file"]) != digest(loader)
     ):
         raise ValueError("aiperf executable does not load the pinned producer and campaign corpus adapter")
+    capture = loader.parent / "capture.py"
+    if digest(proof["capture_file"]) != digest(capture):
+        raise ValueError("aiperf executable does not load the campaign capture hooks")
+    proof["capture_sha256"] = digest(capture)
     proof["loader_sha256"] = digest(loader)
     return proof
 
@@ -348,6 +354,11 @@ def main():
     parser.add_argument("--endpoint", required=True)
     parser.add_argument("--metrics-url", action="append", default=[])
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--diagnostic-token-echo",
+        action="store_true",
+        help="Unscored diagnostic: return exact prompt/output IDs, increasing response payload size",
+    )
     parser.add_argument(
         "--execute",
         action="store_true",
@@ -400,9 +411,17 @@ def main():
         args.output.resolve(),
         args.metrics_url,
     )
+    if args.diagnostic_token_echo:
+        command += ["--extra-inputs", "return_token_ids:true"]
     proof = verify_producer(args.aiperf.resolve(), args.producer_checkout, command)
     identity = {
         "producer_environment": proof,
+        "capture": {
+            "boundary_hooks": True,
+            "diagnostic_token_echo": args.diagnostic_token_echo,
+            "metric_equivalence_claimed": False if args.diagnostic_token_echo else None,
+            "normal_mode_input_identity": "raw payload plus pinned native formatter; offline reconstruction pending",
+        },
         "context_gate": context,
         "max_model_len": server["max_model_len"],
         "model_key": args.model_key,
@@ -451,6 +470,7 @@ def main():
     if args.execute:
         env = {
             **os.environ,
+            "DSPARK_AGENTX_CAPTURE_DIR": str((args.output / "capture").resolve()),
             "DSPARK_AGENTX_CORPUS_RECEIPT": str((args.output / "corpus.json").resolve()),
             "AIPERF_TIMING_CANCEL_DRAIN_TIMEOUT": "10",
             "AIPERF_DATASET_MMAP_CACHE_ENABLED": "false",

@@ -87,5 +87,43 @@
       "git diff --check passed"
     ],
     "serving_scope": "One qualified production pair,128requests; complete matrix still pending."
+  },
+  "agentx_pd_checkpoint": {
+    "base_revision": "8c5fc6fcdc52c01ffeeefcbdbe6a9edce1ee9186",
+    "native_sha256": "b0a7066a8ca5634b859a61ef615e90246a4aabfdf1d438e4b9dd5e5b93e6fdbe",
+    "native_build_command": "CARGO_TARGET_DIR=/tmp/aisim-dspark-warmup-tests uv pip install --python python/aisimulate/.venv/bin/python --no-deps --reinstall -e python/aisimulate",
+    "checks": [
+      {
+        "check": "Rust loadgen including exact-token snapshot/warmup/recycle",
+        "result": "198 passed; four new exact-token tests"
+      },
+      {
+        "check": "Python complete Runner API",
+        "result": "491 passed",
+        "log_sha256": "af6dce9f20d9a0b1607f5b980c7ebd5d22b1129a163b2fab8070b99785143f0e"
+      },
+      {
+        "check": "Campaign entrypoints, capture and prediction qualification",
+        "result": "44 passed",
+        "log_sha256": "0967a98ae32f0f0d0398fb8f625dfccef3a1ac2c2c5500d9abb33916aa17bd2b"
+      },
+      {
+        "check": "Pro aggregated/P-D cache and transfer contract",
+        "result": "15 passed, 6 subtests passed",
+        "log_sha256": "9e688e145c68dbfaa303bf3a12cc05d5ae07a4ebea2263de20fc7bfffa421f98"
+      },
+      {
+        "check": "Kimi native collector backend parity",
+        "result": "14 collector tests passed"
+      }
+    ],
+    "static_checks": [
+      "Ruff check and format passed",
+      "cargo fmt passed",
+      "Packaged legal copies match",
+      "Release artifact contract check-only passed",
+      "git diff --check passed"
+    ],
+    "serving_scope": "One qualified production pair (128 requests) plus three one-request diagnostic smokes. First P/D smoke completed; production P/D and AgentX scoring remain pending."
   }
 }

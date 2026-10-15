@@ -659,6 +659,7 @@ fn lower_agentic(
                     .clone()
                     .unwrap_or_else(|| "unknown".to_string()),
                 input_length: Some(entry.request.replay.input_length),
+                input_token_ids: None,
                 output_length: Some(
                     usize::try_from(
                         entry

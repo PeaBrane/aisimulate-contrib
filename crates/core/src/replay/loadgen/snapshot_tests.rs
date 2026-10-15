@@ -882,3 +882,183 @@ fn live_warmup_restores_global_stream_spread_after_concurrent_quota_drain() {
             .all(|request| request.request.metadata().max_output_tokens == 3)
     );
 }
+
+fn exact_row(id: &str, tokens: Vec<u32>, output: Vec<u32>) -> AgenticMooncakeRow {
+    AgenticMooncakeRow {
+        input_length: Some(tokens.len()),
+        input_token_ids: Some(tokens),
+        output_length: Some(output.len()),
+        output_token_ids: Some(output),
+        hash_ids: None,
+        ..row(id, "conversation", 0.0, Some(1.0))
+    }
+}
+
+#[test]
+fn exact_agentic_tokens_preserve_closed_loop_dependencies_and_native_prefix_hashes() {
+    let input: Vec<u32> = (100..229).collect();
+    let output = vec![900, 901, 902];
+    let root = exact_row("root", input.clone(), output.clone());
+    let mut child_input = input.clone();
+    child_input.extend_from_slice(&output);
+    let mut child = exact_row("child", child_input.clone(), vec![]);
+    child.dependencies = vec![edge(
+        "root",
+        AgenticDependencyRelation::Sequence,
+        AgenticDependencyTrigger::Completion,
+        7.0,
+    )];
+    let mut driver =
+        WorkloadDriver::new_agentic_trace_with_options(graph(vec![root, child]), 4, true, None)
+            .unwrap();
+    let first = driver.pop_ready(0.0, 2).pop().unwrap();
+    assert_eq!(first.request.tokens, input);
+    assert_eq!(first.request.output_token_ids, Some(output));
+    assert_eq!(
+        first.replay_hashes,
+        Some(ReplayRequestHashes::from_tokens(&input, 4))
+    );
+    assert!(
+        driver.pop_ready(100.0, 2).is_empty(),
+        "child requires modeled completion"
+    );
+    driver.on_complete(first.request_uuid, 10.0).unwrap();
+    assert!(driver.pop_ready(16.0, 2).is_empty());
+    let second = driver.pop_ready(17.0, 2).pop().unwrap();
+    assert_eq!(second.request.tokens, child_input);
+    assert_eq!(second.request.max_output_tokens, 0);
+    assert_eq!(second.request.output_token_ids, Some(vec![]));
+    let hashes = second.replay_hashes.unwrap();
+    assert_eq!(
+        &hashes.sequence_hashes[..32],
+        &first.replay_hashes.unwrap().sequence_hashes[..]
+    );
+    driver.on_complete(second.request_uuid, 20.0).unwrap();
+    assert!(driver.is_drained());
+}
+
+#[test]
+fn exact_agentic_tokens_survive_snapshot_recycling_and_primer_warmup() {
+    let tokens: Vec<u32> = (100..228).collect();
+    let mut history = exact_row("history", tokens.clone(), vec![700, 701]);
+    history.not_before_ms = 0.0;
+    let mut future = exact_row("future", tokens.clone(), vec![800, 801]);
+    future.not_before_ms = 100.0;
+    let graph = graph(vec![history, future]);
+    let context = graph
+        .prepare_snapshots(1, AgenticSnapshotOptions { seed: 42 })
+        .unwrap()
+        .context()
+        .clone();
+    for ordinal in [0, 1] {
+        let play = context.prepare_play(0, ordinal, Some(50.0)).unwrap();
+        assert_eq!(
+            play.materialize_prefix("history", 65).unwrap(),
+            tokens[..65]
+        );
+        let mut profile = WorkloadDriver::new_agentic_snapshots(
+            PreparedAgenticSnapshots::from_plays(vec![play.clone()]).unwrap(),
+            64,
+            true,
+            1.0,
+        )
+        .unwrap();
+        let ready_at = profile.next_ready_time_ms().unwrap();
+        let request = profile.pop_ready(ready_at, 1).pop().unwrap();
+        assert_eq!(request.request.tokens, tokens);
+        assert_eq!(request.request.output_token_ids, Some(vec![800, 801]));
+        assert_eq!(
+            request.replay_hashes,
+            Some(ReplayRequestHashes::from_tokens(&tokens, 64))
+        );
+
+        let mut driver = WorkloadDriver::new_agentic_warmup(
+            PreparedAgenticSnapshots::from_plays(vec![play]).unwrap(),
+            64,
+            true,
+            1.0,
+        )
+        .unwrap();
+        let primer = driver.pop_ready(0.0, 1).pop().unwrap();
+        assert_eq!(primer.request.tokens, tokens);
+        assert_eq!(primer.request.max_output_tokens, 1);
+        assert_eq!(primer.request.output_token_ids, Some(vec![700]));
+        assert_eq!(
+            primer.replay_hashes,
+            Some(ReplayRequestHashes::from_tokens(&tokens, 64))
+        );
+    }
+}
+
+#[test]
+fn exact_agentic_tokens_are_validated_serialized_and_part_of_graph_identity() {
+    let original = exact_row("root", vec![10, 20], vec![30]);
+    let serialized = serde_json::to_string(&original).unwrap();
+    let restored: AgenticMooncakeRow = serde_json::from_str(&serialized).unwrap();
+    let first = graph(vec![restored]);
+    let mut changed = original.clone();
+    changed.input_token_ids = Some(vec![10, 21]);
+    assert_ne!(
+        first.identity().graph_digest,
+        graph(vec![changed]).identity().graph_digest
+    );
+    let header: AgenticMooncakeHeader = serde_json::from_value(serde_json::json!({
+        "schema": AGENTIC_MOONCAKE_SCHEMA, "version": AGENTIC_MOONCAKE_VERSION,
+        "block_size": 64, "hash_id_scope": "local", "source": {"format": "test", "digest": "test"}
+    }))
+    .unwrap();
+    for bad in [
+        AgenticMooncakeRow {
+            hash_ids: Some(vec![1]),
+            ..original.clone()
+        },
+        AgenticMooncakeRow {
+            input_length: Some(3),
+            ..original.clone()
+        },
+        AgenticMooncakeRow {
+            output_length: Some(2),
+            ..original.clone()
+        },
+    ] {
+        assert!(
+            ValidatedAgenticGraph::from_agentic_mooncake_rows(header.clone(), vec![bad]).is_err()
+        );
+    }
+    for invalid in [
+        serde_json::json!([true]),
+        serde_json::json!([-1]),
+        serde_json::json!([4294967296_u64]),
+    ] {
+        let mut value = serde_json::to_value(&original).unwrap();
+        value["input_token_ids"] = invalid;
+        assert!(serde_json::from_value::<AgenticMooncakeRow>(value).is_err());
+    }
+    let hash_only = row("legacy", "conversation", 0.0, None);
+    assert!(
+        !serde_json::to_value(&hash_only)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .contains_key("input_token_ids")
+    );
+}
+
+#[test]
+fn exact_agentic_tokens_reject_mixed_synthetic_identity_to_avoid_false_cache_hits() {
+    let header: AgenticMooncakeHeader = serde_json::from_value(serde_json::json!({
+        "schema": AGENTIC_MOONCAKE_SCHEMA, "version": AGENTIC_MOONCAKE_VERSION,
+        "block_size": 64, "hash_id_scope": "local", "source": {"format": "test", "digest": "test"}
+    }))
+    .unwrap();
+    let exact = exact_row("exact", vec![0; 128], vec![1]);
+    let synthetic = row("synthetic", "other", 0.0, None);
+    for rows in [
+        vec![exact.clone(), synthetic.clone()],
+        vec![synthetic, exact],
+    ] {
+        let error =
+            ValidatedAgenticGraph::from_agentic_mooncake_rows(header.clone(), rows).unwrap_err();
+        assert!(error.to_string().contains("cannot mix"));
+    }
+}

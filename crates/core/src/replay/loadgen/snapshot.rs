@@ -543,6 +543,9 @@ impl AgenticPlaySnapshot {
         if length > node.input_length {
             bail!("prefix length exceeds original input length");
         }
+        if let Some(tokens) = &node.input_token_ids {
+            return Ok(tokens[..length].to_vec());
+        }
         let ids = self.token_ids(index);
         super::trace::validate_synthesizable_prompt(
             node.input_length,

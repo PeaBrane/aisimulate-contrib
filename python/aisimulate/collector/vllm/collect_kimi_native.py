@@ -85,6 +85,10 @@ def run(args):
             "speculative_config": {
                 "model": str(args.draft),
                 "method": "dspark",
+                # Match the campaign's explicit serving selector. Pinned
+                # ac9126 v1/worker/gpu/spec_decode/dspark/utils.py:15-31
+                # honors this override; Kimi otherwise does not inherit it.
+                "attention_backend": "FLASHINFER_MLA",
                 "num_speculative_tokens": 2,
                 "enable_adaptive_verification": False,
                 "draft_sample_method": "probabilistic",

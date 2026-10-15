@@ -131,15 +131,38 @@ def _reconcile_pool(ranks, *, replicas, k, concurrency, input_length, output_len
     }
 
 
-def reconcile_pd(receipt, *, k, concurrency, input_length, output_length):
+def reconcile_pd(
+    receipt, *, k, concurrency, input_length, output_length, bandwidth_evidence=None, source_residency_evidence=None
+):
     """P TP1/DP8/EP8 has independent pools; D TP8/EP1 replicates one request set.
 
     Capacity is checked per physical pool, without dividing concurrency by DP.
     This covers uneven routing and source blocks held until transfer completes.
-    It does not estimate NIXL bytes, bandwidth or transfer completion latency.
+    Transfer bounds include packed registration padding, not protocol wire overhead.
     """
     if set(receipt) != {"prefill", "decode"}:
         raise ValueError("P/D receipt requires separate prefill and decode roles")
+    source_resident_bounds = [None] * 8
+    if source_residency_evidence is not None:
+        if (
+            source_residency_evidence.get("kind") not in ("measured", "conservative")
+            or not isinstance(source_residency_evidence.get("source"), str)
+            or not source_residency_evidence["source"].strip()
+            or source_residency_evidence.get("includes_active_and_finished_holds") is not True
+        ):
+            raise ValueError("source residency evidence must bound active and finished held requests per pool")
+        scalar = source_residency_evidence.get("max_resident_requests_per_pool")
+        by_rank = source_residency_evidence.get("max_resident_requests_by_dp_rank")
+        if (scalar is None) == (by_rank is None):
+            raise ValueError("source residency requires exactly one scalar or complete DP-rank bound")
+        if scalar is not None:
+            source_resident_bounds = [scalar] * 8
+        elif isinstance(by_rank, dict) and set(by_rank) == {str(i) for i in range(8)}:
+            source_resident_bounds = [by_rank[str(i)] for i in range(8)]
+        else:
+            raise ValueError("source residency requires all eight DP-rank bounds")
+        if any(type(bound) is not int or bound < 0 for bound in source_resident_bounds):
+            raise ValueError("source residency bounds must be nonnegative integers")
     results = {}
     for role, dp, tp in (("prefill", 8, 1), ("decode", 1, 8)):
         ranks = receipt[role]
@@ -168,6 +191,7 @@ def reconcile_pd(receipt, *, k, concurrency, input_length, output_length):
         role_output = 1 if role == "prefill" else output_length
         pools = []
         for d in range(dp):
+            source_resident_bound = source_resident_bounds[d]
             members = sorted(
                 (r for r in ranks if r["data_parallel_index"] == d), key=lambda r: r["tensor_parallel_rank"]
             )
@@ -181,36 +205,139 @@ def reconcile_pd(receipt, *, k, concurrency, input_length, output_length):
             )
             pool["data_parallel_index"] = d
             pool["tensor_parallel_ranks"] = list(range(tp))
+            # Reserve every sliding group for the entire workload up front.
+            # This avoids pretending rolling windows are recurrent state whose
+            # position cannot be rewound under the pinned B0/R1 contract.
+            resident_bound = max(concurrency, source_resident_bound or 0) if role == "prefill" else concurrency
+            reserve = resident_bound * sum(
+                ceildiv(pool["conservative_retained_tokens_per_group"], block) + 1
+                for _, block, window, _ in pool["cache_groups"]
+                if window is not None
+            )
+            pool["static_rolling_reserve_blocks"] = reserve
+            pool["static_resident_requests_bound"] = resident_bound
+            pool["remaining_full_context_blocks"] = pool["physical_pool_blocks"] - reserve
+            full_blocks_per_request = ceildiv(pool["conservative_retained_tokens_per_group"], 256) + 1
+            # C bounds Replay's atomically released source copies. Native P
+            # cleanup is asynchronous and requires a separate resident bound.
+            pool["replay_peak_with_static_reserve_blocks"] = reserve + concurrency * full_blocks_per_request + 1
+            pool["replay_capacity_proven_nonbinding"] = (
+                pool["replay_peak_with_static_reserve_blocks"] < pool["physical_pool_blocks"]
+            )
+            native_bound = source_resident_bound if role == "prefill" else concurrency
+            pool["native_conservative_peak_blocks"] = (
+                reserve + native_bound * full_blocks_per_request + 1 if native_bound is not None else None
+            )
+            pool["native_resident_requests_bound"] = native_bound
+            pool["native_capacity_proven_nonbinding"] = (
+                native_bound is not None and pool["native_conservative_peak_blocks"] < pool["physical_pool_blocks"]
+            )
+            cache = pool["replay_kv_cache"]
+            del cache["state_cache"]
+            cache["capacity"]["blocks"] = pool["remaining_full_context_blocks"]
+            if not pool["replay_capacity_proven_nonbinding"]:
+                pool["replay_kv_cache"] = None
             pool["approximations"][-1] = "Role-specific prefix-disabled cache mapping; transport is not qualified here."
             pools.append(pool)
         geometry = {(p["physical_bytes_per_block"], p["approximate_steady_state_blocks_per_request"]) for p in pools}
         if len(geometry) != 1:
             raise ValueError(f"{role} pool geometries differ; one Replay role template cannot represent them")
-        limiting = min(pools, key=lambda p: p["physical_pool_blocks"])
+        limiting = min(pools, key=lambda p: p["remaining_full_context_blocks"])
         results[role] = {
             "independent_request_pools": dp,
             "physical_tp_copies_per_pool": tp,
             "rank_pools": pools,
             "physical_pool_bytes_across_role": sum(p["physical_pool_bytes_per_rank"] * tp for p in pools),
             "capacity_proven_nonbinding": all(p["capacity_proven_nonbinding"] for p in pools),
+            "replay_capacity_proven_nonbinding": all(p["replay_capacity_proven_nonbinding"] for p in pools),
+            "native_capacity_proven_nonbinding": all(p["native_capacity_proven_nonbinding"] for p in pools),
             "concurrency_bound_per_pool": concurrency,
-            "replay_capacity_policy": "minimum measured capacity across independent DP pools; no capacity pooling",
+            "replay_capacity_policy": "minimum remaining capacity after static rolling reserve; no capacity pooling",
             "replay_kv_cache": limiting["replay_kv_cache"],
         }
+    # ac9126 nixl/base_scheduler.py:135-147,252-295 clips each sliding
+    # transfer group to ceil(window / block_size) + 1 blocks. Use the same
+    # complete async allocation bound as P's independent capacity proof.
+    transfer_groups = []
+    source_token_bound = results["prefill"]["rank_pools"][0]["conservative_retained_tokens_per_group"]
+    for group in receipt["prefill"][0]["kv_cache_config"]["kv_cache_groups"]:
+        specs = group["kv_cache_spec"]["kv_cache_specs"]
+        first = next(iter(specs.values()))
+        block, window = first["block_size"], first.get("sliding_window")
+        count = ceildiv(source_token_bound, block)
+        if window is not None:
+            count = min(count, ceildiv(window, block) + 1)
+        transfer_groups.append(
+            {
+                "layers": list(specs),
+                "block_count_bound": count,
+                "page_bytes_per_block": sum(s["page_size_bytes"] for s in specs.values()),
+            }
+        )
+    # All DP engines must use the same per-layer physical geometry. Capacity
+    # may differ after runtime reservation; storage shape may not.
+    reference_groups = receipt["prefill"][0]["kv_cache_config"]["kv_cache_groups"]
+    if any(r["kv_cache_config"]["kv_cache_groups"] != reference_groups for rows in receipt.values() for r in rows):
+        raise ValueError("P/D layer storage geometries differ")
+    payload_bound = sum(g["block_count_bound"] * g["page_bytes_per_block"] for g in transfer_groups)
+    # Packed MLA aliases register one whole storage-row region, not only the
+    # layer pages: pinned nixl/base_worker.py:1664-1674,1699-1714. Group block
+    # IDs address that shared region once per group block (:234-259).
+    stride = results["prefill"]["rank_pools"][0]["physical_bytes_per_block"]
+    registered_bound = sum(g["block_count_bound"] for g in transfer_groups) * stride
+    bandwidth = None
+    if bandwidth_evidence is not None:
+        if (
+            bandwidth_evidence.get("kind") not in ("measured", "assumed")
+            or not isinstance(bandwidth_evidence.get("source"), str)
+            or not bandwidth_evidence["source"].strip()
+            or type(bandwidth_evidence.get("gb_per_second")) not in (int, float)
+            or not 0 < bandwidth_evidence["gb_per_second"] < float("inf")
+        ):
+            raise ValueError("bandwidth evidence requires kind, positive finite gb_per_second, and source")
+        bandwidth = bandwidth_evidence["gb_per_second"]
     return {
         "schema": "dspark-pro-pd-cache-reconciliation-v1",
         "roles": results,
         "capacity_proven_nonbinding": all(r["capacity_proven_nonbinding"] for r in results.values()),
+        "capacity_proof_scope": "capacity_proven_nonbinding retains the original C-request Replay bound only.",
+        "replay_capacity_proven_nonbinding": all(r["replay_capacity_proven_nonbinding"] for r in results.values()),
+        "native_capacity_proven_nonbinding": all(r["native_capacity_proven_nonbinding"] for r in results.values()),
+        "source_residency": {
+            "evidence": source_residency_evidence,
+            "native_bound_established": all(bound is not None for bound in source_resident_bounds),
+            "scope": "Active prefill plus completed requests holding cache for connector cleanup, per DP pool.",
+            "limitation": "Global client concurrency and max_num_seqs do not bound delayed native source holds.",
+            "source_contract": "vllm ac9126 scheduler.py:893,2756-2764,3154-3157; holds are outside running queues.",
+        },
         "workload": {"k": k, "concurrency": concurrency, "input_length": input_length, "output_length": output_length},
         "source_prefill_backoff_tokens": 0,
         "decode_recompute_tokens": 1,
+        "scope": "Fixed-length, prefix-disabled, closed-loop workload with proven nonbinding capacity only.",
+        "replay_kv_transfer": {
+            "bytes_per_token": ceildiv(registered_bound, input_length),
+            "timing_mode": "full_prompt",
+            "prefill_backoff_tokens": 0,
+            "decode_recompute_tokens": 1,
+            "bandwidth_gb_per_second": bandwidth,
+        },
         "transport": {
             "logical_source_engines_per_request": 1,
             "destination_tp_readers": 8,
             "source_release_notifications": 8,
             "request_wire_bytes": None,
             "bandwidth_qualified": False,
-            "scope": "Logical per-rank state, replicated destination reads, and physical wire bytes are distinct.",
+            "bandwidth_evidence": bandwidth_evidence,
+            "timing_status": "unmodeled" if bandwidth is None else "explicit bandwidth assumption with bounded payload",
+            "per_reader_page_payload_bound_bytes": payload_bound,
+            "per_reader_registered_region_bound_bytes": registered_bound,
+            "registered_region_bytes_per_block": stride,
+            "source_allocated_tokens_bound": source_token_bound,
+            "scalar_rounding_bytes": ceildiv(registered_bound, input_length) * input_length - registered_bound,
+            "groups": transfer_groups,
+            "source_contract": "vllm ac9126e58aa7bbab1856ba6593ba4d5003fea516 nixl/base_scheduler.py:135-147,252-295",
+            "packed_region_contract": "vllm ac9126 nixl/base_worker.py:234-259,1664-1674,1699-1714",
+            "scope": "Logical content, padded registered payload per reader, and aggregate wire bytes are distinct.",
         },
     }
 
@@ -224,7 +351,11 @@ def main():
     parser.add_argument("--input-length", required=True, type=int)
     parser.add_argument("--output-length", required=True, type=int)
     parser.add_argument("--deployment", choices=("aggregated", "disaggregated"), default="aggregated")
+    parser.add_argument("--bandwidth-receipt", type=Path, help="Explicit measured/assumed bandwidth evidence for P/D")
+    parser.add_argument("--source-residency-receipt", type=Path, help="Bound all active and finished held P requests")
     args = parser.parse_args()
+    if (args.bandwidth_receipt or args.source_residency_receipt) and args.deployment != "disaggregated":
+        parser.error("P/D evidence receipts require --deployment disaggregated")
     raw = args.receipt.read_bytes()
     result = (reconcile_pd if args.deployment == "disaggregated" else reconcile)(
         json.loads(raw),
@@ -232,6 +363,12 @@ def main():
         concurrency=args.concurrency,
         input_length=args.input_length,
         output_length=args.output_length,
+        **({"bandwidth_evidence": json.loads(args.bandwidth_receipt.read_text())} if args.bandwidth_receipt else {}),
+        **(
+            {"source_residency_evidence": json.loads(args.source_residency_receipt.read_text())}
+            if args.source_residency_receipt
+            else {}
+        ),
     )
     result["runtime_receipt_sha256"] = hashlib.sha256(raw).hexdigest()
     result["adapter_sha256"] = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()

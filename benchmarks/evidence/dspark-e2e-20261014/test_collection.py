@@ -66,6 +66,40 @@ class CollectionTests(unittest.TestCase):
             self.assertEqual(json.loads((Path(temp) / "prefill-preflight.json").read_text())["command"], ["server"])
             self.assertFalse((Path(temp) / "prefill-identity.json").exists())
 
+    def test_pd_prefill_memory_budget_and_reference_control_are_explicit(self):
+        with tempfile.TemporaryDirectory() as temp:
+            argv = [
+                "serve_role.py",
+                "--model-key",
+                "v4-pro",
+                "--role",
+                "prefill",
+                "--k",
+                "6",
+                "--port",
+                "8010",
+                "--output",
+                temp,
+                "--preflight-only",
+                "--synthetic-al",
+                "3.77",
+                "--gpu-memory-utilization",
+                "0.92",
+            ]
+            with (
+                patch("sys.argv", argv),
+                patch("serve_smoke.inspect_checkpoint", return_value={"path": "/pinned/model"}),
+                patch.dict("os.environ", {"VLLM_NIXL_SIDE_CHANNEL_HOST": "private-p-node"}),
+            ):
+                role_main()
+            identity = json.loads((Path(temp) / "prefill-preflight.json").read_text())
+            command = identity["command"]
+            self.assertEqual(command[command.index("--gpu-memory-utilization") + 1], "0.92")
+            self.assertEqual(identity["synthetic_control"]["accepted_tokens"], 2.77)
+            self.assertTrue(identity["synthetic_control"]["frozen_before_measurement"])
+            config = json.loads(command[command.index("--speculative-config") + 1])
+            self.assertEqual(config["synthetic_acceptance_length"], 3.77)
+
     def test_entrypoint_forwards_loader_and_internal_startup_deadline(self):
         with tempfile.TemporaryDirectory() as temp:
             argv = [

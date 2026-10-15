@@ -13,3 +13,10 @@ public_dataset_loader:
       is_trace: true
       default_block_size: 64
       default_prompt_corpus: coding
+
+timing_strategy:
+  agentic_replay:
+    class: aisim_agentx_pin.capture:CapturedAgenticReplayStrategy
+    priority: 10
+    description: Read-only sampled trajectory and drained warmup handoff capture.
+    metadata: {}
