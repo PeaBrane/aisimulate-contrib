@@ -725,6 +725,7 @@ impl Engine {
         }
         let upper = runtime.osl - 1; // exclusive, matches Python `range(0, osl-1, stride)`
         let mut i = 0u32;
+        let mut step_fold: Vec<(&Op, PerformanceResult)> = Vec::new();
         while i < upper {
             // Python `s = isl + i + 1`. NOTE the `+1` — distinct from the FPM
             // bridge's `context_length = isl + i` packing convention.
@@ -733,7 +734,6 @@ impl Engine {
             // Per-step name fold FIRST (Python's per-iteration dict), with
             // the phase-dict source merge (mismatch -> Mixed, no
             // zero-identity — mirrors `base_backend.py:391-393`).
-            let mut step_fold: Vec<(&Op, PerformanceResult)> = Vec::new();
             let step = run_generation_ops_step_beamed_with(
                 &self.generation_ops,
                 &self.db,
@@ -755,7 +755,7 @@ impl Engine {
                     }
                 },
             )?;
-            for (op, folded) in step_fold {
+            for (op, folded) in step_fold.drain(..) {
                 on_op(op, folded.scaled(repeat_count as f64));
             }
             total += step * repeat_count as f64;
