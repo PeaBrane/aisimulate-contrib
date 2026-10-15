@@ -1420,6 +1420,18 @@ contributors to the vLLM project. Apache-2.0.
 The archived `cache-adapter-v1-source.tar.gz` retains the earlier adapter and
 tests under this same source, revision and license attribution.
 
+The original read-only observer `source_pool_observer.py`, its CPU behavior
+tests `test_source_pool_observer.py`, source manifest `source_pool_sources.json`,
+and adjacent collection/overhead evidence under
+`benchmarks/evidence/dspark-e2e-20261014/` adapt the same immutable runtime's
+`vllm/v1/core/{block_pool,kv_cache_manager,kv_cache_coordinator,single_type_kv_cache_manager}.py`,
+`vllm/v1/core/sched/{scheduler,async_scheduler}.py`, `vllm/config/scheduler.py`
+and `vllm/v1/engine/core.py`. Installed source hashes match revision
+`ac9126e58aa7bbab1856ba6593ba4d5003fea516` in the image identified above.
+These are modified independent adapters; no allocator or scheduler algorithm
+is copied. Copyright contributors to the vLLM project. Apache-2.0, source and
+license URLs above.
+
 The P/D collection client
 `benchmarks/evidence/dspark-fixed-20261014/collect_pd.py` adapts (modified) the
 Mooncake HTTP handshake from
@@ -1468,7 +1480,8 @@ License: https://github.com/SemiAnalysisAI/aiperf/blob/754356e9a39acc6cc6afb242d
 
 The campaign entrypoints, context probes and capture adapters under
 `benchmarks/evidence/dspark-e2e-20261014/` (`agentx_phaseb.py`,
-`agentx_server.py`, `agentx_context_audit.py`, `agentx_capture.py`, their tests,
+`agentx_server.py`, `agentx_context_audit.py`, `agentx_capture.py`,
+`agentx_import.py`, `agentx_native_inputs.py`, their tests,
 and `agentx_corpus_pin/`) are original, modified adaptations of the same pinned
 producer's configuration, dataset, lifecycle and export contracts. Their adjacent
 manifests and documentation derive identity and lifecycle facts from those sources.
@@ -1480,7 +1493,9 @@ Original paths at that revision, under `src/aiperf/`:
 - `dataset/loader/{base_hf_dataset,semianalysis_cc_traces_weka,weka_trace,weka_trace_models}.py`
 - `dataset/composer/public.py`
 - `timing/strategies/agentic_replay.py` and `timing/trajectory_source.py`
+- `workers/session_manager.py` and `timing/branch_orchestrator.py`
 - `common/models/{dataset_models,record_models}.py`
+- `common/models/{branch,prerequisites}.py`
 - `post_processors/raw_record_writer_processor.py`
 - `records/record_processor_service.py`
 - `config/resolution/plan.py` and `config/flags/cli_config.py`
@@ -1489,7 +1504,7 @@ Original paths at that revision, under `src/aiperf/`:
 The optional diagnostic token-echo contract and native Pro formatter probe also
 follow vLLM `ac9126e58aa7bbab1856ba6593ba4d5003fea516`, paths
 `vllm/entrypoints/openai/chat_completion/{protocol,serving}.py` and
-`vllm/tokenizers/deepseek_v4_encoding.py`. Copyright contributors to the vLLM
+`vllm/tokenizers/{deepseek_v4,deepseek_v4_encoding}.py`. Copyright contributors to the vLLM
 project; Apache-2.0. These are modified contract adaptations; the native formatter
 is imported externally, not copied into this repository.
 Source: https://github.com/vllm-project/vllm/tree/ac9126e58aa7bbab1856ba6593ba4d5003fea516

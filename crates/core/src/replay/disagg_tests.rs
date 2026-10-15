@@ -4061,3 +4061,50 @@ fn prefill_placement_receives_replay_hashes_in_both_handoff_orders(
     .unwrap();
     assert_eq!(*seen.borrow(), expected);
 }
+
+#[test]
+fn unknown_output_ids_survive_handoff_without_becoming_reusable_prefixes() {
+    for authored in [false, true] {
+        for backoff in [0, 1] {
+            let mut config = transfer_timing_config(
+                EngineType::Vllm,
+                KvTransferTimingMode::DestinationMissing,
+                1,
+            );
+            config.num_prefill_workers = 1;
+            config.num_decode_workers = 1;
+            for args in [&mut config.prefill_args, &mut config.decode_args] {
+                args.block_size = 4;
+                args.kv_transfer_timing_mode = KvTransferTimingMode::DestinationMissing;
+                args.kv_transfer_prefill_backoff_tokens = backoff;
+            }
+            // Independent UUID=1 fixture values, also pinned by sequence unit tests.
+            let ids = vec![2515880452, 3600266899, 2716793611, 2249174135, 99];
+            let mut first = request(1, 4, 5, 0.0);
+            first.output_token_ids = authored.then(|| ids.clone());
+            first.output_identity = if authored {
+                crate::engine::OutputTokenIdentity::Synthetic
+            } else {
+                crate::engine::OutputTokenIdentity::Unknown
+            };
+            let mut second = request(2, 4, 1, 100.0);
+            second.tokens.extend_from_slice(&ids[..4]);
+            second.tokens.push(99);
+            let (collector, _) = run_trace_collect(&config, vec![first, second], None, 1.0);
+            let report = collector.finish();
+            let record = report
+                .per_request
+                .iter()
+                .find(|r| r.uuid == Uuid::from_u128(2).to_string())
+                .unwrap();
+            let transfer_ms =
+                record.destination_activated_ms.unwrap() - record.destination_reserved_ms.unwrap();
+            let expected_ms = ((9 - backoff).div_ceil(4) * 4 - if authored { 8 } else { 4 }) as f64;
+            assert!(
+                (transfer_ms - expected_ms).abs() < 1e-6,
+                "authored={authored} backoff={backoff}: transfer={transfer_ms}, expected={expected_ms}"
+            );
+            assert_eq!(report.request_counts.total_output_tokens, 6);
+        }
+    }
+}

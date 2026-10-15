@@ -796,3 +796,61 @@ fn agg_first_step_settles_initial_scaling_and_zero_delay_worker_startup() {
     assert!(stepped.events.iter().all(|event| event.at_ms > 0.0));
     assert!(stepped.next_timestamps().1.unwrap() > 0.0);
 }
+
+#[test]
+fn unknown_output_ids_do_not_publish_reusable_aggregate_prefixes() {
+    use crate::engine::Backend;
+    for backend in [Backend::Vllm, Backend::Sglang] {
+        for authored in [false, true] {
+            // Independent UUID=1 fixture values, also pinned by sequence unit tests.
+            let ids = vec![2515880452, 3600266899, 2716793611, 2249174135, 99];
+            let mut first = request(1, 0.0);
+            first.max_output_tokens = 5;
+            first.output_token_ids = authored.then(|| ids.clone());
+            first.output_identity = if authored {
+                crate::engine::OutputTokenIdentity::Synthetic
+            } else {
+                crate::engine::OutputTokenIdentity::Unknown
+            };
+            let mut second = request(2, 100.0);
+            second.tokens.extend_from_slice(&ids[..4]);
+            second.tokens.push(99);
+            let config = ReplayEngineConfig {
+                rank: EngineConfig {
+                    block_size: 4,
+                    enable_prefix_caching: true,
+                    timing_model: TimingModelConfig::Fixed {
+                        prefill_ms: 1.0,
+                        decode_ms: 1.0,
+                    },
+                    ..EngineConfig::for_backend(backend)
+                },
+                ..Default::default()
+            };
+            let role = ReplayEngineFactory::new()
+                .role_factory(&config, WorkerStage::Aggregated, false)
+                .unwrap();
+            let (collector, _) = RoundRobinAggRuntime::new_composed(
+                role,
+                AdmissionQueue::new_requests(VecDeque::from([first, second]), ReplayMode::Trace),
+                1,
+                None,
+                |dp, topology| Ok(AggregatedRoundRobinPlacement::new(dp, topology)),
+            )
+            .unwrap()
+            .with_per_request_records(true)
+            .run()
+            .unwrap();
+            let hit = collector
+                .snapshot(Uuid::from_u128(2))
+                .unwrap()
+                .reused_input_tokens;
+            assert_eq!(
+                hit,
+                if authored { 8 } else { 4 },
+                "{backend:?} authored={authored}"
+            );
+            assert_eq!(collector.finish().request_counts.total_output_tokens, 6);
+        }
+    }
+}

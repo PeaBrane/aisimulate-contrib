@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import copy
 import importlib.util
 import json
 from pathlib import Path
@@ -263,6 +264,23 @@ def test_pd_cache_receipt_checks_both_role_capacities(tmp_path):
     path.write_text(json.dumps(mapping))
     receipt["cache_reconciliation_sha256"] = prediction.digest(path)
     prediction.validate_cache(config, identity, receipt, tmp_path)
+
+    identity["serving_run_id"] = "same-service"
+    receipt["measurement_identity_sha256"] = "a" * 64
+    mapping["native_pool_observations"] = {
+        "serving_run_id": "same-service",
+        "measurement_identity_sha256": "a" * 64,
+    }
+    path.write_text(json.dumps(mapping))
+    receipt["cache_reconciliation_sha256"] = prediction.digest(path)
+    prediction.validate_cache(config, identity, receipt, tmp_path)
+    for field, value in (("serving_run_id", "other-service"), ("measurement_identity_sha256", "b" * 64)):
+        changed = copy.deepcopy(mapping)
+        changed["native_pool_observations"][field] = value
+        path.write_text(json.dumps(changed))
+        receipt["cache_reconciliation_sha256"] = prediction.digest(path)
+        with pytest.raises(ValueError, match="another measurement or serving run"):
+            prediction.validate_cache(config, identity, receipt, tmp_path)
 
 
 @pytest.mark.parametrize("scope", ["engine", "worker"])

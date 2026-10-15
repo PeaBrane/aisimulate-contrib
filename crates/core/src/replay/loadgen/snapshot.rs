@@ -18,7 +18,7 @@ use uuid::Uuid;
 
 use super::{
     AgenticDependencyRelation, AgenticDependencyTrigger, AgenticGraphIdentity, AgenticNode,
-    SYNTHETIC_OUTPUT_SEED, ValidatedAgenticGraph, planned_output_token_ids,
+    SYNTHETIC_OUTPUT_SEED, ValidatedAgenticGraph, agentic_output_token_ids,
 };
 use crate::replay::AgenticRuntimeIdentity;
 
@@ -114,7 +114,7 @@ pub struct AgenticReplayContext {
     node_to_play: Vec<usize>,
     topological_rank: Vec<usize>,
     recorded_intervals: Vec<(f64, Option<f64>)>,
-    pub(super) outputs: Vec<Vec<u32>>,
+    pub(super) outputs: Vec<Option<Vec<u32>>>,
     token_stride: u64,
     request_stride: u128,
 }
@@ -239,7 +239,8 @@ impl ValidatedAgenticGraph {
             .nodes
             .iter_mut()
             .map(|node| {
-                planned_output_token_ids(
+                agentic_output_token_ids(
+                    node.input_token_ids.is_some(),
                     node.output_token_ids.take(),
                     node.max_output_tokens,
                     &mut rng,

@@ -101,6 +101,16 @@ contract. A missing bandwidth measurement remains an explicit timing limitation.
 P/D qualification checks both the Replay capacity bound and the native source
 residency bound. The latter includes active requests and completed requests whose
 blocks await connector cleanup; global concurrency alone does not bound them.
+Alternatively, `reconcile_pro_cache.py --pool-observation-receipt PATH` accepts
+complete observations from all eight P engines and the D engine. The evidence
+binds the serving run, frozen measurement identity, runtime cache receipt and
+an absolute measurement-window file by hash. Each observation must cover that
+window and match the pinned observer/runtime sources and physical capacity.
+Native nonbinding capacity requires a peak below capacity and zero allocation
+denials, errors and preemptions. This proof does not replace Replay's separate
+capacity bound. Incomplete shutdown receipts cannot qualify a run. The adapter
+retains the evidence; the predictor rejects reuse for another measurement or
+serving run. These checks apply only to the observer's prefix-disabled scope.
 An approximate cache mapping cannot qualify a workload whose capacity may be
 binding. Source contracts
 alone do not establish measured P/D cache capacities or transport performance.

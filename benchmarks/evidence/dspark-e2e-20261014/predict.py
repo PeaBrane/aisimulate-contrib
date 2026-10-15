@@ -241,6 +241,12 @@ def validate_cache(config, identity, receipt, receipt_dir):
         )
         if any(mapping.get(proof) is not True for proof in proofs):
             raise ValueError("approximate cache mapping cannot qualify a capacity-bound workload")
+        observation = mapping.get("native_pool_observations")
+        if observation is not None and (
+            observation.get("measurement_identity_sha256") != receipt["measurement_identity_sha256"]
+            or observation.get("serving_run_id") != identity.get("serving_run_id")
+        ):
+            raise ValueError("native pool observations belong to another measurement or serving run")
     roles = {"aggregated": mapping} if deployment == "agg" else mapping["roles"]
     if deployment == "disagg" and set(roles) != {"prefill", "decode"}:
         raise ValueError("P/D cache reconciliation must contain both roles")

@@ -327,7 +327,7 @@ class RunnerCapabilities:
     supported_agentic_backends: tuple[str, ...] = ("*",)
     supports_agentic_host_offload: bool = True
     supports_agentic_speculative_decoding: bool = True
-    supported_agentic_speculation_kinds: tuple[str, ...] = ()
+    supported_agentic_speculation_kinds: tuple[str, ...] = field(default=(), kw_only=True)
     supports_agentic_snapshots: bool = False
     supports_agentic_warmup: bool = False
     supports_cached_prefix_tokens: bool = False

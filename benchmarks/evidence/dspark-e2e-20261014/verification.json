@@ -185,5 +185,106 @@
       "Release artifact contract check-only passed"
     ],
     "scope": "Initial external cuts and session mapping are functional. Full producer warmup frontier/recycling alignment and AgentX paired scoring remain unfinished. One production fixed-length pair remains qualified; PD smoke prediction is diagnostic only."
+  },
+  "pd_production_and_output_identity_checkpoint": {
+    "date": "2026-10-15",
+    "base_revision": "b1c56e9cb6c381fbc94c47e3317f70c34d9cf664",
+    "native_sha256": "3af8fb12cff28b87249648ab15e26ed18551bd1e17f334318487ea448ff0be40",
+    "checks": [
+      {
+        "check": "Rust core library",
+        "log_sha256": "fd26446bb90cd2c1c133b423ea0df681a547c64434c45bac7e0c9d64e5c82db9",
+        "results": [
+          "test result: ok. 2017 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 82.61s"
+        ]
+      },
+      {
+        "check": "Rust integration targets",
+        "log_sha256": "dde72e3705b3eed03e202be1a49eae8a6acdb72eb153e1f17ae38eab5f211dde",
+        "results": [
+          "test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.16s",
+          "test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s",
+          "test result: ok. 53 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s",
+          "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s",
+          "test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s",
+          "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s",
+          "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s",
+          "test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s"
+        ]
+      },
+      {
+        "check": "Rust doctests",
+        "log_sha256": "0189dd249d8ccd1c060d5f8a464de65c76307a93d5cf5cc5aa887f63cd48a869",
+        "results": [
+          "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s"
+        ]
+      },
+      {
+        "check": "Rust public API",
+        "log_sha256": "9a8fa5171da3b783b62699ef7c495a0bd54a6a666b338ad4ee3fa87352fcd736",
+        "results": [
+          "test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+        ]
+      },
+      {
+        "check": "Python Runner and exact-input importer",
+        "log_sha256": "e7a2fb84a52e7b98b6daf26f9ce50c6d71ebedb6cb18055749db8f4f425fe362",
+        "results": [
+          "505 passed in 19.55s"
+        ]
+      },
+      {
+        "check": "Campaign, cache observer and scoring",
+        "log_sha256": "ba1488dbfe0876bcad44943e367aaf261cc18e847b4b7454673da5771aa48921",
+        "results": [
+          "82 passed, 25 subtests passed in 2.32s"
+        ]
+      },
+      {
+        "check": "CI positional compatibility and CLI help",
+        "log_sha256": "5d12ba5e98d276cb9e6f98e4684fee8da4141d2c3268d41335949b3893bd0a33",
+        "results": [
+          "31 passed in 2.33s"
+        ]
+      },
+      {
+        "check": "CI model contracts",
+        "log_sha256": "67129f3464c0bb7c954e2f8df375f3e6229bcf02db1f4cf06ddb5452df335a62",
+        "results": [
+          "94 passed, 1 warning in 0.65s"
+        ]
+      },
+      {
+        "check": "Ownership contracts",
+        "log_sha256": "ca6b77d3f239541bfe53c6501529785e152905f4d61935448193deed6e229837",
+        "results": [
+          "107 passed in 6.08s"
+        ]
+      }
+    ],
+    "additional_checks": [
+      "Unchanged legacy synthetic-output artifact test passed on all three engine backends.",
+      "Unknown outputs preserve request-scoped cache occupancy, eviction and same-request preemption reuse.",
+      "Raw P/D archive and all 53 member hashes independently verified.",
+      "Prediction archive and all three member hashes independently verified.",
+      "CPU preflight archives and every member hash verified.",
+      "Affected Ruff check/format, cargo fmt, strict ownership and packaged legal equality passed."
+    ],
+    "serving_coverage": {
+      "qualified_configurations": 2,
+      "qualified_runs": 2,
+      "paired_requests": 256,
+      "failed_measured_requests": 0,
+      "missing_runs": 586
+    },
+    "scope": "P/D production used isolated clean b1 predictor; AgentX output identity changes are separately functionally verified. Full campaign and producer-matched AgentX validation remain unfinished. Remote jobs cannot be verified while corporate cluster DNS is unavailable."
   }
 }

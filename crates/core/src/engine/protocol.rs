@@ -8,6 +8,24 @@ use uuid::Uuid;
 
 use super::{HandoffId, HandoffTransferTiming};
 
+/// Identity of generated tokens when no exact output token plan is supplied.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputTokenIdentity {
+    /// Legacy deterministic synthetic tokens are valid cache identities.
+    #[default]
+    Synthetic,
+    /// Real output IDs are unavailable. Cache only an opaque request-scoped identity.
+    /// Distinct executions must use distinct request IDs, including repeated turns.
+    Unknown,
+}
+
+impl OutputTokenIdentity {
+    pub(crate) fn is_synthetic(&self) -> bool {
+        *self == Self::Synthetic
+    }
+}
+
 /// Runtime-neutral request accepted by the rank engine.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Request {
@@ -22,6 +40,9 @@ pub struct Request {
     /// output position, so reusing a request ID reproduces the same stream.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_token_ids: Option<Vec<u32>>,
+    /// Unknown outputs remain resident but cannot match authored token prefixes.
+    #[serde(default, skip_serializing_if = "OutputTokenIdentity::is_synthetic")]
+    pub output_identity: OutputTokenIdentity,
 }
 
 /// Commands supported by the standalone scheduler.
@@ -365,4 +386,26 @@ pub struct PassCompletionEffects {
 pub struct PendingPass {
     pub(crate) started_at_ms: f64,
     pub(crate) effects: PassCompletionEffects,
+}
+
+#[cfg(test)]
+mod output_identity_tests {
+    use super::{OutputTokenIdentity, Request};
+
+    #[test]
+    fn output_identity_preserves_legacy_wire_and_unknown_roundtrip() {
+        let wire = serde_json::json!({
+            "request_id": "00000000-0000-0000-0000-000000000001",
+            "tokens": [1,2,3,4], "max_output_tokens": 9
+        });
+        let mut request: Request = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(request.output_identity, OutputTokenIdentity::Synthetic);
+        assert_eq!(serde_json::to_value(&request).unwrap(), wire);
+        request.output_identity = OutputTokenIdentity::Unknown;
+        let encoded = serde_json::to_value(&request).unwrap();
+        assert_eq!(encoded["output_identity"], "unknown");
+        let decoded: Request = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, request);
+        assert!(decoded.output_token_ids.is_none());
+    }
 }

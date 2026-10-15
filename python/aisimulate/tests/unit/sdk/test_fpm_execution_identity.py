@@ -35,8 +35,13 @@ def test_v41_config_and_execution_cannot_borrow_a_table():
         == off
     )
     assert raw == config()
-    with pytest.raises(NotImplementedError, match="not verified for vllm"):
-        execution_identity(raw, decoder_replay=True, engram_cpu_offload=False, input_modality="text")
+    # The pinned vLLM decoder-replay path now has the same bounded execution
+    # profile; backend/version remain separate performance-table scopes.
+    vllm = execution_identity(raw, decoder_replay=True, backend="vllm", engram_cpu_offload=False, input_modality="text")
+    assert vllm == on
+    assert vllm != off
+    with pytest.raises(NotImplementedError, match="not verified for trtllm"):
+        execution_identity(raw, decoder_replay=True, backend="trtllm", engram_cpu_offload=False, input_modality="text")
 
 
 def test_existing_model_identity_stays_legacy():
@@ -85,7 +90,7 @@ def test_native_v41_requires_measured_execution_and_text_evidence():
     )
 
 
-@pytest.mark.parametrize("replay,backend", [(False, "vllm"), (True, "sglang")])
+@pytest.mark.parametrize("replay,backend", [(False, "vllm"), (True, "sglang"), (True, "vllm")])
 def test_v41_fpm_wrap_retains_resident_inventory_and_serialized_stages(replay, backend):
     from aisimulate_core.sdk.config import ModelConfig
     from aisimulate_core.sdk.deepseek_v41 import MODEL_PATH

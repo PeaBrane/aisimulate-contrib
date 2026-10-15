@@ -76,6 +76,11 @@ pub(crate) struct DirectRequest {
     pub max_output_tokens: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_token_ids: Option<Vec<Token>>,
+    #[serde(
+        default,
+        skip_serializing_if = "crate::engine::OutputTokenIdentity::is_synthetic"
+    )]
+    pub output_identity: crate::engine::OutputTokenIdentity,
     pub uuid: Option<Uuid>,
     pub arrival_timestamp_ms: Option<f64>,
 }

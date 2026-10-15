@@ -70,6 +70,25 @@ pub(super) fn planned_output_token_ids(
     })
 }
 
+// Exact prompts must not turn unknown generated tokens into reusable cache identity.
+// Legacy hash-only traces retain their deterministic synthetic output plans.
+pub(super) fn agentic_output_token_ids(
+    exact_input: bool,
+    authored: Option<Vec<u32>>,
+    max_output_tokens: usize,
+    output_rng: &mut StdRng,
+) -> Option<Vec<u32>> {
+    if exact_input {
+        authored
+    } else {
+        Some(planned_output_token_ids(
+            authored,
+            max_output_tokens,
+            output_rng,
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests;
 

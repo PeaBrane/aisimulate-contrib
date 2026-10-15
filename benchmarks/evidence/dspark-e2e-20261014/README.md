@@ -1,16 +1,26 @@
 # Fixed-length DSpark serving validation
 
 This campaign implements the approved AgentX-model matrix and MTP-aligned
-V4-Pro P/D topology. **One qualified serving pair is available: one configuration,
-one repetition and 128 measured requests.** Its TTFT/TPOT/throughput MAPE is
-60.39%/10.77%/6.47%; with one pair, these equal that point's APE. The remaining
-587 planned runs have no scored error. Functional tests and op-table query
+V4-Pro P/D topology. **Two qualified serving pairs are available: two configurations,
+one repetition each and 256 measured requests.** Their TTFT/TPOT/throughput MAPE is
+58.90%/9.58%/3.35%. The remaining 586 planned runs have no scored error.
+These two points use different deployments and acceptance modes; see the
+stratified report before interpreting the combined average. Functional tests and op-table query
 coverage are separate from serving accuracy.
 
 The [first production pair](pro-initial-c1-r1/README.md) uses Pro0813 on 8 B200,
 TP8/EP1, K6, synthetic AL3.77, 1024/1024 and concurrency1. All 128 requests
 completed, with zero failures. Measurements, frozen matching evidence, original
 and qualified summaries, source patches and raw records are retained.
+
+The [first production P/D pair](pro-pd-initial-c1-r1/README.md) uses the same
+Pro0813 checkpoint on 8P+8D B200, P TP1/attention-DP8/EP8 and D TP8/EP1,
+K6 with real acceptance, 1024/1024 and concurrency1. All 128 requests completed
+after warming every P engine. TTFT/TPOT/throughput APE is 57.41%/8.39%/0.24%.
+The small throughput error reflects cancellation between underestimated TTFT
+and overestimated TPOT; it does not establish accurate component timing.
+Transfer latency remains explicitly unmodeled. Different GPU counts and
+acceptance modes prevent an equal-resource aggregated-versus-P/D speedup claim.
 
 Two aggregated single-request Pro0813 diagnostics are available:
 [`eager with real acceptance`](smoke-pro-eager/README.md) and
@@ -75,6 +85,12 @@ Three repetitions measure `max(128, 10 × concurrency)` requests each.
   subtests, including the Kimi legacy-import regression found by Full CI.
   The AgentX/P-D checkpoint adds 198 loadgen checks, 491 Runner API checks,
   44 campaign checks and 15 cache checks with six subtests.
+  The P/D production checkpoint passes 2,017 Rust library tests (one ignored),
+  134 integration tests, 13 public API tests and three doctests; 505 Runner/import
+  tests, 82 campaign/scoring tests with 25 subtests, 31 compatibility/CLI checks
+  and 94 model contract checks. Unknown AgentX output IDs retain cache occupancy
+  without inventing real-token prefix hits; legacy synthetic output hashes stay
+  unchanged.
 - [`op-coverage-schema31.json`](op-coverage-schema31.json) records current canonical `op_level` + `SILICON`
   + `fallback_policy: deny` construction/query checks. These CPU queries are
   predictions, not collected kernel or serving measurements.

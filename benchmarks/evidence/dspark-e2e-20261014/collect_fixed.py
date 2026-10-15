@@ -194,15 +194,26 @@ def main():
     if any(row["status"] != "success" for row in warmup):
         raise RuntimeError("warmup failed; preserved warmup records, profiling not started")
     before = metric_snapshot(args.metrics_url)
-    rows, duration = run_requests(
-        args.endpoint,
-        args.model,
-        prompts[warmup_count:],
-        cell["output_length"],
-        cell["concurrency"],
-        args.temperature,
-        "measure",
-    )
+    measurement_start_unix_ns = time.time_ns()
+    try:
+        rows, duration = run_requests(
+            args.endpoint,
+            args.model,
+            prompts[warmup_count:],
+            cell["output_length"],
+            cell["concurrency"],
+            args.temperature,
+            "measure",
+        )
+    finally:
+        window = {
+            "serving_run_id": identity.get("serving_run_id", args.output.parent.name),
+            "identity_sha256": identity_hash,
+            "start_unix_ns": measurement_start_unix_ns,
+            "end_unix_ns": time.time_ns(),
+            "scope": "Measured client requests only; warmup drained before this interval.",
+        }
+        (args.output / "measurement-window.json").write_text(json.dumps(window, indent=2) + "\n")
     after = metric_snapshot(args.metrics_url)
     (args.output / "request_records.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows))
     (args.output / "metrics-before.json").write_text(json.dumps(before, indent=2))

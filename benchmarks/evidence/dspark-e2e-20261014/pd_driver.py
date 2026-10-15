@@ -65,6 +65,26 @@ def collect_role_receipts(endpoint, root, model_key, role):
     return load_role_receipts(root, model_key, role)
 
 
+def selected_windows(mode, concurrencies=None, repetitions=None, windows=None):
+    """Select distinct measurement windows without restarting loaded workers."""
+    if windows and (concurrencies or repetitions):
+        raise ValueError("explicit windows cannot be combined with concurrency/repetition filters")
+    pairs = (
+        [tuple(pair) for pair in windows]
+        if windows
+        else [
+            (concurrency, repetition)
+            for concurrency in (concurrencies or ([1, 4] if mode == "initial" else [1]))
+            for repetition in (repetitions or ([1, 2, 3] if mode == "initial" else [1]))
+        ]
+    )
+    if any(concurrency not in (1, 4) or repetition not in (1, 2, 3) for concurrency, repetition in pairs):
+        raise ValueError("windows require concurrency 1/4 and repetition 1/2/3")
+    if len(set(pairs)) != len(pairs):
+        raise ValueError("duplicate measurement window")
+    return pairs
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-key", choices=list(MODELS), required=True)
@@ -75,8 +95,10 @@ def main():
     parser.add_argument("--mode", choices=["smoke", "pilot", "initial"], default="smoke")
     parser.add_argument("--concurrency", type=int, choices=[1, 4], action="append")
     parser.add_argument("--repetition", type=int, choices=[1, 2, 3], action="append")
+    parser.add_argument("--window", type=int, nargs=2, action="append", metavar=("CONCURRENCY", "REPETITION"))
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    windows = selected_windows(args.mode, args.concurrency, args.repetition, args.window)
     if hashlib.sha256(args.proxy_script.read_bytes()).hexdigest() != PROXY_SHA256:
         raise ValueError("NIXL proxy differs from pinned unmodified upstream source")
     prefill, decode = (
@@ -94,6 +116,7 @@ def main():
     cache_bytes = (json.dumps(role_receipts, indent=2, sort_keys=True) + "\n").encode()
     cache_path.write_bytes(cache_bytes)
     identity = {
+        "serving_run_id": args.output.name,
         "model": MODELS[args.model_key],
         "image": IMAGE,
         "runtime_revision": RUNTIME_REVISION,
@@ -161,52 +184,49 @@ def main():
                 "metrics_urls": [prefill + "/metrics", decode + "/metrics"],
             }
             (args.output / "server-ready.json").write_text(json.dumps(ready, indent=2) + "\n")
-            concurrencies = args.concurrency or ([1, 4] if args.mode == "initial" else [1])
-            repetitions = args.repetition or ([1, 2, 3] if args.mode == "initial" else [1])
-            for concurrency in concurrencies:
-                for repetition in repetitions:
-                    cell_id = f"{args.model_key}-disagg-k{args.k}-i1024-o1024-c{concurrency}-{acceptance}"
-                    run_output = args.output / f"{args.mode}-c{concurrency}-r{repetition}"
-                    client = [
+            for concurrency, repetition in windows:
+                cell_id = f"{args.model_key}-disagg-k{args.k}-i1024-o1024-c{concurrency}-{acceptance}"
+                run_output = args.output / f"{args.mode}-c{concurrency}-r{repetition}"
+                client = [
+                    sys.executable,
+                    str(Path(__file__).with_name("collect_fixed.py")),
+                    "--matrix",
+                    str(Path(__file__).with_name("matrix.json")),
+                    "--cell-id",
+                    cell_id,
+                    "--identity",
+                    str(identity_path),
+                    "--endpoint",
+                    ready["endpoint"],
+                    "--tokenizer-endpoint",
+                    prefill,
+                    "--metrics-url",
+                    prefill + "/metrics",
+                    "--metrics-url",
+                    decode + "/metrics",
+                    "--model",
+                    MODELS[args.model_key]["model"],
+                    "--output",
+                    str(run_output),
+                    "--repetition",
+                    str(repetition),
+                ]
+                if args.mode == "smoke":
+                    client.append("--smoke")
+                subprocess.run(client, check=True)
+                subprocess.run(
+                    [
                         sys.executable,
-                        str(Path(__file__).with_name("collect_fixed.py")),
-                        "--matrix",
-                        str(Path(__file__).with_name("matrix.json")),
-                        "--cell-id",
-                        cell_id,
-                        "--identity",
-                        str(identity_path),
-                        "--endpoint",
-                        ready["endpoint"],
-                        "--tokenizer-endpoint",
-                        prefill,
-                        "--metrics-url",
-                        prefill + "/metrics",
-                        "--metrics-url",
-                        decode + "/metrics",
-                        "--model",
-                        MODELS[args.model_key]["model"],
-                        "--output",
+                        str(Path(__file__).with_name("acceptance.py")),
+                        "--run",
                         str(run_output),
-                        "--repetition",
-                        str(repetition),
-                    ]
-                    if args.mode == "smoke":
-                        client.append("--smoke")
-                    subprocess.run(client, check=True)
-                    subprocess.run(
-                        [
-                            sys.executable,
-                            str(Path(__file__).with_name("acceptance.py")),
-                            "--run",
-                            str(run_output),
-                            "--k",
-                            str(args.k),
-                            "--endpoint",
-                            decode + "/metrics",
-                        ],
-                        check=True,
-                    )
+                        "--k",
+                        str(args.k),
+                        "--endpoint",
+                        decode + "/metrics",
+                    ],
+                    check=True,
+                )
         finally:
             proxy.terminate()
             try:

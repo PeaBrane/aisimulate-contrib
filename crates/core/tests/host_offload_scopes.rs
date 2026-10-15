@@ -449,6 +449,7 @@ fn serve_prompt(engine: &mut Engine, id: u128, now_ms: &mut f64) -> usize {
             SchedulerCommand::new(
                 0,
                 Command::Submit(Request {
+                    output_identity: Default::default(),
                     request_id,
                     tokens: PROMPT.to_vec(),
                     max_output_tokens: 1,

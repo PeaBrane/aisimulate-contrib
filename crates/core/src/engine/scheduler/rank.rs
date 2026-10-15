@@ -173,6 +173,16 @@ impl RankEngine for SchedulerRank {
         context: CommandContext,
         pending_pass: Option<&mut Self::PendingPass>,
     ) -> Result<Self::CommandEffects> {
+        if let Command::Submit(request)
+        | Command::SubmitHandoffPrefill { request, .. }
+        | Command::ReserveDestination { request, .. } = &command
+        {
+            anyhow::ensure!(
+                request.output_identity != crate::engine::OutputTokenIdentity::Unknown
+                    || request.output_token_ids.is_none(),
+                "unknown output identity cannot include exact output_token_ids"
+            );
+        }
         let pending_suppression = pending_output_suppression(&command, &self.handoff_requests);
         let handoff_update = handoff_tracking_update(&command);
         let core_command = Self::core_command(command);
@@ -512,6 +522,7 @@ fn core_request(request: Request) -> DirectRequest {
         tokens: request.tokens,
         max_output_tokens: request.max_output_tokens,
         output_token_ids: request.output_token_ids,
+        output_identity: request.output_identity,
         uuid: Some(request.request_id),
         arrival_timestamp_ms: None,
     }
@@ -692,6 +703,75 @@ mod tests {
     };
 
     #[test]
+    fn unknown_output_identity_rejects_authored_plan_before_admission() {
+        let config = EngineConfig {
+            timing_model: TimingModelConfig::Fixed {
+                prefill_ms: 1.0,
+                decode_ms: 1.0,
+            },
+            ..Default::default()
+        };
+        let mut rank = SchedulerRank::new(
+            RankIdentity {
+                worker_id: 0,
+                dp_rank: 0,
+                dp_size: NonZeroU32::new(1).unwrap(),
+            },
+            &config,
+        )
+        .unwrap();
+        let request = Request {
+            request_id: Uuid::from_u128(1701),
+            tokens: vec![1, 2, 3, 4],
+            max_output_tokens: 1,
+            output_token_ids: Some(vec![5]),
+            output_identity: crate::engine::OutputTokenIdentity::Unknown,
+        };
+        for command in [
+            Command::Submit(request.clone()),
+            Command::SubmitHandoffPrefill {
+                handoff_id: HandoffId::new(request.request_id),
+                request: request.clone(),
+            },
+            Command::ReserveDestination {
+                handoff_id: HandoffId::new(request.request_id),
+                request: request.clone(),
+            },
+        ] {
+            let error = rank
+                .apply_command_effects(
+                    command,
+                    CommandContext {
+                        now_ms: 0.0,
+                        pass_in_flight: false,
+                    },
+                    None,
+                )
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("unknown output identity cannot include")
+            );
+            assert_eq!(rank.core.num_requests(), 0);
+            assert!(rank.handoff_requests.is_empty());
+        }
+        rank.apply_command_effects(
+            Command::Submit(Request {
+                output_token_ids: None,
+                ..request
+            }),
+            CommandContext {
+                now_ms: 0.0,
+                pass_in_flight: false,
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(rank.core.num_requests(), 1);
+    }
+
+    #[test]
     fn state_cache_parameters_reach_rank_local_args() {
         let config: EngineConfig = serde_json::from_value(serde_json::json!({
             "num_gpu_blocks":8,"block_size":64,"kv_cache_bytes_per_token":16,
@@ -767,6 +847,7 @@ mod tests {
             let first = Uuid::from_u128(94_001);
             rank.apply_command_effects(
                 Command::Submit(Request {
+                    output_identity: Default::default(),
                     request_id: first,
                     tokens: vec![1, 2, 3, 4],
                     max_output_tokens: 20,
@@ -787,6 +868,7 @@ mod tests {
             let second = Uuid::from_u128(94_002);
             rank.apply_command_effects(
                 Command::Submit(Request {
+                    output_identity: Default::default(),
                     request_id: second,
                     tokens: (10..22).collect(),
                     max_output_tokens: 1,
@@ -926,6 +1008,7 @@ mod tests {
         let effects = rank
             .apply_command_effects(
                 Command::Submit(Request {
+                    output_identity: Default::default(),
                     request_id,
                     tokens,
                     max_output_tokens: 0,
@@ -970,6 +1053,7 @@ mod tests {
                 Command::SubmitHandoffPrefill {
                     handoff_id,
                     request: Request {
+                        output_identity: Default::default(),
                         request_id: restore_id,
                         tokens: vec![1, 2, 3, 4],
                         max_output_tokens: 0,
@@ -998,6 +1082,7 @@ mod tests {
         let effects = rank
             .apply_command_effects(
                 Command::Submit(Request {
+                    output_identity: Default::default(),
                     request_id,
                     tokens: vec![1, 2, 3, 4],
                     max_output_tokens: output_token_ids.len(),
@@ -1115,6 +1200,7 @@ mod tests {
         let submission = rank
             .apply_command_effects(
                 Command::Submit(Request {
+                    output_identity: Default::default(),
                     request_id: busy_id,
                     tokens: vec![21, 22, 23, 24],
                     max_output_tokens: 0,
@@ -1136,6 +1222,7 @@ mod tests {
         let arrival = rank
             .apply_command_effects(
                 Command::Submit(Request {
+                    output_identity: Default::default(),
                     request_id: arrival_id,
                     tokens: vec![31, 32, 33, 34],
                     max_output_tokens: 0,
@@ -1193,6 +1280,7 @@ mod tests {
         let error = rank
             .apply_command_effects(
                 Command::Submit(Request {
+                    output_identity: Default::default(),
                     request_id: restore_id,
                     tokens: vec![41, 42, 43, 44],
                     max_output_tokens: 0,
@@ -1249,6 +1337,7 @@ mod tests {
             let effects = rank
                 .apply_command_effects(
                     Command::Submit(Request {
+                        output_identity: Default::default(),
                         request_id: *request_id,
                         tokens: tokens.clone(),
                         max_output_tokens: 0,
@@ -1286,6 +1375,7 @@ mod tests {
             let busy_id = Uuid::from_u128(94_000 + u128::from(cancel_source));
             rank.apply_command_effects(
                 Command::Submit(Request {
+                    output_identity: Default::default(),
                     request_id: busy_id,
                     tokens: vec![21, 22, 23, 24],
                     max_output_tokens: 0,
@@ -1377,6 +1467,7 @@ mod tests {
                 Command::ReserveDestination {
                     handoff_id,
                     request: Request {
+                        output_identity: Default::default(),
                         request_id,
                         tokens: vec![1, 2, 3, 4],
                         max_output_tokens: 1,
@@ -1445,6 +1536,7 @@ mod tests {
             let effects = rank
                 .apply_command_effects(
                     Command::Submit(Request {
+                        output_identity: Default::default(),
                         request_id,
                         tokens,
                         max_output_tokens: 8,
@@ -1500,6 +1592,7 @@ mod tests {
                 Command::SubmitHandoffPrefill {
                     handoff_id,
                     request: Request {
+                        output_identity: Default::default(),
                         request_id,
                         tokens: vec![1, 2, 3, 4],
                         max_output_tokens: 1,
@@ -1592,6 +1685,7 @@ mod tests {
                 Command::ReserveDestination {
                     handoff_id: historical_handoff,
                     request: Request {
+                        output_identity: Default::default(),
                         request_id: history,
                         tokens: (1..=9).collect(),
                         max_output_tokens: 2,
@@ -1640,6 +1734,7 @@ mod tests {
                 Command::SubmitHandoffPrefill {
                     handoff_id: consumer_handoff,
                     request: Request {
+                        output_identity: Default::default(),
                         request_id: consumer,
                         tokens: (1..=9).collect(),
                         max_output_tokens: 1,

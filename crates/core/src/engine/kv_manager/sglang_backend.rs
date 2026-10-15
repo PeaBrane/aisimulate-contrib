@@ -11,9 +11,11 @@ use crate::engine::common::hashing::{
 };
 use crate::engine::common::kv_cache_trace;
 use crate::engine::common::protocols::KvEventPublishers;
+use crate::engine::common::sequence::opaque_output_block_hash;
 use crate::engine::{KvBlock, KvEvent, KvEventData, KvEventTier, StoredBlocks};
 use fixedbitset::FixedBitSet;
 use rustc_hash::{FxHashMap, FxHashSet};
+use uuid::Uuid;
 
 /// Move-only ownership of a request's SGLang KV state.
 ///
@@ -30,6 +32,10 @@ pub(crate) struct RadixRequestLease {
     /// `cached_tokens`, this never grows with the request's own chunks or outputs.
     admission_reused_tokens: usize,
     page_hashes: Vec<LocalBlockHash>,
+    /// Unknown outputs retain request-scoped cache occupancy, without claiming
+    /// their execution placeholders are real token identities. Ordinary leases
+    /// pay only this pointer; the namespace is allocated only for Unknown.
+    opaque_output: Option<Box<(Uuid, usize)>>,
     last_node: Option<NodeId>,
 }
 
@@ -111,10 +117,52 @@ impl RadixRequestLease {
             return;
         }
         let first_new_token = self.page_hashes.len() * page_size;
-        self.page_hashes.extend(compute_block_hash_for_seq(
-            &token_ids[first_new_token..complete_pages * page_size],
-            page_size,
-        ));
+        if let Some(identity) = self.opaque_output.as_deref() {
+            let (owner, known_tokens) = *identity;
+            let first_opaque_page = known_tokens / page_size;
+            let known_end = complete_pages
+                .min(first_opaque_page)
+                .max(self.page_hashes.len());
+            self.page_hashes.extend(compute_block_hash_for_seq(
+                &token_ids[first_new_token..known_end * page_size],
+                page_size,
+            ));
+            self.page_hashes.extend(
+                (known_end..complete_pages)
+                    .map(|position| LocalBlockHash(opaque_output_block_hash(owner, position))),
+            );
+        } else {
+            self.page_hashes.extend(compute_block_hash_for_seq(
+                &token_ids[first_new_token..complete_pages * page_size],
+                page_size,
+            ));
+        }
+    }
+
+    pub(crate) fn ensure_page_hashes_with_unknown_suffix(
+        &mut self,
+        token_ids: &[u32],
+        page_size: usize,
+        owner: Uuid,
+        known_tokens: usize,
+    ) {
+        if let Some(identity) = self.opaque_output.as_deref() {
+            assert_eq!(
+                *identity,
+                (owner, known_tokens),
+                "opaque cache namespace changed"
+            );
+        } else {
+            assert!(self.page_hashes.len() <= known_tokens / page_size);
+            self.opaque_output = Some(Box::new((owner, known_tokens)));
+        }
+        self.ensure_page_hashes(token_ids, page_size);
+    }
+
+    fn known_tokens(&self) -> usize {
+        self.opaque_output
+            .as_deref()
+            .map_or(usize::MAX, |identity| identity.1)
     }
 
     fn page_hashes_through(&self, token_count: usize, page_size: usize) -> &[LocalBlockHash] {
@@ -143,6 +191,7 @@ impl RadixRequestLease {
             cached_tokens,
             admission_reused_tokens: cached_tokens,
             page_hashes: Vec::new(),
+            opaque_output: None,
             last_node: Some(last_node),
         }
     }
@@ -546,7 +595,13 @@ impl SglangKvManager {
         let allocated_tokens = available_before - self.cache.available_tokens();
 
         // Observer-visible KV events are complete-block only.
-        self.publish_stored_hashes(materialized_hashes, &pages, prefix_len, token_ids);
+        self.publish_stored_hashes_with_known_tokens(
+            materialized_hashes,
+            &pages,
+            prefix_len,
+            token_ids,
+            lease.known_tokens(),
+        );
 
         self.log_trace("allocation", allocated_tokens);
 
@@ -611,11 +666,12 @@ impl SglangKvManager {
         lease.ensure_page_hashes(token_ids, page_size);
         let allocated_tokens = available_before - self.cache.available_tokens();
 
-        self.publish_stored_hashes(
+        self.publish_stored_hashes_with_known_tokens(
             lease.page_hashes_through(token_ids.len(), page_size),
             &lease.pages,
             prefix_len,
             token_ids,
+            lease.known_tokens(),
         );
         self.log_trace("allocation", allocated_tokens);
         Some(prefix_len)
@@ -644,6 +700,7 @@ impl SglangKvManager {
         let last_node = lease.last_node();
         let complete_pages = complete_len / self.cache.page_size();
         let page_hashes = &lease.page_hashes[..complete_pages];
+        let known_tokens = lease.known_tokens();
         let pages = &mut lease.pages[..complete_pages];
         let new_last_node = self.cache_unfinished_hashes(
             page_hashes,
@@ -651,6 +708,7 @@ impl SglangKvManager {
             last_node,
             lease.cached_tokens,
             token_ids,
+            known_tokens,
         );
         lease.last_node = Some(new_last_node);
         lease.cached_tokens = complete_len;
@@ -706,6 +764,7 @@ impl SglangKvManager {
             last_node,
             lease.cached_tokens,
             token_ids,
+            lease.known_tokens(),
         );
     }
 
@@ -733,9 +792,16 @@ impl SglangKvManager {
         last_node: NodeId,
         first_new_token: usize,
         token_ids: &[u32],
+        known_tokens: usize,
     ) {
         let complete_len = page_hashes.len() * self.cache.page_size();
-        self.publish_stored_hashes(page_hashes, pages, first_new_token, token_ids);
+        self.publish_stored_hashes_with_known_tokens(
+            page_hashes,
+            pages,
+            first_new_token,
+            token_ids,
+            known_tokens,
+        );
         let new_last_node =
             self.cache
                 .insert_page_hashes_from_node(last_node, first_new_token, page_hashes, pages);
@@ -751,6 +817,7 @@ impl SglangKvManager {
     ///
     /// Returns the new `last_node` that the caller should use for
     /// subsequent calls.
+    #[allow(clippy::too_many_arguments)]
     fn cache_unfinished_hashes(
         &mut self,
         page_hashes: &[LocalBlockHash],
@@ -758,6 +825,7 @@ impl SglangKvManager {
         last_node: NodeId,
         first_new_token: usize,
         token_ids: &[u32],
+        known_tokens: usize,
     ) -> NodeId {
         let block_size = self.cache.page_size();
         let complete_len = page_hashes.len() * block_size;
@@ -769,7 +837,13 @@ impl SglangKvManager {
             pages.len()
         );
 
-        self.publish_stored_hashes(page_hashes, pages, first_new_token, token_ids);
+        self.publish_stored_hashes_with_known_tokens(
+            page_hashes,
+            pages,
+            first_new_token,
+            token_ids,
+            known_tokens,
+        );
         let new_last_node =
             self.cache
                 .insert_page_hashes_from_node(last_node, first_new_token, page_hashes, pages);
@@ -862,6 +936,7 @@ impl SglangKvManager {
                     last_node,
                     prefix_len,
                     token_ids,
+                    lease.known_tokens(),
                 ),
                 token_count / self.cache.page_size() * self.cache.page_size(),
             )
@@ -1146,12 +1221,30 @@ impl SglangKvManager {
 
     /// Publish complete materialized blocks. `token_ids` must start at sequence
     /// position zero and cover all supplied page hashes when token emission is enabled.
+    #[cfg(test)]
     fn publish_stored_hashes(
         &mut self,
         page_hashes: &[LocalBlockHash],
         pages: &[KvPageId],
         first_new_token: usize,
         token_ids: &[u32],
+    ) -> usize {
+        self.publish_stored_hashes_with_known_tokens(
+            page_hashes,
+            pages,
+            first_new_token,
+            token_ids,
+            usize::MAX,
+        )
+    }
+
+    fn publish_stored_hashes_with_known_tokens(
+        &mut self,
+        page_hashes: &[LocalBlockHash],
+        pages: &[KvPageId],
+        first_new_token: usize,
+        token_ids: &[u32],
+        known_tokens: usize,
     ) -> usize {
         if self.kv_event_publishers.is_empty() {
             return 0;
@@ -1225,9 +1318,10 @@ impl SglangKvManager {
                 blocks.push(KvBlock {
                     block_hash,
                     tokens_hash: tokens_hash.0,
-                    token_ids: self.emit_token_ids.then(|| {
-                        token_ids[page_idx * block_size..(page_idx + 1) * block_size].to_vec()
-                    }),
+                    token_ids: (self.emit_token_ids && (page_idx + 1) * block_size <= known_tokens)
+                        .then(|| {
+                            token_ids[page_idx * block_size..(page_idx + 1) * block_size].to_vec()
+                        }),
                 });
             }
         }
@@ -1345,6 +1439,81 @@ mod tests {
             self.events.lock().unwrap().push(event);
             Ok(())
         }
+    }
+
+    #[test]
+    fn unknown_suffix_retains_lru_and_retraction_identity_without_claiming_tokens() {
+        let sink = Arc::new(MockSink::new());
+        let mut manager = SglangKvManager::new_with_prefix_caching(
+            12,
+            4,
+            KvEventPublishers::new(Some(sink.clone())),
+            0,
+            true,
+            true,
+        );
+        let owner = Uuid::from_u128(103);
+        let tokens = (1..=8).collect::<Vec<_>>();
+        let mut lease = RadixRequestLease::default();
+        lease.ensure_page_hashes_with_unknown_suffix(&tokens, 4, owner, 4);
+        let opaque_hashes = lease.page_hashes().to_vec();
+        assert_eq!(
+            manager.allocate_for_request_lease_capped(&tokens, &mut lease, 8),
+            Some(0)
+        );
+        manager.extend_cached_prefix(&tokens, &mut lease);
+        assert!(manager.retract_in_place(&mut lease));
+        assert_eq!(manager.cache().evictable_size, 8);
+        assert_eq!(manager.cache().available_tokens(), 4);
+        assert_eq!(
+            manager.allocate_for_request_lease_capped(&tokens, &mut lease, 8),
+            Some(8)
+        );
+        manager.finish(&tokens, lease);
+        assert_eq!(manager.cache().prefix_match_hashes_len(&opaque_hashes), 8);
+        assert_eq!(
+            manager
+                .cache()
+                .prefix_match_hashes_len(&compute_block_hash_for_seq(&tokens, 4)),
+            4
+        );
+
+        let stored = sink
+            .clone_events()
+            .into_iter()
+            .filter_map(|event| match event.data {
+                KvEventData::Stored(stored) => Some(stored.blocks),
+                _ => None,
+            })
+            .flatten()
+            .collect::<Vec<_>>();
+        assert_eq!(stored.len(), 2);
+        assert_eq!(stored[0].token_ids.as_deref(), Some(&tokens[..4]));
+        assert!(stored[1].token_ids.is_none());
+
+        // Cached unknown output still consumes physical capacity and participates
+        // in ordinary LRU eviction after completion.
+        let pressure = manager
+            .allocate_for_request(&[41, 42, 43, 44, 45, 46, 47, 48])
+            .unwrap();
+        assert_eq!(manager.cache().prefix_match_hashes_len(&opaque_hashes), 4);
+        manager.finish(&[41, 42, 43, 44, 45, 46, 47, 48], pressure.lease);
+    }
+
+    #[test]
+    fn opaque_hashing_preserves_known_pages_and_scopes_mixed_boundary_per_request() {
+        let tokens = (1..=12).collect::<Vec<_>>();
+        let mut first = RadixRequestLease::default();
+        first.ensure_page_hashes(&tokens[..6], 4);
+        first.ensure_page_hashes_with_unknown_suffix(&tokens[..8], 4, Uuid::from_u128(1), 6);
+        first.ensure_page_hashes(&tokens, 4);
+        let mut other = RadixRequestLease::default();
+        other.ensure_page_hashes_with_unknown_suffix(&tokens, 4, Uuid::from_u128(2), 6);
+        let real = compute_block_hash_for_seq(&tokens, 4);
+        assert_eq!(first.page_hashes()[0], real[0]);
+        assert_eq!(other.page_hashes()[0], real[0]);
+        assert_ne!(first.page_hashes()[1..], real[1..]);
+        assert_ne!(first.page_hashes()[1..], other.page_hashes()[1..]);
     }
 
     #[test]
@@ -2111,7 +2280,14 @@ mod tests {
         let page_hashes = alloc.lease.page_hashes().to_vec();
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            mgr.cache_unfinished_hashes(&page_hashes, &mut alloc.lease.pages, last_node, 2, &tokens)
+            mgr.cache_unfinished_hashes(
+                &page_hashes,
+                &mut alloc.lease.pages,
+                last_node,
+                2,
+                &tokens,
+                usize::MAX,
+            )
         }));
 
         assert!(result.is_err());
@@ -2130,7 +2306,14 @@ mod tests {
         let page_hashes = alloc.lease.page_hashes().to_vec();
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            mgr.cache_unfinished_hashes(&page_hashes, &mut alloc.lease.pages, last_node, 0, &tokens)
+            mgr.cache_unfinished_hashes(
+                &page_hashes,
+                &mut alloc.lease.pages,
+                last_node,
+                0,
+                &tokens,
+                usize::MAX,
+            )
         }));
 
         assert!(result.is_err());

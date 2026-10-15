@@ -43,8 +43,8 @@ pub use handoff::{HandoffId, HandoffTransferTiming, TransferTimingMode, prefill_
 pub use protocol::{
     Admission, CacheTierAttribution, Command, CommandEffects, CommandResult, DecodeAcceptance,
     ForwardPassMetrics, KvBlock, KvEvent, KvEventData, KvEventTier, LifecycleEvent, Metrics,
-    Output, PassCompletionEffects, PassStartEffects, PressureEvent, PressureKind, PressureState,
-    Request, StoredBlocks,
+    Output, OutputTokenIdentity, PassCompletionEffects, PassStartEffects, PressureEvent,
+    PressureKind, PressureState, Request, StoredBlocks,
 };
 pub use runtime::{Engine, EngineFactory};
 pub use scheduler::SchedulerRank;

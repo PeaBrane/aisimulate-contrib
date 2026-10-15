@@ -71,6 +71,11 @@ pub struct DirectRequest {
     pub max_output_tokens: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_token_ids: Option<Vec<u32>>,
+    #[serde(
+        default,
+        skip_serializing_if = "crate::engine::OutputTokenIdentity::is_synthetic"
+    )]
+    pub output_identity: crate::engine::OutputTokenIdentity,
     pub uuid: Option<Uuid>,
     pub dp_rank: u32,
     /// Optional rank requested by the authored ReplaySpec. The runtime-owned

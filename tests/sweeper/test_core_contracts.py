@@ -225,6 +225,7 @@ def test_runner_capabilities_preserve_existing_positional_constructor():
     assert capabilities.supports_mtp_expected_acceptance is True
     assert capabilities.supports_state_cache is True
     assert capabilities.supports_agentic_profile is False
+    assert capabilities.supported_agentic_speculation_kinds == ()
     capabilities.require_compatible(
         ReplaySpec(
             backend_deployment=_deployment(),

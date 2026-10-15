@@ -23,6 +23,16 @@ pub(crate) fn synthetic_output_token(request_id: Uuid, output_ordinal: usize) ->
     xxh3_64(&bytes) as u32
 }
 
+/// Opaque cache identity for a generated block whose real token IDs are absent.
+/// The byte domain is distinct from token hashing; request IDs scope executions.
+pub(crate) fn opaque_output_block_hash(request_id: Uuid, block_ordinal: usize) -> u64 {
+    let mut bytes = [0u8; 48];
+    bytes[..24].copy_from_slice(b"aisim-unknown-output-v1\0");
+    bytes[24..40].copy_from_slice(request_id.as_bytes());
+    bytes[40..].copy_from_slice(&(block_ordinal as u64).to_le_bytes());
+    xxh3_64(&bytes)
+}
+
 #[derive(Debug)]
 struct FlatTokens {
     retained: Vec<u32>,
@@ -126,6 +136,7 @@ pub(crate) struct RequestSequence {
     max_output_tokens: usize,
     generated_tokens: usize,
     planned_output_ids: Option<Vec<u32>>,
+    output_identity: crate::engine::OutputTokenIdentity,
     num_input_tokens: usize,
     enable_prefix_caching: bool,
     emit_token_ids: bool,
@@ -185,6 +196,7 @@ impl RequestSequence {
             max_output_tokens,
             generated_tokens: 0,
             planned_output_ids,
+            output_identity: crate::engine::OutputTokenIdentity::Synthetic,
             num_input_tokens,
             enable_prefix_caching,
             emit_token_ids,
@@ -208,6 +220,22 @@ impl RequestSequence {
 
     pub(crate) fn num_input_tokens(&self) -> usize {
         self.num_input_tokens
+    }
+
+    pub(crate) fn set_output_identity(&mut self, identity: crate::engine::OutputTokenIdentity) {
+        debug_assert_eq!(self.generated_tokens, 0);
+        self.output_identity = identity;
+    }
+
+    /// Boundary of token IDs that can be reported as actual cache content.
+    /// Later Unknown blocks use opaque identities but remain cache-resident.
+    pub(crate) fn cacheable_tokens(&self) -> usize {
+        self.num_input_tokens
+            + if self.output_identity.is_synthetic() {
+                self.max_output_tokens
+            } else {
+                0
+            }
     }
 
     pub(crate) fn enable_prefix_caching(&self) -> bool {
@@ -263,7 +291,11 @@ impl RequestSequence {
                 local_hash: None,
             };
         }
-        let local_hash = compute_block_hash_for_tokens(tokens, XXH3_SEED);
+        let local_hash = if (position + 1) * self.block_size > self.cacheable_tokens() {
+            opaque_output_block_hash(self.request_id, position)
+        } else {
+            compute_block_hash_for_tokens(tokens, XXH3_SEED)
+        };
         let sequence_hash = parent_hash
             .map(|parent| compute_next_sequence_hash(parent, local_hash))
             .unwrap_or(local_hash);
@@ -279,7 +311,7 @@ impl RequestSequence {
     ///
     /// Panics if token-ID event mode did not retain the full request history.
     pub(crate) fn block_token_ids(&self, position: usize) -> Option<Vec<u32>> {
-        if !self.emit_token_ids {
+        if !self.emit_token_ids || (position + 1) * self.block_size > self.cacheable_tokens() {
             return None;
         }
         assert_eq!(

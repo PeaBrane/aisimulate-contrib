@@ -39,6 +39,25 @@ does not participate in source generation. Open-loop and existing trace inputs
 retain their current behavior. Integrations such as Dynamo must opt into the
 generated source after adopting a crate release containing this API.
 
+## Output identity at the request boundary
+
+`engine::Request` and Replay's materialized `DirectRequest` carry an
+`output_identity` policy. The serialized default is omitted, preserving existing
+request payloads.
+
+| Field value | Contract |
+| --- | --- |
+| `synthetic` (default) | Missing `output_token_ids` use the existing deterministic generated tokens and cache hashes. Explicit token plans retain their exact identity. |
+| `unknown` | Real output IDs are unavailable; an explicit output plan is rejected. Generated KV uses opaque request-scoped hashes, remains resident and evictable, and can be reused by that request after preemption. It cannot match another request's authored tokens. |
+
+For `unknown`, each distinct execution must have a distinct `request_id`, even
+when executions belong to the same producer session. Reusing a request ID means
+reusing its opaque execution identity. AgenticMooncake automatically selects this
+policy for exact-input rows without output IDs and allocates separate execution
+UUIDs. P/D preserves the same policy across both roles. Cache events retain opaque
+hashes but omit token IDs for blocks containing unknown outputs. Ordinary inline,
+length-only and hash-only workload defaults remain unchanged.
+
 ## Source layout and upstream syncs
 
 The former AIConfigurator Rust crate is kept as a stable mirror subtree under

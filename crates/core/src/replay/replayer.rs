@@ -725,6 +725,7 @@ fn lower_requests(
             };
             let routing = request.routing_metadata()?;
             Ok(DirectRequest {
+                output_identity: Default::default(),
                 tokens,
                 max_output_tokens: request.output_tokens,
                 output_token_ids: request.output_token_ids.clone(),

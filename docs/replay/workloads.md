@@ -321,6 +321,7 @@ A snapshot is cut at request boundaries. It does not model partial decode
 progress or restore an engine checkpoint: without warmup, the caches start
 empty.
 
+
 To use an external sampler's initial selection, set `agentic_snapshot.sampled`.
 Rust validates the complete source graph identity before applying any selection.
 Use `ValidatedAgenticGraph::identity()` from the native importer, or the `graph`
@@ -530,6 +531,17 @@ recycled plays. Hash-only input retains its existing synthetic token namespaces
 and compact representation. The optional exact field is omitted from saved
 rows/graph identity when absent, preserving historical hash-only identities.
 This extension does not restore an external producer snapshot or warmup frontier.
+
+For exact-token AgentX rows, omitting `output_token_ids` keeps generated token
+identity unknown. Replay executes the requested output length and keeps computed
+output KV in the normal cache and eviction order, using opaque request-scoped
+hashes. That KV can be reused after the same request is preempted, but cannot
+match another request's authored prompt. Cache events omit token-ID claims for
+opaque blocks. This also applies to warmup and P/D handoff. Supplying real output
+IDs enables ordinary cross-request reuse of computed prompt-plus-output blocks.
+Hash-based and legacy inline workloads retain their deterministic synthetic
+output identities. Unknown output IDs can omit real generated-prefix hits;
+record this limitation separately from prediction timing error.
 
 A dependent node becomes ready after the latest request in `wait_for` completes, plus its `delay` and
 `tool_wait_ms`. `speedup` therefore scales both authored root arrivals and those post-dependency waits.

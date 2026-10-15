@@ -491,8 +491,21 @@ def test_dense_draft_attention_keeps_checkpoint_window_in_both_phases(kind, conf
         attention = [op for op in phase if op._name.startswith("draft_") and op._name.endswith("_attention")]
         assert attention
         for op in attention:
-            assert op._window_size == 128
-            wire = next(iter(json.loads(op._spec_json()).values()))
+            native = json.loads(op._spec_json())
+            if "TokenScale" in native:
+                # DSpark proposes once per request after prefill; the native
+                # wrapper carries request/query width and owns no attention geometry.
+                wrapper = native["TokenScale"]
+                assert phase is model.context_ops
+                assert wrapper["sequence_basis"] is True
+                assert (wrapper["numerator"], wrapper["denominator"]) == (
+                    model.spec_scheme.num_draft_tokens,
+                    1,
+                )
+                native = wrapper["op"]
+            else:
+                assert op._window_size == 128
+            wire = next(iter(native.values()))
             assert wire["window_size"] == 128
     scheme = model.spec_scheme
     assert scheme.draft_kv_bytes_per_sequence(model, 128) == scheme.draft_kv_bytes_per_sequence(model, 4096)

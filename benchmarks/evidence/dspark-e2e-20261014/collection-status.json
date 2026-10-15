@@ -1,8 +1,8 @@
 {
   "schema": "dspark-collection-status-v1",
   "matrix": "matrix.json",
-  "measured_request_records": 131,
-  "eligible_paired_runs": 1,
+  "measured_request_records": 259,
+  "eligible_paired_runs": 2,
   "checkpoint_references": "checkpoint-references.json",
   "gpu_jobs": [
     {
@@ -314,7 +314,7 @@
       "k": 6,
       "gpus": 16,
       "phase": "initial real",
-      "state": "RUNNING",
+      "state": "COMPLETED",
       "deployment": "disagg",
       "requests": 128,
       "warmup_requests": 8,
@@ -327,7 +327,16 @@
       "cpu_preflight_job": "2257929",
       "prefill_gpu_memory_utilization": 0.92,
       "decode_gpu_memory_utilization": 0.9,
-      "source_residency_evidence": "Absolute per-engine issued/success counters include warmup and measurement; qualification must audit all-issued conservative capacity bound."
+      "source_residency_evidence": "Absolute per-engine issued/success counters include warmup and measurement; qualification must audit all-issued conservative capacity bound.",
+      "progress": "Qualified native Replay pair:128 measured requests, zero failures; eight drained warmups excluded from serving metrics.",
+      "exit_code": "0:0",
+      "elapsed": "00:46:21",
+      "completed_requests": 128,
+      "failed_requests": 0,
+      "local_artifacts": "raw/pd-production-2258192",
+      "transfer_evidence": "pd-transfer-production-2258192.json",
+      "archive": "pd-production-2258192-archive.json",
+      "eligible_paired_runs": 1
     },
     {
       "cluster": "aws-pdx-slurm-1",
@@ -357,7 +366,7 @@
       "gpus": 4,
       "host_memory_gb": 768,
       "phase": "native stage operator observation",
-      "state": "PENDING",
+      "state": "RUNNING",
       "dependency": "afterok:2258192",
       "cpu_preflight_job": "2258231",
       "time_limit": "01:00:00",
@@ -366,7 +375,8 @@
       "bundle": "jobs/dspark-e2e-20261014/v41-native-current-bundle",
       "operator_requests": 35,
       "operator_output_tokens": 16,
-      "scope": "C1 only; diagnostic operator measurements, not production E2E coverage."
+      "scope": "C1 only; diagnostic operator measurements, not production E2E coverage.",
+      "node": "nsc-svg-slurm-1-gpu-131"
     },
     {
       "cluster": "aws-pdx-slurm-1",
@@ -376,7 +386,7 @@
       "gpus": 8,
       "host_memory_gb": 2048,
       "phase": "smoke",
-      "state": "PENDING",
+      "state": "CANCELLED",
       "time_limit": "02:00:00",
       "results": "results/dspark-e2e-20261014/smoke-kimi-k3-k2-791196",
       "cpu_preflight_job": "791177",
@@ -388,7 +398,196 @@
       "attention_backend": "FLASHINFER_MLA",
       "draft_attention_backend": "FLASHINFER_MLA",
       "synthetic_acceptance_length": 2.51,
-      "reason": "Source-qualified replacement of incompatible default FLASH_ATTN MLA prefill; CPU exact bundle/config/import checks passed; GPU result pending."
+      "reason": "Cancelled after more than10minutes without progress at NCCL initialization;8workers spinning~94%CPU, all GPUs0%utilization/1070MiB. Fabric reported healthy; no hardware fault established. Zero requests. Retry excludes this node for one attempt.",
+      "node": "pool0-0201",
+      "qos": "interactive",
+      "queue_note": "Permitted interactive QoS for actively supervised smoke; changed while pending after normal queue forecast exceeded90minutes. Same job, resources and frozen bundle.",
+      "elapsed": "00:11:11",
+      "local_artifacts": "raw/kimi-nccl-stalled-791196",
+      "superseded_by": "791280"
+    },
+    {
+      "cluster": "aws-pdx-slurm-1",
+      "job_id": "791250",
+      "model": "kimi-k3",
+      "k": 2,
+      "gpus": 8,
+      "host_memory_gb": 2048,
+      "phase": "native MLA operator observation",
+      "state": "CANCELLED",
+      "dependency": "afterok:791196",
+      "cpu_preflight_job": "791204",
+      "time_limit": "02:00:00",
+      "qos": "interactive",
+      "results": "results/dspark-e2e-20261014/kimi-native-k2-791250",
+      "bundle": "jobs/dspark-e2e-20261014/kimi-ragged-native-bundle",
+      "prefill_backend": "TRTLLM_RAGGED",
+      "attention_backend": "FLASHINFER_MLA",
+      "draft_attention_backend": "FLASHINFER_MLA",
+      "scope": "C1/C4,25 operator requests with1056outputs; not part of production E2E runs.",
+      "elapsed": "00:00:00",
+      "reason": "Serving dependency stalled; native observer never started."
+    },
+    {
+      "cluster": "aws-pdx-slurm-1",
+      "job_id": "791280",
+      "model": "kimi-k3",
+      "k": 2,
+      "gpus": 8,
+      "host_memory_gb": 2048,
+      "phase": "smoke",
+      "state": "RUNNING",
+      "qos": "interactive",
+      "time_limit": "02:00:00",
+      "results": "results/dspark-e2e-20261014/smoke-kimi-k3-k2-791280",
+      "cpu_preflight_job": "791177",
+      "bundle": "jobs/dspark-e2e-20261014/kimi-ragged-serving-bundle",
+      "excluded_node": "pool0-0201",
+      "prefill_backend": "TRTLLM_RAGGED",
+      "attention_backend": "FLASHINFER_MLA",
+      "draft_attention_backend": "FLASHINFER_MLA",
+      "synthetic_acceptance_length": 2.51,
+      "reason": "Communicator initialization completed normally on retry; actual log selects TRTLLM_RAGGED and eager checkpoint load is progressing.",
+      "node": "pool0-0211"
+    },
+    {
+      "cluster": "aws-pdx-slurm-1",
+      "job_id": "791291",
+      "model": "kimi-k3",
+      "k": 2,
+      "gpus": 8,
+      "host_memory_gb": 2048,
+      "phase": "native MLA operator observation",
+      "state": "PENDING",
+      "dependency": "afterok:791280",
+      "cpu_preflight_job": "791204",
+      "time_limit": "02:00:00",
+      "qos": "interactive",
+      "results": "results/dspark-e2e-20261014/kimi-native-k2-791291",
+      "bundle": "jobs/dspark-e2e-20261014/kimi-ragged-native-bundle",
+      "excluded_node": "pool0-0201",
+      "prefill_backend": "TRTLLM_RAGGED",
+      "attention_backend": "FLASHINFER_MLA",
+      "draft_attention_backend": "FLASHINFER_MLA",
+      "scope": "C1/C4,25 operator requests with1056outputs; not part of production E2E runs."
+    },
+    {
+      "cluster": "nsc-svg-slurm-1",
+      "job_id": "2258652",
+      "model": "v4-pro",
+      "k": 6,
+      "gpus": 16,
+      "deployment": "disagg",
+      "phase": "initial real grouped",
+      "state": "PENDING",
+      "dependency": "afterany:2258242",
+      "windows": [
+        [
+          1,
+          2
+        ],
+        [
+          1,
+          3
+        ],
+        [
+          4,
+          1
+        ],
+        [
+          4,
+          2
+        ],
+        [
+          4,
+          3
+        ]
+      ],
+      "requests_per_window": 128,
+      "warmup_requests_per_window": 8,
+      "time_limit": "02:00:00",
+      "qos": "interactive",
+      "results": "results/dspark-e2e-20261014/pd-initial-v4-pro-k6-2258652",
+      "bundle": "jobs/dspark-e2e-20261014/pro-pd-grouped-bundle",
+      "cpu_preflight_job": "2258639",
+      "source_pool_observer_sha256": "cbf53ad84d1ac91aa5b89bd72547f9ec2680157faa8d6c32bd36fdb341ad4ce5",
+      "prefill_gpu_memory_utilization": 0.92,
+      "decode_gpu_memory_utilization": 0.9,
+      "qualification": "Physical pool peak receipts must be complete after shutdown; each window retains its own identity and wall-clock interval. No timing accuracy claim from submission."
+    },
+    {
+      "cluster": "nsc-svg-slurm-1",
+      "job_id": "2258674",
+      "model": "v4-pro",
+      "k": 3,
+      "gpus": 16,
+      "deployment": "disagg",
+      "phase": "pilot real pilot",
+      "state": "PENDING",
+      "dependency": "afterok:2258652",
+      "windows": [
+        [
+          1,
+          1
+        ]
+      ],
+      "requests_per_window": 128,
+      "warmup_requests_per_window": 8,
+      "time_limit": "02:00:00",
+      "qos": "interactive",
+      "results": "results/dspark-e2e-20261014/pd-pilot-v4-pro-k3-2258674",
+      "bundle": "jobs/dspark-e2e-20261014/pro-pd-controls-bundle",
+      "cpu_preflight_job": "2258668",
+      "source_pool_observer_sha256": "cbf53ad84d1ac91aa5b89bd72547f9ec2680157faa8d6c32bd36fdb341ad4ce5",
+      "synthetic_acceptance_length": null,
+      "scope": "Independent real acceptance pilot; excluded from production scoring and used only to freeze K3 control after counters are checked."
+    },
+    {
+      "cluster": "nsc-svg-slurm-1",
+      "job_id": "2258677",
+      "model": "v4-pro",
+      "k": 6,
+      "gpus": 16,
+      "deployment": "disagg",
+      "phase": "initial synthetic",
+      "state": "PENDING",
+      "dependency": "afterok:2258674",
+      "windows": [
+        [
+          1,
+          1
+        ],
+        [
+          1,
+          2
+        ],
+        [
+          1,
+          3
+        ],
+        [
+          4,
+          1
+        ],
+        [
+          4,
+          2
+        ],
+        [
+          4,
+          3
+        ]
+      ],
+      "requests_per_window": 128,
+      "warmup_requests_per_window": 8,
+      "time_limit": "02:00:00",
+      "qos": "interactive",
+      "results": "results/dspark-e2e-20261014/pd-initial-v4-pro-k6-2258677",
+      "bundle": "jobs/dspark-e2e-20261014/pro-pd-controls-bundle",
+      "cpu_preflight_job": "2258668",
+      "source_pool_observer_sha256": "cbf53ad84d1ac91aa5b89bd72547f9ec2680157faa8d6c32bd36fdb341ad4ce5",
+      "synthetic_acceptance_length": 3.77,
+      "scope": "Initial matrix windows"
     }
   ],
   "cpu_jobs": [
@@ -623,8 +822,54 @@
       "cluster": "aws-pdx-slurm-1",
       "job_id": "791204",
       "purpose": "Corrected Kimi native bundle CPU source/import/CLI and evaluated engine-argument check",
-      "state": "RUNNING",
-      "results": "results/dspark-e2e-20261014/kimi-native-ragged-preflight.json"
+      "state": "COMPLETED",
+      "results": "results/dspark-e2e-20261014/kimi-native-ragged-preflight.json",
+      "exit_code": "0:0",
+      "elapsed": "00:03:17",
+      "local_artifacts": "raw/kimi-native-ragged-preflight.json"
+    },
+    {
+      "cluster": "nsc-svg-slurm-1",
+      "job_id": "2258382",
+      "purpose": "Future physical source-pool observer exact-image CPU source/subclass/inherited scheduler-method/config resolution preflight",
+      "state": "COMPLETED",
+      "results": "results/dspark-e2e-20261014/source-pool-preflight.json",
+      "exit_code": "0:0",
+      "elapsed": "00:00:42",
+      "local_artifacts": "raw/source-pool-preflight.json"
+    },
+    {
+      "cluster": "nsc-svg-slurm-1",
+      "job_id": "2258448",
+      "purpose": "Revised no-hot-path-I/O pool observer plus both Pro role command/checkpoint/flag construction",
+      "state": "COMPLETED",
+      "exit_code": "0:0",
+      "elapsed": "00:00:41",
+      "local_artifacts": "raw/pro-pd-observed-preflight",
+      "observer_sha256": "cbf53ad84d1ac91aa5b89bd72547f9ec2680157faa8d6c32bd36fdb341ad4ce5"
+    },
+    {
+      "cluster": "nsc-svg-slurm-1",
+      "job_id": "2258639",
+      "purpose": "Immutable grouped P/D bundle exact checkpoint/role/observer and explicit window selection CPU preflight",
+      "state": "COMPLETED",
+      "results": "results/dspark-e2e-20261014/pro-pd-grouped-preflight",
+      "bundle": "jobs/dspark-e2e-20261014/pro-pd-grouped-bundle",
+      "exit_code": "0:0",
+      "elapsed": "00:00:42",
+      "local_artifacts": "raw/pro-pd-grouped-preflight"
+    },
+    {
+      "cluster": "nsc-svg-slurm-1",
+      "job_id": "2258668",
+      "purpose": "Pro P/D K6 synthetic and K3 real role/checkpoint/control CPU preflight using observer bundle",
+      "state": "COMPLETED",
+      "bundle": "jobs/dspark-e2e-20261014/pro-pd-controls-bundle",
+      "results": "results/dspark-e2e-20261014/pro-pd-controls-preflight",
+      "exit_code": "0:0",
+      "elapsed": "00:00:42",
+      "local_artifacts": "raw/pro-pd-controls-preflight",
+      "archive_index": "cpu-controls-preflight-2258668.json"
     }
   ],
   "storage_root": "/lustre/fsw/portfolios/coreai/projects/coreai_comparch_inferencex/users/simonec",
@@ -639,7 +884,7 @@
     "Expanded matrix after initial paired coverage",
     "AgentX pilots after matched lifecycle/context qualification"
   ],
-  "production_request_records": 128,
+  "production_request_records": 256,
   "smoke_request_records": 3,
   "runtime_checks": [
     {
@@ -671,5 +916,26 @@
       "job_id": null,
       "reason": "Slurm rejected dependency on completed CPUjob790888 after its live job record expired; no GPU allocation. Refresh explicit draft backend bundle before resubmission; gate CPUcheck by receipt and dependency only on active servingjob790797."
     }
-  ]
+  ],
+  "cpu_preflight_archive": "cpu-preflights.json",
+  "paired_request_records": 256,
+  "paired_configurations": 2,
+  "monitoring": {
+    "status": "blocked_dns",
+    "checked_utc": "2026-10-15T15:45:39Z",
+    "hosts": [
+      "nsc-svg-slurm-1-login-02.nvidia.com",
+      "aws-pdx-slurm-1-login-01.nvidia.com"
+    ],
+    "error": "Could not resolve hostname; local resolver configuration contains home-router DNS and no corporate resolver.",
+    "scope": "Previously submitted jobs may have advanced or completed during the access gap; their recorded states are last observations, not current status. No duplicate jobs submitted.",
+    "unverified_jobs": [
+      "2258242",
+      "2258652",
+      "2258674",
+      "2258677",
+      "791280",
+      "791291"
+    ]
+  }
 }

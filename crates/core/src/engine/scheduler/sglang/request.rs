@@ -22,6 +22,7 @@ pub(super) struct SglangRequest {
     pub(super) prompt_len: usize,
     pub(super) max_output_tokens: usize,
     pub(super) planned_output_ids: Option<Vec<u32>>,
+    pub(super) output_identity: crate::engine::OutputTokenIdentity,
     pub(super) kv_lease: RadixRequestLease,
     pub(super) materialized_tokens: usize,
     pub(super) allocated_tokens: usize,
@@ -50,6 +51,7 @@ impl SglangRequest {
             prompt_len,
             max_output_tokens,
             planned_output_ids: req.output_token_ids,
+            output_identity: req.output_identity,
             kv_lease,
             materialized_tokens: 0,
             allocated_tokens: 0,
@@ -130,8 +132,17 @@ impl SglangRequest {
 
     pub(super) fn append_output_token(&mut self, token: u32, block_size: usize) {
         self.sequence_tokens.push(token);
-        self.kv_lease
-            .ensure_page_hashes(&self.sequence_tokens, block_size);
+        if self.output_identity == crate::engine::OutputTokenIdentity::Unknown {
+            self.kv_lease.ensure_page_hashes_with_unknown_suffix(
+                &self.sequence_tokens,
+                block_size,
+                self.uuid,
+                self.prompt_len,
+            );
+        } else {
+            self.kv_lease
+                .ensure_page_hashes(&self.sequence_tokens, block_size);
+        }
         self.materialized_tokens += 1;
     }
 

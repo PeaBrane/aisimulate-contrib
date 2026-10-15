@@ -16,7 +16,7 @@ from acceptance import measured_acceptance
 from campaign import cells
 from collect_fixed import one_request
 from freeze_acceptance import freeze
-from pd_driver import load_role_receipts
+from pd_driver import load_role_receipts, selected_windows
 from runtime_receipt import DsparkReceiptWorker, primitive
 from serve_role import main as role_main
 from serve_smoke import main as serve_main
@@ -37,6 +37,21 @@ def snapshot(rounds, proposed, accepted, positions):
 
 
 class CollectionTests(unittest.TestCase):
+    def test_explicit_windows_resume_without_repeating_completed_point(self):
+        windows = [(1, 2), (1, 3), (4, 1), (4, 2), (4, 3)]
+        self.assertEqual(selected_windows("initial", windows=windows), windows)
+        self.assertEqual(selected_windows("initial"), [(1, 1), (1, 2), (1, 3), (4, 1), (4, 2), (4, 3)])
+        self.assertEqual(selected_windows("smoke"), [(1, 1)])
+        for kwargs in (
+            {"windows": [(1, 1), (1, 1)]},
+            {"windows": [(16, 1)]},
+            {"windows": [(1, 4)]},
+            {"windows": [(1, 2)], "concurrencies": [1]},
+            {"windows": [(1, 2)], "repetitions": [2]},
+        ):
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                selected_windows("initial", **kwargs)
+
     def test_role_preflight_resolves_command_without_gpu_or_server_launch(self):
         with tempfile.TemporaryDirectory() as temp:
             argv = [
@@ -65,6 +80,46 @@ class CollectionTests(unittest.TestCase):
             launch.assert_not_called()
             self.assertEqual(json.loads((Path(temp) / "prefill-preflight.json").read_text())["command"], ["server"])
             self.assertFalse((Path(temp) / "prefill-identity.json").exists())
+
+    def test_source_pool_observer_is_explicit_and_rejects_prefix_caching(self):
+        with tempfile.TemporaryDirectory() as temp:
+            argv = [
+                "serve_role.py",
+                "--model-key",
+                "v4-pro",
+                "--role",
+                "prefill",
+                "--k",
+                "6",
+                "--port",
+                "8010",
+                "--output",
+                temp,
+                "--preflight-only",
+                "--observe-source-pool",
+            ]
+            with (
+                patch("sys.argv", argv),
+                patch("serve_role.server_command", return_value=(["server"], {}, {})),
+            ):
+                role_main()
+            receipt = json.loads((Path(temp) / "prefill-preflight.json").read_text())
+            self.assertEqual(
+                receipt["command"][-2:],
+                [
+                    "--scheduler-cls",
+                    "source_pool_observer.SourcePoolObserverScheduler",
+                ],
+            )
+            self.assertTrue(receipt["source_pool_observer"]["enabled"])
+            self.assertEqual(receipt["runtime_environment"]["AISIM_POOL_OBSERVER_ROLE"], "prefill")
+            self.assertEqual(len(receipt["source_pool_observer"]["source_pool_observer.py"]), 64)
+            with (
+                patch("sys.argv", argv + ["--prefix-cache"]),
+                patch("sys.stderr", io.StringIO()),
+                self.assertRaises(SystemExit),
+            ):
+                role_main()
 
     def test_pd_prefill_memory_budget_and_reference_control_are_explicit(self):
         with tempfile.TemporaryDirectory() as temp:

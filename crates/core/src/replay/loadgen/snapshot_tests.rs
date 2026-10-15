@@ -1366,3 +1366,66 @@ fn external_sampled_cut_selects_source_play_and_leaves_unmapped_ids_explicit() {
         serde_json::json!({"seed":42})
     );
 }
+
+#[test]
+fn exact_unknown_output_ids_remain_unknown_across_snapshot_and_warmup() {
+    let mut history = exact_row("history", vec![1; 128], vec![7, 8]);
+    history.output_token_ids = None;
+    let mut future = history.clone();
+    future.request_id = "future".into();
+    future.not_before_ms = 100.0;
+    let source = graph(vec![history, future]);
+    let mut plain =
+        WorkloadDriver::new_agentic_trace_with_options(source.clone(), 64, true, None).unwrap();
+    assert!(
+        plain.pop_ready(0.0, 1)[0]
+            .request
+            .output_token_ids
+            .is_none()
+    );
+    let context = source
+        .prepare_snapshots(
+            1,
+            AgenticSnapshotOptions {
+                seed: 42,
+                sampled: None,
+            },
+        )
+        .unwrap()
+        .context()
+        .clone();
+    let play = context.prepare_play(0, 0, Some(50.0)).unwrap();
+    let mut profile = WorkloadDriver::new_agentic_snapshots(
+        PreparedAgenticSnapshots::from_plays(vec![play.clone()]).unwrap(),
+        64,
+        true,
+        1.0,
+    )
+    .unwrap();
+    assert!(
+        profile.pop_ready(50.0, 1)[0]
+            .request
+            .output_token_ids
+            .is_none()
+    );
+    for policy in [
+        AgenticWarmupPolicy::Primer,
+        AgenticWarmupPolicy::LiveTrajectories,
+    ] {
+        let mut warmup = WorkloadDriver::new_agentic_warmup_with_policy(
+            PreparedAgenticSnapshots::from_plays(vec![play.clone()]).unwrap(),
+            64,
+            true,
+            1.0,
+            policy,
+        )
+        .unwrap();
+        let primer = warmup.pop_ready(0.0, 1).pop().unwrap();
+        assert_eq!(primer.request.max_output_tokens, 1);
+        assert!(primer.request.output_token_ids.is_none());
+        assert_eq!(
+            primer.request.output_identity,
+            crate::engine::OutputTokenIdentity::Unknown
+        );
+    }
+}

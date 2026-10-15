@@ -1435,6 +1435,9 @@ impl VllmCore {
             self.emit_token_ids,
             planned_output_ids,
         );
+        sequence
+            .sequence
+            .set_output_identity(request.output_identity);
         if let (Some(unit), Some(tokens)) = (self.args.prefix_match_unit, prefix_tokens) {
             sequence.lease.configure_prefix_hashes(&tokens, unit);
         }

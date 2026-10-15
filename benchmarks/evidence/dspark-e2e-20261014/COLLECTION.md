@@ -292,6 +292,68 @@ by eight without per-engine routing evidence. Each pool's static reservation
 uses the larger of its source-resident bound and Replay concurrency. A native
 capacity proof is reported only if these bounds fit the actual role pools.
 
+For future grouped windows, `source_pool_observer.SourcePoolObserverScheduler`
+is an optional observer selected through the pinned `--scheduler-cls` option.
+`cpu-preflights.json` indexes the small `cpu-preflights-20261014.tar.gz` archive:
+successful Kimi serving/native, V4.1 native and final Pro P/D observer checks,
+their executed commands, receipts and per-member hashes. These are CPU checks;
+they do not establish GPU execution or serving accuracy.
+The campaign role launcher enables it only with `--observe-source-pool`
+(`DSPARK_OBSERVE_SOURCE_POOL=1` for `pd-smoke.sh`); the default is disabled.
+The launcher rejects non-Pro, aggregated and prefix-enabled configurations,
+and records the observer/module-manifest hashes plus its role/run environment.
+Each future client window writes `measurement-window.json` with serving run ID,
+identity hash and absolute Unix-nanosecond bounds around measured requests,
+after warmup drains. Per-request latency still uses the monotonic clock.
+Bind that file's hash to complete observer receipts after server shutdown;
+an incomplete startup receipt cannot qualify a measured window.
+It subclasses the actual `AsyncScheduler`; scheduling, routing and speculative
+state updates remain inherited. Its eight runtime source hashes are checked
+against `source_pool_sources.json` before installation. Set
+`AISIM_POOL_OBSERVER_DIR` to a new receipt directory,
+`AISIM_POOL_OBSERVER_ROLE` to `prefill` or `decode`, and
+`AISIM_POOL_OBSERVER_RUN_ID` to the serving run's identity. This observer is not
+enabled on earlier runs and does not change the cache adapter's proof rules.
+
+The observer wraps the existing pool's `get_new_blocks` and `touch` methods,
+calling the originals unchanged and reading the remaining free count in O(1).
+These are the only free-queue depletion paths after the reserved null block
+is created. The peak includes that null block, detached deferred frees and
+copy-on-write retentions; it does not scan blocks or approximate request counts.
+It also counts `allocate_slots` denials/errors and scheduler preemptions.
+Positive free capacity alone is insufficient: full-request admission and
+watermark/reserved-block checks can reject a request before allocation.
+Prefix caching, offload, non-PP1 operation and alternate physical pools are
+rejected. The audited Pro text-token path has no separate encoder-cache gate.
+
+Each engine keeps peaks and counters in memory and atomically writes
+`ROLE-dp-N.json` at startup and shutdown. Denials/errors or preemption may also
+flush evidence; these events invalidate a nonbinding-capacity claim. There are
+no filesystem writes on successful allocation paths. Receipts retain the observer/source
+hashes, run identity, cumulative mutation/admission counters, physical capacity
+and peak, and completion state. A crash leaves an incomplete startup receipt;
+successful reconciliation requires a final `complete=true` receipt from every
+expected engine, matching runtime cache receipts, and zero denials/errors
+and preemptions; Replay capacity still requires its own proof. The observer
+does not declare the run qualified. Instrumentation adds Python wrappers and
+constant-time reads to allocation calls, plus filesystem writes at the stated
+events. `source-pool-observer-host-overhead.json` measures only a mock CPU loop
+and local receipt writes; it is not silicon or serving overhead and does not
+correct measured latencies. Future serving identities must record the hook.
+
+After shutdown, combine those nine receipts in a
+`dspark-native-pool-evidence-v1` JSON object with `roles.prefill` (eight rows),
+`roles.decode` (one row), `serving_run_id`, `measurement_identity_sha256` and
+`runtime_cache_receipt_sha256`. Its `window` contains the relative `source`
+path and `sha256` of `measurement-window.json`, plus that file's
+`start_unix_ns` and `end_unix_ns`. The captured file also identifies the serving
+run and frozen measurement through `serving_run_id` and `identity_sha256`.
+Pass this evidence to `reconcile_pro_cache.py --deployment disaggregated
+--pool-observation-receipt PATH`. Do not also pass a source-residency bound.
+The adapter verifies the window file, source pins, engine coverage and pool
+capacities. Observed native pressure cannot override a failed Replay capacity
+bound, and these observations do not qualify prefix-enabled AgentX behavior.
+
 Automatic simulator transfer bytes remain a rank-local logical payload. The
 Pro source sends replicated MLA to eight D ranks; these parallel reads do not
 imply eight times the latency. A measured effective per-handoff bandwidth may
@@ -540,7 +602,15 @@ so later uploads cannot change a running job.
 
 P/D supports `DSPARK_RUN_MODE=smoke|pilot|initial`, optional
 `DSPARK_CONCURRENCY=1|4` and `DSPARK_REPETITION=1|2|3`. Initial defaults cover
-C1/C4 and all three repetitions. Each completed window has separate raw records
+C1/C4 and all three repetitions. To resume only missing windows, set
+`DSPARK_WINDOWS="1:2 1:3 4:1 4:2 4:3"` (or repeat
+`pd_driver.py --window CONCURRENCY REPETITION`). Explicit windows cannot be mixed
+with the separate concurrency/repetition filters; duplicates are rejected.
+The exact grouped bundle passed CPU preflight 2258639;
+`cpu-grouped-preflight-2258639.json` indexes its archived receipts and command checks.
+`cpu-controls-preflight-2258668.json` retains the subsequent K3 real and K6
+synthetic role-command checks, including the frozen AL 3.77 control.
+Each completed window has separate raw records
 and acceptance evidence. `DSPARK_SYNTHETIC_AL` accepts only the verified
 reference K/AL; other K values require `DSPARK_SYNTHETIC_CONTROL` from the separate
 128-request real pilot. Both roles receive and record the same control. Real
@@ -554,7 +624,7 @@ below the8.99GiB required for16K context. The next configuration explicitly sets
 topology, graph policy and context remain the same; the cache receipt is
 re-exported and the changed serving identity is retained.
 
-## AgentX capture adapter (CPU qualified; native graph import pending)
+## AgentX capture adapter (bounded CPU import; measured windows pending)
 
 The installed `aisim_agentx_pin` plugin also selects a read-only timing-strategy
 subclass. `agentx_phaseb.py` verifies its source hash and sets
@@ -563,7 +633,8 @@ recycling to the pinned producer, then exports the realized trajectories,
 snapshot `t_star_ms`, live stream/frontier states, root/parent identities,
 join-gate memberships, completed-prefix replay boundaries and session cache
 markers. Selected-tree metadata includes the original turn dependencies, branch
-structure, tool delays, source coordinates and output-length settings. Templates
+structure, tool delays and source coordinates. Full message bodies and per-turn
+output limits remain in the corpus/raw records, not this timing metadata. Templates
 are written once per sampled source tree; ordinary request/token dispatch does
 not perform extra capture writes. Capture is inactive without this environment
 variable. The hook adds boundary/recycle serialization work; equivalence of host
@@ -622,17 +693,133 @@ prefixes. The canonical snapshot API also accepts externally selected initial
 source plays, cuts and producer session mappings, bound to the full source graph
 identity and retained provenance. It executes native warmup rather than restoring
 a captured post-warmup frontier or cache. Captured dependencies/idle caps,
-recycling and stop/cancellation cohorts still need canonical graph lowering and
-a comparison of the actual native warmup frontier with the producer handoff. `capture-audit.json` therefore always remains unscored.
+recycling and stop/cancellation cohorts still need qualification, together with
+a comparison of the actual native warmup frontier with the producer handoff.
+`capture-audit.json` therefore always remains unscored.
+
+`agentx_native_inputs.py` runs on CPU inside the pinned runtime image. It uses
+that image's `DeepseekV4Tokenizer.from_pretrained` with the immutable Pro tokenizer
+revision, verifies both installed formatter source hashes, and formats unchanged
+normal raw chat payloads offline. It checks prompt length against actual server
+usage, preserves the session marker, and accepts only plain text system/user/
+assistant messages with role/content fields. Tool-call, content-part, truncation
+and other normalization paths require explicit qualification. It does not enable token echo or send requests.
+Observed completion usage supplies the output stop length; missing output IDs
+remain unknown. The pinned Weka producer accumulates prescribed trace responses
+(`SessionState.advance_turn`) and does not store live assistant responses in
+`DELTAS_WITH_RESPONSES`. Thus later captured prompts can be reconstructed without
+inventing earlier output IDs.
+
+`agentx_import.py` lowers complete, small selected initial source trees into
+AgenticMooncake v2. It binds native input IDs, optional observed output IDs,
+source coordinates, marker/session identity, sequence delays, fork/spawn gates,
+completion barriers and joins. Overlapping spawn edges use the source dispatch
+clock; join waits and parent delays remain separate. It never schedules from
+measured arrival times. The resulting graph digest is distinct from the full
+corpus content pin. Bind sampled cuts only to the graph identity returned by the
+canonical native API; Python does not recreate the native digest.
+
+```bash
+# In the pinned vLLM image; normal raw records, no prompt-token echo.
+python agentx_native_inputs.py --capture /work/run/capture \
+  --raw /work/run/aiperf/raw_records/raw_records_*.jsonl \
+  --runtime-image-digest "$PINNED_IMAGE_DIGEST" --output /work/run/native-inputs.jsonl
+python agentx_import.py --capture /work/run/capture \
+  --materializations /work/run/complete-selected-inputs.jsonl \
+  --provenance /work/run/materialization-provenance.json \
+  --model deepseek-ai/DeepSeek-V4-Pro-0813 --output /work/run/lowered
+python -m unittest test_agentx_import
+```
+
+Materialization provenance must pin `producer_revision`, `corpus_sha256`,
+`runtime_image_digest`, `formatter_sha256`, `encoder_sha256` and
+`tokenizer_revision`; every row must match those pins. Each script defaults to a
+2,000,000-total-input-token budget, adjustable with `--max-input-tokens`. This is
+a bounded diagnostic importer, not a whole-corpus token expansion. Native graph
+nodes currently own full token arrays; large selected trees need a separately
+measured shared-prefix design before scaling this path. A failed formatter leaves
+only a `.partial` artifact, never a completed materialization file.
+
+Normal raw records alone may omit historical or undispatched turns in an initial
+tree. The importer rejects those missing materializations; it does not truncate
+the source graph or invent prompt bodies. Generating those missing payloads with
+the pinned producer and marker contract remains open. Recycled trees, arbitrary
+post-warmup frontier restoration, failures/cancellation lowering and full-window
+metric qualification also remain open. Both manifests stay unscored. Current
+original CPU fixtures verify small complete trees and explicit rejection paths;
+the offline formatter has not yet been executed on an actual AgentX window.
 
 Capture API anchors are
 [SemiAnalysisAI/aiperf@754356e9](https://github.com/SemiAnalysisAI/aiperf/tree/754356e9a39acc6cc6afb242d123bb57c3fb6f75/src/aiperf):
 `timing/strategies/agentic_replay.py`, `timing/trajectory_source.py`,
-`common/models/{dataset_models,record_models}.py`,
+`timing/branch_orchestrator.py`, `workers/session_manager.py`,
+`common/models/{dataset_models,record_models,branch,prerequisites}.py`,
 `post_processors/raw_record_writer_processor.py`,
 `records/record_processor_service.py`, `plugin/plugins.yaml` and
 `config/flags/cli_config.py` (Apache-2.0, NVIDIA Corporation & Affiliates).
 Token echo is grounded in
 [vLLM@ac9126 chat completion](https://github.com/vllm-project/vllm/tree/ac9126e58aa7bbab1856ba6593ba4d5003fea516/vllm/entrypoints/openai/chat_completion)
-`protocol.py` and `serving.py` (Apache-2.0, vLLM contributors). All capture and
+`protocol.py`, `serving.py` and `vllm/tokenizers/deepseek_v4{,_encoding}.py`
+(Apache-2.0, vLLM contributors). All capture and
 fixture code here is original; upstream scheduling and serving code is unmodified.
+
+## Pro grouped cache and AgentX prefix reuse
+
+`model-support.json` (`pro_grouped_prefix_cache_audit`) records the source audit
+and exact cache receipt. The current grouped allocator supports cold, request-owned
+window/full-history ranges. It explicitly rejects speculative prefix reuse and
+P/D; removing those guards would not implement shared cache identities, accepted
+versus reserved progress, per-group common hits, or pending source-reader leases.
+
+The measured prefix-OFF Pro pool combines target and draft SWA, compressed KV,
+indexer and compressor groups in one padded physical block pool. A future
+implementation should extend the existing physical pool with group-qualified
+keys and transactional group leases, preserving each group's processed frontier,
+window retention, common-hit alignment and source ownership. It must count shared
+draft storage once. The existing generic cold grouped path and scalar fast path
+can remain separate. This is a proposal, not implemented prefix-ON support.
+
+Fixed-length nonbinding capacity evidence remains valid only in its stated
+prefix-OFF scope. Actual AgentX prefix-ON validation needs a fresh effective-cache
+receipt and tests for group-tail misses, rollback, eviction, fork sharing and P/D
+source retention. No FPM timing or unsupported grouped-cache guard is enabled by
+this audit. Exact repository/runtime source anchors and hashes are retained in
+the JSON audit.
+
+## V4.1 cache qualification before serving comparison
+
+`model-support.json` (`v41.cache_adapter_audit`) records the installed-source
+ownership audit and required receipt fields. Forty target and three draft layers
+own SWA. Only layers 2, 8, 14 and 20 own compressed main/index caches; later
+index producers share them. The three ratio-two compressor rings each need eight
+FP32 rows for K3/K5. Decoder replay reuses these caches and adds working buffers,
+not a second paged KV pool. Engram weight residency is a separate setting.
+
+A prefix-OFF C1/C4 manual mapping is feasible in principle through existing
+numeric cache fields and a conservative static reserve. Qualification still
+requires all four initialized serving-rank receipts, physical alias/stride
+validation, and separate native/Replay nonbinding checks. The eager maxseq1
+operator probe cannot establish the graph/maxseq64 serving capacity. No capacity
+or group count has been invented while that receipt is pending.
+
+The existing raw V4.1 memory formula is not a physical-pool receipt: it uses
+ratio-sized compressor state and unpadded target SWA. A runtime-derived mapping
+must include the eight-row rings and draft SWA exactly once. Prefix hits, eviction
+and per-step rolling allocation remain outside this fixed-length approximation;
+the grouped AgentX limitation above remains in force. CPU source/config evidence
+is preserved in `cpu-preflights-20261014.tar.gz`, indexed and hashed by
+`cpu-preflights.json`; it does not claim GPU execution or serving accuracy.
+
+The first P/D production window 2258192 completed 128/128 requests, after eight
+warmups. Every P engine completed one warmup and 16 measured requests; D completed
+8 warmups and 128 measured requests. `pd-transfer-production-2258192.json` retains
+all per-engine counters and NIXL window deltas: 1,024 rank observations,
+38,231,212,032 transferred bytes, and zero failed transfers, notifications or
+expired requests. Transfer-duration sums aggregate rank observations, not the
+request critical path. The all-issued source retention bound is 17 requests per
+P engine, including warmup; it does not assume prompt source release.
+
+The qualified P/D production raw records and receipts are archived in
+`pd-production-2258192.tar.gz`; `pd-production-2258192-archive.json` records
+the archive hash and all 53 member hashes, including the original and qualified
+summaries. Extract at the campaign directory to restore the original raw paths.

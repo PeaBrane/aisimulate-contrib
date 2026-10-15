@@ -69,11 +69,15 @@ contract allows it. More specific flags cover disaggregated attention-DP,
 AgentX backends/topologies/lanes/snapshots/warmup/profiles, offload/speculation,
 analytical EPD, cached-prefix tokens, state/grouped cache and model controls.
 Generic flag defaults are not qualification evidence for an optional stack.
+`supported_agentic_speculation_kinds` is a keyword-only tuple, preserving the
+existing positional constructor. The offline engine advertises `("dspark",)`;
+other runners must explicitly declare their supported methods.
 
 `require_compatible(spec)` checks versions and coarse combinations before
 execution. AgentX G2 additionally requires offline vLLM, a static single
-aggregated worker or 1P1D, and DP1 on every role. G3 and agentic speculation
-remain rejected. The [feature matrix](../replay/features.md) records the built-in
+aggregated worker or 1P1D, and DP1 on every role. G3 remains rejected. Fixed-length
+DSpark is supported with HBM-only cache; other agentic speculation methods and
+speculation with offload remain rejected. The [feature matrix](../replay/features.md) records the built-in
 stack's actual boundary, including limitations stricter than a capability flag.
 
 If every backend/topology pair fails Sweeper preflight, `RunnerIncompatibleError`

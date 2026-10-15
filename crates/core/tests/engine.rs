@@ -510,6 +510,7 @@ fn submit_interval_request(
             SchedulerCommand::new(
                 dp_rank,
                 Command::Submit(Request {
+                    output_identity: Default::default(),
                     request_id: Uuid::from_u128(id),
                     tokens: vec![id as u32; input_tokens],
                     max_output_tokens: output_tokens,
@@ -589,6 +590,7 @@ fn sglang_split_prefixes_remain_reusable_across_cache_pressure() {
                 SchedulerCommand::new(
                     0,
                     Command::Submit(Request {
+                        output_identity: Default::default(),
                         request_id,
                         tokens,
                         max_output_tokens: 0,
@@ -642,6 +644,7 @@ fn sglang_prefill_packs_remaining_pages_and_completes_partial_chunks() {
                     SchedulerCommand::new(
                         0,
                         Command::Submit(Request {
+                            output_identity: Default::default(),
                             request_id: Uuid::from_u128(index as u128 + 1),
                             tokens,
                             max_output_tokens: 0,

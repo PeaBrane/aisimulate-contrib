@@ -30,6 +30,9 @@ container=(--container-image="$storage_root/images/vllm-ac9126e58aa7-3d17635c.sq
   --container-workdir="$result/source"
   --container-env=HF_HOME,XDG_CACHE_HOME,VLLM_NIXL_SIDE_CHANNEL_HOST,VLLM_NIXL_SIDE_CHANNEL_PORT)
 role_args=()
+if [[ "${DSPARK_OBSERVE_SOURCE_POOL:-0}" == 1 ]]; then
+  role_args+=(--observe-source-pool)
+fi
 if [[ -n "${DSPARK_SYNTHETIC_AL:-}" ]]; then
   role_args+=(--synthetic-al "$DSPARK_SYNTHETIC_AL")
 fi
@@ -42,6 +45,16 @@ if [[ -n "${DSPARK_CONCURRENCY:-}" ]]; then
 fi
 if [[ -n "${DSPARK_REPETITION:-}" ]]; then
   driver_args+=(--repetition "$DSPARK_REPETITION")
+fi
+if [[ -n "${DSPARK_WINDOWS:-}" ]]; then
+  read -r -a selected_windows <<< "$DSPARK_WINDOWS"
+  for window in "${selected_windows[@]}"; do
+    if [[ ! "$window" =~ ^[14]:[123]$ ]]; then
+      echo "Invalid DSPARK_WINDOWS entry: $window" >&2
+      exit 2
+    fi
+    driver_args+=(--window "${window%:*}" "${window#*:}")
+  done
 fi
 pids=()
 cleanup() { for pid in "${pids[@]}"; do kill "$pid" 2>/dev/null || true; done; wait || true; }

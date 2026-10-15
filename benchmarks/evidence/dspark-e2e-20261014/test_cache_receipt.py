@@ -2,10 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import copy
+import hashlib
+import json
+import tempfile
 import unittest
 from pathlib import Path
 
-from reconcile_pro_cache import reconcile, reconcile_pd
+from reconcile_pro_cache import read_pool_evidence, reconcile, reconcile_pd
 
 from aisimulate.compiler import prediction_to_replay_spec
 from aisimulate.config.cli import CorePredictionConfig
@@ -98,7 +101,144 @@ def run_pd(value, concurrency=4):
     return reconcile_pd(value, k=6, concurrency=concurrency, input_length=1024, output_length=1024)
 
 
+def pool_evidence():
+    root = Path(__file__).parent
+    rows = {}
+    for role, dp, tp in (("prefill", 8, 1), ("decode", 1, 8)):
+        rows[role] = [
+            {
+                "schema": "dspark-native-pool-observation-v1",
+                "run_id": "original-test-serving-run",
+                "role": role,
+                "data_parallel_index": rank,
+                "tensor_parallel_size": tp,
+                "data_parallel_size": dp,
+                "async_scheduler": True,
+                "prefix_caching": False,
+                "initial_null_block_included": True,
+                "runtime_revision": "ac9126e58aa7bbab1856ba6593ba4d5003fea516",
+                "source_hashes": json.loads((root / "source_pool_sources.json").read_text()),
+                "observer_sha256": hashlib.sha256((root / "source_pool_observer.py").read_bytes()).hexdigest(),
+                "num_blocks": 10000,
+                "complete": True,
+                "reason": "shutdown",
+                "started_ns": 1,
+                "updated_ns": 100,
+                "peak_used_blocks": 500,
+                "current_used_blocks": 1,
+                "pool_mutation_calls": 300,
+                "allocation_attempts": 150,
+                "allocation_denials": 0,
+                "observation_or_allocation_errors": 0,
+                "preemptions": 0,
+            }
+            for rank in range(dp)
+        ]
+    return {
+        "schema": "dspark-native-pool-evidence-v1",
+        "serving_run_id": "original-test-serving-run",
+        "measurement_identity_sha256": "d" * 64,
+        "window": {"start_unix_ns": 10, "end_unix_ns": 90, "source": "window.json", "sha256": "a" * 64},
+        "roles": rows,
+    }
+
+
 class CacheReceiptTests(unittest.TestCase):
+    def test_pool_observation_bounds_native_holds_without_changing_replay_bound(self):
+        evidence = pool_evidence()
+        result = reconcile_pd(
+            pd_receipt(),
+            k=6,
+            concurrency=4,
+            input_length=1024,
+            output_length=1024,
+            pool_observation_evidence=evidence,
+        )
+        self.assertTrue(result["native_capacity_proven_nonbinding"])
+        self.assertTrue(result["replay_capacity_proven_nonbinding"])
+        self.assertFalse(result["source_residency"]["native_bound_established"])
+        pool = result["roles"]["prefill"]["rank_pools"][0]
+        self.assertEqual(pool["native_observed_peak_blocks"], 500)
+        self.assertEqual(pool["static_rolling_reserve_blocks"], 4 * 431)
+        self.assertIsNone(pool["native_resident_requests_bound"])
+        large = reconcile_pd(
+            pd_receipt(),
+            k=6,
+            concurrency=64,
+            input_length=8192,
+            output_length=1024,
+            pool_observation_evidence=evidence,
+        )
+        self.assertTrue(large["native_capacity_proven_nonbinding"])
+        self.assertFalse(large["replay_capacity_proven_nonbinding"])
+
+    def test_pool_admission_denials_preemption_or_full_pool_prevent_qualification(self):
+        for field, value in (
+            ("allocation_denials", 1),
+            ("preemptions", 1),
+            ("observation_or_allocation_errors", 1),
+            ("peak_used_blocks", 10000),
+        ):
+            with self.subTest(field=field):
+                evidence = pool_evidence()
+                evidence["roles"]["prefill"][3][field] = value
+                result = reconcile_pd(
+                    pd_receipt(),
+                    k=6,
+                    concurrency=4,
+                    input_length=1024,
+                    output_length=1024,
+                    pool_observation_evidence=evidence,
+                )
+                self.assertTrue(result["replay_capacity_proven_nonbinding"])
+                self.assertFalse(result["native_capacity_proven_nonbinding"])
+
+    def test_pool_observation_rejects_incomplete_stale_or_mismatched_evidence(self):
+        mutations = (
+            ("complete", False),
+            ("started_ns", 11),
+            ("updated_ns", 89),
+            ("num_blocks", 10001),
+            ("run_id", "other-run"),
+            ("observer_sha256", "b" * 64),
+            ("source_hashes", {}),
+            ("prefix_caching", True),
+            ("data_parallel_index", 1),
+            ("peak_used_blocks", -1),
+        )
+        for field, value in mutations:
+            with self.subTest(field=field):
+                evidence = pool_evidence()
+                evidence["roles"]["prefill"][0][field] = value
+                with self.assertRaises(ValueError):
+                    reconcile_pd(
+                        pd_receipt(),
+                        k=6,
+                        concurrency=4,
+                        input_length=1024,
+                        output_length=1024,
+                        pool_observation_evidence=evidence,
+                    )
+
+    def test_pool_window_file_and_runtime_receipt_are_hash_bound(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            evidence = pool_evidence()
+            evidence["runtime_cache_receipt_sha256"] = "c" * 64
+            window = {"serving_run_id": evidence["serving_run_id"], "start_unix_ns": 10, "end_unix_ns": 90}
+            window["identity_sha256"] = evidence["measurement_identity_sha256"]
+            raw = json.dumps(window).encode()
+            (root / "window.json").write_bytes(raw)
+            evidence["window"]["sha256"] = hashlib.sha256(raw).hexdigest()
+            path = root / "pool.json"
+            path.write_text(json.dumps(evidence))
+            self.assertEqual(read_pool_evidence(path, "c" * 64), evidence)
+            with self.assertRaisesRegex(ValueError, "cache receipt hash"):
+                read_pool_evidence(path, "d" * 64)
+            (root / "window.json").write_bytes(raw + b" ")
+            with self.assertRaisesRegex(ValueError, "window hash"):
+                read_pool_evidence(path, "c" * 64)
+
     def test_aliases_are_not_summed_and_pool_blocks_are_preserved(self):
         result = run(receipt())
         self.assertEqual(result["physical_pool_bytes_per_rank"], 10250000)

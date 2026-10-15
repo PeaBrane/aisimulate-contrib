@@ -26,6 +26,7 @@ def main():
     parser.add_argument("--prefix-cache", action="store_true")
     parser.add_argument("--context-length", type=int, default=16384)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.90)
+    parser.add_argument("--observe-source-pool", action="store_true")
     parser.add_argument(
         "--graph-policy",
         choices=["eager", "runtime-default"],
@@ -36,6 +37,8 @@ def main():
     args = parser.parse_args()
     if args.k not in MODELS[args.model_key]["k"]:
         parser.error("K must belong to the approved matrix")
+    if args.observe_source_pool and (args.model_key != "v4-pro" or args.role == "agg" or args.prefix_cache):
+        parser.error("source pool observation requires Pro P/D with prefix caching disabled")
     model = MODELS[args.model_key]
     control = None
     if args.synthetic_control is not None:
@@ -73,6 +76,16 @@ def main():
         context_length=args.context_length,
         gpu_memory_utilization=args.gpu_memory_utilization,
     )
+    observer = {"enabled": args.observe_source_pool}
+    if args.observe_source_pool:
+        command += ["--scheduler-cls", "source_pool_observer.SourcePoolObserverScheduler"]
+        env.update(
+            AISIM_POOL_OBSERVER_DIR=str((args.output / "source-pool-observations").resolve()),
+            AISIM_POOL_OBSERVER_ROLE=args.role,
+            AISIM_POOL_OBSERVER_RUN_ID=args.output.name,
+        )
+        for name in ("source_pool_observer.py", "source_pool_sources.json"):
+            observer[name] = hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
     receipt_name = f"{args.role}-preflight.json" if args.preflight_only else f"{args.role}-identity.json"
     (args.output / receipt_name).write_text(
         json.dumps(
@@ -83,6 +96,7 @@ def main():
                 "synthetic_control": control,
                 "prefix_cache": args.prefix_cache,
                 "gpu_memory_utilization": args.gpu_memory_utilization,
+                "source_pool_observer": observer,
                 "runtime_environment": {
                     name: env[name]
                     for name in (
@@ -91,6 +105,9 @@ def main():
                         "VLLM_SERVER_DEV_MODE",
                         "VLLM_USE_V2_MODEL_RUNNER",
                         "VLLM_USE_RUST_FRONTEND",
+                        "AISIM_POOL_OBSERVER_DIR",
+                        "AISIM_POOL_OBSERVER_ROLE",
+                        "AISIM_POOL_OBSERVER_RUN_ID",
                     )
                     if name in env
                 },

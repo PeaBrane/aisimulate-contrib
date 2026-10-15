@@ -412,17 +412,23 @@ impl AgenticPreparation {
             let evidence = &mut self.requests[request_index];
             let source = &lane.snapshot.context.graph.nodes[source_index];
             let metadata = DirectRequest {
+                output_identity: if source.input_token_ids.is_some()
+                    && lane.snapshot.context.outputs[source_index].is_none()
+                {
+                    crate::engine::OutputTokenIdentity::Unknown
+                } else {
+                    crate::engine::OutputTokenIdentity::Synthetic
+                },
                 uuid: Some(evidence.uuid),
                 max_output_tokens: 1,
-                // A source prefill-only request has no output plan. Its warmup
-                // emits a fixed execution-only token without consuming the
-                // corpus RNG or appending output to another request's input.
-                output_token_ids: Some(vec![
-                    lane.snapshot.context.outputs[source_index]
-                        .first()
-                        .copied()
-                        .unwrap_or(0),
-                ]),
+                // Unknown generated tokens cannot establish reusable exact-token KV.
+                // Keep the old execution-only sentinel for hash-only source rows.
+                output_token_ids: lane.snapshot.context.outputs[source_index]
+                    .as_ref()
+                    .and_then(|tokens| tokens.first())
+                    .copied()
+                    .or_else(|| source.input_token_ids.is_none().then_some(0))
+                    .map(|token| vec![token]),
                 arrival_timestamp_ms: Some(lane.ready_at_ms),
                 priority: source.priority,
                 strict_priority: source.strict_priority,

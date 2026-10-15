@@ -1852,6 +1852,66 @@ mod tests {
         outcome.ready()
     }
 
+    #[test]
+    fn opaque_output_stays_cached_for_same_request_and_state_restore() {
+        for state_blocks in [0, 1] {
+            let owner = Uuid::from_u128(103);
+            let mut manager =
+                VllmKvManager::new_with_event_sink(8, 4, true, KvEventPublishers::default(), 0);
+            if state_blocks > 0 {
+                manager.enable_state_cache(state_blocks, false);
+            }
+            let (mut sequence, identities) =
+                RequestSequence::new(owner, vec![1, 2, 3, 4], 5, 5, 4, true, true, true, None);
+            sequence.set_output_identity(crate::engine::OutputTokenIdentity::Unknown);
+            let mut lease = BlockRequestLease::new(owner, identities);
+            ready(manager.allocate_lease(owner, &mut lease, 4, 0));
+            manager.finalize_lease_computed_prefix(owner, &mut sequence, &mut lease, 0, 4);
+            manager.begin_step();
+            let mut literal_tokens = vec![1, 2, 3, 4];
+            for _ in 0..5 {
+                let (token, opened) = sequence.generate_token();
+                literal_tokens.push(token);
+                if opened {
+                    lease.append_partial();
+                }
+            }
+            ready(manager.allocate_lease(owner, &mut lease, 8, 0));
+            manager.finalize_lease_computed_prefix(owner, &mut sequence, &mut lease, 4, 8);
+            let opaque = lease.entries[1].identity.sequence_hash.unwrap();
+            assert!(sequence.block_token_ids(0).is_some());
+            assert!(sequence.block_token_ids(1).is_none());
+            manager.begin_step();
+            manager.preempt_lease(owner, &mut lease);
+            assert!(manager.num_inactive_blocks() >= 2);
+            assert_eq!(
+                manager
+                    .get_lease_prefill_cost(&sequence, &lease)
+                    .cached_tokens,
+                8
+            );
+
+            let other = Uuid::from_u128(104);
+            let (real, identities) =
+                RequestSequence::new(other, literal_tokens, 0, 0, 4, true, true, false, None);
+            let real_lease = BlockRequestLease::new(other, identities);
+            assert_eq!(
+                manager
+                    .get_lease_prefill_cost(&real, &real_lease)
+                    .cached_tokens,
+                // Latest-only state retention replaced the input checkpoint;
+                // a real-token reader cannot borrow the opaque output state.
+                if state_blocks == 0 { 4 } else { 0 }
+            );
+            manager.finish_lease(other, real_lease);
+            manager.finish_lease(owner, lease);
+            assert!(manager.pool.prefix_hit(opaque).is_some());
+            let pressure = manager.pool.reserve(&[], 8).unwrap();
+            assert!(manager.pool.prefix_hit(opaque).is_none());
+            manager.pool.cancel(pressure.reservation);
+        }
+    }
+
     fn finish_source_with_dependency(
         manager: &mut VllmKvManager,
         owner: Uuid,

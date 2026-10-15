@@ -154,6 +154,41 @@ mod vllm {
     }
 
     #[test]
+    fn preempted_unknown_output_ids_cannot_query_an_authored_prefix() {
+        let owner = Uuid::from_u128(701);
+        let mut manager = kv_manager(3);
+        let mut request = native_sequence(owner, 0..6, 8, true);
+        request
+            .sequence
+            .set_output_identity(crate::engine::OutputTokenIdentity::Unknown);
+        allocate_and_finalize(&mut manager, owner, &mut request, 6);
+        let mut collision = (0..6).collect::<Vec<_>>();
+        for _ in 0..3 {
+            collision.push(request.generate_token());
+        }
+        assert!(matches!(
+            manager.allocate_native(owner, &mut request.lease, 9, 0),
+            NativeAllocation::Ready { .. }
+        ));
+        manager.finalize_native_computed_prefix(
+            owner,
+            6,
+            9,
+            &mut request.sequence,
+            &mut request.lease,
+        );
+        manager.preempt_native(owner, &mut request.lease);
+        let other = Uuid::from_u128(702);
+        let mut real = RequestKvState::native(other, collision, 0, 9, 4, true, false, false, None);
+        allocate_and_finalize(&mut manager, other, &mut real, 9);
+        manager.finish_native(other, real.lease);
+        let cost = manager.get_native_prefill_cost(&request.sequence, &request.lease);
+        assert_eq!(cost.cached_tokens, 4);
+        assert_eq!(cost.new_tokens, 5);
+        manager.finish_native(owner, request.lease);
+    }
+
+    #[test]
     fn preempted_non_aligned_prompt_uses_complete_known_context() {
         let owner = Uuid::from_u128(700);
         let mut manager = kv_manager(8);
@@ -935,6 +970,7 @@ mod trtllm {
 
     fn receive(core: &mut VllmCore, uuid: Uuid, tokens: std::ops::Range<u32>, max_output: usize) {
         core.receive(DirectRequest {
+            output_identity: Default::default(),
             tokens: tokens.collect(),
             max_output_tokens: max_output,
             output_token_ids: None,

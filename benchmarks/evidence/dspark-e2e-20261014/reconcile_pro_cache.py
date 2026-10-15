@@ -13,6 +13,112 @@ def ceildiv(value, divisor):
     return (value + divisor - 1) // divisor
 
 
+def validate_pool_observations(evidence, receipt):
+    """Bind complete physical-pool observations to one measured serving window."""
+    if evidence.get("schema") != "dspark-native-pool-evidence-v1":
+        raise ValueError("unsupported native pool evidence schema")
+    run_id, window = evidence.get("serving_run_id"), evidence.get("window", {})
+    start, end = window.get("start_unix_ns"), window.get("end_unix_ns")
+    if (
+        not isinstance(run_id, str)
+        or not run_id.strip()
+        or type(start) is not int
+        or type(end) is not int
+        or not 0 < start < end
+        or not isinstance(window.get("source"), str)
+        or not window["source"].strip()
+        or not isinstance(window.get("sha256"), str)
+        or len(window["sha256"]) != 64
+        or any(c not in "0123456789abcdef" for c in window["sha256"])
+    ):
+        raise ValueError("pool evidence needs a serving identity and hashed absolute measurement window")
+    root = Path(__file__).parent
+    measurement_hash = evidence.get("measurement_identity_sha256")
+    if (
+        not isinstance(measurement_hash, str)
+        or len(measurement_hash) != 64
+        or any(c not in "0123456789abcdef" for c in measurement_hash)
+    ):
+        raise ValueError("pool evidence needs the frozen measurement identity hash")
+    sources = json.loads((root / "source_pool_sources.json").read_text())
+    observer_hash = hashlib.sha256((root / "source_pool_observer.py").read_bytes()).hexdigest()
+    roles = evidence.get("roles", {})
+    if set(roles) != {"prefill", "decode"}:
+        raise ValueError("pool observations require both roles")
+    result = {}
+    for role, dp, tp in (("prefill", 8, 1), ("decode", 1, 8)):
+        observations = roles[role]
+        if (
+            not isinstance(observations, list)
+            or len(observations) != dp
+            or any(type(r.get("data_parallel_index")) is not int for r in observations)
+            or {r.get("data_parallel_index") for r in observations} != set(range(dp))
+        ):
+            raise ValueError(f"{role} pool observations require every unique engine")
+        for row in observations:
+            rank = row["data_parallel_index"]
+            capacities = {r["kv_cache_config"]["num_blocks"] for r in receipt[role] if r["data_parallel_index"] == rank}
+            if (
+                row.get("schema") != "dspark-native-pool-observation-v1"
+                or row.get("run_id") != run_id
+                or row.get("role") != role
+                or row.get("tensor_parallel_size") != tp
+                or row.get("data_parallel_size") != dp
+                or row.get("async_scheduler") is not True
+                or row.get("prefix_caching") is not False
+                or row.get("initial_null_block_included") is not True
+                or row.get("runtime_revision") != "ac9126e58aa7bbab1856ba6593ba4d5003fea516"
+                or row.get("source_hashes") != sources
+                or row.get("observer_sha256") != observer_hash
+                or capacities != {row.get("num_blocks")}
+            ):
+                raise ValueError(f"{role} pool observation differs from pinned runtime, observer or capacity")
+            if (
+                row.get("complete") is not True
+                or row.get("reason") != "shutdown"
+                or type(row.get("started_ns")) is not int
+                or type(row.get("updated_ns")) is not int
+                or not row["started_ns"] <= start < end <= row["updated_ns"]
+            ):
+                raise ValueError("pool observation does not cover the complete measurement window")
+            counts = (
+                "peak_used_blocks",
+                "current_used_blocks",
+                "pool_mutation_calls",
+                "allocation_attempts",
+                "allocation_denials",
+                "observation_or_allocation_errors",
+                "preemptions",
+            )
+            if any(type(row.get(key)) is not int or row[key] < 0 for key in counts):
+                raise ValueError("pool observation counters must be nonnegative integers")
+            if not 1 <= row["current_used_blocks"] <= row["peak_used_blocks"] <= row["num_blocks"]:
+                raise ValueError("pool observation has invalid physical occupancy")
+            if row["allocation_denials"] > row["allocation_attempts"]:
+                raise ValueError("pool observation has more denials than allocation attempts")
+            result[(role, rank)] = row
+        if not any(row["allocation_attempts"] for row in observations):
+            raise ValueError(f"{role} pool observations contain no allocation attempts")
+    return result
+
+
+def read_pool_evidence(path, runtime_receipt_hash):
+    evidence = json.loads(path.read_text())
+    if evidence.get("runtime_cache_receipt_sha256") != runtime_receipt_hash:
+        raise ValueError("pool evidence runtime cache receipt hash differs")
+    window = evidence["window"]
+    raw = (path.parent / window["source"]).read_bytes()
+    if hashlib.sha256(raw).hexdigest() != window["sha256"]:
+        raise ValueError("pool evidence measurement window hash differs")
+    captured = json.loads(raw)
+    if (
+        captured.get("serving_run_id") != evidence["serving_run_id"]
+        or captured.get("identity_sha256") != evidence["measurement_identity_sha256"]
+    ) or any(captured.get(key) != window[key] for key in ("start_unix_ns", "end_unix_ns")):
+        raise ValueError("pool evidence measurement window identity differs")
+    return evidence
+
+
 def reconcile(receipt, *, k, concurrency, input_length, output_length):
     """Preserve pool block count; expose rounding and steady-residency estimates.
 
@@ -132,7 +238,15 @@ def _reconcile_pool(ranks, *, replicas, k, concurrency, input_length, output_len
 
 
 def reconcile_pd(
-    receipt, *, k, concurrency, input_length, output_length, bandwidth_evidence=None, source_residency_evidence=None
+    receipt,
+    *,
+    k,
+    concurrency,
+    input_length,
+    output_length,
+    bandwidth_evidence=None,
+    source_residency_evidence=None,
+    pool_observation_evidence=None,
 ):
     """P TP1/DP8/EP8 has independent pools; D TP8/EP1 replicates one request set.
 
@@ -142,6 +256,11 @@ def reconcile_pd(
     """
     if set(receipt) != {"prefill", "decode"}:
         raise ValueError("P/D receipt requires separate prefill and decode roles")
+    if source_residency_evidence is not None and pool_observation_evidence is not None:
+        raise ValueError("choose source residency bounds or native pool observations, not both")
+    observations = (
+        validate_pool_observations(pool_observation_evidence, receipt) if pool_observation_evidence is not None else {}
+    )
     source_resident_bounds = [None] * 8
     if source_residency_evidence is not None:
         if (
@@ -232,6 +351,15 @@ def reconcile_pd(
             pool["native_capacity_proven_nonbinding"] = (
                 native_bound is not None and pool["native_conservative_peak_blocks"] < pool["physical_pool_blocks"]
             )
+            if observations:
+                observation = observations[(role, d)]
+                pool["native_observed_peak_blocks"] = observation["peak_used_blocks"]
+                pool["native_capacity_proven_nonbinding"] = (
+                    observation["peak_used_blocks"] < pool["physical_pool_blocks"]
+                    and observation["allocation_denials"] == 0
+                    and observation["observation_or_allocation_errors"] == 0
+                    and observation["preemptions"] == 0
+                )
             cache = pool["replay_kv_cache"]
             del cache["state_cache"]
             cache["capacity"]["blocks"] = pool["remaining_full_context_blocks"]
@@ -310,6 +438,7 @@ def reconcile_pd(
             "limitation": "Global client concurrency and max_num_seqs do not bound delayed native source holds.",
             "source_contract": "vllm ac9126 scheduler.py:893,2756-2764,3154-3157; holds are outside running queues.",
         },
+        "native_pool_observations": pool_observation_evidence,
         "workload": {"k": k, "concurrency": concurrency, "input_length": input_length, "output_length": output_length},
         "source_prefill_backoff_tokens": 0,
         "decode_recompute_tokens": 1,
@@ -353,10 +482,14 @@ def main():
     parser.add_argument("--deployment", choices=("aggregated", "disaggregated"), default="aggregated")
     parser.add_argument("--bandwidth-receipt", type=Path, help="Explicit measured/assumed bandwidth evidence for P/D")
     parser.add_argument("--source-residency-receipt", type=Path, help="Bound all active and finished held P requests")
+    parser.add_argument("--pool-observation-receipt", type=Path, help="Complete native pool observations and window")
     args = parser.parse_args()
-    if (args.bandwidth_receipt or args.source_residency_receipt) and args.deployment != "disaggregated":
+    if (
+        args.bandwidth_receipt or args.source_residency_receipt or args.pool_observation_receipt
+    ) and args.deployment != "disaggregated":
         parser.error("P/D evidence receipts require --deployment disaggregated")
     raw = args.receipt.read_bytes()
+    runtime_hash = hashlib.sha256(raw).hexdigest()
     result = (reconcile_pd if args.deployment == "disaggregated" else reconcile)(
         json.loads(raw),
         k=args.k,
@@ -369,8 +502,13 @@ def main():
             if args.source_residency_receipt
             else {}
         ),
+        **(
+            {"pool_observation_evidence": read_pool_evidence(args.pool_observation_receipt, runtime_hash)}
+            if args.pool_observation_receipt
+            else {}
+        ),
     )
-    result["runtime_receipt_sha256"] = hashlib.sha256(raw).hexdigest()
+    result["runtime_receipt_sha256"] = runtime_hash
     result["adapter_sha256"] = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
     args.output.write_text(json.dumps(result, indent=2) + "\n")
 

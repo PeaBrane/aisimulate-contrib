@@ -29,7 +29,7 @@ use super::types::{
 };
 use super::{
     AgenticPlaySnapshot, AgenticReplayContext, AgenticSnapshotEvidence, PreparedAgenticSnapshots,
-    SYNTHETIC_OUTPUT_SEED, planned_output_token_ids,
+    SYNTHETIC_OUTPUT_SEED, agentic_output_token_ids, planned_output_token_ids,
 };
 use crate::engine::belady::{SequenceHash, input_sequence_hashes};
 use crate::replay::ReplayTerminalStatus;
@@ -2190,16 +2190,18 @@ impl WorkloadDriver {
                 *hash_id = *prompt_hash_id;
             }
 
+            let exact_input = node.input_token_ids.is_some();
             let prompt_tokens = if let Some(tokens) = node.input_token_ids {
                 PromptTokens::Materialized(tokens)
             } else {
                 PromptTokens::deferred(node.input_length, hash_ids, trace_block_size)?
             };
-            let output_token_ids = Some(planned_output_token_ids(
+            let output_token_ids = agentic_output_token_ids(
+                exact_input,
                 node.output_token_ids,
                 node.max_output_tokens,
                 &mut output_rng,
-            ));
+            );
             // WorkloadDriver is deliberately model-neutral. Callers must define
             // and report how source-model provenance is projected onto the
             // configured execution timing model before handing the graph here.
@@ -2679,7 +2681,7 @@ impl WorkloadDriver {
                                 input_length,
                                 context.graph.nodes[source_index].input_token_ids.clone(),
                                 context.token_ids(slot, source_index),
-                                Some(context.outputs[source_index].clone()),
+                                context.outputs[source_index].clone(),
                             )
                         } else if let PromptTokens::Materialized(tokens) = &mut turn.prompt_tokens {
                             (
@@ -2692,7 +2694,14 @@ impl WorkloadDriver {
                             let (input_length, hash_ids) = turn.prompt_tokens.take_deferred();
                             (input_length, None, hash_ids, turn.output_token_ids.take())
                         };
+                    let output_identity = if input_token_ids.is_some() && output_token_ids.is_none()
+                    {
+                        crate::engine::OutputTokenIdentity::Unknown
+                    } else {
+                        crate::engine::OutputTokenIdentity::Synthetic
+                    };
                     let request_metadata = DirectRequest {
+                        output_identity,
                         tokens: Vec::new(),
                         max_output_tokens: if live_warmup {
                             1
@@ -2700,13 +2709,12 @@ impl WorkloadDriver {
                             turn.max_output_tokens
                         },
                         output_token_ids: if live_warmup {
-                            Some(vec![
-                                output_token_ids
-                                    .as_ref()
-                                    .and_then(|tokens| tokens.first())
-                                    .copied()
-                                    .unwrap_or(0),
-                            ])
+                            output_token_ids
+                                .as_ref()
+                                .and_then(|tokens| tokens.first())
+                                .copied()
+                                .or_else(|| input_token_ids.is_none().then_some(0))
+                                .map(|token| vec![token])
                         } else {
                             output_token_ids
                         },
@@ -2738,6 +2746,7 @@ impl WorkloadDriver {
                         ReplayRequestHashes::from_tokens(&request_tokens, self.engine_block_size)
                     });
                     let request = ReplayRequestPayload::materialized(DirectRequest {
+                        output_identity: Default::default(),
                         tokens: request_tokens,
                         max_output_tokens: turn.max_output_tokens,
                         output_token_ids: turn.output_token_ids.clone(),
