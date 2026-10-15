@@ -1,8 +1,8 @@
 {
   "schema": "dspark-collection-status-v1",
   "matrix": "matrix.json",
-  "measured_request_records": 259,
-  "eligible_paired_runs": 2,
+  "measured_request_records": 1796,
+  "eligible_paired_runs": 13,
   "checkpoint_references": "checkpoint-references.json",
   "gpu_jobs": [
     {
@@ -366,7 +366,7 @@
       "gpus": 4,
       "host_memory_gb": 768,
       "phase": "native stage operator observation",
-      "state": "RUNNING",
+      "state": "FAILED",
       "dependency": "afterok:2258192",
       "cpu_preflight_job": "2258231",
       "time_limit": "01:00:00",
@@ -376,7 +376,14 @@
       "operator_requests": 35,
       "operator_output_tokens": 16,
       "scope": "C1 only; diagnostic operator measurements, not production E2E coverage.",
-      "node": "nsc-svg-slurm-1-gpu-131"
+      "node": "nsc-svg-slurm-1-gpu-131",
+      "exit_code": "1:0",
+      "elapsed": "00:15:34",
+      "local_artifacts": "raw/v41-native-failed-2258242",
+      "archive": "v41-native-failed-2258242-archive.json",
+      "completed_requests": null,
+      "progress": "Native collector rejected missing or unsupported observation shapes; partial rank records preserved.",
+      "reason": "Native observer rejected nonconsecutive query positions; all4 partial rank records retained; no eligible op table published."
     },
     {
       "cluster": "aws-pdx-slurm-1",
@@ -436,7 +443,7 @@
       "gpus": 8,
       "host_memory_gb": 2048,
       "phase": "smoke",
-      "state": "RUNNING",
+      "state": "COMPLETED",
       "qos": "interactive",
       "time_limit": "02:00:00",
       "results": "results/dspark-e2e-20261014/smoke-kimi-k3-k2-791280",
@@ -448,7 +455,13 @@
       "draft_attention_backend": "FLASHINFER_MLA",
       "synthetic_acceptance_length": 2.51,
       "reason": "Communicator initialization completed normally on retry; actual log selects TRTLLM_RAGGED and eager checkpoint load is progressing.",
-      "node": "pool0-0211"
+      "node": "pool0-0211",
+      "exit_code": "0:0",
+      "elapsed": "00:59:27",
+      "local_artifacts": "raw/kimi-smoke-791280",
+      "archive": "kimi-smoke-791280-archive.json",
+      "completed_requests": 1,
+      "progress": "Kimi K2 smoke success,one measured request,zero failures; not production coverage."
     },
     {
       "cluster": "aws-pdx-slurm-1",
@@ -458,7 +471,7 @@
       "gpus": 8,
       "host_memory_gb": 2048,
       "phase": "native MLA operator observation",
-      "state": "PENDING",
+      "state": "FAILED",
       "dependency": "afterok:791280",
       "cpu_preflight_job": "791204",
       "time_limit": "02:00:00",
@@ -469,7 +482,14 @@
       "prefill_backend": "TRTLLM_RAGGED",
       "attention_backend": "FLASHINFER_MLA",
       "draft_attention_backend": "FLASHINFER_MLA",
-      "scope": "C1/C4,25 operator requests with1056outputs; not part of production E2E runs."
+      "scope": "C1/C4,25 operator requests with1056outputs; not part of production E2E runs.",
+      "exit_code": "1:0",
+      "elapsed": "00:57:51",
+      "local_artifacts": "raw/kimi-native-failed-791291",
+      "archive": "kimi-native-failed-791291-archive.json",
+      "completed_requests": null,
+      "progress": "Observer raised: native MLA projection precision differs from BF16 contract; EngineCore terminated.",
+      "reason": "Native observer rejected actual MLA projection precision against BF16 contract; no eligible op table published."
     },
     {
       "cluster": "nsc-svg-slurm-1",
@@ -479,7 +499,7 @@
       "gpus": 16,
       "deployment": "disagg",
       "phase": "initial real grouped",
-      "state": "PENDING",
+      "state": "COMPLETED",
       "dependency": "afterany:2258242",
       "windows": [
         [
@@ -513,7 +533,18 @@
       "source_pool_observer_sha256": "cbf53ad84d1ac91aa5b89bd72547f9ec2680157faa8d6c32bd36fdb341ad4ce5",
       "prefill_gpu_memory_utilization": 0.92,
       "decode_gpu_memory_utilization": 0.9,
-      "qualification": "Physical pool peak receipts must be complete after shutdown; each window retains its own identity and wall-clock interval. No timing accuracy claim from submission."
+      "qualification": "Physical pool peak receipts must be complete after shutdown; each window retains its own identity and wall-clock interval. No timing accuracy claim from submission.",
+      "exit_code": "0:0",
+      "elapsed": "00:31:54",
+      "local_artifacts": "raw/pd-production-2258652",
+      "archive": "pd-production-2258652-archive.json",
+      "completed_requests": 640,
+      "progress": "Five production windows,128 completions each,zero failures; pairing pending.",
+      "qualified_measurement_windows": 5,
+      "pairing_status": "All windows qualified and paired with canonical native Replay.",
+      "capacity_evidence": "Exact-zero drained-boundary physical gauges and matched cumulative completion counters, source-audited;16 measured admissions per P engine conservatively retained.",
+      "observer_status": "All9 engine receipts incomplete/start-only; not used to prove capacity.",
+      "eligible_paired_runs": 5
     },
     {
       "cluster": "nsc-svg-slurm-1",
@@ -523,7 +554,7 @@
       "gpus": 16,
       "deployment": "disagg",
       "phase": "pilot real pilot",
-      "state": "PENDING",
+      "state": "COMPLETED",
       "dependency": "afterok:2258652",
       "windows": [
         [
@@ -540,7 +571,13 @@
       "cpu_preflight_job": "2258668",
       "source_pool_observer_sha256": "cbf53ad84d1ac91aa5b89bd72547f9ec2680157faa8d6c32bd36fdb341ad4ce5",
       "synthetic_acceptance_length": null,
-      "scope": "Independent real acceptance pilot; excluded from production scoring and used only to freeze K3 control after counters are checked."
+      "scope": "Independent real acceptance pilot; excluded from production scoring and used only to freeze K3 control after counters are checked.",
+      "exit_code": "0:0",
+      "elapsed": "00:22:40",
+      "local_artifacts": "raw/pd-pilot-2258674",
+      "archive": "pd-pilot-2258674-archive.json",
+      "completed_requests": 128,
+      "progress": "Independent real-acceptance pilot; excluded from production scoring."
     },
     {
       "cluster": "nsc-svg-slurm-1",
@@ -550,7 +587,7 @@
       "gpus": 16,
       "deployment": "disagg",
       "phase": "initial synthetic",
-      "state": "PENDING",
+      "state": "COMPLETED",
       "dependency": "afterok:2258674",
       "windows": [
         [
@@ -587,7 +624,18 @@
       "cpu_preflight_job": "2258668",
       "source_pool_observer_sha256": "cbf53ad84d1ac91aa5b89bd72547f9ec2680157faa8d6c32bd36fdb341ad4ce5",
       "synthetic_acceptance_length": 3.77,
-      "scope": "Initial matrix windows"
+      "scope": "Initial matrix windows",
+      "exit_code": "0:0",
+      "elapsed": "00:47:50",
+      "local_artifacts": "raw/pd-production-2258677",
+      "archive": "pd-production-2258677-archive.json",
+      "completed_requests": 768,
+      "progress": "Six production windows,128 completions each,zero failures; pairing pending.",
+      "qualified_measurement_windows": 6,
+      "pairing_status": "All windows qualified and paired with canonical native Replay.",
+      "capacity_evidence": "Exact-zero drained-boundary physical gauges and matched cumulative completion counters, source-audited;16 measured admissions per P engine conservatively retained.",
+      "observer_status": "All9 engine receipts incomplete/start-only; not used to prove capacity.",
+      "eligible_paired_runs": 6
     }
   ],
   "cpu_jobs": [
@@ -877,15 +925,15 @@
   "results": "results/dspark-e2e-20261014",
   "runtime": "vllm/vllm-openai:nightly-dev-x86_64-cu130-ac9126e58aa7@sha256:3d17635c5aa0340e2f2502c067ce4b587d8e7dc678195e90b71142490dc6d71c",
   "pending": [
-    "Complete Pro P/D runtime smoke and connector/cache qualification",
-    "Complete Kimi graph smoke, then native MLA measurement",
-    "V4.1 native-stage measurement and aggregate/P-D qualification",
-    "Remaining initial47 configurations and repetitions",
-    "Expanded matrix after initial paired coverage",
-    "AgentX pilots after matched lifecycle/context qualification"
+    "Repair V4.1 native observation contract for masked/nonconsecutive query positions; no eligible timing table from2258242.",
+    "Resolve Kimi native MLA projection precision contract; graph smoke791280 succeeded but native table791291 failed.",
+    "Complete43 remaining initial configurations and remaining repetitions (131 initial production runs unscored).",
+    "Freeze K3 synthetic control from the separate completed128-request real pilot before K3 synthetic scoring.",
+    "Expanded matrix after initial paired coverage.",
+    "AgentX pilots after matched lifecycle/context qualification."
   ],
-  "production_request_records": 256,
-  "smoke_request_records": 3,
+  "production_request_records": 1664,
+  "smoke_request_records": 4,
   "runtime_checks": [
     {
       "cluster": "aws-pdx-slurm-1",
@@ -918,24 +966,19 @@
     }
   ],
   "cpu_preflight_archive": "cpu-preflights.json",
-  "paired_request_records": 256,
-  "paired_configurations": 2,
+  "paired_request_records": 1664,
+  "paired_configurations": 5,
   "monitoring": {
-    "status": "blocked_dns",
-    "checked_utc": "2026-10-15T15:45:39Z",
-    "hosts": [
-      "nsc-svg-slurm-1-login-02.nvidia.com",
-      "aws-pdx-slurm-1-login-01.nvidia.com"
-    ],
-    "error": "Could not resolve hostname; local resolver configuration contains home-router DNS and no corporate resolver.",
-    "scope": "Previously submitted jobs may have advanced or completed during the access gap; their recorded states are last observations, not current status. No duplicate jobs submitted.",
-    "unverified_jobs": [
-      "2258242",
-      "2258652",
-      "2258674",
-      "2258677",
-      "791280",
-      "791291"
-    ]
-  }
+    "status": "restored",
+    "checked_utc": "2026-10-15T19:07:36Z",
+    "active_jobs_among_six": 0,
+    "source": "raw/status-check-20261015T1907Z.json",
+    "unverified_jobs": []
+  },
+  "production_completed_runs": 13,
+  "production_configurations": 5,
+  "qualified_measurement_runs": 13,
+  "pilot_request_records": 128,
+  "record_count_scope": "Completed E2E records:1664 production +128 independent real-acceptance pilot +4 diagnostic smokes. Failed native operator observations are separate and not E2E request counts.",
+  "qualification_receipts": "qualification-20261015/index.json"
 }

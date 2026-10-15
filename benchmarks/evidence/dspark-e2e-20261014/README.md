@@ -1,12 +1,16 @@
 # Fixed-length DSpark serving validation
 
 This campaign implements the approved AgentX-model matrix and MTP-aligned
-V4-Pro P/D topology. **Two qualified serving pairs are available: two configurations,
-one repetition each and 256 measured requests.** Their TTFT/TPOT/throughput MAPE is
-58.90%/9.58%/3.35%. The remaining 586 planned runs have no scored error.
-These two points use different deployments and acceptance modes; see the
-stratified report before interpreting the combined average. Functional tests and op-table query
-coverage are separate from serving accuracy.
+V4-Pro P/D topology. **Five configurations, 13 qualified production runs and
+1,664 measured requests are paired.** TTFT/TPOT/throughput MAPE is
+58.81%/25.24%/12.56%; signed bias is -58.81%/+25.24%/-12.39%.
+The remaining 575 planned runs have no scored error. All scored points use
+Pro0813 K6 and 1024/1024; the new P/D runs cover concurrency 1/4 and real/synthetic
+acceptance with three repetitions per configuration. The aggregated configuration
+still has one repetition. See the [grouped results](comparison/README.md) and
+[11 new predictions](pro-pd-followup-11/README.md). This average is dominated by
+P/D and does not establish V4.1, Kimi, AgentX or FPM accuracy. Functional tests
+and op-table query coverage are separate from serving accuracy.
 
 The [first production pair](pro-initial-c1-r1/README.md) uses Pro0813 on 8 B200,
 TP8/EP1, K6, synthetic AL3.77, 1024/1024 and concurrency1. All 128 requests

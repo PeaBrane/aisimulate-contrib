@@ -1441,6 +1441,16 @@ These are modified independent adapters; no allocator or scheduler algorithm
 is copied. Copyright contributors to the vLLM project. Apache-2.0, source and
 license URLs above.
 
+The source-derived boundary audit
+`benchmarks/evidence/dspark-e2e-20261014/pd-drained-pool-boundary-source-audit.json`
+and its `qualification-20261015/audit.py` checks and per-window receipts describe the same
+pinned runtime's physical cache and metrics contracts. Additional original paths
+are `vllm/v1/metrics/loggers.py`, `vllm/v1/engine/async_llm.py`, and
+`vllm/v1/engine/output_processor.py`, alongside the cache and scheduler paths
+above. These are modified contract descriptions; no serving source is copied.
+Copyright contributors to the vLLM project. Apache-2.0, source revision and
+license URLs above. The audit preserves installed source hashes and line anchors.
+
 The P/D collection client
 `benchmarks/evidence/dspark-fixed-20261014/collect_pd.py` adapts (modified) the
 Mooncake HTTP handshake from

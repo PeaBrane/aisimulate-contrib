@@ -115,6 +115,18 @@ An approximate cache mapping cannot qualify a workload whose capacity may be
 binding. Source contracts
 alone do not establish measured P/D cache capacities or transport performance.
 
+The follow-up Pro P/D windows use a separate drained-boundary proof in
+`pd-drained-pool-boundary-source-audit.json` and `qualification-20261015/`.
+The native peak observers remained startup-only after forced server cleanup and
+are not peak evidence. Instead, each window's exact Prometheus gauges show empty
+physical P pools after drained warmup. Complete per-engine completion counters
+and the pinned frontend update order establish that these are current readings.
+Each P engine subsequently admits 16 measured requests. Retaining all their
+blocks without any releases bounds each pool at 6,993 blocks, below its 7,640
+capacity. Replay and D capacity checks still use the actual C1 or C4 workload.
+This proof does not apply to nonzero boundaries, unrelated traffic, prefix reuse
+or offload. No measured latency or acceptance is changed by qualification.
+
 If runtime qualification finishes after collection, preserve the original
 `summary.json` and frozen `identity.json`. Write a separate
 `qualified-summary.json` beside them, retaining all original metrics and

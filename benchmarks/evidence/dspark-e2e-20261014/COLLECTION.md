@@ -870,3 +870,46 @@ The qualified P/D production raw records and receipts are archived in
 `pd-production-2258192.tar.gz`; `pd-production-2258192-archive.json` records
 the archive hash and all 53 member hashes, including the original and qualified
 summaries. Extract at the campaign directory to restore the original raw paths.
+
+
+## Completed follow-up windows (2026-10-15)
+
+Jobs 2258652 and 2258677 completed five real-acceptance and six synthetic-acceptance
+Pro P/D windows respectively, each with 128 measured 1024/1024 requests. All 11
+passed identity, token, streaming-usage, closed-loop concurrency, acceptance-counter
+and runtime/cache checks. Together with the previous two pairs, the campaign has
+13 scored production runs across five configurations and 1,664 requests. The 128
+K3 real-pilot requests and four one-request diagnostic smokes remain separate.
+
+The observer files in both grouped jobs are incomplete startup receipts. They
+remain unchanged and are not peak-occupancy evidence. Qualification instead uses
+`pd-drained-pool-boundary-source-audit.json`: exact-zero physical P cache gauges,
+completion counters matching every request issued through drained warmup, and no
+new admissions during the snapshot. Each P engine then receives exactly 16
+measured requests. Retaining all 16 until the window ends bounds occupancy below
+the 7,640-block physical pool without assuming release timing within the window.
+The per-window cache adapter also checks the independent Replay capacity bound.
+
+`qualification-20261015/index.json` indexes all 11 qualification receipts, source
+residency bounds, cache mappings and request audits. The original summaries and
+raw records remain immutable; qualified summaries are adjacent derived files.
+Extract the archives at this directory, then reproduce the raw checks from the
+repository root:
+
+```bash
+python3 benchmarks/evidence/dspark-e2e-20261014/qualification-20261015/audit.py
+```
+
+Archives `pd-production-2258652.tar.gz` and `pd-production-2258677.tar.gz` retain
+all windows, launch identities, effective caches, source files, acceptance,
+metrics, original and qualified summaries, incomplete observer receipts and
+logs. Their matching `*-archive.json` files hash every member and the archive.
+The pilot, Kimi smoke and failed native probes likewise have separate archives:
+`pd-pilot-2258674`, `kimi-smoke-791280`, `v41-native-failed-2258242`, and
+`kimi-native-failed-791291` (each with `.tar.gz` and `-archive.json`).
+
+The V4.1 native probe rejected nonconsecutive query positions and retained partial
+records from all four ranks. The Kimi native probe rejected the actual MLA
+projection precision against its BF16 observation contract. Neither produced an
+eligible imported timing table; neither failure receives a zero-error score.
+No jobs were resubmitted during this result-import and scoring pass.
