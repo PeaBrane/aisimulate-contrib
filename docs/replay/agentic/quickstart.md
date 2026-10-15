@@ -12,16 +12,11 @@ remaining requests and recycles completed plays to keep two client lanes occupie
 for a 3,600-second simulated admission window. The simulator runs offline on your
 CPU; you do not need to allocate those GPUs or download model weights.
 
-**Integration status:** the complete routing example requires the existing
-Dynamo replay runner and router adapter delivered by
-[Dynamo #15240](https://github.com/ai-dynamo/dynamo/pull/15240) (C), built against
-the matching AISimulate source. A and B alone do not enable this example.
-
-The call chain is YAML → the existing `dynamo` runner/config-adapter entry points
-→ Dynamo's Rust replay composition → the shared AISimulate executor → Dynamo's
-native worker selection and session affinity → simulated engines and reports.
-AISimulate exposes generic placement lifecycle hooks and conversation lineage;
-its engine runner does not import Dynamo or bridge policy calls through Python.
+AISimulate owns the complete simulation: YAML → the built-in `engine` runner
+and `engine.router` config adapter → AISimulate's native replay composition →
+Dynamo's production worker selector and affinity policy → simulated engines
+and reports. The policy runs inside the AISimulate process. No Dynamo service,
+Dynamo Python package, or Dynamo replay runner is required.
 
 The YAML below sets `traffic.load.agentic_profile.duration_seconds: 3600`.
 This controls simulated admission time, not CPU wall time. See
@@ -29,109 +24,69 @@ This controls simulated admission time, not CPU wall time. See
 [continuous agentic profiles](continuous-profiles.md) for its detailed contract.
 Functional simulation does not establish hardware performance accuracy.
 
-## Delivery status and merge order
+## Source and package status
 
-[AISimulate #307](https://github.com/ai-dynamo/aisimulate/pull/307) has merged as
-`a9c358c5cd0f053054800a72137a4db5f95a1671`. The remaining order is:
+[Dynamo #15631](https://github.com/ai-dynamo/dynamo/pull/15631) is merged at
+`094aaca91941421bb0dcb645b0f700a42d6de3ef`. AISimulate pins its native policy
+crates to that revision. [AISimulate #306](https://github.com/ai-dynamo/aisimulate/pull/306)
+provides the simulation, routing adapter, CLI configuration and reports.
+These two changes implement the standalone path.
+[Dynamo #15240](https://github.com/ai-dynamo/dynamo/pull/15240) updates the
+optional Dynamo integration to consume AISimulate's interfaces; it is not a
+prerequisite for this example.
 
-1. **A — [Dynamo #15631](https://github.com/ai-dynamo/dynamo/pull/15631):** expose
-   a native manual clock, shared conversation group-key construction and policy
-   queue wakeup support, without upgrading Dynamo's AISimulate dependency.
-2. **B — [AISimulate #306](https://github.com/ai-dynamo/aisimulate/pull/306):**
-   provide generic dispatch/time hooks, conversation lineage and the shared replay
-   executor, and select the existing Dynamo plugin from routing configuration.
-   AISimulate does not depend on or package Dynamo policy code.
-3. **Publish B:** after B merges, publish the Python wheel and Rust crate from
-   the same source revision, including a matching nightly if that is the chosen
-   release channel. Verify that both artifacts are actually installable; source
-   merge alone does not complete this step.
-4. **C — [Dynamo #15240](https://github.com/ai-dynamo/dynamo/pull/15240):** wire
-   those APIs into the existing native adapter, pin the actual published B version
-   consistently in Rust, Python and containers, and qualify the full installed
-   CLI including duration and routing. Development source pins below are for
-   pre-release validation, not a substitute for this publication gate.
+The development wheel contains the `native-dynamo-router` feature. It builds
+against the pinned Dynamo source without importing Dynamo's mocker or LLM
+crate. Publishing AISimulate's Rust crate also requires publication of the
+matching Dynamo leaf crates, including `dynamo-custom-policy-builtin`; a source
+build does not establish that those registry releases exist. No published
+AISimulate version is claimed here to contain this new path.
 
-[#15149](https://github.com/ai-dynamo/dynamo/pull/15149) and
-[#15625](https://github.com/ai-dynamo/dynamo/pull/15625) are closed. Source merge,
-published matching packages, required CI/review, and installed CLI qualification
-are separate gates. No published version is claimed here to contain the complete
-A/B/C integration. Earlier A/B Python-bridge results do not validate this path.
+## 1. Install the standalone AISimulate development wheel
 
-## 1. Install a matching C development build
-
-The source pair below passed installed end-to-end qualification, but matching
-packages have not been published. This remains a development installation
-procedure. Use the pinned C revision and its matching B API. Installing A's
-runtime wheel alone or an arbitrary nightly does not supply the required runner.
-The three distributions below already exist: `aisimulate`, `ai-dynamo-runtime`,
-and `ai-dynamo`. No additional policy package or Cargo lockfile is needed.
-
-You need Python 3.12, `uv`, the Rust toolchains required by the checked-out
-repositories, and Dynamo's CPU build prerequisites (C/C++ compiler and linker,
-`pkg-config`, OpenSSL development headers, CMake and protobuf compiler). No running
-Dynamo service, model weights, or physical GPU is required. See
-[source installation](../../getting-started/installation.md#use-current-source) for
-AISimulate platform details.
-
-The commands use qualified C source `0be36a28b7814bc73ffeafb678b040733c76b0b0`
-and build the AISimulate source it pins:
-`91b8ef98ac056654902751a6ade8585c4cf9439b`. The validated native runtime was
-built at `ac77d287a27806825f72d1a71f2f72b2f7638ed8`; the later C commit changes
-only test worker configuration. Retain both revisions and wheel hashes with results.
-A version number alone does not identify an unreleased source build.
+You need Python 3.12, `uv`, the AISimulate Rust toolchain, a C/C++ compiler,
+`pkg-config`, OpenSSL development headers and a protobuf compiler. Build and
+install AISimulate only. See [source installation](../../getting-started/installation.md#use-current-source)
+for platform details. Record the resolved source revision and wheel hash;
+PR branch heads can change.
 
 ```bash
 mkdir -p /tmp/agentx-quickstart
 uv venv --python 3.12 /tmp/agentx-quickstart/venv
 uv pip install --python /tmp/agentx-quickstart/venv/bin/python 'maturin>=1.12,<2' patchelf
 
-git clone https://github.com/ai-dynamo/dynamo.git /tmp/agentx-quickstart/dynamo
-git -C /tmp/agentx-quickstart/dynamo fetch origin pull/15240/head
-git -C /tmp/agentx-quickstart/dynamo checkout --detach 0be36a28b7814bc73ffeafb678b040733c76b0b0
-agentx_dynamo_rev=$(git -C /tmp/agentx-quickstart/dynamo rev-parse HEAD)
-agentx_aisim_rev=$(/tmp/agentx-quickstart/venv/bin/python - <<'PYTHON'
-import tomllib
-from pathlib import Path
-manifest = tomllib.loads(Path("/tmp/agentx-quickstart/dynamo/Cargo.toml").read_text())
-print(manifest["workspace"]["dependencies"]["aisimulate-core"]["rev"])
-PYTHON
-)
 git clone https://github.com/ai-dynamo/aisimulate.git /tmp/agentx-quickstart/aisimulate
-git -C /tmp/agentx-quickstart/aisimulate checkout --detach "$agentx_aisim_rev"
-
+git -C /tmp/agentx-quickstart/aisimulate fetch origin pull/306/head
+git -C /tmp/agentx-quickstart/aisimulate checkout --detach FETCH_HEAD
+git -C /tmp/agentx-quickstart/aisimulate rev-parse HEAD > /tmp/agentx-quickstart/source-revision.txt
 cd /tmp/agentx-quickstart/aisimulate/python/aisimulate
 /tmp/agentx-quickstart/venv/bin/maturin build --locked --release \
   --interpreter /tmp/agentx-quickstart/venv/bin/python \
   --out /tmp/agentx-quickstart/wheels
-cd /tmp/agentx-quickstart/dynamo/lib/bindings/python
-/tmp/agentx-quickstart/venv/bin/maturin build --locked --release \
-  --features ais-forward-pass \
-  --interpreter /tmp/agentx-quickstart/venv/bin/python \
-  --out /tmp/agentx-quickstart/wheels
-uv build --wheel --out-dir /tmp/agentx-quickstart/wheels /tmp/agentx-quickstart/dynamo
 uv pip install --python /tmp/agentx-quickstart/venv/bin/python \
-  /tmp/agentx-quickstart/wheels/ai_dynamo_runtime-*.whl \
-  /tmp/agentx-quickstart/wheels/ai_dynamo-*.whl \
   /tmp/agentx-quickstart/wheels/aisimulate-*.whl
 uv pip check --python /tmp/agentx-quickstart/venv/bin/python
 cd /tmp/agentx-quickstart
-printf '%s\n' "$agentx_dynamo_rev" "$agentx_aisim_rev" > source-revisions.txt
 sha256sum wheels/*.whl > wheel-sha256.txt
 /tmp/agentx-quickstart/venv/bin/python - <<'PYTHON'
+from importlib import metadata
 from aisimulate.stack import resolve_runner_factory
 from aisimulate.config_adapter import resolve_config_adapters
-print(resolve_runner_factory("dynamo").capabilities())
-print(resolve_config_adapters(["dynamo.router"])["dynamo.router"].name)
+for name in ("ai-dynamo", "ai-dynamo-runtime"):
+    try:
+        metadata.distribution(name)
+    except metadata.PackageNotFoundError:
+        continue
+    raise RuntimeError(f"Standalone qualification requires an environment without {name}")
+print(resolve_runner_factory("engine").capabilities())
+print(resolve_config_adapters(["engine.router"])["engine.router"].name)
 PYTHON
 ```
 
-Dependency resolution remains strict: the Rust core pin, installed AISimulate
-Python package and container source wheel must agree. The plugin also checks its
-replay API compatibility. Do not bypass these checks with an editable install,
-path override or dependency-ignore flag. The source pair above has historical installed qualification recorded in the
-[replay evidence](../../../benchmarks/evidence/accuracy/replay-evidence.md#agentx-native-routing-source-qualification).
-Those measurements apply to the pinned sources, not to later AISimulate revisions.
-The checks above verify discovery only.
+The final checks verify installation and adapter discovery. Run the prediction
+below to exercise native routing and inspect `routing_policy` in its report.
+Do not substitute the older Dynamo source-pair qualification for validation of
+this standalone wheel.
 
 ## 2. Download a reproducible Weka workload
 
@@ -240,12 +195,11 @@ native hard affinity and commits a binding only after the engine accepts dispatc
 The TTL starts when the last active request releases its lease, using simulated
 time; supported TTL values are 1 through 31,536,000 seconds, including fractions.
 
-YAML with `router` automatically selects the installed `dynamo` stack. Explicit
-`--stack dynamo` selects the same integration; explicit `--stack engine` retains
-the engine choice and rejects the unsupported router configuration. Without a
-routing section, the default remains `engine`. A missing plugin, incompatible
-core/API version, or unsupported affinity configuration must produce an error;
-it must never silently use round-robin.
+The default `engine` stack accepts `router` through its built-in adapter.
+Explicit `--stack engine` uses the same path. `--stack dynamo` is an optional
+integration for Dynamo-specific capabilities such as Planner. A native build
+without the required routing feature or an unsupported configuration fails
+explicitly; it never silently substitutes round-robin.
 
 The trace's embedded hash blocks contain 64 tokens. The explicit
 `traffic.source.block_size: 64` keeps host resource inspection aligned with
@@ -372,9 +326,8 @@ include initial snapshot history, and the corpus can be replayed repeatedly as
 lanes recycle, so this is not the expected measured request count.
 
 The [historical source qualification](../../../benchmarks/evidence/accuracy/replay-evidence.md#agentx-native-routing-source-qualification)
-records installed end-to-end coverage, source revisions, and 600/3,600-second
-results. It covers the pinned development pair; it does not establish a published
-paired release, qualification of later revisions, or hardware accuracy.
+records earlier Dynamo-runner results and their immutable revisions. Those
+measurements do not qualify this AISimulate-owned path or hardware accuracy.
 
 To compare against a cold snapshot, repeat the command with a separate output
 directory and add:
@@ -393,15 +346,15 @@ seeded snapshots for the initial lanes.
 
 ## Capability boundaries
 
-This development source pair supports offline vLLM/SGLang aggregated and P/D
-simulation, including attention DP, seeded snapshots, saved-frontier warmup and
-duration profiles. The existing Dynamo adapter supports offline `predict` with
-static pools and preserves optional capture/telemetry. Routing with `recommend`,
-Planner scaling, authored DP pins, custom policy classes, selector seeds, online
-execution or unsupported backends is rejected. Workload/snapshot seeds remain
-supported. Other explicit
-stacks retain their own capabilities. Required CI/review, source merges and an
-actual matching published release remain separate from this installed qualification.
+The standalone path supports offline vLLM/SGLang aggregated and P/D simulation,
+including attention DP, seeded snapshots, saved-frontier warmup and duration
+profiles. `predict` and `recommend` can use a fixed routing configuration;
+searching router parameters is unsupported. Conversation affinity requires
+static workers, device-only KV cache, default scoring, and speculative decoding
+disabled. Planner scaling, custom prefill estimators or policy classes, authored
+DP pins, online execution and unsupported backends are rejected with affinity.
+Canonical selector seeds require a separate `replay-bench` build. Workload/snapshot seeds remain supported. The optional Dynamo
+stack has separate integration and compatibility requirements.
 
 The KV index receives physical simulated engine store/remove events. Cache reuse
 is still simulated behavior, not measured GPU performance. The existing

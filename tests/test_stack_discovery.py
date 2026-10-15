@@ -67,14 +67,14 @@ def test_optional_stack_is_loaded_lazily() -> None:
     assert isinstance(resolve_runner_factory("dynamo", entry_points=[entry]), _RunnerFactory)
 
 
-def test_router_requires_the_selected_stack_plugin() -> None:
+def test_engine_router_is_builtin_and_explicit_dynamo_uses_plugin() -> None:
     class UnusedEntryPoint(_EntryPoint):
         def load(self):
             pytest.fail("engine must not load the external Dynamo integration")
 
     entry = UnusedEntryPoint("dynamo.router", "dynamo:adapter", _Adapter)
-    with pytest.raises(ConfigAdapterResolutionError, match="'engine.router' is unavailable"):
-        resolve_config_adapters(["engine.router"], entry_points=[entry])
+    builtin = resolve_config_adapters(["engine.router"], entry_points=[entry])["engine.router"]
+    assert builtin.name == "engine.router"
     assert isinstance(
         resolve_config_adapters(
             ["dynamo.router"], entry_points=[_EntryPoint("dynamo.router", "dynamo:adapter", _Adapter)]

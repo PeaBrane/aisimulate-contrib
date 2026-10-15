@@ -22,6 +22,8 @@ pub mod engine;
 pub mod perfmodel;
 #[cfg(feature = "python")]
 mod python;
+#[cfg(all(feature = "python", feature = "native-dynamo-router"))]
+pub use python::execute_native_router_replay;
 #[cfg(feature = "python")]
 pub use python::{
     ReplayExecutionResult, execute_replay_json_with_composition, execute_replay_with_composition,

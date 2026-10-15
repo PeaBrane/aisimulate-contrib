@@ -42,17 +42,14 @@ single aggregated worker or 1P1D, with attention DP=1 on every role and
 speculative decoding disabled.
 Weka, Agentic Mooncake, and agentic Dynamo traces share this path.
 
-Conversation routing requires the existing Dynamo runner and native router adapter.
+Conversation routing uses the built-in AISimulate runner and native adapter.
 [Dynamo #15631](https://github.com/ai-dynamo/dynamo/pull/15631) provides the native
-policy interface (A), [AISimulate #306](https://github.com/ai-dynamo/aisimulate/pull/306)
-provides the shared executor and generic hooks (B), and
-[Dynamo #15240](https://github.com/ai-dynamo/dynamo/pull/15240) consumes them (C).
-A and B alone do not enable routing. The [AgentX quickstart](quickstart.md)
-gives the pinned C development installation with `router.policy: kv_router`
-and session/sibling affinity, including the exact source qualification limits.
-Matching published packages remain a separate requirement; the qualified source
-pair is not an official release. Engine-stack G2 support does not qualify G2 with
-Dynamo routing. Online execution and other backends require separate qualification.
+policy interface; [AISimulate #306](https://github.com/ai-dynamo/aisimulate/pull/306)
+drives it directly. The [AgentX quickstart](quickstart.md) describes a standalone
+wheel build with `router.policy: kv_router` and session/sibling affinity.
+Dynamo's optional compatibility PR is not required. Conversation affinity has
+its own static, device-only deployment limits; engine-stack G2 support does not
+qualify G2 with routing. Online execution requires separate qualification.
 
 ## Lanes and virtual time
 

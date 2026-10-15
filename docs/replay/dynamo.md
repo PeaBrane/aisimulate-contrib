@@ -9,14 +9,14 @@ SPDX-License-Identifier: Apache-2.0
 
 # Dynamo integration
 
-A `router` section automatically selects the `dynamo` stack for Dynamo-owned
-routing. Explicit `--stack` remains authoritative; use `--stack dynamo` for a
-Planner-only configuration. Install the integration in the same environment as
-AISimulate and use the same stack when replaying a saved recommendation.
-The engine stack remains sufficient for reading native Dynamo trace files.
-Conversation affinity and continuous AgentX profiles require the matching C
-integration described in the [AgentX quickstart](agentic/quickstart.md); the
-historical package pairing alone does not qualify those features.
+The default AISimulate engine stack supports native Dynamo routing through its
+built-in `engine.router` adapter. Conversation-aware AgentX simulation runs
+independently as described in the [AgentX quickstart](agentic/quickstart.md).
+
+This page describes the optional `--stack dynamo` integration, including Planner,
+its configuration adapters and package compatibility. Install the integration
+in the same environment as AISimulate and explicitly select `--stack dynamo`.
+Use the same stack when replaying a saved recommendation.
 
 `predict --online` requests wall-clock-paced simulation only when the selected
 stack advertises it; it does not launch a serving endpoint. `recommend` is
@@ -110,10 +110,10 @@ verify that Planner loads.
 
 ## Router configuration
 
-Router is not part of the AISimulate core schema. The `dynamo.router` config adapter owns this
-section's concrete model, defaults, recommendation domains, validation, and runtime lowering. The
-section is accepted only when the selected stack provides that adapter; omitting it keeps an
-engine-only configuration engine-only.
+With `--stack dynamo`, the `dynamo.router` adapter owns this section's model,
+defaults, recommendation domains and runtime lowering. The default engine stack
+provides its own `engine.router` adapter for fixed policies without a Dynamo
+Python dependency. The table below describes the optional Dynamo adapter.
 
 | Knob | Default | Default Range | Preset | Rules |
 |---|---:|---|---|---|
@@ -122,7 +122,7 @@ engine-only configuration engine-only.
 | `router.overlap_score_credit` | `1.0` | `{choices: [0.0, 0.5, 1.0]}` | `-` | Finite, nonnegative, and KV-router-only. |
 | `router.prefill_load_scale` | `1.0` | `{choices: [0.0, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0]}` | `-` | Finite, nonnegative, and KV-router-only. |
 | `router.temperature` | `0.0` | `{choices: [0.0, 0.2, 0.5, 1.0]}` | `-` | Finite, nonnegative, and KV-router-only. |
-| `router.affinity.mode` | Unset | `-` | `-` | `session` or `sibling_group`; requires the matching C integration described below. |
+| `router.affinity.mode` | Unset | `-` | `-` | `session` or `sibling_group`; requires an integration compatible with AISimulate native routing. |
 | `router.affinity.ttl_seconds` | Integration-defined | `-` | `-` | From 1 through 31,536,000 seconds, including fractions; starts when the binding's last active request releases its lease. |
 
 `round_robin` requires `prefill_load_model.type: none` and has no KV-router-only knobs. The
@@ -130,13 +130,10 @@ engine-only configuration engine-only.
 1 contract. Replacing the legacy `aic` load-model name with an implementation-neutral public name is
 deferred until the Router exposes that name.
 
-Conversation affinity uses the development C integration in the
-[AgentX quickstart](agentic/quickstart.md), which pins the qualified source pair.
-`session` binds each conversation; `sibling_group` binds child conversations
-sharing a parent while keeping the parent and separate plays independent.
-Bindings include worker and attention-DP rank per pool and commit only after
-accepted engine dispatch. These fields do not imply support in the historical
-published pairing or qualify G2, Planner scaling, or routing with `recommend`.
+Conversation affinity is implemented by AISimulate's native composition. See the
+[AgentX quickstart](agentic/quickstart.md) for a standalone example and supported
+configurations. The optional Dynamo adapter delegates to the same composition.
+Its historical published pairing does not contain the new compatibility APIs.
 
 <a id="planner-dynamo-adapter"></a>
 

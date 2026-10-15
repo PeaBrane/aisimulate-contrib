@@ -1026,7 +1026,7 @@ def test_engine_stack_rejects_explicit_unavailable_component(tmp_path, monkeypat
                     "context_length": 4096,
                     "workers": {"aggregated": {}},
                 },
-                "router": {"policy": "round_robin"},
+                "custom_router": {"policy": "round_robin"},
             }
         )
     )
@@ -1042,21 +1042,21 @@ def test_engine_stack_rejects_explicit_unavailable_component(tmp_path, monkeypat
 
     with pytest.raises(SystemExit, match="2"):
         cli.main(["predict", "--stack", "engine", "--config", str(config_path)])
-    assert "engine.router" in capsys.readouterr().err
+    assert "engine.custom_router" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize(
     ("router", "explicit", "selected"),
     [
         (None, None, "engine"),
-        ({"policy": "kv_router"}, None, "dynamo"),
-        ({"policy": "kv_router", "affinity": {"mode": "sibling_group"}}, None, "dynamo"),
+        ({"policy": "kv_router"}, None, "engine"),
+        ({"policy": "kv_router", "affinity": {"mode": "sibling_group"}}, None, "engine"),
         ({"policy": "kv_router"}, "engine", "engine"),
         ({"policy": "kv_router"}, "dynamo", "dynamo"),
     ],
 )
 @pytest.mark.parametrize("command", ["predict", "recommend"])
-def test_cli_selects_router_stack_only_when_not_explicit(
+def test_cli_defaults_to_engine_and_preserves_explicit_stack(
     tmp_path, monkeypatch, router, explicit, selected, command
 ) -> None:
     raw = {"engine": {}}
@@ -1093,12 +1093,11 @@ def test_prediction_router_override_selects_native_policy(tmp_path, monkeypatch)
     monkeypatch.setattr(cli, "resolve_runner_factory", lambda name: loaded.append(name) or object())
     monkeypatch.setattr(cli, "_predict", lambda args, raw, factory: 0)
     assert cli.main(["predict", "--config", str(path), "--set", "router.policy=kv_router"]) == 0
-    assert loaded == ["dynamo"]
+    assert loaded == ["engine"]
 
 
 @pytest.mark.parametrize("command", ["predict", "recommend"])
-@pytest.mark.parametrize("explicit", [False, True])
-def test_router_missing_integration_is_configuration_error(tmp_path, monkeypatch, capsys, command, explicit) -> None:
+def test_explicit_router_integration_missing_is_configuration_error(tmp_path, monkeypatch, capsys, command) -> None:
     from aisimulate.stack import resolve_runner_factory
 
     path = tmp_path / "routing.yaml"
@@ -1110,9 +1109,7 @@ def test_router_missing_integration_is_configuration_error(tmp_path, monkeypatch
         return resolve_runner_factory(name, entry_points=[])
 
     monkeypatch.setattr(cli, "resolve_runner_factory", resolve)
-    argv = [command, "--config", str(path)]
-    if explicit:
-        argv += ["--stack", "dynamo"]
+    argv = [command, "--config", str(path), "--stack", "dynamo"]
     with pytest.raises(SystemExit, match="2"):
         cli.main(argv)
     assert requested == ["dynamo"]  # Never retry with the default round-robin runner.

@@ -52,6 +52,7 @@ areas:
       - crates/core/src/replay/
       - python/aisimulate/src/aisimulate/replay/
       - python/aisimulate/src/aisimulate/runner.py
+      - python/aisimulate/src/aisimulate/router.py
       - python/aisimulate/src/aisimulate/traffic.py
       - tests/test_cli_config.py
       - tests/test_epd_cli.py
@@ -73,6 +74,7 @@ areas:
       - tests/test_shared_g2_cli.py
       - tests/test_agentx_g2.py
       - tests/test_runner.py
+      - tests/test_native_router_cli.py
       - tests/test_traffic.py
       - tests/e2e/
   - label: mocker

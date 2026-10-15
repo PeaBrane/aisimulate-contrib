@@ -24,6 +24,7 @@ from typing import Any
 import psutil
 
 from .config.common import (
+    BUILTIN_CONFIG_ADAPTER_NAMES,
     CONFIG_ADAPTER_ENTRY_POINT_GROUP,
     PREDICTION_CORE_SECTIONS,
     RECOMMENDATION_CORE_SECTIONS,
@@ -364,9 +365,9 @@ def _require_output_adapters(names: Iterable[str]) -> None:
 
 
 def _require_known_sections(raw: dict[str, Any], *, command: str, stack: str) -> None:
-    """Reject top-level sections that no installed config adapter owns."""
+    """Reject sections that no built-in or installed config adapter owns."""
     core = PREDICTION_CORE_SECTIONS if command == "predict" else RECOMMENDATION_CORE_SECTIONS
-    installed = _installed_names(CONFIG_ADAPTER_ENTRY_POINT_GROUP)
+    installed = None
     for section in raw:
         # split_config_sections reports malformed keys and predict-only restrictions.
         if not isinstance(section, str) or not section or "." in section:
@@ -374,10 +375,21 @@ def _require_known_sections(raw: dict[str, Any], *, command: str, stack: str) ->
         if section in RECOMMENDATION_CORE_SECTIONS:
             continue
         name = f"{stack}.{section}"
+        if name in BUILTIN_CONFIG_ADAPTER_NAMES:
+            continue
+        if installed is None:
+            installed = _installed_names(CONFIG_ADAPTER_ENTRY_POINT_GROUP)
         if installed.count(name) > 1:
             raise ValueError(f"config adapter {name!r} has multiple installed providers")
         if name not in installed:
-            known = sorted(core | {entry.split(".", 1)[1] for entry in installed if entry.startswith(f"{stack}.")})
+            known = sorted(
+                core
+                | {
+                    entry.split(".", 1)[1]
+                    for entry in {*installed, *BUILTIN_CONFIG_ADAPTER_NAMES}
+                    if entry.startswith(f"{stack}.")
+                }
+            )
             match = difflib.get_close_matches(section, known, n=1)
             hint = f" (did you mean {match[0]!r}?)" if match else ""
             raise ValueError(

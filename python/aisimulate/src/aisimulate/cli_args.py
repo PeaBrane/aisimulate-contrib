@@ -74,7 +74,7 @@ def build_parser() -> argparse.ArgumentParser:
         child.add_argument("-c", "--config", required=True)
         child.add_argument(
             "--stack",
-            help="execution stack; defaults to engine, or dynamo when router is configured",
+            help="execution stack; defaults to engine, including native Dynamo routing",
         )
         child.add_argument(
             "--set",
@@ -94,8 +94,10 @@ def build_parser() -> argparse.ArgumentParser:
         "single aggregated worker or 1P1D, with DP1 on every role and speculative decoding disabled for G2. "
         "HBM-only AgentX supports speculative decoding with explicit acceptance assumptions. "
         "agentic_snapshot selects seeded starts; agentic_warmup primes saved prefixes; "
-        "agentic_profile enables duration controls on the offline engine or a compatible Dynamo stack; "
-        "Dynamo profile support requires a matching adapter/core build. Results are functional_only; "
+        "agentic_profile enables duration controls on the offline engine. Native Dynamo routing and "
+        "conversation affinity run inside AISimulate; affinity requires device-only KV cache and "
+        "speculative decoding disabled. Explicit --stack dynamo selects an optional compatibility adapter. "
+        "Results are functional_only; "
         "hardware accuracy and complete AgentX recipe parity are not qualified."
     )
     subparsers.choices["predict"].add_argument(
@@ -135,11 +137,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def select_stack(explicit: str | None, config: dict[str, Any]) -> str:
-    """Select an optional integration only when no stack was explicitly requested."""
+    """Keep AISimulate in charge unless an integration is explicitly selected."""
 
-    if explicit is not None:
-        return explicit
-    return "dynamo" if "router" in config else "engine"
+    del config
+    return explicit if explicit is not None else "engine"
 
 
 def _load_mapping(path: str) -> dict[str, Any]:

@@ -119,7 +119,7 @@ python-packages = [
     "aisimulate_core",
 ]
 abi3 = true
-features = ["extension-module"]
+features = ["extension-module", "native-dynamo-router"]
 exclude = ["**/__pycache__/**", "**/*.pyc"]
 include = [
     "src/aisimulate/legacy_cli/*.yaml",
