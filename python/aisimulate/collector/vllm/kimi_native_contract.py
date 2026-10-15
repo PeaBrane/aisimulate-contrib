@@ -88,10 +88,16 @@ def table_rows(rank_payloads, sequence_counts=(1,)):
                 raise ValueError("native MLA elapsed time must be positive and finite")
             if not isinstance(row["kernel_source"], str) or not row["kernel_source"]:
                 raise ValueError("native MLA kernel identity is required")
+            if type(row.get("gemm_reduce_scatter")) is not bool:
+                raise ValueError("native MLA output-projection dispatch identity is required")
+            kernel = json.dumps(
+                {"attention": row["kernel_source"], "gemm_reduce_scatter": row["gemm_reduce_scatter"]},
+                sort_keys=True,
+            )
             key = (row["sample_id"], row["invocation_id"])
             if payload["rank"] in invocations[key]:
                 raise ValueError("duplicate rank observation")
-            invocations[key][payload["rank"]] = (identity, total, row["kernel_source"], latency)
+            invocations[key][payload["rank"]] = (identity, total, kernel, latency)
     physical = defaultdict(list)
     kernels = {}
     for ranks in invocations.values():

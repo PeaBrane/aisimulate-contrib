@@ -262,8 +262,13 @@ impl Availability<'_> {
     }
 
     fn exact_miss(&self, name: &str) -> AicError {
+        let family = if name == "dsv41_native_stage_perf.parquet" {
+            "DeepSeek-V4.1 native stage"
+        } else {
+            "GLM-5.3-Flash"
+        };
         AicError::PerfDatabase(format!(
-            "GLM-5.3-Flash SILICON requires {name} measured on the exact runtime {}/{} \
+            "{family} SILICON requires {name} measured on the exact runtime {}/{} \
              (primary or declared reuse.yaml donor) under {}; earlier-version and \
              cross-backend tables are not admitted",
             self.db.backend,

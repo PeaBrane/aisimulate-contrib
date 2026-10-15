@@ -46,7 +46,15 @@ warmup records are archived in `../pro-eager-smoke-2257185.tar.gz`.
 SHA256: `d055ebba1ab4240356582b622dd088b3310f856c6c2c8579a5215540853122cc`.
 The embedded draft configuration is attributed in `../configs/pro0813/README.md`.
 
-To reproduce from the repository root:
+This historical comparison used the implementation captured in checkpoint
+`782dd178`. Subsequent code rejects automatic DSpark state sizing because it
+omits draft groups. Reproduce this historical approximation at that checkpoint;
+current comparisons must use measured, manually reconciled cache geometry.
+The older prediction records contain source-diff hashes without the patch bytes;
+their exact uncommitted source snapshots are not fully reconstructable. New
+prediction runs preserve those patches and reject source changes during a run.
+
+At that checkpoint, from the repository root:
 
 ```bash
 tar -xzf benchmarks/evidence/dspark-e2e-20261014/pro-eager-smoke-2257185.tar.gz \

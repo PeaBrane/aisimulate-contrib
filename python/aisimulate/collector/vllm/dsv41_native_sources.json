@@ -1,8 +1,10 @@
 {
-  "vllm.models.deepseek_v41.nvidia.model": "6e8a5b8b4ab07118f9d1f91a78c707b02a536e92d6b86c3126188bd7028410d5",
+  "vllm.models.deepseek_v41.nvidia.model": "1e73358b61b8135c11a5fcee9facbff33b438d6474d7436459b087a78f6e0a80",
   "vllm.models.deepseek_v41.nvidia.dspark": "30e5362e96491a2b7c99b03998de3bf359e053f2d189bbffc250084e17678326",
   "vllm.models.deepseek_v41.attention": "44b870805c1c796715d13029604428aa38a74dd1eebafbe1cc6879817b66d957",
   "vllm.models.deepseek_v41.common.engram": "7866f9cc58dd55a08e508f71a75d584584c3780aaf6e427accca9b00f22c1ef1",
   "vllm.v1.attention.backends.mla.sparse_swa": "3585df3b635ac26ce6820e202bfd4e619eaa7142c84929bd445dd12e2090aafb",
-  "vllm.models.deepseek_v41.decoder_replay_layers": "bd5fecbde5bc859ec9c82b8ee4d8ac768c9eb15f7f977cbfa56ff04f55f8e851"
+  "vllm.models.deepseek_v41.decoder_replay_layers": "5031738db67d1e6519a4ae9a70f09ffd02adcc49f7f6d544cee2f511ca984935",
+  "vllm.models.deepseek_v41.nvidia.model_state": "b60e0fff9ac60561f569a3beb2bc9ca431b14e3c2833d8537b3f866d5e7340de",
+  "vllm.models.deepseek_v41.nvidia.decoder_replay_cudagraph": "7d248e67c10834121db0d4a0423cd986e332dfd3dc0c480e6d70a711a8c733db"
 }

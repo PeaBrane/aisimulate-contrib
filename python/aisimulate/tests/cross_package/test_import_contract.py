@@ -98,6 +98,7 @@ CORE_SDK_LEAF_MODULES = [
     "speculation.draft_model",
     "speculation.dspark",
     "speculation.eagle",
+    "speculation.kimi_draft",
     "speculation.materialize",
     "speculation.mtp",
     "speculation.ngram",

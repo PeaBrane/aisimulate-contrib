@@ -14,6 +14,7 @@ from aisimulate.compiler import prediction_to_replay_spec
 from aisimulate.config import CorePredictionConfig, CoreRecommendationConfig
 from aisimulate.config.engine import KvCachePredictionConfig, StateCacheConfig
 from aisimulate.runner import EngineReplayRunnerFactory, _materialize_engine_role
+from aisimulate.state_size import resolve_state_size
 
 pytestmark = [pytest.mark.unit, pytest.mark.pre_merge, pytest.mark.gpu_0]
 
@@ -49,6 +50,24 @@ def _public(*, timing="fixed", **cache_overrides):
             "stop": {"requests": 1},
         },
     }
+
+
+@pytest.mark.parametrize("model", ["moonshotai/Kimi-K3", FLASH])
+def test_dspark_state_cache_requires_runtime_derived_geometry(model):
+    payload = _public(state_cache={})
+    payload["engine"].update(
+        model=model,
+        speculation={"kind": "dspark", "num_speculative_tokens": 3, "accepted_tokens": 2},
+    )
+    config = CorePredictionConfig.model_validate(payload)
+    with pytest.raises(ValueError, match="target-only sizing omits draft cache groups"):
+        resolve_state_size(config.engine, config.engine.workers.aggregated)
+    payload["engine"]["workers"]["aggregated"]["kv_cache"]["state_cache"] = STATE
+    config = CorePredictionConfig.model_validate(payload)
+    resolved = resolve_state_size(config.engine, config.engine.workers.aggregated)
+    assert resolved["source"] == "overridden"
+    assert resolved["bytes_per_request"] == 1500
+    assert resolved["state_blocks"] == 2
 
 
 class RecordingRuntime:

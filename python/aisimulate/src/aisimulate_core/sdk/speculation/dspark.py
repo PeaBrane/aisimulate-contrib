@@ -571,6 +571,20 @@ class DSparkScheme(SpecSchemeBase):
                 )
             )
         weights = float(sum(op.get_weights() for op in weight_ops))
+        if model.model_family == "DEEPSEEKV4" and model._backend_name == "vllm":
+            # ac9126 attention.py creates no compressor for draft SWA. The
+            # HCA op remains a latency proxy, but its compressor matrices and
+            # position parameters are not resident draft weights.
+            v4 = model.extra_params
+            compressor_bytes = (
+                2 * model._hidden_size * v4.head_dim * model.config.gemm_quant_mode.value.memory
+                + _SWA_LATENCY_PROXY_RATIO * v4.head_dim * 4
+            )
+            weights -= self.num_draft_layers * compressor_bytes
+            # nvidia/dspark.py owns these once for the complete draft stack:
+            # FP32 final mHC collapse, plus BF16 main/final RMSNorm weights.
+            weights += (v4.hc_mult**2 * model._hidden_size + v4.hc_mult + 1) * 4
+            weights += 2 * model._hidden_size * 2
         if (
             model.model_family == "DEEPSEEKV41"
             and model.config.moe_quant_mode.name.startswith("w4")

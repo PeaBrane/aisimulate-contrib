@@ -5,7 +5,6 @@ import copy
 import json
 
 import pytest
-
 from collector.vllm.kimi_native_contract import physical_identity, table_rows
 
 pytestmark = pytest.mark.unit
@@ -28,6 +27,7 @@ def row(draft=False, width=3, prefill=False):
         "sample_id": "0",
         "invocation_id": 0,
         "kernel_source": "FLASHINFER_MLA",
+        "gemm_reduce_scatter": not draft,
         "latency_ms": 1.0,
     }
 
@@ -83,6 +83,15 @@ def test_rank_aggregation_does_not_sum_layers_or_ranks():
     broken = copy.deepcopy(payloads)
     broken[0]["rows"][0]["kernel_source"] = "other"
     with pytest.raises(ValueError, match="disagree"):
+        table_rows(broken)
+    broken = copy.deepcopy(payloads)
+    broken[0]["rows"][0]["gemm_reduce_scatter"] = False
+    with pytest.raises(ValueError, match="disagree"):
+        table_rows(broken)
+    broken = copy.deepcopy(payloads)
+    for payload in broken:
+        payload["rows"].append(dict(payload["rows"][0], invocation_id=3, gemm_reduce_scatter=False))
+    with pytest.raises(ValueError, match="changes within"):
         table_rows(broken)
     with pytest.raises(ValueError, match="all eight"):
         table_rows(payloads + [payloads[0]])

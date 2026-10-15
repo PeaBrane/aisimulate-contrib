@@ -9,7 +9,11 @@ cd "$storage_root"
 mkdir -p "$storage_root/.cache/dspark-e2e-20261014"
 export HF_HOME=/workspace/.cache/dspark-e2e-20261014/huggingface
 export XDG_CACHE_HOME=/workspace/.cache/dspark-e2e-20261014
-run_args=(--mode "${DSPARK_RUN_MODE:-smoke}" --graph-policy "${DSPARK_GRAPH_POLICY:-eager}")
+run_args=(--mode "${DSPARK_RUN_MODE:-smoke}" --graph-policy "${DSPARK_GRAPH_POLICY:-eager}"
+  --startup-timeout "${DSPARK_STARTUP_TIMEOUT:-3600}")
+if [[ -n "${DSPARK_LOAD_STRATEGY:-}" ]]; then
+  run_args+=(--load-strategy "$DSPARK_LOAD_STRATEGY")
+fi
 if [[ -n "${DSPARK_CONCURRENCY:-}" ]]; then
   run_args+=(--concurrency "$DSPARK_CONCURRENCY")
 fi

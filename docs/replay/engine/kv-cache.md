@@ -256,12 +256,17 @@ This gives eight 1024-byte blocks. Each request's state takes two blocks
 
 | Knob | Default | Rules |
 |---|---|---|
-| `state_cache.bytes_per_request` | Inferred | State bytes per request per rank. When set, `block_size` and numeric `bytes_per_token` must also be set. |
+| `state_cache.bytes_per_request` | Inferred | State bytes per request per rank. When set, `block_size` and numeric `bytes_per_token` must also be set. DSpark requires explicit runtime-derived geometry. |
 | `state_cache.mamba_cache_dtype` | `auto` | Kimi K3 only. `auto` (model dtype), `float16` or `float32`. Used when bytes are inferred. |
 | `state_cache.indexer_cache_dtype` | `auto` | DeepSeek V4 only. `auto` (vLLM's FP8), `fp8` or `mxfp4`; vLLM supports `mxfp4` only on Blackwell datacenter GPUs. Used when bytes are inferred. |
 | `prefix_match_unit` | Unset (`block_size`) | Positive divisor of `block_size`. Lets prefixes match at a finer granularity than the physical block. |
 
-`state_cache: {}` infers Kimi K3 geometry from the model. `block_size` is then
+With DSpark, automatic `state_cache: {}` sizing is rejected: the target-only
+sizing API does not include the resolved draft cache groups or their effect on
+pool packing. Supply `bytes_per_request`, `block_size`, and `bytes_per_token`
+from the matching runtime's complete target-plus-draft cache allocation.
+
+Without DSpark, `state_cache: {}` infers Kimi K3 geometry from the model. `block_size` is then
 a requested page size (default 64) that is enlarged to fit one state per layer.
 For example, TP8 with FP8 KV and `block_size: 128` resolves to 1536-token blocks
 of 13824 bytes per token. The same estimate is available in the SDK:

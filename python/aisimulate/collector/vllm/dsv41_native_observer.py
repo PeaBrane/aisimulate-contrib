@@ -95,6 +95,12 @@ class NativeObserver:
         def observed(model, *args, **kwargs):
             if not self.active:
                 return original(model, *args, **kwargs)
+            replay = getattr(model, "decoder_replay_layers", None)
+            replay_batch = getattr(replay, "replay_batch", None)
+            if replay_batch is not None and replay_batch.run_graph is not None:
+                message = "native observer cannot measure decoder replay CUDA graphs as eager layers"
+                self.failures.append(message)
+                raise RuntimeError(message)
             positions = args[1] if len(args) > 1 else kwargs["positions"]
             layers = [layer for layer in model.layers if hasattr(layer, "attn")]
             starts, counts, _ = self._metadata(layers[0].attn)
@@ -393,6 +399,8 @@ class Dsv41ObserverWorker:
         spec = config.speculative_config
         if not config.model_config.enforce_eager or spec is None or not spec.use_dspark():
             raise ValueError("observer requires real eager DSpark serving")
+        if config.compilation_config.cudagraph_mode.name != "NONE":
+            raise ValueError("native observer requires CUDA graph mode NONE, including decoder replay")
         if spec.num_speculative_tokens != 5 or spec.enable_adaptive_verification:
             raise ValueError("initial V4.1 observer requires fixed K5 and adaptive verification disabled")
         if config.parallel_config.tensor_parallel_size != 4 or config.parallel_config.enable_expert_parallel:

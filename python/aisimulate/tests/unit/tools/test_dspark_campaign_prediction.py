@@ -26,6 +26,7 @@ def inputs():
                 "hardware": "b200_sxm",
                 "estimation_mode": "op_level",
                 "fallback_policy": "deny",
+                "context_length": 16384,
                 "speculation": {"kind": "dspark", "num_speculative_tokens": 3, "accepted_tokens": 1.25},
                 "workers": {
                     "aggregated": {
@@ -38,6 +39,7 @@ def inputs():
     )
     identity = {
         "model": {"model": config.engine.model},
+        "server_command": ["--max-model-len", "16384", "--max-num-seqs", "256", "--max-num-batched-tokens", "8192"],
         "cell": {
             "expected_requests": 1,
             "num_speculative_tokens": 3,
@@ -114,6 +116,15 @@ def test_smoke_can_be_predicted_without_changing_production_matrix():
         prediction.validate_inputs(config, identity, records)
 
 
+@pytest.mark.parametrize("flag", ["--max-model-len", "--max-num-seqs", "--max-num-batched-tokens"])
+def test_context_and_scheduler_must_match_the_actual_launch(flag):
+    config, identity, records = inputs()
+    command = identity["server_command"]
+    command[command.index(flag) + 1] = "1048576"
+    with pytest.raises(ValueError, match="frozen launch"):
+        prediction.validate_inputs(config, identity, records)
+
+
 @pytest.mark.parametrize("mismatch", ["model", "hardware", "draft_width", "topology", "prefix", "tokens", "failure"])
 def test_identity_or_workload_mismatches_cannot_be_scored(mismatch):
     config, identity, records = inputs()
@@ -157,6 +168,46 @@ def test_conditional_rates_take_precedence_over_mean_only_approximation():
         update={"accepted_tokens": None, "acceptance_rates": [0.75, 0.5, 0.1]}
     )
     prediction.validate_acceptance(speculation, evidence, "real")
+
+
+def test_qualified_cache_receipt_binds_workload_capacity_and_runtime_bytes(tmp_path):
+    config, identity, _ = inputs()
+    identity["cell"].update(model_key="v4-pro", concurrency=1)
+    raw = tmp_path / "runtime.json"
+    raw.write_text('{"runtime": "cache"}')
+    mapping = {
+        "schema": "dspark-pro-cache-reconciliation-v1",
+        "workload": {"k": 3, "concurrency": 1, "input_length": 4, "output_length": 3},
+        "runtime_receipt_sha256": prediction.digest(raw),
+        "capacity_proven_nonbinding": True,
+        "replay_kv_cache": {"capacity": {"type": "fixed", "blocks": 128}},
+    }
+    path = tmp_path / "cache.json"
+    path.write_text(json.dumps(mapping))
+    receipt = {
+        "qualification": {"eligible": True},
+        "cache_reconciliation_path": path.name,
+        "cache_reconciliation_sha256": prediction.digest(path),
+        "runtime_cache_receipt_path": raw.name,
+    }
+    prediction.validate_cache(config, identity, receipt, tmp_path)
+    config.engine.workers.aggregated.kv_cache.capacity.blocks = 256
+    with pytest.raises(ValueError, match="reconciled runtime capacity"):
+        prediction.validate_cache(config, identity, receipt, tmp_path)
+    config.engine.workers.aggregated.kv_cache.capacity.blocks = 128
+    identity["cell"]["concurrency"] = 4
+    with pytest.raises(ValueError, match="workload"):
+        prediction.validate_cache(config, identity, receipt, tmp_path)
+    identity["cell"]["concurrency"] = 1
+    raw.write_text("changed")
+    with pytest.raises(ValueError, match="runtime cache receipt digest"):
+        prediction.validate_cache(config, identity, receipt, tmp_path)
+
+
+def test_qualified_prediction_requires_cache_evidence(tmp_path):
+    config, identity, _ = inputs()
+    with pytest.raises(ValueError, match="verified cache reconciliation"):
+        prediction.validate_cache(config, identity, {"qualification": {"eligible": True}}, tmp_path)
 
 
 @pytest.mark.parametrize("scope", ["engine", "worker"])

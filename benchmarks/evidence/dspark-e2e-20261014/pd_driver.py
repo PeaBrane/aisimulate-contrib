@@ -28,6 +28,43 @@ def wait_ready(endpoint, deadline):
     raise TimeoutError(f"endpoint not ready: {endpoint}")
 
 
+def load_role_receipts(root, model_key, role):
+    """Validate every DP/TP worker, not only the HTTP client's first DP result."""
+    dp, tp = (8, 1) if model_key == "v4-pro" and role == "prefill" else (1, MODELS[model_key]["gpus_per_role"])
+    expected = {(d, t) for d in range(dp) for t in range(tp)}
+    ranks = [json.loads(path.read_text()) for path in sorted(root.glob("dp-*-tp-*.json"))]
+    keys = [(row["data_parallel_index"], row["tensor_parallel_rank"]) for row in ranks]
+    if len(keys) != len(expected) or set(keys) != expected:
+        raise ValueError(f"{role} cache receipt is missing or duplicates DP/TP workers")
+    for row in ranks:
+        parallel = row["parallelism"]
+        if (
+            parallel["data_parallel_size"] != dp
+            or parallel["tensor_parallel_size"] != tp
+            or parallel["pipeline_parallel_size"] != 1
+            or parallel["enable_expert_parallel"] != (dp == 8)
+            or row["schema"] != "dspark-native-cache-v1"
+            or not row["layer_specs"]
+            or not row["transfer_group_ids"]
+        ):
+            raise ValueError(f"{role} cache receipt differs from the approved physical topology")
+    return ranks
+
+
+def collect_role_receipts(endpoint, root, model_key, role):
+    root.mkdir(parents=True, exist_ok=False)
+    # DPLBAsyncMPClient joins every engine but only returns engine zero's
+    # result. The worker extension writes one unique atomic file per worker.
+    with fetch(
+        endpoint + "/collective_rpc",
+        {"method": "dspark_campaign_receipt", "args": [str(root)], "timeout": 120},
+        timeout=150,
+    ) as response:
+        rpc_result = json.load(response)
+    (root / "rpc-result.json").write_text(json.dumps(rpc_result, indent=2) + "\n")
+    return load_role_receipts(root, model_key, role)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-key", choices=list(MODELS), required=True)
@@ -46,6 +83,13 @@ def main():
     deadline = time.monotonic() + 3600
     for endpoint in [prefill, decode]:
         wait_ready(endpoint + "/health", deadline)
+    role_receipts = {
+        role: collect_role_receipts(endpoint, args.output / "cache-receipts" / role, args.model_key, role)
+        for role, endpoint in (("prefill", prefill), ("decode", decode))
+    }
+    cache_path = args.output / "effective-cache.json"
+    cache_bytes = (json.dumps(role_receipts, indent=2, sort_keys=True) + "\n").encode()
+    cache_path.write_bytes(cache_bytes)
     identity = {
         "model": MODELS[args.model_key],
         "image": IMAGE,
@@ -53,6 +97,18 @@ def main():
         "deployment": "disagg",
         "proxy_url": PROXY_URL,
         "proxy_sha256": PROXY_SHA256,
+        "runtime_cache_sha256": hashlib.sha256(cache_bytes).hexdigest(),
+        "transfer_accounting": {
+            "simulator_bytes": "rank-local logical target KV plus draft state",
+            "bandwidth_scope": "effective bandwidth per modeled handoff, not total wire throughput",
+            "physical_bytes": "Physical page/group sizes retained per worker; request wire bytes are unmeasured.",
+            "pro_mla_fanout": (
+                "Each of 8 D TP ranks pulls replicated MLA from rank 0 of the selected P DP engine. "
+                "Parallel copies do not imply 8x latency; shared-source NIC contention is unmodeled."
+                if args.model_key == "v4-pro"
+                else None
+            ),
+        },
         "roles": {
             role: json.loads((args.output / f"{role}-identity.json").read_text()) for role in ["prefill", "decode"]
         },
@@ -85,8 +141,8 @@ def main():
             wait_ready("http://127.0.0.1:8030/healthcheck", time.monotonic() + 120)
             ready = {
                 "identity_path": str(identity_path),
-                "effective_config_path": str(identity_path),
-                "cache_capacity_by_role_rank": None,
+                "effective_config_path": str(cache_path),
+                "cache_capacity_by_role_rank": role_receipts,
                 "log_paths": [str(args.output / f"{role}.log") for role in ["prefill", "decode"]],
                 "cell_id": f"{args.model_key}-disagg-k{args.k}-i1024-o1024-c1-real",
                 "endpoint": "http://127.0.0.1:8030",

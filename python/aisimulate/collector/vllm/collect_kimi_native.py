@@ -61,6 +61,8 @@ def run(args):
         receipt["prompt_sha256"] = hashlib.sha256(args.prompt_tokens.read_bytes()).hexdigest()
         (args.output / "prompt-token-ids.json").write_text(json.dumps(tokens) + "\n")
         os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "1"
+        os.environ["VLLM_ENGINE_READY_TIMEOUT_S"] = "6000"
+        receipt["startup_timeout_seconds"] = 6000
         # Framework imports occur only at the GPU executable boundary.
         vllm = importlib.import_module("vllm")
         engine_args = {
@@ -68,6 +70,7 @@ def run(args):
             "tensor_parallel_size": 8,
             "trust_remote_code": True,
             "language_model_only": True,
+            "safetensors_load_strategy": "eager",
             "skip_tokenizer_init": True,
             "kv_cache_dtype": "fp8",
             "attention_config": {"use_prefill_query_quantization": True},

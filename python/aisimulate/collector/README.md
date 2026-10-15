@@ -670,6 +670,12 @@ width2. Raw per-rank observations and a receipt are retained on failure. Accepte
 rows use the maximum rank duration per invocation, then the median of repeated
 physical cases. The table is `mla_native_module_perf.parquet`; it includes the
 full native target output collective and excludes the draft's external reduction.
+The recorded kernel identity also retains fused output-projection reduction
+dispatch; ranks or repeated samples with different dispatch are not merged.
+Kimi weights use the supported eager safetensors loading strategy, with a
+6000-second engine startup budget; both settings are retained in the receipt.
+Allow at least 120 minutes for the allocation, including collection and cleanup.
+This loader setting does not change the eager serving measurement policy.
 Query width, causal mode, sequence count, local heads, TP and precision are exact
 keys; only total KV length interpolates within the measured interval. Queries
 outside that interval fail explicitly. It is separate from historical partial

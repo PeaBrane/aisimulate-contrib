@@ -1,8 +1,8 @@
 {
   "schema": "dspark-collection-status-v1",
   "matrix": "matrix.json",
-  "measured_request_records": 1,
-  "eligible_paired_runs": 0,
+  "measured_request_records": 130,
+  "eligible_paired_runs": 1,
   "checkpoint_references": "checkpoint-references.json",
   "gpu_jobs": [
     {
@@ -157,14 +157,18 @@
       "gpus": 8,
       "host_memory_gb": 1200,
       "phase": "graph smoke",
-      "state": "last observed running",
+      "state": "COMPLETED",
       "node": "nsc-svg-slurm-1-gpu-72",
       "dependency": "2257188",
       "graph_policy": "runtime-default",
       "synthetic_acceptance_length": 3.77,
       "qos": "interactive",
       "time_limit": "01:00:00",
-      "results": "results/dspark-e2e-20261014/smoke-v4-pro-k6-2257371"
+      "results": "results/dspark-e2e-20261014/smoke-v4-pro-k6-2257371",
+      "exit_code": "0:0",
+      "measured_requests": 1,
+      "local_artifacts": "raw/pro-graph-smoke-2257371",
+      "qualification": "Diagnostic smoke only; full native cache receipt available, semantic mapping pending."
     },
     {
       "cluster": "aws-pdx-slurm-1",
@@ -174,14 +178,104 @@
       "gpus": 8,
       "host_memory_gb": 2048,
       "phase": "graph smoke",
-      "state": "last observed running",
+      "state": "CANCELLED",
       "node": "pool0-0227",
       "graph_policy": "runtime-default",
       "synthetic_acceptance_length": 2.51,
       "use_prefill_query_quantization": true,
       "qos": "normal",
       "time_limit": "02:00:00",
-      "results": "results/dspark-e2e-20261014/smoke-kimi-k3-k2-790647"
+      "results": "results/dspark-e2e-20261014/smoke-kimi-k3-k2-790647",
+      "exit_code": "0:0",
+      "batch_exit_code": "143:0",
+      "reason": "Observed mmap load47/96 after24min projected beyond both3600sstartup deadlines; replaced by source-verified eager weight loading.",
+      "local_artifacts": "raw/kimi-mmap-cancelled-790647",
+      "superseded_by": "790797"
+    },
+    {
+      "cluster": "nsc-svg-slurm-1",
+      "job_id": "2257500",
+      "model": "v4-pro",
+      "k": 6,
+      "gpus": 8,
+      "host_memory_gb": 1200,
+      "phase": "initial synthetic",
+      "state": "COMPLETED",
+      "graph_policy": "runtime-default",
+      "synthetic_acceptance_length": 3.77,
+      "qos": "interactive",
+      "time_limit": "01:00:00",
+      "concurrency": 1,
+      "repetition": 1,
+      "requests": 128,
+      "warmup_requests": 8,
+      "results": "results/dspark-e2e-20261014/initial-v4-pro-k6-2257500",
+      "budget_evidence": "Graph smoke2257371:3.611s/request,20m25 totalstartup+smoke; one window only.",
+      "node": "nsc-svg-slurm-1-gpu-166",
+      "exit_code": "0:0",
+      "elapsed": "00:22:03",
+      "measured_requests": 128,
+      "failed_requests": 0,
+      "local_artifacts": "raw/pro-production-2257500",
+      "paired_evidence": "pro-initial-c1-r1"
+    },
+    {
+      "cluster": "aws-pdx-slurm-1",
+      "job_id": "790786",
+      "model": "kimi-k3",
+      "k": 2,
+      "gpus": 8,
+      "host_memory_gb": 2048,
+      "phase": "graph smoke loader retry",
+      "state": "CANCELLED",
+      "reason": "Requested eager loader/6000s options were not forwarded into actual launch. No measurements; corrected main-entrypoint regression added.",
+      "results": "results/dspark-e2e-20261014/smoke-kimi-k3-k2-790786",
+      "superseded_by": "790797",
+      "elapsed": "00:02:38"
+    },
+    {
+      "cluster": "aws-pdx-slurm-1",
+      "job_id": "790797",
+      "model": "kimi-k3",
+      "k": 2,
+      "gpus": 8,
+      "host_memory_gb": 2048,
+      "phase": "graph smoke",
+      "state": "RUNNING",
+      "graph_policy": "runtime-default",
+      "requested_load_strategy": "eager",
+      "startup_timeout_s": 6000,
+      "synthetic_acceptance_length": 2.51,
+      "use_prefill_query_quantization": true,
+      "qos": "normal",
+      "time_limit": "02:00:00",
+      "results": "results/dspark-e2e-20261014/smoke-kimi-k3-k2-790797",
+      "reason": "Priority",
+      "forecast_start_utc": "2026-10-14T20:40:00",
+      "start_utc": "2026-10-14T19:10:40",
+      "node": "pool0-0086",
+      "actual_loader_verified": true,
+      "actual_engine_ready_timeout_s": 6000
+    },
+    {
+      "cluster": "nsc-svg-slurm-1",
+      "job_id": "2257706",
+      "purpose": "Pro P/D joint16B200 smoke",
+      "state": "CANCELLED",
+      "reason": "Frozen source snapshot omitted checkpoint-references.json; both roles exited before loading. Fixed snapshot dependency copying and early-role failure supervisor.",
+      "measured_requests": 0
+    },
+    {
+      "cluster": "nsc-svg-slurm-1",
+      "job_id": "2257733",
+      "purpose": "Pro P/D joint16B200 graph smoke",
+      "state": "RUNNING",
+      "nodes": [
+        "nsc-svg-slurm-1-gpu-136",
+        "nsc-svg-slurm-1-gpu-185"
+      ],
+      "results": "results/dspark-e2e-20261014/pd-smoke-v4-pro-k6-2257733",
+      "launch_identity": "K6 real acceptance, adaptive off, prefix off, TP1/DP8/EP8 prefill and TP8/EP1 decode, runtime-default graphs; immutable source+JSON snapshot"
     }
   ],
   "cpu_jobs": [
@@ -275,6 +369,59 @@
       "results": "results/dspark-e2e-20261014/v41-installed-source-audit",
       "exit_code": "0:0",
       "finding": "Two installed source mismatches: deepseek_v41/nvidia/model.py and decoder_replay_layers.py; other four sources match manifest. Semantic audit pending."
+    },
+    {
+      "cluster": "nsc-svg-slurm-1",
+      "job_id": "2257494",
+      "purpose": "Export installed V41 package Python sources for bounded graph patch audit",
+      "state": "COMPLETED",
+      "results": "results/dspark-e2e-20261014/v41-installed-source-audit/package",
+      "exit_code": "0:0",
+      "local_audit_path": "/tmp/aisim-dspark-v41-installed-source/package"
+    },
+    {
+      "cluster": "nsc-svg-slurm-1",
+      "job_id": "2257592",
+      "purpose": "Export installed NIXL and worker/scheduler integration source audit",
+      "state": "COMPLETED",
+      "exit_code": "0:0",
+      "results": "results/dspark-e2e-20261014/pd-installed-source-audit"
+    },
+    {
+      "cluster": "nsc-svg-slurm-1",
+      "job_id": "2257620",
+      "purpose": "Export installed P/D config and transfer topology source audit",
+      "state": "COMPLETED",
+      "results": "results/dspark-e2e-20261014/pd-installed-source-audit",
+      "exit_code": "0:0"
+    },
+    {
+      "cluster": "nsc-svg-slurm-1",
+      "job_id": "2257637",
+      "purpose": "Installed Pro/Kimi model source audit",
+      "state": "COMPLETED",
+      "exit_code": "0:0"
+    },
+    {
+      "cluster": "nsc-svg-slurm-1",
+      "job_id": "2257688",
+      "purpose": "Installed tokenizer and metrics publication audit",
+      "state": "COMPLETED",
+      "exit_code": "0:0"
+    },
+    {
+      "cluster": "nsc-svg-slurm-1",
+      "job_id": "2257734",
+      "purpose": "Installed speculation counter source audit",
+      "state": "COMPLETED"
+    },
+    {
+      "cluster": "nsc-svg-slurm-1",
+      "job_id": "2257744",
+      "purpose": "Exact frozen P/D bundle CPU role-command and checkpoint preflight",
+      "state": "COMPLETED",
+      "exit_code": "0:0",
+      "scope": "Both actual role commands and shared checkpoint lookup match the immutable2257733 source bundle. No GPU execution."
     }
   ],
   "storage_root": "/lustre/fsw/portfolios/coreai/projects/coreai_comparch_inferencex/users/simonec",
@@ -282,14 +429,15 @@
   "results": "results/dspark-e2e-20261014",
   "runtime": "vllm/vllm-openai:nightly-dev-x86_64-cu130-ac9126e58aa7@sha256:3d17635c5aa0340e2f2502c067ce4b587d8e7dc678195e90b71142490dc6d71c",
   "pending": [
-    "graph smoke and per-family aggregated qualification",
-    "P/D GPU smoke and connector qualification",
-    "fixed-length measured pilot and scoring",
-    "expanded matrix",
-    "AgentX pilots"
+    "Complete Pro P/D runtime smoke and connector/cache qualification",
+    "Complete Kimi graph smoke, then native MLA measurement",
+    "V4.1 native-stage measurement and aggregate/P-D qualification",
+    "Remaining initial47 configurations and repetitions",
+    "Expanded matrix after initial paired coverage",
+    "AgentX pilots after matched lifecycle/context qualification"
   ],
-  "production_request_records": 0,
-  "smoke_request_records": 1,
+  "production_request_records": 128,
+  "smoke_request_records": 2,
   "runtime_checks": [
     {
       "cluster": "aws-pdx-slurm-1",
@@ -300,6 +448,16 @@
       "logs": [
         "logs/dspark-e2e-20261014/kimi-native-cpu-import-790490.log",
         "logs/dspark-e2e-20261014/kimi-native-source-check-790490.log"
+      ]
+    },
+    {
+      "cluster": "nsc-svg-slurm-1",
+      "allocation_job_id": "2257500",
+      "purpose": "V41 observer import with audited installed source hashes",
+      "state": "passed",
+      "scope": "All8 source hashes match; no GPU hooks executed.",
+      "logs": [
+        "logs/dspark-e2e-20261014/v41-native-installed-source-check-2257500.log"
       ]
     }
   ]

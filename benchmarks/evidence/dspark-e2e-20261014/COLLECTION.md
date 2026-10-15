@@ -117,6 +117,11 @@ The following source references use vLLM
 - `vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py`: transfer groups
   support target and draft cache regions; replicated MLA regions differ from
   head-sharded full-attention regions.
+- `nixl/tp_mapping.py:91-104` supports Pro's TP1-to-TP8 MLA handoff: each D rank
+  reads the complete replicated MLA region from rank zero of the selected P
+  engine. `nixl/base_scheduler.py:76-80` adds the DP index to the base side-channel
+  port, so the eight P engines have distinct listeners. The launcher uses base
+  ports 5557 (P) and 5657 (D), with both roles in the same allocation.
 - `nixl/base_scheduler.py` uses prefill backoff
   `max(has_mamba ? 1 : 0, num_prefill_lookahead_tokens - 1)`. DSpark's lookahead is
   one (`vllm/config/vllm.py`). Kimi KDA returns `MambaSpec`, so Kimi trims one prompt
@@ -191,7 +196,46 @@ and available cache bytes to `effective-cache.json`. Its hash and the extension
 source hash are frozen into the serving identity before requests begin. The
 extension never replaces a forward method or runs inside the measured window.
 Initial smokes launched before this addition retain their original logs and are
-unqualified. P/D still requires an equivalent per-role receipt before scoring.
+unqualified.
+
+P/D now binds each role's API and inspection RPC to its explicit private
+allocation hostname. Before warmup, each worker atomically writes a unique
+`cache-receipts/ROLE/dp-D-tp-T.json`; the driver requires all eight workers per
+Pro role with the expected DP/TP/EP configuration. This is necessary because
+`vllm/v1/engine/core_client.py:1669-1671` broadcasts the utility call to all DP
+engines but returns only the first engine's response. Missing or duplicate
+worker identities fail before collection. The combined `effective-cache.json`
+and its hash retain target/draft transfer groups and physical page sizes.
+No serving forward path is changed.
+
+`reconcile_pro_cache.py --deployment disaggregated` validates these role receipts
+separately. P uses TP1/attention-DP8/EP8: each of its eight independent cache pools
+must pass the full-concurrency retention bound, without assuming evenly routed
+requests. The shared Replay P template uses the smallest measured pool capacity,
+applied independently to every DP rank. D uses TP8/EP1: all eight physical replicas
+must agree, and capacity is counted once per request set. P retains its prompt and
+hidden one-token response; D retains the requested output window. Both bounds
+include unsettled verification rounds and draft lookahead. Missing workers,
+missing draft layers, partial transfer groups, and unsupported geometry fail.
+
+Replay preserves these independent pools: `compiler.py` passes attention-DP into
+the role configuration; `runner.py` validates its timing identity;
+`engine/runtime.rs::EngineFactory::build` and
+`engine/generalized/engine.rs::new_with_rank_factory` create a separate scheduler
+and allocator for each DP rank. Disaggregated placement addresses those ranks
+individually. This mapping establishes cache capacity only. It does not qualify
+runtime routing latency or NIXL transport. The P/D adapter has synthetic contract
+tests; validation against the first complete P/D runtime receipt remains pending.
+
+Automatic simulator transfer bytes remain a rank-local logical payload. The
+Pro source sends replicated MLA to eight D ranks; these parallel reads do not
+imply eight times the latency. A measured effective per-handoff bandwidth may
+represent that fanout, while a shared-source NIC limit would require aggregate
+wire accounting. Physical block padding, auxiliary state and per-request wire
+bytes remain unmeasured until the NIXL smoke. The receipt labels these limits;
+it never treats logical bytes as measured total wire traffic or inserts an
+unmeasured bandwidth. The original proxy streams D's token IDs unchanged and
+does not prepend P's discarded sampled token.
 
 New aggregated runs snapshot launcher/client sources and the matrix into their
 result directory, hash each file, and execute the client and read-only cache
@@ -202,3 +246,190 @@ Kimi FP8 KV requires `attention_config.use_prefill_query_quantization=true` in
 the pinned runtime. The first eager startup reached native warmup and rejected
 the missing flag; its failure is retained. Corrected launches explicitly enable
 it, preserving BF16 projection weights and the runtime's FP8 prefill query path.
+
+## Phase B AgentX entrypoint
+
+`agentx_phaseb.py` prepares or runs the pinned AgentX client against an existing
+server; it never allocates GPUs. `agentx_server.py` records launch commands and
+all native cache workers. `agentx_context_audit.py` verifies the complete corpus
+and checks every source request, including subagents. The full corpus stays
+outside Git. No Phase B measurement has been completed.
+
+The producer is [SemiAnalysisAI/aiperf at 754356e9](https://github.com/SemiAnalysisAI/aiperf/tree/754356e9a39acc6cc6afb242d123bb57c3fb6f75).
+The original CLI/dataset adapter follows its `src/aiperf/config/flags/cli_config.py`,
+`common/scenario/inferencex_agentx_mvp.py`, `dataset/loader/base_hf_dataset.py`,
+`dataset/loader/semianalysis_cc_traces_weka.py`, `dataset/loader/weka_trace.py`,
+`dataset/loader/weka_trace_models.py`, and `plugin/plugins.yaml` contracts
+(Apache-2.0; NVIDIA Corporation & Affiliates). It does not replace producer
+scheduling or reconstruct requests independently. The external loader plugin
+only fixes the HF revision and verifies the file's bytes before delegation.
+
+The Apache-2.0 [public corpus](https://huggingface.co/datasets/semianalysisai/cc-traces-weka-062126/tree/23f152f6f0f9399a85901b89a6458def0ef16729)
+is pinned by revision, LFS SHA256 and size in `agentx-context-audit.json`.
+The complete 1,847,151,435-byte local file passed its SHA256 check. Its 393 traces
+contain 98,827 model requests; 91,944 exceed the fixed campaign's 16,384 context
+limit. The largest source input plus requested output is 996,579 tokens. All
+three pinned model configs declare 1,048,576 positions. This is the proposed
+explicit Phase B context limit; source lengths alone do not prove the final
+chat-template/tokenizer payload bound.
+
+Before executing AgentX, collect and score a separate fixed-length anchor with
+`--context-length 1048576` with prefix caching still disabled. Preserve the other serving settings.
+This anchor has a different serving identity and must not replace a 16K point
+in the initial campaign. The launcher defaults remain 16K/prefix-disabled.
+A native-formatter witness plus complete source bounds supports pilot preflight.
+The live server validates every sampled request with no filtering or truncation.
+All context failures must be retained and reviewed before scoring. Unsampled
+corpus payloads remain unverified; an exhaustive tokenizer pass is optional.
+
+Prepare the producer environment on the authorized CPU/client host:
+
+```bash
+git clone https://github.com/SemiAnalysisAI/aiperf.git /work/aiperf-agentx
+git -C /work/aiperf-agentx checkout --detach 754356e9a39acc6cc6afb242d123bb57c3fb6f75
+uv venv /work/agentx-venv --python 3.12
+uv pip install --python /work/agentx-venv/bin/python -e /work/aiperf-agentx
+uv pip install --python /work/agentx-venv/bin/python -e ./agentx_corpus_pin
+/work/agentx-venv/bin/aiperf plugins public_dataset_loader semianalysis_cc_traces_weka_062126
+```
+
+Inside an already allocated, pinned-image worker, the following starts an
+aggregated Pro service; it does not submit a job. Run only after the context
+identity change and matching anchor are selected for that deployment.
+
+```bash
+python serve_role.py --model-key v4-pro --role agg --k 6 --port 8010 \
+  --graph-policy runtime-default --prefix-cache --context-length 1048576 \
+  --output /work/agentx-server
+python agentx_server.py --model-key v4-pro --deployment agg --k 6 \
+  --role agg http://127.0.0.1:8010 /work/agentx-server/agg-identity.json \
+  --output /work/agentx-server-receipt
+```
+
+For P/D, use the same role launcher with `--role prefill` / `--role decode`,
+private `VLLM_NIXL_SIDE_CHANNEL_HOST`, separate side-channel ports, and the same
+context/prefix settings. Start the pinned unmodified proxy with the command
+already used by `pd_driver.py`, then give `agentx_server.py` both role endpoints
+and launch receipts. All worker receipt directories must be visible to every
+role. Preserve allocation/image, proxy and native-cache receipts alongside the
+client output; declared image metadata alone is not proof of the running OCI.
+
+A C1 pilot can advance once that model/deployment/K's C1 fixed anchor qualifies;
+C4 similarly requires its C4 anchor. No other model, deployment or numerical
+error threshold blocks this progress. Example preparation (add `--execute --context-audit agentx-context-preflight-pro.json`
+after the matching fixed anchor qualifies):
+
+```bash
+python agentx_phaseb.py --model-key v4-pro --deployment agg --k 6 \
+  --phase pilot --concurrency 1 --repetition 1 \
+  --fixed-pair /work/anchor-c1/summary.json /work/prediction-c1.json \
+  --server-identity /work/agentx-server-receipt/identity.json \
+  --producer-checkout /work/aiperf-agentx --aiperf /work/agentx-venv/bin/aiperf \
+  --endpoint http://127.0.0.1:8010 --metrics-url http://127.0.0.1:8010/metrics \
+  --output /work/agentx-pro-agg-c1-pilot
+```
+
+The exact command is parsed in the executable's own Python environment before
+execution. The manifest verifies the imported producer checkout and loader
+content, and records installed dependency versions. Corpus mmap reuse is
+disabled so the producer cannot bypass content verification with an older
+cached dataset. HF's immutable download cache remains available.
+
+Requested pilots last 600 seconds at C1/C4. The pinned scenario requires at
+least 900 seconds, so pilots explicitly use `--unsafe-override` and are
+**diagnostics, not valid scenario submissions**. Full profiles use strict
+scenario validation: 3,600 seconds at C1/C4/C16, three repetitions each.
+They require completed C1 and C4 pilots with hashed lifecycle evidence for
+`dependencies`, `fork_join`, `warmup_frontier`, `prefix_reuse`, and
+`stop_and_cancel`. Review receipts contain `run_receipt`, its SHA256, those
+boolean `checks`, and an `evidence` list of `{path, sha256}` artifacts. These
+receipts record evidence review; the tool never manufactures passing reviews.
+
+Both phases use seed 42, snapshot ratios 0.25–0.75, all 393 traces, prefix cache,
+10 warmup requests per lane after mandatory primers, zero idle warmup, and the
+producer's drained-wire/live-DAG transition. No `--burst-phase-starts` is set.
+The correct auto-warmup timeout flag is `--agentic-warmup-grace-period 1800`;
+`--warmup-grace-period` alone does not configure that generated phase at this
+pin. Tree/global idle caps are 300/10 seconds; response grace is 30 seconds,
+cancel drain 10 seconds, and failed-request threshold 0.1. Scenario output
+policy ignores EOS, uses recorded output length (minimum one), and preserves
+parent/subagent dependencies. No input/output cap or corpus filter is supplied.
+
+Execution also requires `--context-audit PATH`. An optional exhaustive receipt identifies the
+exact corpus and tokenizer revision, `all_generated_payloads_verified: true`,
+`truncation_or_filtering: false`, output policy
+`recorded_out_minimum_one_ignore_eos`, `max_prompt_plus_requested_output`, and
+hashed `evidence`. The checked maximum must fit the server and each anchor's
+identical context limit. Fixed anchors keep prefix cache disabled; AgentX enables it as an explicit workload-policy change. Do not convert a source-only
+length audit into this receipt.
+
+Raw producer exports, logs, dependency versions and corpus receipt are hashed.
+A completed client run remains **unscored** until Replay matches the actual
+sampled snapshot/frontier, synthesized prompts and prefix identities, warmup
+cleanup, output stops, acceptance, routing and metric cohorts. Equal random
+seeds do not establish identical snapshots across different implementations.
+The Weka producer intentionally skips `inputs.json`; retain raw exports and do
+not treat that missing optional file as lost requests or invent its contents.
+
+For slow network checkpoint reads, `DSPARK_LOAD_STRATEGY=eager` explicitly
+selects the pinned runtime's full-shard reader. This is a weight-loading choice,
+independent of graph execution. `DSPARK_STARTUP_TIMEOUT` sets both the supervisor
+and vLLM engine-ready deadline; the Slurm allocation must leave room afterward
+for measurement and cleanup. Kimi retries use 6000 seconds within a two-hour
+allocation. Every run records actual command/environment as well as requested
+settings. Attempt790786 exposed a missing pass-through; it was cancelled before
+requests, and the main-entrypoint regression now covers both parameters.
+
+The actual CPU tokenizer probe is retained in `agentx-tokenizer-probe.json`.
+All three pinned tokenizers load. Pro0813 has no HF chat template; V4.1 and
+Kimi execute their respective single-user template probes. These probes do not
+prove equivalence to the serving image's native formatters or a full-corpus
+payload bound. Reproduce with `agentx_corpus_pin/probe_tokenizers.py --model
+HF_ID REVISION --output PATH` in the pinned producer environment (repeat
+`--model` for each target). Adapter tests run there with
+`python agentx_corpus_pin/test_loader.py`; the campaign's CPU gate tests use
+`python -m unittest test_agentx_phaseb`.
+
+The supported pilot policy is `native_runtime_per_request`, demonstrated by
+`agentx-context-preflight-pro.json`. It binds the full source audit, a hashed
+actual-image formatter witness, tokenizer revision and explicit 1M context.
+It preserves every context failure and labels unsampled corpus payloads
+unverified. This authorizes preflight only: review actual native usage, request
+lengths, failures and cancellation cohorts before qualifying the measured window.
+No multi-hour full-corpus tokenizer sweep is required to start the authorized pilot.
+
+`agentx_corpus_pin/probe_native_context.py` reproduces the Pro witness with the
+pinned producer and an unmodified native encoder exported from image job 2257688:
+
+```bash
+/work/agentx-venv/bin/python agentx_corpus_pin/probe_native_context.py \
+  --manifest agentx-manifest.json --corpus /work/cache/traces.jsonl \
+  --native-encoder /work/native-source/tokenizers/deepseek_v4_encoding.py \
+  --output /work/native-context-probe.json
+```
+
+It reconstructs the complete trace containing the source maximum (37
+conversations, 1,569 turns), then encodes that request with the actual image's
+Pro formatter: 987,290 prompt tokens plus 9,379 requested output tokens gives
+996,669. The session marker is excluded from this CPU witness; actual sampled
+requests, including markers, are checked by the native server. The script
+imports AIPerf's original reconstruction implementation and the external
+encoder; it does not vendor either source or reimplement token generation.
+
+P/D launches freeze Python files and JSON configuration dependencies together
+under each allocation's `source/` directory. Run an image-backed CPU preflight
+from that exact bundle before a new GPU submission: resolve the shared pinned
+checkpoint and construct both role commands with their actual private host
+environment. Preserve the bundle hashes and commands in
+`bundle-cpu-preflight.json`. The supervisor exits when either role fails; it
+does not leave the client waiting for the full startup deadline. Attempt2257706
+failed before weight loading because its snapshot omitted checkpoint references;
+the corrected2257733 bundle passed independent CPU check2257744.
+
+[`acceptance-publication-audit.json`](acceptance-publication-audit.json) records
+the installed source chain for counter updates. Prometheus speculation counters
+update on every engine output, independently of periodic console logging. For
+the qualified C1 window, completion is queued and counters are recorded without
+an intervening asynchronous yield. Final-round proposals can exceed client
+output after clipping; these counters describe sampled acceptance, not committed
+client output counts.

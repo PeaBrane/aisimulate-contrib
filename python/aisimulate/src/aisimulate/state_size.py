@@ -22,6 +22,11 @@ def resolve_state_size(engine: EnginePredictionConfig, worker: WorkerPredictionC
             "kv_bytes_per_token": cache.bytes_per_token,
         }
     else:
+        if engine.speculation is not None:
+            raise ValueError(
+                "DSpark automatic state_cache sizing is unsupported: target-only sizing omits draft cache groups; "
+                "supply runtime-derived bytes_per_request, block_size and bytes_per_token"
+            )
         result = estimate_state_cache(
             engine.model,
             backend=engine.backend,

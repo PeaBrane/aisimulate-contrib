@@ -660,11 +660,15 @@ adaptations of, the named DeepSeek model repositories:
 
 The unmodified evidence configuration
 `benchmarks/evidence/dspark-e2e-20261014/configs/pro0813/config.json` and its
-embedded copy in `smoke-pro-eager/replay-config.yaml` come from
+embedded copies in `smoke-pro-eager/replay-config.yaml`,
+`smoke-pro-graph/replay-config.yaml`, and
+`pro-initial-c1-r1/replay-config.yaml` come from
 `deepseek-ai/DeepSeek-V4-Pro-0813@72e1d3230f6c080a530b0a1d46f8eb4602340597/config.json`.
 Copyright (c) 2023 DeepSeek. MIT; the adjacent evidence directory preserves the
 upstream license. The Replay YAML combines the unchanged configuration with
-original campaign settings.
+original campaign settings. The generated Replay specifications, reports and
+archived source/configuration snapshots in these evidence directories retain
+the same attribution for embedded configuration content.
 Source: https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro-0813/blob/72e1d3230f6c080a530b0a1d46f8eb4602340597/config.json
 License: https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro-0813/blob/72e1d3230f6c080a530b0a1d46f8eb4602340597/LICENSE
 
@@ -1374,6 +1378,44 @@ project and NVIDIA CORPORATION & AFFILIATES. Apache-2.0.
 
 Source: https://github.com/vllm-project/vllm/tree/ac9126e58aa7bbab1856ba6593ba4d5003fea516
 License: https://github.com/vllm-project/vllm/blob/ac9126e58aa7bbab1856ba6593ba4d5003fea516/LICENSE
+
+The V4.1 native observer, its source manifest, regression tests, and
+`benchmarks/evidence/dspark-e2e-20261014/v41-installed-source-audit.json`
+additionally describe modified source installed in runtime image
+`sha256:3d17635c5aa0340e2f2502c067ce4b587d8e7dc678195e90b71142490dc6d71c`.
+This immutable image includes a decoder replay patch beyond the base revision:
+`vllm/models/deepseek_v41/nvidia/model.py`,
+`vllm/models/deepseek_v41/decoder_replay_layers.py`,
+`vllm/models/deepseek_v41/nvidia/model_state.py`, and
+`vllm/models/deepseek_v41/nvidia/decoder_replay_cudagraph.py`.
+The manifest identifies each installed source by SHA256; the evidence retains
+the upstream hashes and audited eager-only semantics. These original adapters
+and derived descriptions are modified; no serving kernels are copied.
+Copyright contributors to the vLLM project. Apache-2.0, under the source and
+license URLs above.
+
+`benchmarks/evidence/dspark-e2e-20261014/pd-installed-source-audit.json`
+contains modified source-derived descriptions and hashes for the same immutable
+runtime image and base revision. In addition to the NIXL connector subtree,
+it covers `vllm/distributed/kv_transfer/kv_connector/utils.py`,
+`vllm/config/vllm.py`, `vllm/v1/core/sched/scheduler.py`,
+`vllm/v1/engine/core_client.py`, `vllm/v1/worker/gpu/{model_runner,kv_connector}.py`,
+`vllm/v1/worker/gpu/model_states/{__init__,interface,default}.py`,
+`vllm/v1/worker/gpu/spec_decode/dflash/{speculator,cudagraph}.py`,
+`vllm/v1/worker/gpu/spec_decode/dspark/speculator.py`, and Pro target/draft
+source under `vllm/models/deepseek_v4/`. Copyright contributors to the vLLM
+project. Apache-2.0, source and license URLs above; no serving kernels are copied.
+
+The original CPU cache-receipt adapter
+`benchmarks/evidence/dspark-e2e-20261014/reconcile_pro_cache.py`, its tests and
+adjacent README adapt the shared allocation and scheduling contracts in
+`vllm/v1/kv_cache_interface.py`, `vllm/config/vllm.py`, and
+`vllm/v1/core/sched/scheduler.py` at revision
+`ac9126e58aa7bbab1856ba6593ba4d5003fea516` (source and license URLs above).
+These are modified derivations; no runtime allocator is copied. Copyright
+contributors to the vLLM project. Apache-2.0.
+The archived `cache-adapter-v1-source.tar.gz` retains the earlier adapter and
+tests under this same source, revision and license attribution.
 
 The P/D collection client
 `benchmarks/evidence/dspark-fixed-20261014/collect_pd.py` adapts (modified) the

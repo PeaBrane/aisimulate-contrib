@@ -91,11 +91,11 @@ impl NativeMlaTable {
             .map_err(|e| invalid(e))?;
         let curve = curves
             .get(key)
-            .ok_or_else(|| invalid(format!("native MLA data missing for {key:?}")))?;
+            .ok_or_else(|| missing(format!("native MLA data missing for {key:?}")))?;
         let first = curve.iter().next().map(|(kv, _)| kv);
         let last = curve.iter().next_back().map(|(kv, _)| kv);
         if first.is_none_or(|first| total_kv < first) || last.is_none_or(|last| total_kv > last) {
-            return Err(invalid(format!(
+            return Err(missing(format!(
                 "native MLA total_kv_tokens={total_kv} outside measured range {first:?}..={last:?} for {key:?}"
             )));
         }
@@ -103,9 +103,12 @@ impl NativeMlaTable {
     }
 
     fn load(&self) -> Result<BTreeMap<NativeMlaKey, LeafAxisCurve>, AicError> {
-        let Some(path) = self.path.as_ref().filter(|p| p.is_file()) else {
-            return Err(invalid("native MLA primary table missing"));
+        let Some(path) = &self.path else {
+            return Ok(BTreeMap::new());
         };
+        if !path.try_exists().map_err(invalid)? {
+            return Ok(BTreeMap::new());
+        }
         let reader = PerfReader::open(path)?;
         let identity = reader.col("identity")?;
         let kv = reader.col("total_kv_tokens")?;
@@ -188,6 +191,10 @@ impl NativeMlaTable {
 }
 
 fn invalid(message: impl std::fmt::Display) -> AicError {
+    AicError::InvalidPerfData(message.to_string())
+}
+
+fn missing(message: impl std::fmt::Display) -> AicError {
     AicError::PerfDatabase(message.to_string())
 }
 
@@ -234,7 +241,13 @@ mod tests {
                 path: Some(path),
                 curves: OnceLock::new(),
             };
-            assert_eq!(table.load().is_ok(), valid);
+            let key: NativeMlaKey = serde_json::from_str(identity).unwrap();
+            let result = table.query(&key, 1026, &|x| x);
+            assert_eq!(result.is_ok(), valid);
+            if let Err(error) = result {
+                assert!(matches!(error, AicError::InvalidPerfData(_)), "{error}");
+                assert!(!error.is_missing_perf_data());
+            }
         }
     }
 
@@ -266,8 +279,18 @@ mod tests {
         };
         assert_eq!(table.query(&key, 1026, &|x| x).unwrap().latency, 1.0);
         assert_eq!(table.query(&key, 1029, &|x| x).unwrap().latency, 1.5);
-        assert!(table.query(&key, 1025, &|x| x).is_err());
-        assert!(table.query(&key, 1033, &|x| x).is_err());
+        assert!(
+            table
+                .query(&key, 1025, &|x| x)
+                .unwrap_err()
+                .is_missing_perf_data()
+        );
+        assert!(
+            table
+                .query(&key, 1033, &|x| x)
+                .unwrap_err()
+                .is_missing_perf_data()
+        );
         for other in [
             NativeMlaKey {
                 query_tokens: 3,

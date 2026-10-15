@@ -182,6 +182,25 @@ def test_partial_metadata_is_preserved_as_failure(tmp_path):
         observer.restore()
 
 
+def test_replay_graph_cannot_be_labeled_as_eager_layer_measurement(tmp_path):
+    observer = NativeObserver(None, None, tmp_path, 0)
+
+    class Model:
+        decoder_replay_layers = SimpleNamespace(replay_batch=SimpleNamespace(run_graph=lambda: None))
+
+        def forward(self, *args):
+            raise AssertionError("graph-backed replay must fail before the model executes")
+
+    observer.wrap_root(Model, "forward", "target")
+    observer.begin("graph", "layer")
+    try:
+        with pytest.raises(RuntimeError, match="replay CUDA graphs"):
+            Model().forward()
+        assert len(observer.failures) == 1
+    finally:
+        observer.restore()
+
+
 def test_nested_records_never_summed_or_imported():
     root = {
         "invocation_id": 0,

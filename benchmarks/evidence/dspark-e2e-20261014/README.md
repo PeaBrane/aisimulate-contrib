@@ -1,14 +1,23 @@
 # Fixed-length DSpark serving validation
 
 This campaign implements the approved AgentX-model matrix and MTP-aligned
-V4-Pro P/D topology. **No qualified serving measurement/prediction pairs are
-available yet. MAPE and signed bias are unavailable, not zero.** Functional
-tests and op-table query coverage are separate from serving accuracy.
+V4-Pro P/D topology. **One qualified serving pair is available: one configuration,
+one repetition and 128 measured requests.** Its TTFT/TPOT/throughput MAPE is
+60.39%/10.77%/6.47%; with one pair, these equal that point's APE. The remaining
+587 planned runs have no scored error. Functional tests and op-table query
+coverage are separate from serving accuracy.
 
-A completed single-request Pro-0813 eager smoke and its unqualified Replay
-diagnostic are available in [`smoke-pro-eager/`](smoke-pro-eager/README.md).
-It is excluded from production MAPE; the observed large latency gap remains
-unresolved pending graph-enabled collection and operation-level qualification.
+The [first production pair](pro-initial-c1-r1/README.md) uses Pro0813 on 8 B200,
+TP8/EP1, K6, synthetic AL3.77, 1024/1024 and concurrency1. All 128 requests
+completed, with zero failures. Measurements, frozen matching evidence, original
+and qualified summaries, source patches and raw records are retained.
+
+Two completed single-request Pro0813 diagnostics are available:
+[`eager with real acceptance`](smoke-pro-eager/README.md) and
+[`graph with synthetic acceptance`](smoke-pro-graph/README.md). The graph smoke
+has measured/predicted TTFT 195.70/76.64 ms and TPOT 3.34/3.62 ms. Both are
+excluded from production MAPE. Their acceptance settings differ, so they do not
+establish an eager-versus-graph speedup.
 
 ## Matrix and references
 
@@ -42,12 +51,21 @@ Three repetitions measure `max(128, 10 × concurrency)` requests each.
   At most one GPU collection job runs per platform.
 - [`model-support.json`](model-support.json) records functional model coverage
   and remaining cache/operator approximations.
+- [`pd-installed-source-audit.json`](pd-installed-source-audit.json) compares
+  actual-image source hashes with the nominal runtime revision. The installed
+  draft graph moves context preparation into capture; source-level ownership
+  and transport compatibility remain separate from measured P/D qualification.
 - [`verification.json`](verification.json) records schema31 functional checks:
   2,000 Rust library tests plus integration suites, 13 public API tests, 145
   affected Python tests, and 107 ownership checks. These are not serving samples.
-- [`op-coverage.json`](op-coverage.json) records canonical `op_level` + `SILICON`
+  The production checkpoint adds 170 passing campaign/import tests and six cache
+  subtests, including the Kimi legacy-import regression found by Full CI.
+- [`op-coverage-schema31.json`](op-coverage-schema31.json) records current canonical `op_level` + `SILICON`
   + `fallback_policy: deny` construction/query checks. These CPU queries are
   predictions, not collected kernel or serving measurements.
+  The earlier `op-coverage.json` remains historical evidence. Current V4.1/Kimi
+  construction rejects missing native-stage/MLA tables instead of reusing
+  incompatible measurements.
 - [`missing-op-plan.json`](missing-op-plan.json) identifies blocked V4.1 and
   Kimi table contracts and the minimum source-qualified collection work.
 - [`COMPARISON.md`](COMPARISON.md) defines immutable match receipts, exact-token
@@ -58,11 +76,26 @@ Three repetitions measure `max(128, 10 × concurrency)` requests each.
 
 The initial 256 GB host-memory smoke attempts did not produce requests. Their
 slow weight-loading observations and subsequent resource changes remain in the
-ledger. The first eager Pro K=6 smoke completed one 1024/1024 request; it is
-diagnostic evidence, outside production coverage. Production uses the pinned
+ledger. Pro K=6 eager and graph smokes each completed one 1024/1024 request; both are
+diagnostic evidence, outside production coverage. The graph smoke exported all
+eight ranks' cache layouts. Production uses the pinned
 runtime's default graph policy after a separate graph smoke, with a fresh cache
 receipt and identity. Model/GPU identities are retained; resource retries are
 not treated as completed coverage.
+
+`reconcile_pro_cache.py` checks the Pro TP8/PP1 cache receipt against the pinned
+runtime's shared-pool contract. Tensor descriptors overlay one allocation;
+their sizes are not summed. Replay preserves the physical pool block count,
+reports byte rounding, and uses an approximate steady-state reservation for
+sliding groups. A separate conservative capacity check retains the entire
+input/output history in every group, two unsettled K+1 verify rounds, K draft
+lookahead slots, alignment slack, and the shared null block. This bound follows
+vLLM `ac9126e58aa7bbab1856ba6593ba4d5003fea516`:
+`vllm/v1/kv_cache_interface.py:1416` (aliasing),
+`vllm/config/vllm.py:592` and `:630` (PP1 in-flight batches/lookahead), and
+`vllm/v1/core/sched/scheduler.py:637` (unclipped final speculative rounds).
+The mapping qualifies only the pinned prefix-disabled aggregated workload;
+it does not reproduce native sliding-block lifetimes or P/D transfers.
 
 Host regression comparisons use the frozen performance-gate trace and verify
 its hash and recursively counted requests against its manifest before timing.
@@ -105,3 +138,16 @@ one-hour profiles at 1/4/16 with three repetitions after lifecycle/cache checks.
 
 Full fixed-length collection, P/D qualification and AgentX profiling remain
 unfinished until their actual records and paired reports are present.
+
+Phase B preparation is in [`agentx-manifest.json`](agentx-manifest.json) and the
+[AgentX entrypoint instructions](COLLECTION.md#phase-b-agentx-entrypoint).
+The pinned producer's exact pilot/profile commands passed CPU parsing. No
+AgentX serving run has been submitted by these tools. The complete pinned
+corpus passed content verification; [`agentx-context-audit.json`](agentx-context-audit.json)
+records 98,827 requests and a largest source input/output sum of 996,579 tokens.
+The current 16K fixed-run identity cannot serve 91,944 of those requests.
+An explicit 1M context/prefix-disabled fixed anchor and native formatter
+preflight are required before execution. Pro preflight is available in
+[`agentx-context-preflight-pro.json`](agentx-context-preflight-pro.json); the
+live server validates sampled requests, and all failures remain evidence. Final snapshot/frontier and
+metric parity remain separate gates before any AgentX accuracy claim.

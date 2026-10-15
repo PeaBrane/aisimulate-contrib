@@ -33,6 +33,25 @@
         "elapsed_seconds": 322
       },
       "interpretation": "Slow checkpoint reads with skipped automatic prefetch under256GB allocation."
+    },
+    {
+      "job_id": "790647",
+      "phase": "checkpoint loading before graph smoke",
+      "worker_pid": 11943,
+      "worker_state": "D (disk sleep)",
+      "worker_wchan": "folio_wait_bit_common",
+      "worker_rss_kib": 5318880,
+      "worker_peak_rss_kib": 9158124,
+      "worker_read_bytes": 192024256512,
+      "cgroup_memory_current_bytes": 144904675328,
+      "cgroup_memory_peak_bytes": 1439241703424,
+      "cgroup_memory_events": {
+        "max": 0,
+        "oom": 0,
+        "oom_kill": 0
+      },
+      "host_memory_requested_gb": 2048,
+      "interpretation": "Observed checkpoint I/O wait with large prior cache/memory peak and no memory-limit event; current RSS alone would understate required host headroom."
     }
   ]
 }

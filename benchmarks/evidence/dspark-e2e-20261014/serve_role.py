@@ -3,6 +3,7 @@
 """Run one P/D role inside its assigned Slurm step, with identical DSpark settings."""
 
 import argparse
+import hashlib
 import json
 import os
 import subprocess
@@ -15,22 +16,63 @@ from serve_smoke import server_command
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-key", choices=list(MODELS), required=True)
-    parser.add_argument("--role", choices=["prefill", "decode"], required=True)
+    parser.add_argument("--role", choices=["agg", "prefill", "decode"], required=True)
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--k", type=int, required=True)
     parser.add_argument("--synthetic-al", type=float)
-    parser.add_argument("--graph-policy", choices=["eager", "runtime-default"], default="runtime-default")
+    parser.add_argument("--prefix-cache", action="store_true")
+    parser.add_argument("--context-length", type=int, default=16384)
+    parser.add_argument(
+        "--graph-policy",
+        choices=["eager", "runtime-default"],
+        default="runtime-default",
+    )
+    parser.add_argument("--preflight-only", action="store_true", help="Resolve identity without GPU access")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if args.k not in MODELS[args.model_key]["k"]:
         parser.error("K must belong to the approved matrix")
     args.output.mkdir(parents=True, exist_ok=True)
     command, env, checkpoint = server_command(
-        args.model_key, args.k, args.port, args.role, args.synthetic_al, args.graph_policy
+        args.model_key,
+        args.k,
+        args.port,
+        args.role,
+        args.synthetic_al,
+        args.graph_policy,
+        prefix_cache=args.prefix_cache,
+        context_length=args.context_length,
     )
-    (args.output / f"{args.role}-identity.json").write_text(
-        json.dumps({"command": command, "checkpoint": checkpoint, "graph_policy": args.graph_policy}, indent=2) + "\n"
+    receipt_name = f"{args.role}-preflight.json" if args.preflight_only else f"{args.role}-identity.json"
+    (args.output / receipt_name).write_text(
+        json.dumps(
+            {
+                "command": command,
+                "checkpoint": checkpoint,
+                "graph_policy": args.graph_policy,
+                "prefix_cache": args.prefix_cache,
+                "runtime_environment": {
+                    name: env[name]
+                    for name in (
+                        "VLLM_NIXL_SIDE_CHANNEL_HOST",
+                        "VLLM_NIXL_SIDE_CHANNEL_PORT",
+                        "VLLM_SERVER_DEV_MODE",
+                        "VLLM_USE_V2_MODEL_RUNNER",
+                        "VLLM_USE_RUST_FRONTEND",
+                    )
+                    if name in env
+                },
+                "receipt_rpc_scope": "Private allocation host; runtime inspection before measurement.",
+                "cache_receipt_extension_sha256": hashlib.sha256(
+                    Path(__file__).with_name("runtime_receipt.py").read_bytes()
+                ).hexdigest(),
+            },
+            indent=2,
+        )
+        + "\n"
     )
+    if args.preflight_only:
+        return
     with (args.output / f"{args.role}-gpu.csv").open("w") as output:
         subprocess.run(
             [

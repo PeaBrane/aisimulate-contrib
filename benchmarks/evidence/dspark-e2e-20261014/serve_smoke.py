@@ -20,7 +20,20 @@ from collect_fixed import fetch
 from inspect_runtime import checkpoint_path, inspect_checkpoint
 
 
-def server_command(model_key, k, port, role="agg", synthetic_al=None, graph_policy="eager"):
+def server_command(
+    model_key,
+    k,
+    port,
+    role="agg",
+    synthetic_al=None,
+    graph_policy="eager",
+    prefix_cache=False,
+    load_strategy=None,
+    startup_timeout_s=3600,
+    context_length=16384,
+):
+    if type(context_length) is not int or context_length <= 0:
+        raise ValueError("context length must be positive")
     model = MODELS[model_key]
     checkpoint = inspect_checkpoint(model["model"], model["revision"])
     speculation = {
@@ -55,12 +68,12 @@ def server_command(model_key, k, port, role="agg", synthetic_al=None, graph_poli
         "--gpu-memory-utilization",
         "0.90",
         "--max-model-len",
-        "16384",
+        str(context_length),
         "--max-num-seqs",
         "64",
         "--max-num-batched-tokens",
         "8192",
-        "--no-enable-prefix-caching",
+        "--enable-prefix-caching" if prefix_cache else "--no-enable-prefix-caching",
         "--port",
         str(port),
         "--seed",
@@ -68,6 +81,8 @@ def server_command(model_key, k, port, role="agg", synthetic_al=None, graph_poli
         "--speculative-config",
         json.dumps(speculation),
     ]
+    if load_strategy is not None:
+        command += ["--safetensors-load-strategy", load_strategy]
     if graph_policy == "eager":
         command.append("--enforce-eager")
     if model_key == "v4-pro":
@@ -89,12 +104,27 @@ def server_command(model_key, k, port, role="agg", synthetic_al=None, graph_poli
         "TRANSFORMERS_OFFLINE": "1",
         "VLLM_USE_V2_MODEL_RUNNER": "1",
         "VLLM_USE_RUST_FRONTEND": "0",
-        "VLLM_ENGINE_READY_TIMEOUT_S": "3600",
+        "VLLM_ENGINE_READY_TIMEOUT_S": str(startup_timeout_s),
     }
     if role == "agg":
-        command += ["--host", "127.0.0.1", "--worker-extension-cls", "runtime_receipt.DsparkReceiptWorker"]
+        command += [
+            "--host",
+            "127.0.0.1",
+            "--worker-extension-cls",
+            "runtime_receipt.DsparkReceiptWorker",
+        ]
         env["VLLM_SERVER_DEV_MODE"] = "1"
     if role != "agg":
+        private_host = env.get("VLLM_NIXL_SIDE_CHANNEL_HOST")
+        if not private_host or private_host in ("0.0.0.0", "::"):
+            raise ValueError("P/D receipt RPC requires an explicit private role host")
+        command += [
+            "--host",
+            private_host,
+            "--worker-extension-cls",
+            "runtime_receipt.DsparkReceiptWorker",
+        ]
+        env["VLLM_SERVER_DEV_MODE"] = "1"
         command += [
             "--kv-transfer-config",
             json.dumps({"kv_connector": "NixlConnector", "kv_role": "kv_both"}),
@@ -111,14 +141,20 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--k", type=int, required=True)
     parser.add_argument("--port", type=int, default=8010)
+    parser.add_argument("--context-length", type=int, default=16384)
+    parser.add_argument("--prefix-cache", action="store_true")
     parser.add_argument("--mode", choices=["smoke", "pilot", "initial"], default="smoke")
     parser.add_argument("--graph-policy", choices=["eager", "runtime-default"], default="eager")
+    parser.add_argument("--load-strategy", choices=["eager"])
+    parser.add_argument("--startup-timeout", type=int, default=3600)
     parser.add_argument("--concurrency", type=int, choices=[1, 4], action="append")
     parser.add_argument("--repetition", type=int, choices=[1, 2, 3], action="append")
     acceptance = parser.add_mutually_exclusive_group()
     acceptance.add_argument("--synthetic-al", type=float)
     acceptance.add_argument("--synthetic-control", type=Path)
     args = parser.parse_args()
+    if args.startup_timeout <= 0:
+        parser.error("startup timeout must be positive and fit the Slurm allocation with cleanup margin")
     model = MODELS[args.model_key]
     if args.k not in model["k"]:
         parser.error("K must be in the approved matrix")
@@ -155,7 +191,15 @@ def main():
         shutil.copy2(source, source_dir / name)
         source_hashes[name] = hashlib.sha256(source.read_bytes()).hexdigest()
     command, env, checkpoint = server_command(
-        args.model_key, args.k, args.port, synthetic_al=args.synthetic_al, graph_policy=args.graph_policy
+        args.model_key,
+        args.k,
+        args.port,
+        synthetic_al=args.synthetic_al,
+        graph_policy=args.graph_policy,
+        prefix_cache=args.prefix_cache,
+        context_length=args.context_length,
+        load_strategy=args.load_strategy,
+        startup_timeout_s=args.startup_timeout,
     )
     env["PYTHONPATH"] = str(source_dir.resolve()) + os.pathsep + env.get("PYTHONPATH", "")
     identity = {
@@ -174,10 +218,13 @@ def main():
                 "VLLM_USE_V2_MODEL_RUNNER",
                 "VLLM_USE_RUST_FRONTEND",
                 "VLLM_SERVER_DEV_MODE",
+                "VLLM_ENGINE_READY_TIMEOUT_S",
             )
         },
         "graph_policy": args.graph_policy,
-        "prefix_cache": False,
+        "weight_load_strategy": args.load_strategy or "runtime-default",
+        "startup_timeout_s": args.startup_timeout,
+        "prefix_cache": args.prefix_cache,
         "external_kv_offload": False,
         "engram_cpu_offload": False,
         "phase": args.mode,
@@ -219,12 +266,12 @@ def main():
             start_new_session=True,
         )
         try:
-            deadline = time.monotonic() + 3600
+            deadline = time.monotonic() + args.startup_timeout
             while True:
                 if process.poll() is not None:
                     raise RuntimeError(f"server exited {process.returncode}")
                 if time.monotonic() > deadline:
-                    raise TimeoutError("server startup exceeded one hour")
+                    raise TimeoutError(f"server startup exceeded {args.startup_timeout} seconds")
                 try:
                     with fetch(f"http://127.0.0.1:{args.port}/health", timeout=5):
                         break

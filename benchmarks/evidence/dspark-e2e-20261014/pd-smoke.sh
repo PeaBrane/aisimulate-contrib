@@ -20,10 +20,13 @@ fi
 export HF_HOME=/workspace/.cache/dspark-e2e-20261014/huggingface
 export XDG_CACHE_HOME=/workspace/.cache/dspark-e2e-20261014
 result="/workspace/results/dspark-e2e-20261014/pd-smoke-$DSPARK_MODEL_KEY-k$DSPARK_K-$SLURM_JOB_ID"
-mkdir -p "$storage_root/${result#/workspace/}"
+mkdir -p "$storage_root/${result#/workspace/}/source"
+cp "$storage_root/jobs/dspark-e2e-20261014/"*.py \
+  "$storage_root/jobs/dspark-e2e-20261014/"*.json \
+  "$storage_root/${result#/workspace/}/source/"
 container=(--container-image="$storage_root/images/vllm-ac9126e58aa7-3d17635c.sqsh"
   --container-mounts="$storage_root:/workspace,/scratch/fsw/portfolios/coreai/projects/coreai_dlalgo_ci/artifacts/model:/scratch/fsw/portfolios/coreai/projects/coreai_dlalgo_ci/artifacts/model:ro"
-  --container-workdir=/workspace/jobs/dspark-e2e-20261014
+  --container-workdir="$result/source"
   --container-env=HF_HOME,XDG_CACHE_HOME,VLLM_NIXL_SIDE_CHANNEL_HOST,VLLM_NIXL_SIDE_CHANNEL_PORT)
 pids=()
 cleanup() { for pid in "${pids[@]}"; do kill "$pid" 2>/dev/null || true; done; wait || true; }
@@ -43,4 +46,17 @@ done
 srun --nodes=1 --ntasks=1 --nodelist="$prefill_host" --overlap --gres=gpu:0 --cpus-per-task=2 --mem=4G \
   "${container[@]}" /usr/bin/python3 pd_driver.py --model-key "$DSPARK_MODEL_KEY" --k "$DSPARK_K" \
   --prefill-host "$prefill_host" --decode-host "$decode_host" --output "$result" \
-  --proxy-script /workspace/jobs/dspark-e2e-20261014/upstream/toy_proxy_server.py
+  --proxy-script /workspace/jobs/dspark-e2e-20261014/upstream/toy_proxy_server.py &
+driver_pid=$!
+while kill -0 "$driver_pid" 2>/dev/null; do
+  for pid in "${pids[@]}"; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      echo "A P/D role exited before the client completed" >&2
+      kill "$driver_pid" 2>/dev/null || true
+      wait "$driver_pid" || true
+      exit 1
+    fi
+  done
+  sleep 5
+done
+wait "$driver_pid"

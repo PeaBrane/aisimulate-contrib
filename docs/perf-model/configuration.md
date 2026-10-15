@@ -142,6 +142,8 @@ its copied WKV weights are counted separately. For vLLM TP8/EP1, target and
 draft attention output reductions are added because existing attention module
 tables omit TP collectives. Generic collective timing and the HCA proxy for
 noncausal draft SWA remain approximations pending native measurements.
+The V4 draft inventory excludes the HCA proxy's nonexistent compressor weights
+and counts its stack-level mHC head and main/final normalization weights once.
 
 For Kimi-K3 on the pinned vLLM DSpark runtime, MLA uses the complete native
 attention module, including input projections, normalization, output gate and

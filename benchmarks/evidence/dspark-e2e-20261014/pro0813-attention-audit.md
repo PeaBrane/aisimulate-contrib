@@ -29,6 +29,13 @@ its observed/predicted difference is not qualified accuracy evidence.
    layer (3), at the corresponding query-token count. This correction is limited
    to vLLM TP8/EP1. The generic collective table remains an approximation to the
    runtime's selected communication implementation.
+4. **Proxy compressor weights and missing stack heads.** Draft SWA has no
+   compressor, so its HCA timing proxy's compressor matrices and FP32 position
+   parameters are excluded from resident draft weights. The stack's final
+   FP32 mHC collapse and BF16 main/final RMSNorm weights are counted once.
+   The existing replicated BF16 Markov matrices match the runtime. Optional
+   confidence-head tensors and quantization metadata still require a checkpoint
+   allocation receipt; this correction does not claim complete memory closure.
 
 Source references:
 
@@ -59,8 +66,9 @@ approximation, not proof of exact seven-query serving coverage.
 
 Draft attention still substitutes HCA with capped KV `128+K`. Actual noncausal
 SWA uses padded index width `ceil((128+K)/64)*64`, which is 192 at K6, and has no
-compressed branch. HCA latency and its compressor weight inventory remain proxy
-errors; this audit did not manufacture a SWA row or claim exact memory closure.
+compressed branch. HCA latency remains a proxy error; its nonexistent compressor
+weights have been removed from the draft inventory. This audit did not
+manufacture a SWA row or claim exact memory closure.
 
 Additional missing or approximate work includes auxiliary hidden-state
 reconstruction/mean at the three target taps, hyper-connection head collapse,

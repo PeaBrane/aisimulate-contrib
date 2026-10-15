@@ -58,5 +58,34 @@
     "git diff --check passed"
   ],
   "ci_snapshot_fix": "Assert warmup_policy=primer separately and remove only that new metadata before hashing. All historical timing/lifecycle hashes remain unchanged.",
-  "scope": "Functional validation only. Production serving accuracy and full collection remain incomplete."
+  "scope": "Functional validation only. Production serving accuracy and full collection remain incomplete.",
+  "production_checkpoint": {
+    "base_revision": "782dd178bf47ad7e8cc33d7727467f521bd330b5",
+    "native_sha256": "026d857f9166be5182e66affd3b10d47ad3fed3a6348fd97af99c1d186bebc54",
+    "checks": [
+      {
+        "check": "Campaign, cache, PhaseB, predictor and SDK import contracts",
+        "result": "170 passed, 6 subtests passed",
+        "log_sha256": "ecf04bf6c9b6f797e002c3213fb744797b108e4d83c4006b592fb68171a01a89"
+      },
+      {
+        "check": "Import compatibility regression",
+        "result": "126 passed; adds Kimi draft compatibility alias required by CI leaf coverage"
+      },
+      {
+        "check": "Native MLA malformed-data guard",
+        "result": "2 focused Rust tests passed; invalid data cannot masquerade as missing coverage"
+      },
+      {
+        "check": "State sizing and predictor post-audit checks",
+        "result": "143 passed at preceding post-audit checkpoint; predictor expanded to19 tests in combined suite"
+      }
+    ],
+    "static_checks": [
+      "Ruff check and format passed for campaign and import changes",
+      "Packaged legal-file copies match",
+      "git diff --check passed"
+    ],
+    "serving_scope": "One qualified production pair,128requests; complete matrix still pending."
+  }
 }

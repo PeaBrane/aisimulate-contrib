@@ -5,11 +5,18 @@ actual eager execution sites. It never constructs attention metadata, synthetic
 KV state, or substitute kernels. The initial scope is B200 TP4/EP1, fixed K5,
 adaptive verification disabled, 1024 input tokens, and 16 output tokens.
 
-The source pin is [vLLM ac9126e58aa7bbab1856ba6593ba4d5003fea516](https://github.com/vllm-project/vllm/tree/ac9126e58aa7bbab1856ba6593ba4d5003fea516).
+The base source pin is [vLLM ac9126e58aa7bbab1856ba6593ba4d5003fea516](https://github.com/vllm-project/vllm/tree/ac9126e58aa7bbab1856ba6593ba4d5003fea516).
 Its Apache-2.0 source is copyright contributors to the vLLM project. These
 collector modules are original adapters using the pinned public worker-extension
 and request APIs. `dsv41_native_sources.json` hashes the installed source files;
 the worker rejects a different implementation before installing observation hooks.
+The image `sha256:3d17635c5aa0340e2f2502c067ce4b587d8e7dc678195e90b71142490dc6d71c`
+contains a decoder replay graph patch beyond that base revision. The manifest
+pins the installed model, replay layers, model state and replay graph manager.
+The observer requires graph mode `NONE` and rejects an active replay graph;
+only the audited eager branch retains the measured per-layer boundaries.
+The upstream/installed hash comparison is retained in the campaign's
+`v41-installed-source-audit.json` evidence. This is not graph-mode qualification.
 
 ## Run
 
@@ -46,7 +53,8 @@ unchanged; inclusive scope and reduction ownership remain explicit.
 
 ## Source contracts
 
-All paths below are relative to the immutable vLLM source pin:
+Paths below refer to the base source pin, except the four replay patch files
+identified above, whose installed hashes are pinned to the image:
 
 | Contract | Source |
 | --- | --- |
@@ -58,6 +66,7 @@ All paths below are relative to the immutable vLLM source pin:
 | Fused prior post/current pre/RMSNorm and optional reduction | `vllm/models/deepseek_v41/nvidia/model.py:557`, `:599` |
 | Eager mHC stream behavior | `vllm/models/deepseek_v41/nvidia/model.py:475` |
 | Bounded replay gather/scatter and restored full rows | `vllm/models/deepseek_v41/decoder_replay_layers.py:46` |
+| Eager versus inner replay graph selection | Installed `vllm/models/deepseek_v41/nvidia/model_state.py:242`, `:479`; `nvidia/decoder_replay_cudagraph.py` |
 | Root input and finalization boundaries | `vllm/models/deepseek_v41/nvidia/model.py:851`, `:1005`, `:1074` |
 | Noncausal draft and native context insertion | `vllm/models/deepseek_v41/nvidia/dspark.py:1`, `:173` |
 

@@ -9,13 +9,18 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from acceptance import measured_acceptance
 from campaign import cells
 from collect_fixed import one_request
 from freeze_acceptance import freeze
-from runtime_receipt import primitive
+from pd_driver import load_role_receipts
+from runtime_receipt import DsparkReceiptWorker, primitive
+from serve_role import main as role_main
+from serve_smoke import main as serve_main
+from serve_smoke import server_command
 
 
 def snapshot(rounds, proposed, accepted, positions):
@@ -32,6 +37,120 @@ def snapshot(rounds, proposed, accepted, positions):
 
 
 class CollectionTests(unittest.TestCase):
+    def test_role_preflight_resolves_command_without_gpu_or_server_launch(self):
+        with tempfile.TemporaryDirectory() as temp:
+            argv = [
+                "serve_role.py",
+                "--model-key",
+                "v4-pro",
+                "--role",
+                "prefill",
+                "--k",
+                "6",
+                "--port",
+                "8010",
+                "--output",
+                temp,
+                "--preflight-only",
+            ]
+            with (
+                patch("sys.argv", argv),
+                patch("serve_role.server_command", return_value=(["server"], {}, {"path": "/model"})) as build,
+                patch("serve_role.subprocess.run") as gpu,
+                patch("serve_role.os.execvpe") as launch,
+            ):
+                role_main()
+            build.assert_called_once()
+            gpu.assert_not_called()
+            launch.assert_not_called()
+            self.assertEqual(json.loads((Path(temp) / "prefill-preflight.json").read_text())["command"], ["server"])
+            self.assertFalse((Path(temp) / "prefill-identity.json").exists())
+
+    def test_entrypoint_forwards_loader_and_internal_startup_deadline(self):
+        with tempfile.TemporaryDirectory() as temp:
+            argv = [
+                "serve_smoke.py",
+                "--model-key",
+                "kimi-k3",
+                "--k",
+                "2",
+                "--output",
+                str(Path(temp) / "run"),
+                "--load-strategy",
+                "eager",
+                "--startup-timeout",
+                "6000",
+                "--graph-policy",
+                "runtime-default",
+            ]
+            with (
+                patch("sys.argv", argv),
+                patch("serve_smoke.server_command", side_effect=RuntimeError("stop before launch")) as build,
+                self.assertRaisesRegex(RuntimeError, "stop before launch"),
+            ):
+                serve_main()
+            self.assertEqual(build.call_args.kwargs["load_strategy"], "eager")
+            self.assertEqual(build.call_args.kwargs["startup_timeout_s"], 6000)
+            self.assertEqual(build.call_args.kwargs["graph_policy"], "runtime-default")
+
+    def test_pd_launcher_preserves_fixed_k_and_private_rpc_topology(self):
+        with (
+            patch("serve_smoke.inspect_checkpoint", return_value={"path": "/pinned/model"}),
+            patch.dict("os.environ", {"VLLM_NIXL_SIDE_CHANNEL_HOST": "private-p-node"}),
+        ):
+            for role, tp in (("prefill", "1"), ("decode", "8")):
+                command, env, _ = server_command("v4-pro", 6, 8010, role=role, graph_policy="runtime-default")
+                self.assertEqual(command[command.index("--tensor-parallel-size") + 1], tp)
+                self.assertEqual(command[command.index("--host") + 1], "private-p-node")
+                self.assertEqual(env["VLLM_SERVER_DEV_MODE"], "1")
+                self.assertEqual("--enable-expert-parallel" in command, role == "prefill")
+                if role == "prefill":
+                    self.assertEqual(command[command.index("--data-parallel-size") + 1], "8")
+                spec = json.loads(command[command.index("--speculative-config") + 1])
+                self.assertEqual(spec["num_speculative_tokens"], 6)
+                self.assertFalse(spec["enable_adaptive_verification"])
+                self.assertNotIn("--enforce-eager", command)
+            command, _, _ = server_command("v4-pro", 6, 8010)
+            self.assertEqual(command[command.index("--host") + 1], "127.0.0.1")
+        with (
+            patch("serve_smoke.inspect_checkpoint", return_value={"path": "/pinned/model"}),
+            patch.dict("os.environ", {"VLLM_NIXL_SIDE_CHANNEL_HOST": "0.0.0.0"}),
+            self.assertRaisesRegex(ValueError, "private role host"),
+        ):
+            server_command("v4-pro", 6, 8010, role="prefill")
+
+    def test_pd_cache_receipts_keep_all_dp_workers_and_reject_missing_or_duplicate_ranks(self):
+        @dataclasses.dataclass
+        class Cache:
+            num_blocks: int = 100
+            transfer_group_ids: tuple = (0, 1)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for dp in range(8):
+                worker = SimpleNamespace(
+                    rank=0,
+                    local_rank=dp,
+                    parallel_config=SimpleNamespace(
+                        data_parallel_index=dp,
+                        tensor_parallel_size=1,
+                        data_parallel_size=8,
+                        pipeline_parallel_size=1,
+                        enable_expert_parallel=True,
+                    ),
+                    model_runner=SimpleNamespace(kv_cache_config=Cache(), get_kv_cache_spec=lambda: {"layer": Cache()}),
+                )
+                DsparkReceiptWorker.dspark_campaign_receipt(worker, str(root))
+            self.assertEqual(len(load_role_receipts(root, "v4-pro", "prefill")), 8)
+            self.assertEqual(list(root.glob("*.tmp")), [])
+            last = root / "dp-7-tp-0.json"
+            last.unlink()
+            with self.assertRaisesRegex(ValueError, "missing or duplicates"):
+                load_role_receipts(root, "v4-pro", "prefill")
+            last.write_text((root / "dp-0-tp-0.json").read_text())
+            with self.assertRaisesRegex(ValueError, "missing or duplicates"):
+                load_role_receipts(root, "v4-pro", "prefill")
+
     def test_cache_receipt_preserves_computed_page_padding(self):
         @dataclasses.dataclass
         class PaddedState:

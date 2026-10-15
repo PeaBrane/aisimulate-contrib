@@ -169,7 +169,14 @@ def test_v4_pro_bundled_dspark_ignores_legacy_mtp_depth_and_keeps_native_ownersh
     expected = block_weights + scheme._main_proj_op(model).get_weights()
     expected += 2 * model._vocab_size * scheme.markov_rank * 2
     expected += preparation["dspark_context_kv_proj"].get_weights()
+    # Pure SWA owns no compressor, despite its HCA latency proxy. The final
+    # mHC collapse and two stack-level norms are separate resident weights.
+    expected -= 3 * (2 * 7168 * 512 + 128 * 512 * 4)
+    expected += (4 * 4 * 7168 + 4 + 1) * 4 + 2 * 7168 * 2
     assert scheme.draft_weights_bytes(model) == expected
+    # The memory correction does not replace the existing timing proxy.
+    attention = json.loads(draft_ops["dspark_attention"].op._spec_json())["Dsv4Generation"]
+    assert attention["attn_kind"] == "Hca"
 
 
 def test_v41_bundled_draft_depth_keeps_its_separate_runtime_fallback():

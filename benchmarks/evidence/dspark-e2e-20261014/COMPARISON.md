@@ -52,6 +52,10 @@ The predictor passes the measured input and output token IDs to native Engine
 Replay with the measured closed-loop request concurrency. It saves the resolved
 Replay specification, raw report, performance/memory diagnostics, source hashes
 and host wall time. Host wall time is never used as serving latency.
+The predictor saves a binary-capable patch for tracked runtime sources and its
+own entrypoint against the recorded Git revision. New runtime source files must
+be committed first. A source or native-library change during prediction rejects
+the attempt, so concurrent builds cannot silently change the reported identity.
 
 Freeze a `replay-match.json` receipt before running the predictor:
 
@@ -65,6 +69,9 @@ Freeze a `replay-match.json` receipt before running the predictor:
   "draft_config_sha256": "<pinned draft config SHA256>",
   "acceptance_path": "acceptance.json",
   "acceptance_sha256": "<SHA256 of acceptance evidence bytes>",
+  "cache_reconciliation_path": "cache-reconciliation.json",
+  "cache_reconciliation_sha256": "<SHA256 of cache mapping bytes>",
+  "runtime_cache_receipt_path": "effective-cache.json",
   "qualification": {"eligible": false, "reasons": ["unresolved identity differences"]}
 }
 ```
@@ -83,6 +90,11 @@ Config paths are also relative to the receipt. Their hashes and revisions must
 match `checkpoint-references.json`. The predictor checks the canonical target
 loader against the pinned source config and requires the exact pinned
 `draft_config` in Replay YAML. A public model name alone is insufficient.
+The predictor also checks context and scheduler limits against frozen launch
+arguments. Qualified Pro aggregated runs require the cache adapter's matching
+workload, capacity, runtime receipt hash, and nonbinding-capacity proof. Other
+families and P/D need their own checked adapters before scoring. An approximate
+cache mapping cannot qualify a workload whose capacity may be binding.
 
 If runtime qualification finishes after collection, preserve the original
 `summary.json` and frozen `identity.json`. Write a separate

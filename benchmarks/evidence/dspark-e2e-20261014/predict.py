@@ -23,6 +23,29 @@ def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def source_snapshot():
+    root = Path(__file__).resolve().parents[3]
+    paths = [
+        "crates/core",
+        "python/aisimulate/src",
+        str(Path(__file__).resolve().relative_to(root)),
+    ]
+    untracked = subprocess.check_output(
+        ["git", "ls-files", "--others", "--exclude-standard", "--", *paths],
+        cwd=root,
+        text=True,
+    )
+    if untracked.strip():
+        raise ValueError("commit new predictor source files before recording reproducible predictions")
+    patch = subprocess.check_output(["git", "diff", "--binary", "HEAD", "--", *paths], cwd=root)
+    return {
+        "revision": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip(),
+        "diff_sha256": hashlib.sha256(patch).hexdigest(),
+        "native_sha256": digest(Path(native.__file__)),
+        "source_paths": paths,
+    }, patch
+
+
 def validate_artifacts(config, identity, receipt, receipt_dir, pins):
     """Verify source configs before the canonical loader constructs the model."""
     model = identity["model"]
@@ -79,7 +102,10 @@ def validate_inputs(config, identity, records):
         transfer = config.engine.kv_transfer
         backoff = 1 if cell["model_key"] == "kimi-k3" else 0
         recompute = 128 if cell["model_key"] == "v41-flash" else 1
-        if transfer is None or (transfer.prefill_backoff_tokens, transfer.decode_recompute_tokens) != (
+        if transfer is None or (
+            transfer.prefill_backoff_tokens,
+            transfer.decode_recompute_tokens,
+        ) != (
             backoff,
             recompute,
         ):
@@ -87,6 +113,23 @@ def validate_inputs(config, identity, records):
     roles = ["aggregated"] if expected_mode == "aggregated" else ["prefill", "decode"]
     for role in roles:
         worker = getattr(config.engine.workers, role)
+        command = (
+            identity.get("server_command", [])
+            if role == "aggregated"
+            else identity.get("roles", {}).get(role, {}).get("command", [])
+        )
+        for flag, value in (
+            ("--max-model-len", config.engine.context_length),
+            ("--max-num-seqs", worker.scheduler.max_sequences),
+            ("--max-num-batched-tokens", worker.scheduler.max_batched_tokens),
+        ):
+            supplied = [
+                command[index + 1] if part == flag and index + 1 < len(command) else part[len(flag) + 1 :]
+                for index, part in enumerate(command)
+                if part == flag or part.startswith(flag + "=")
+            ]
+            if len(supplied) != 1 or supplied[0] != str(value):
+                raise ValueError(f"{role} Replay {flag} differs from the frozen launch configuration")
         if (worker.hardware or config.engine.hardware) != config.engine.hardware:
             raise ValueError(f"{role} hardware differs from the measured cell")
         if (
@@ -97,7 +140,13 @@ def validate_inputs(config, identity, records):
             raise ValueError(f"{role} overrides the measured-table op_level/deny contract")
         topology = cell["decode" if role == "aggregated" else role]
         parallel = worker.parallelism
-        if (parallel.tensor, parallel.attention_data, parallel.moe_expert, parallel.pipeline, parallel.replicas) != (
+        if (
+            parallel.tensor,
+            parallel.attention_data,
+            parallel.moe_expert,
+            parallel.pipeline,
+            parallel.replicas,
+        ) != (
             topology["tp"],
             topology["attention_dp"],
             topology["ep"],
@@ -146,9 +195,50 @@ def validate_acceptance(speculation, evidence, acceptance_kind):
         ):
             raise ValueError("Replay conditional acceptance differs from the evidence")
     elif speculation.accepted_tokens is None or not math.isclose(
-        speculation.accepted_tokens, evidence["accepted_tokens"], rel_tol=1e-12, abs_tol=1e-12
+        speculation.accepted_tokens,
+        evidence["accepted_tokens"],
+        rel_tol=1e-12,
+        abs_tol=1e-12,
     ):
         raise ValueError("Replay mean acceptance differs from the evidence")
+
+
+def validate_cache(config, identity, receipt, receipt_dir):
+    """Bind qualified Pro cache mapping to both runtime bytes and Replay fields."""
+    eligible = receipt.get("qualification", {}).get("eligible") is True
+    path = receipt.get("cache_reconciliation_path")
+    if path is None:
+        if eligible:
+            raise ValueError("qualified scoring requires a verified cache reconciliation")
+        return
+    path = receipt_dir / path
+    if digest(path) != receipt["cache_reconciliation_sha256"]:
+        raise ValueError("cache reconciliation digest mismatch")
+    mapping = json.loads(path.read_text())
+    if mapping["schema"] != "dspark-pro-cache-reconciliation-v1" or identity["cell"]["deployment"] != "agg":
+        raise ValueError("cache reconciliation requires an adapter for this deployment")
+    cell = identity["cell"]
+    if cell["model_key"] != "v4-pro" or mapping["workload"] != {
+        "k": cell["num_speculative_tokens"],
+        "concurrency": cell["concurrency"],
+        "input_length": cell["input_length"],
+        "output_length": cell["output_length"],
+    }:
+        raise ValueError("cache reconciliation workload differs from measurement")
+    if eligible:
+        raw = receipt_dir / receipt["runtime_cache_receipt_path"]
+        if digest(raw) != mapping["runtime_receipt_sha256"]:
+            raise ValueError("runtime cache receipt digest mismatch")
+        if mapping["capacity_proven_nonbinding"] is not True:
+            raise ValueError("approximate cache mapping cannot qualify a capacity-bound workload")
+    actual = config.engine.workers.aggregated.kv_cache.model_dump(mode="json")
+    for key, expected in mapping["replay_kv_cache"].items():
+        value = actual[key]
+        matches = (
+            all(value.get(k) == v for k, v in expected.items()) if isinstance(expected, dict) else value == expected
+        )
+        if not matches:
+            raise ValueError(f"Replay cache {key} differs from the reconciled runtime capacity")
 
 
 def main():
@@ -159,15 +249,29 @@ def main():
     parser.add_argument("--output-dir", required=True, type=Path)
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=False)
+    source, patch = source_snapshot()
+    (args.output_dir / "predictor-source.patch").write_bytes(patch)
     measured = json.loads(args.measurement.read_text())
     identity = json.loads((args.measurement.parent / "identity.json").read_text())
     receipt = json.loads(args.match_receipt.read_text())
     records_path = args.measurement.parent / measured["request_records"]
     summary = {
         key: measured[key]
-        for key in ("cell_id", "repetition", "identity_sha256", "metrics_contract", "total_gpus", "expected_requests")
+        for key in (
+            "cell_id",
+            "repetition",
+            "identity_sha256",
+            "metrics_contract",
+            "total_gpus",
+            "expected_requests",
+        )
     }
-    summary.update(run_id=args.output_dir.name, predictor="aisimulate.engine_replay", status="failed", metrics={})
+    summary.update(
+        run_id=args.output_dir.name,
+        predictor="aisimulate.engine_replay",
+        status="failed",
+        metrics={},
+    )
     reasons = list(measured.get("qualification", {}).get("reasons", []))
     if identity.get("phase") == "smoke":
         reasons.append("smoke diagnostic; excluded from production scoring")
@@ -194,6 +298,7 @@ def main():
             for item in json.loads((Path(__file__).parent / "checkpoint-references.json").read_text())
         }
         validate_artifacts(config, identity, receipt, args.match_receipt.parent, pins)
+        validate_cache(config, identity, receipt, args.match_receipt.parent)
         acceptance = json.loads(acceptance_path.read_text())
         validate_acceptance(config.engine.speculation, acceptance, identity["cell"]["acceptance"])
         summary["acceptance"] = {
@@ -208,7 +313,9 @@ def main():
         spec = prediction_to_replay_spec(config)
         concurrency = identity["cell"]["concurrency"]
         spec = replace(
-            spec, workload={"requests": requests, "replay_concurrency": concurrency}, concurrency=concurrency
+            spec,
+            workload={"requests": requests, "replay_concurrency": concurrency},
+            concurrency=concurrency,
         )
         (args.output_dir / "replay-spec.json").write_text(json.dumps(asdict(spec), indent=2, allow_nan=False) + "\n")
         runner = EngineReplayRunnerFactory(determinism="canonical_v1").create(0)
@@ -236,16 +343,16 @@ def main():
             raise ValueError("Replay did not complete the exact measured workload")
         summary["metrics"] = {key: metrics[key] for key in ("mean_ttft_ms", "mean_tpot_ms", "output_throughput_tok_s")}
         summary["metrics"].update(completed_requests=completed, failed_requests=0)
+        if source_snapshot()[0] != source:
+            raise ValueError("predictor source or native library changed during prediction; repeat on a stable build")
         summary["status"] = "success"
         summary["qualification"]["eligible"] = not reasons
     except Exception as error:
         summary["error"] = f"{type(error).__name__}: {error}"
         summary["qualification"]["reasons"].append(summary["error"])
-    root = Path(__file__).resolve().parents[3]
     summary["provenance"] = {
-        "revision": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip(),
-        "diff_sha256": hashlib.sha256(subprocess.check_output(["git", "diff", "HEAD"], cwd=root)).hexdigest(),
-        "native_sha256": digest(Path(native.__file__)),
+        **source,
+        "source_patch": "predictor-source.patch",
         "replay_config_sha256": digest(args.config),
         "match_receipt_sha256": digest(args.match_receipt),
         "measurement_summary_sha256": digest(args.measurement),
