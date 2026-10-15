@@ -74,11 +74,11 @@ immutable revision `6d6d36d7bfa63d80a0302df637c08f85523aa5b6`:
 
 | AISimulate file | Original Dynamo file |
 | --- | --- |
-| `crates/core/src/replay/native_router/affinity.rs` | `lib/mocker/src/replay/offline/extensions/kv_router/affinity.rs` |
-| `crates/core/src/replay/native_router/composition.rs` | `lib/mocker/src/replay/offline/extensions/kv_router/composition.rs` |
-| `crates/core/src/replay/native_router/router.rs` | `lib/mocker/src/replay/offline/extensions/kv_router/mod.rs` |
-| `crates/core/src/replay/native_router/helpers.rs` | `lib/mocker/src/replay/router_shared.rs` |
-| `crates/core/src/replay/native_router/observation.rs` | `lib/mocker/src/replay/offline/extensions/kv_events/mod.rs` and `lib/mocker/src/engine_observations.rs` |
+| `crates/python/src/native_router/affinity.rs` | `lib/mocker/src/replay/offline/extensions/kv_router/affinity.rs` |
+| `crates/python/src/native_router/composition.rs` | `lib/mocker/src/replay/offline/extensions/kv_router/composition.rs` |
+| `crates/python/src/native_router/router.rs` | `lib/mocker/src/replay/offline/extensions/kv_router/mod.rs` |
+| `crates/python/src/native_router/helpers.rs` | `lib/mocker/src/replay/router_shared.rs` |
+| `crates/python/src/native_router/observation.rs` | `lib/mocker/src/replay/offline/extensions/kv_events/mod.rs` and `lib/mocker/src/engine_observations.rs` |
 | `python/aisimulate/src/aisimulate/router.py` | `components/src/dynamo/router/simulation/config.py` and `components/src/dynamo/router/simulation/provider.py` |
 
 Source repository and revision:
@@ -87,8 +87,10 @@ https://github.com/ai-dynamo/dynamo/tree/6d6d36d7bfa63d80a0302df637c08f85523aa5b
 Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 The original per-file copyright years are retained in the derived files.
 The files are modified to use AISimulate-owned execution, configuration, engine
-observations, and reporting. The routing algorithms remain dependencies on
-Dynamo's native policy libraries, pinned separately in the Cargo manifests.
+observations, and reporting. Admission, queueing, booking, worker selection,
+and affinity acquisition call Dynamo's native implementations; the adapter
+translates simulation inputs and lifecycle events. The upstream libraries are
+pinned separately in the Python extension's Cargo manifest.
 
 These sources are licensed under the Apache License, Version 2.0:
 https://github.com/ai-dynamo/dynamo/blob/6d6d36d7bfa63d80a0302df637c08f85523aa5b6/LICENSE

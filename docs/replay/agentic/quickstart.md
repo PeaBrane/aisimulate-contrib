@@ -27,20 +27,23 @@ Functional simulation does not establish hardware performance accuracy.
 ## Source and package status
 
 [Dynamo #15631](https://github.com/ai-dynamo/dynamo/pull/15631) is merged at
-`094aaca91941421bb0dcb645b0f700a42d6de3ef`. AISimulate pins its native policy
-crates to that revision. [AISimulate #306](https://github.com/ai-dynamo/aisimulate/pull/306)
-provides the simulation, routing adapter, CLI configuration and reports.
-These two changes implement the standalone path.
+`094aaca91941421bb0dcb645b0f700a42d6de3ef`. The native policy dependency is
+pinned to `85ce615a409d61144c5b94ce74dae3f7291573dd`, which also exposes an
+admission barrier so AISimulate can drive the production scheduler at each
+simulation timestamp. [AISimulate #306](https://github.com/ai-dynamo/aisimulate/pull/306)
+provides simulation, CLI configuration, and reports.
 [Dynamo #15240](https://github.com/ai-dynamo/dynamo/pull/15240) updates the
 optional Dynamo integration to consume AISimulate's interfaces; it is not a
 prerequisite for this example.
 
-The development wheel contains the `native-dynamo-router` feature. It builds
-against the pinned Dynamo source without importing Dynamo's mocker or LLM
-crate. Publishing AISimulate's Rust crate also requires publication of the
-matching Dynamo leaf crates, including `dynamo-custom-policy-builtin`; a source
-build does not establish that those registry releases exist. No published
-AISimulate version is claimed here to contain this new path.
+The development wheel builds its native routing extension against pinned
+Dynamo source without importing Dynamo's mocker or LLM crate. The extension
+calls Dynamo's `LocalScheduler` for admission, queueing, selection and booking,
+and `SessionAffinity` for affinity acquisition and binding. AISimulate supplies
+simulation time, requests, KV observations and lifecycle events. The published
+Rust core remains independent of Dynamo; no Dynamo release or registry
+publication is required. No published AISimulate version is claimed here to
+contain this new path.
 
 ## 1. Install the standalone AISimulate development wheel
 

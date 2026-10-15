@@ -7,10 +7,11 @@ SPDX-License-Identifier: Apache-2.0
 
 `ReplayComposition` composes placement and optional scaling into
 `Replayer<C>` without importing a serving framework into AISimulate core.
-The built-in `RoundRobinComposition` has fixed workers. The optional
-`native-dynamo-router` Cargo feature adds `NativeDynamoReplayComposition`, which
-uses Dynamo's native policy crates pinned to revision
-`094aaca91941421bb0dcb645b0f700a42d6de3ef`. AISimulate's wheel enables this feature.
+The built-in `RoundRobinComposition` has fixed workers. The unpublished
+`aisimulate-python` wheel host adds `NativeDynamoReplayComposition`, calling
+Dynamo's native policy crates pinned to revision
+`85ce615a409d61144c5b94ce74dae3f7291573dd`. The published core has no Dynamo
+dependency.
 Dynamo integrations may supply Planner callbacks through the same contracts.
 These are Rust crate interfaces, not a stable dynamically loaded binary ABI.
 
@@ -18,8 +19,10 @@ These are Rust crate interfaces, not a stable dynamically loaded binary ABI.
 
 A serialized ReplaySpec selects `adapters.placement.provider: dynamo_kv_router`
 with `config.affinity` and optional `config.router_config`. The native composition
-owns selection, dispatch commit/abort, policy wakeups and simulated-time affinity
-leases; the shared Replayer owns the simulation. Python code is not invoked for
+forwards requests to Dynamo's `LocalScheduler` and `SessionAffinity`. Dynamo
+owns queueing, capacity checks, selection, booking and affinity waits. AISimulate
+forwards dispatch and completion events and drives a paused Tokio clock using
+simulation timestamps; the shared Replayer owns the simulation. Python code is not invoked for
 each routing decision. `routing_policy` reports native provider provenance and
 per-pool evidence. Unsupported config combinations are errors.
 

@@ -1764,7 +1764,9 @@ fn build_runtime_input(
     ))
 }
 
-fn run_with_input(
+/// Execute prepared replay inputs using the built-in placement and artifact path.
+/// Hosts selecting a custom composition can delegate their default branch here.
+pub fn run_prepared_replay(
     spec: ReplaySpec,
     factory: ReplayEngineFactory,
     input: Option<ReplayRuntimeInput>,
@@ -2261,106 +2263,7 @@ fn replay_fpm_coverage(
 }
 
 fn execute_json(payload: &str, capture_artifacts: bool) -> Result<String> {
-    #[cfg(feature = "native-dynamo-router")]
-    let mut routing_evidence = None;
-    let result = execute_json_using(
-        payload,
-        capture_artifacts,
-        |spec, factory, input, capture_artifacts, determinism| {
-            if spec.adapters.placement.provider == "dynamo_kv_router" {
-                if capture_artifacts {
-                    return Err(crate::replay::ReplayError::InvalidSpec(
-                        "native routing does not expose single-worker parity artifacts".into(),
-                    ));
-                }
-                #[cfg(feature = "native-dynamo-router")]
-                {
-                    use crate::replay::native_router::{
-                        NativeDynamoReplayComposition, NativeDynamoRouterConfig,
-                    };
-                    let config =
-                        NativeDynamoRouterConfig::from_value(&spec.adapters.placement.config)
-                            .map_err(|error| {
-                                crate::replay::ReplayError::InvalidSpec(error.to_string())
-                            })?;
-                    let composition = NativeDynamoReplayComposition::from_config(config, None)
-                        .with_capture_decisions(spec.record_per_request);
-                    routing_evidence = Some(composition.routing_evidence());
-                    return run_replay_with_composition(
-                        spec,
-                        factory,
-                        input,
-                        composition,
-                        ReplayCaptureOptions {
-                            determinism,
-                            ..Default::default()
-                        },
-                        None,
-                    )
-                    .map(|report| (report, None));
-                }
-                #[cfg(not(feature = "native-dynamo-router"))]
-                return Err(crate::replay::ReplayError::InvalidSpec(
-                    "this AISimulate runtime was built without native Dynamo routing; install a wheel built with native-dynamo-router".into(),
-                ));
-            }
-            run_with_input(spec, factory, input, capture_artifacts, determinism)
-        },
-    )?;
-    #[cfg(feature = "native-dynamo-router")]
-    let result = {
-        let mut result = result;
-        if let Some(evidence) = routing_evidence {
-            result
-                .report_fields
-                .insert("routing_policy".into(), evidence.snapshot()?);
-        }
-        result
-    };
-    result.into_json()
-}
-
-/// Execute native routing inside AISimulate, retaining optional consumer observers
-/// and scaling callbacks without transferring ownership of the simulation loop.
-#[cfg(feature = "native-dynamo-router")]
-pub fn execute_native_router_replay(
-    payload: &str,
-    capture: ReplayCaptureOptions,
-    scaling: Option<Box<dyn crate::replay::ReplayScalingPolicy>>,
-    telemetry: Option<(f64, Box<dyn ReplayTelemetryObserver>)>,
-    prefill_load_estimator: Option<crate::replay::native_router::ReplayPrefillLoadEstimator>,
-) -> Result<ReplayExecutionResult> {
-    use crate::replay::native_router::{
-        NATIVE_DYNAMO_PROVIDER, NativeDynamoReplayComposition, NativeDynamoRouterConfig,
-    };
-    let envelope: serde_json::Value = serde_json::from_str(payload)?;
-    let spec = envelope.get("spec").unwrap_or(&envelope);
-    ensure!(
-        spec.pointer("/adapters/placement/provider")
-            .and_then(|v| v.as_str())
-            == Some(NATIVE_DYNAMO_PROVIDER),
-        "native routing requires the dynamo_kv_router placement provider"
-    );
-    let config = NativeDynamoRouterConfig::from_value(
-        spec.pointer("/adapters/placement/config")
-            .unwrap_or(&serde_json::Value::Null),
-    )?;
-    let capture_decisions = capture.effective_per_request()
-        || spec
-            .get("record_per_request")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true);
-    let mut composition = NativeDynamoReplayComposition::from_config(config, scaling)
-        .with_capture_decisions(capture_decisions);
-    if let Some(estimator) = prefill_load_estimator {
-        composition = composition.with_prefill_load_estimator(estimator);
-    }
-    let evidence = composition.routing_evidence();
-    let mut result = execute_replay_with_composition(payload, composition, capture, telemetry)?;
-    result
-        .report_fields
-        .insert("routing_policy".into(), evidence.snapshot()?);
-    Ok(result)
+    execute_replay_with_dispatch(payload, capture_artifacts, run_prepared_replay)?.into_json()
 }
 
 /// Complete execution result before the compact JSON boundary.
@@ -2414,7 +2317,7 @@ pub fn execute_replay_with_composition<C: ReplayComposition>(
     capture: ReplayCaptureOptions,
     telemetry: Option<(f64, Box<dyn ReplayTelemetryObserver>)>,
 ) -> Result<ReplayExecutionResult> {
-    let mut result = execute_json_using(
+    let mut result = execute_replay_with_dispatch(
         payload,
         false,
         move |spec, factory, input, _, determinism| {
@@ -2453,7 +2356,10 @@ pub fn execute_replay_json_with_composition<C: ReplayComposition>(
         .into_json()
 }
 
-fn execute_json_using<F>(
+/// Resolve and finalize a replay while the host selects its execution composition.
+/// The callback receives the same prepared inputs as the built-in executor,
+/// after canonical parsing, timing construction, and workload preparation.
+pub fn execute_replay_with_dispatch<F>(
     payload: &str,
     capture_artifacts: bool,
     run: F,
@@ -2947,12 +2853,19 @@ fn engine_launch_from_replay_role_json(
 /// AISimulate native runtime module.
 #[pyfunction]
 fn native_router_available() -> bool {
-    cfg!(feature = "native-dynamo-router")
+    false
 }
 
 /// AISimulate native runtime module.
+#[cfg(feature = "extension-module")]
 #[pymodule]
 fn _runtime(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    register_python_module(module)
+}
+
+/// Register the core Python API in a host-owned extension module.
+/// A host may replace the replay entrypoints to supply its own composition.
+pub fn register_python_module(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(native_router_available, module)?)?;
     module.add_function(wrap_pyfunction!(
         engine_launch_from_replay_role_json,
@@ -2974,68 +2887,6 @@ mod tests {
     };
 
     use super::*;
-
-    #[test]
-    fn native_router_execution_is_owned_by_aisimulate() {
-        let payload = serde_json::json!({
-            "version": 1,
-            "topology": {"kind": "aggregated", "workers": {"initial_workers": 2}},
-            "engine": {"rank": {"block_size": 4, "num_gpu_blocks": 64,
-                "timing_model": {"type": "fixed", "prefill_ms": 1.0, "decode_ms": 1.0}}},
-            "adapters": {"placement": {"provider": "dynamo_kv_router", "config": {
-                "affinity": {"mode": "session", "ttl_seconds": 60.0}
-            }}, "scaling": {"provider": "none"}},
-            "requests": [
-                {"id":"first", "arrival_time_ms":0.0, "input_tokens":4,
-                    "input_token_ids":[1,2,3,4], "output_tokens":1, "session_id":"shared"},
-                {"id":"second", "arrival_time_ms":10.0, "input_tokens":4,
-                    "input_token_ids":[1,2,3,4], "output_tokens":1, "session_id":"shared"}
-            ]
-        })
-        .to_string();
-        #[cfg(not(feature = "native-dynamo-router"))]
-        assert!(
-            format!("{:#}", execute_json(&payload, false).unwrap_err())
-                .contains("without native Dynamo routing")
-        );
-        #[cfg(feature = "native-dynamo-router")]
-        {
-            let report: serde_json::Value =
-                serde_json::from_str(&execute_json(&payload, false).unwrap()).unwrap();
-            let role = &report["routing_policy"]["roles"]["aggregated"];
-            assert_eq!(role["native_policy"], "dynamo.DefaultWorkerSelector");
-            assert_eq!(
-                role["dynamo_revision"],
-                crate::replay::native_router::NATIVE_DYNAMO_REVISION
-            );
-            assert_eq!(role["decision_count"], 2);
-            assert_eq!(role["post_dispatch_checks"], 2);
-            assert!(role["physical_kv_events"].as_u64().unwrap() > 0);
-            assert_eq!(role["decisions"][1]["binding_reused"], true);
-            assert_eq!(
-                role["decisions"][0]["worker_id"],
-                role["decisions"][1]["worker_id"]
-            );
-            assert!(role["decisions"][1]["overlap_blocks"].as_u64().unwrap() > 0);
-            assert_eq!(report["per_request"].as_array().unwrap().len(), 2);
-
-            let mut no_capture: serde_json::Value = serde_json::from_str(&payload).unwrap();
-            no_capture["record_per_request"] = false.into();
-            let report: serde_json::Value =
-                serde_json::from_str(&execute_json(&no_capture.to_string(), false).unwrap())
-                    .unwrap();
-            assert_eq!(
-                report["routing_policy"]["roles"]["aggregated"]["decision_count"],
-                2
-            );
-            assert!(
-                report["routing_policy"]["roles"]["aggregated"]["decisions"]
-                    .as_array()
-                    .unwrap()
-                    .is_empty()
-            );
-        }
-    }
 
     #[test]
     fn replay_coverage_errors_preserve_the_original_chain() {

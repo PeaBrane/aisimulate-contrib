@@ -111,7 +111,7 @@ aisimulate = "aisimulate.supervision:main"
 aiconfigurator = "aisimulate.legacy_cli.entrypoint:main"
 
 [tool.maturin]
-manifest-path = "../../crates/core/Cargo.toml"
+manifest-path = "../../crates/python/Cargo.toml"
 module-name = "aisimulate._runtime"
 python-source = "src"
 python-packages = [
@@ -119,7 +119,7 @@ python-packages = [
     "aisimulate_core",
 ]
 abi3 = true
-features = ["extension-module", "native-dynamo-router"]
+features = ["extension-module"]
 exclude = ["**/__pycache__/**", "**/*.pyc"]
 include = [
     "src/aisimulate/legacy_cli/*.yaml",

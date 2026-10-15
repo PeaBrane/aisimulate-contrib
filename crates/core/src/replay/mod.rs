@@ -25,8 +25,6 @@ pub(crate) mod events {
 }
 mod engine;
 pub mod loadgen;
-#[cfg(feature = "native-dynamo-router")]
-pub mod native_router;
 mod progress;
 mod protocol;
 mod replayer;

@@ -17,11 +17,6 @@ name = "aisimulate_core"
 crate-type = ["rlib", "cdylib"]
 
 [dependencies]
-# Production routing primitives; never depend on Dynamo Mocker or its replay executor.
-dynamo-kv-router = { version = "=1.6.0", git = "https://github.com/ai-dynamo/dynamo.git", rev = "094aaca91941421bb0dcb645b0f700a42d6de3ef", optional = true }
-dynamo-custom-policy-builtin = { version = "=1.6.0", git = "https://github.com/ai-dynamo/dynamo.git", rev = "094aaca91941421bb0dcb645b0f700a42d6de3ef", optional = true }
-dynamo-tokens = { version = "=1.6.0", git = "https://github.com/ai-dynamo/dynamo.git", rev = "094aaca91941421bb0dcb645b0f700a42d6de3ef", optional = true }
-tokio = { version = "1", features = ["time"], optional = true }
 anyhow = { workspace = true }
 bincode = "1.3"
 blake3 = { workspace = true }
@@ -56,8 +51,7 @@ default = []
 python = ["dep:pyo3"]
 extension-module = ["python", "pyo3/extension-module"]
 embed-python = ["python", "pyo3/auto-initialize"]
-replay-bench = ["dynamo-kv-router?/bench"]
-native-dynamo-router = ["dep:dynamo-kv-router", "dep:dynamo-custom-policy-builtin", "dep:dynamo-tokens", "dep:tokio"]
+replay-bench = []
 
 [dev-dependencies]
 rstest = "0.18.2"

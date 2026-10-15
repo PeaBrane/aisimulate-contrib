@@ -285,6 +285,8 @@ shared:
     owners: [mocker, maintainers]
   - glob: crates/core/src/engine/timing.rs
     owners: [mocker, forward-pass-engine, maintainers]
+  - glob: crates/python/
+    owners: [replay, mocker, infra, maintainers]
   - glob: crates/core/Cargo.toml
     owners: [mocker, replay, forward-pass-engine, infra, maintainers]
   - glob: crates/core/deny.toml

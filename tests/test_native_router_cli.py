@@ -168,7 +168,7 @@ def test_feature_absent_fails_without_round_robin_fallback() -> None:
             return False
 
     runtime = WithoutNativeRouter()
-    with pytest.raises(InvalidRunnerError, match="native-dynamo-router"):
+    with pytest.raises(InvalidRunnerError, match="native routing support"):
         EngineReplayRunnerFactory(runtime=runtime).create(0).run(_routed_spec())
     assert runtime.execution_spec is None
 
@@ -224,7 +224,7 @@ def test_nested_rank_model_identity_reaches_agentx_driver() -> None:
 def test_native_agentx_routing_through_supervised_cli(tmp_path, backend, mode, affinity) -> None:
     runtime = pytest.importorskip("aisimulate._runtime")
     if not getattr(runtime, "native_router_available", lambda: False)():
-        pytest.skip("requires the native-dynamo-router extension feature")
+        pytest.skip("requires the AISimulate native routing wheel")
     fixtures = Path(__file__).parent / "e2e/configs/unified_cli/fixtures"
     engine = _prediction_engine(mode=mode)
     engine.update(backend=backend, model=str(fixtures / "tiny-model"))

@@ -11,6 +11,7 @@ mod composition;
 mod helpers;
 mod observation;
 mod router;
+mod runtime;
 #[cfg(test)]
 mod tests;
 
@@ -20,7 +21,7 @@ pub use dynamo_kv_router::PrefillLoadEstimator;
 pub use dynamo_kv_router::config::KvRouterConfig;
 use serde::{Deserialize, Serialize};
 
-pub const NATIVE_DYNAMO_REVISION: &str = "094aaca91941421bb0dcb645b0f700a42d6de3ef";
+pub const NATIVE_DYNAMO_REVISION: &str = "85ce615a409d61144c5b94ce74dae3f7291573dd";
 pub const NATIVE_DYNAMO_PROVIDER: &str = "dynamo_kv_router";
 
 pub type ReplayPrefillLoadEstimator = std::sync::Arc<dyn PrefillLoadEstimator>;

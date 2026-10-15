@@ -570,7 +570,7 @@ class EngineReplayRunner:
                 available = getattr(runtime, "native_router_available", None)
                 if available is not None and not available():
                     raise InvalidRunnerError(
-                        "native Dynamo routing is unavailable; install an AISimulate build with native-dynamo-router"
+                        "native Dynamo routing is unavailable; install the AISimulate wheel with native routing support"
                     )
             report_json = runtime.run_replay_json(execution_spec_json)
         except MemoryError as error:

@@ -5,7 +5,7 @@
 // https://github.com/ai-dynamo/dynamo/blob/6d6d36d7bfa63d80a0302df637c08f85523aa5b6/lib/mocker/src/replay/offline/extensions/kv_router/affinity.rs
 
 //! Dispatch ownership for the native session-affinity table. The existing
-//! selector and PolicyQueue still own worker selection and scheduling.
+//! LocalScheduler owns admission, worker selection, booking and cancellation.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -13,18 +13,15 @@ use std::time::Duration;
 
 use crate::replay::AGENTIC_CONVERSATION_LINEAGE_SCHEMA_V1;
 use anyhow::{Context, Result, anyhow, ensure};
-use dynamo_kv_router::protocols::{WorkerAffinityTarget, WorkerId};
+use dynamo_kv_router::protocols::WorkerAffinityTarget;
 use dynamo_kv_router::services::selection::affinity::{
-    AcquireStep, AffinityLease, Hold, SessionAffinity, SessionAffinityConfig,
-    subagent_group_affinity_id,
+    AffinityLease, Hold, SessionAffinity, SessionAffinityConfig, subagent_group_affinity_id,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::time::Instant;
 use uuid::Uuid;
 
-use super::helpers::ReplayWorkerConfig;
-use super::router::PendingRequest;
 use crate::replay::DirectRequest;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -100,12 +97,11 @@ impl RoutingEvidence {
 
 pub(super) struct ReplayAffinity {
     pub config: ReplayAffinityConfig,
-    table: SessionAffinity,
+    pub table: SessionAffinity,
     epoch: Instant,
     pub now_ms: f64,
     staged: HashMap<Uuid, (Hold, WorkerAffinityTarget)>,
     active: HashMap<Uuid, AffinityLease>,
-    waiting: Vec<PendingRequest>,
     pub ready: bool,
     role: &'static str,
     capture: bool,
@@ -140,7 +136,6 @@ impl ReplayAffinity {
             now_ms: 0.0,
             staged: HashMap::new(),
             active: HashMap::new(),
-            waiting: Vec::new(),
             ready: false,
             role,
             capture,
@@ -162,69 +157,6 @@ impl ReplayAffinity {
         self.table.advance_clock(now)?;
         self.now_ms = now_ms;
         Ok(())
-    }
-
-    pub fn acquire(
-        &self,
-        request: &mut PendingRequest,
-        workers: &HashMap<WorkerId, ReplayWorkerConfig>,
-    ) -> Result<bool> {
-        let key = request
-            .group_key
-            .as_deref()
-            .context("missing affinity group key")?;
-        for _ in 0..2 {
-            if request.affinity_hold.is_none() {
-                match self.table.try_acquire(key, None)? {
-                    AcquireStep::Held(hold) => request.affinity_hold = Some(hold),
-                    AcquireStep::Wait(_) => return Ok(false),
-                }
-            }
-            if request
-                .affinity_hold
-                .as_ref()
-                .and_then(Hold::target)
-                .is_some_and(|target| !workers.contains_key(&target.worker_id))
-            {
-                request
-                    .affinity_hold
-                    .take()
-                    .expect("checked above")
-                    .invalidate();
-            } else {
-                return Ok(true);
-            }
-        }
-        Err(anyhow!("could not acquire a routable affinity target"))
-    }
-
-    pub fn wait(&mut self, request: PendingRequest) {
-        self.waiting.push(request);
-    }
-    pub fn waiting_count(&self) -> usize {
-        self.waiting.len()
-    }
-    pub fn cancel_waiter(&mut self, id: Uuid) -> bool {
-        let before = self.waiting.len();
-        self.waiting.retain(|request| request.uuid != id);
-        before != self.waiting.len()
-    }
-    pub fn take_ready(
-        &mut self,
-        workers: &HashMap<WorkerId, ReplayWorkerConfig>,
-    ) -> Result<Vec<PendingRequest>> {
-        if !std::mem::take(&mut self.ready) {
-            return Ok(Vec::new());
-        }
-        let mut ready = Vec::new();
-        for mut request in std::mem::take(&mut self.waiting) {
-            if self.acquire(&mut request, workers)? {
-                ready.push(request);
-            } else {
-                self.waiting.push(request);
-            }
-        }
-        Ok(ready)
     }
 
     pub fn stage(

@@ -7,34 +7,38 @@
 use dynamo_custom_policy_builtin::DefaultWorkerSelector;
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use dynamo_kv_router::LocalBlockHash;
 use dynamo_kv_router::config::KvRouterConfig;
+use dynamo_kv_router::indexer::{MatchDetails, TieredMatchDetails};
 use dynamo_kv_router::protocols::WorkerAffinityTarget;
 use dynamo_kv_router::protocols::{
-    BlockHashOptions, OverlapScores, PrefillLoadHint, RouterEvent, RoutingConstraints,
-    WorkerConfigLike, WorkerId, WorkerWithDpRank, compute_block_hash_for_seq,
+    BlockHashOptions, OverlapScores, RouterEvent, RoutingConstraints, WorkerId, WorkerWithDpRank,
+    compute_block_hash_for_seq,
 };
-use dynamo_kv_router::queue::DEFAULT_MAX_BATCHED_TOKENS;
+use dynamo_kv_router::scheduling::queue::SchedulerBookingDescriptor;
 use dynamo_kv_router::scheduling::{
-    OverlapSignals, PolicyClassConfig, PolicyProfile, PolicyQueue, QueueSnapshot, ScheduleMode,
-    SchedulingContext, WorkerPlacement,
+    AdmissionAttempt, AdmittedSchedulingResponse, LocalScheduler, OverlapAnalysis, OverlapSignals,
+    ScheduleMode, ScheduleRequest,
 };
 use dynamo_kv_router::sequences::topology::WorkerDpRange;
 use dynamo_kv_router::services::selection::affinity::Hold;
 use dynamo_kv_router::{
     ActiveSequencesMultiWorker, NoopSequencePublisher, RadixTree, RoutingPartitionRef,
-    SchedulingRequest, SequenceRequest, SessionContext, TrackingHashAlgorithm, TrackingHashContext,
-    TrackingHashScope, WorkerLoadProjection, WorkerSelectionInput, WorkerSelector,
-    scheduling::TierOverlapBlocks,
+    SessionContext, TrackingHashAlgorithm, TrackingHashContext, TrackingHashScope,
 };
 use dynamo_tokens::SequenceHash;
-use rustc_hash::FxHashMap;
+use tokio::sync::watch;
 use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
+
+use super::runtime::{ReplayRuntime, WakeFlag};
 use uuid::Uuid;
 
 use super::ReplayPrefillLoadEstimator;
@@ -54,65 +58,6 @@ use crate::replay::{
 #[cfg(test)]
 use super::affinity::ReplayAffinityMode;
 use super::affinity::{ReplayAffinity, ReplayAffinityConfig, RoutingEvidence};
-
-#[derive(Clone, Copy)]
-enum KvEventSummary {
-    Stored {
-        parent_hash: Option<dynamo_kv_router::protocols::ExternalSequenceBlockHash>,
-        start_position: Option<u32>,
-        count: usize,
-        first: Option<dynamo_kv_router::protocols::ExternalSequenceBlockHash>,
-        last: Option<dynamo_kv_router::protocols::ExternalSequenceBlockHash>,
-    },
-    Removed {
-        count: usize,
-        first: Option<dynamo_kv_router::protocols::ExternalSequenceBlockHash>,
-        last: Option<dynamo_kv_router::protocols::ExternalSequenceBlockHash>,
-    },
-    Cleared,
-}
-
-impl KvEventSummary {
-    fn from_data(data: &dynamo_kv_router::protocols::KvCacheEventData) -> Self {
-        match data {
-            dynamo_kv_router::protocols::KvCacheEventData::Stored(stored) => Self::Stored {
-                parent_hash: stored.parent_hash,
-                start_position: stored.start_position,
-                count: stored.blocks.len(),
-                first: stored.blocks.first().map(|block| block.block_hash),
-                last: stored.blocks.last().map(|block| block.block_hash),
-            },
-            dynamo_kv_router::protocols::KvCacheEventData::Removed(removed) => Self::Removed {
-                count: removed.block_hashes.len(),
-                first: removed.block_hashes.first().copied(),
-                last: removed.block_hashes.last().copied(),
-            },
-            dynamo_kv_router::protocols::KvCacheEventData::Cleared => Self::Cleared,
-        }
-    }
-}
-
-impl fmt::Display for KvEventSummary {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Stored {
-                parent_hash,
-                start_position,
-                count,
-                first,
-                last,
-            } => write!(
-                formatter,
-                "stored parent={parent_hash:?} start={start_position:?} count={count} first={first:?} last={last:?}"
-            ),
-            Self::Removed { count, first, last } => write!(
-                formatter,
-                "removed count={count} first={first:?} last={last:?}"
-            ),
-            Self::Cleared => formatter.write_str("cleared"),
-        }
-    }
-}
 
 /// KV identities carried by AISimulate into the native Router placement policy.
 #[derive(Debug, Default)]
@@ -155,17 +100,6 @@ pub(crate) struct WorkerAdmission {
 #[derive(Debug, Default)]
 pub(crate) struct RouterEffects {
     admissions: Vec<WorkerAdmission>,
-}
-
-/// Internal result of a successful ``admit_request`` call: the chosen
-/// worker plus the router's view of prefix-cache overlap, so callers can
-/// forward the overlap stats to the traffic accumulator.
-#[derive(Debug, Clone, Copy)]
-struct AdmitOutcome {
-    worker_idx: usize,
-    overlap_blocks: u32,
-    best_available_overlap_blocks: u32,
-    isl_blocks: u32,
 }
 
 #[cfg(test)]
@@ -259,15 +193,13 @@ pub(super) struct PendingRequest {
     pub(super) uuid: Uuid,
     pub(super) token_seq: Option<Vec<SequenceHash>>,
     pub(super) isl_tokens: usize,
-    pub(super) overlaps: OverlapScores,
-    pub(super) track_prefill_tokens: bool,
+    pub(super) overlaps: OverlapSignals,
     pub(super) expected_output_tokens: Option<u32>,
     pub(super) priority_jump: f64,
     pub(super) strict_priority: u32,
     pub(super) policy_class: Option<String>,
     pub(super) session_id: Option<String>,
     pub(super) group_key: Option<String>,
-    pub(super) affinity_hold: Option<Hold>,
 }
 
 impl PendingRequest {
@@ -275,82 +207,65 @@ impl PendingRequest {
         self.uuid.to_string()
     }
 
-    /// Build the selector input, moving `token_seq` into it; callers that
-    /// still need the sequence take it back from the returned request.
-    fn scheduling_request(
-        &mut self,
-        block_size: usize,
-        worker_loads: FxHashMap<WorkerWithDpRank, WorkerLoadProjection>,
-    ) -> SchedulingRequest {
-        let effective_overlap_blocks = self
-            .overlaps
-            .scores
-            .iter()
-            .map(|(worker, overlap)| (*worker, *overlap as f64))
-            .collect();
-        let effective_cached_tokens = self
-            .overlaps
-            .scores
-            .iter()
-            .map(|(worker, overlap)| (*worker, *overlap as usize * block_size))
-            .collect();
-        SchedulingRequest {
-            mode: ScheduleMode::Tracked {
+    fn scheduling_request(mut self, target: Option<WorkerAffinityTarget>) -> ScheduleRequest {
+        ScheduleRequest {
+            mode: ScheduleMode::TrackedWithLifecycle {
                 request_id: self.request_id(),
             },
             token_seq: self.token_seq.take(),
+            block_hashes: None,
             isl_tokens: self.isl_tokens,
-            overlap: OverlapSignals {
-                tier_overlap_blocks: TierOverlapBlocks::default(),
-                effective_overlap_blocks,
-                effective_cached_tokens,
-            },
+            overlap: self.overlaps,
             kv_transfer_candidates: None,
             retain_kv_transfer_chain: false,
-            worker_loads,
-            track_prefill_tokens: self.track_prefill_tokens,
             router_config_override: None,
             lora_name: None,
             priority_jump: self.priority_jump,
             strict_priority: self.strict_priority,
-            policy_class: self.policy_class.clone(),
+            policy_class: self.policy_class,
             session_context: self
                 .session_id
-                .clone()
-                .map(|session_id| SessionContext::new(session_id, None, None, None)),
+                .map(|id| SessionContext::new(id, None, None, None)),
             expected_output_tokens: self.expected_output_tokens,
-            affinity_target: self.affinity_hold.as_ref().and_then(Hold::target),
-            // An acquired bound lease promises this exact dispatch target.
-            // Reuse native eligibility for capacity and cache-cost accounting.
-            pinned_worker: self
-                .affinity_hold
-                .as_ref()
-                .and_then(Hold::target)
-                .and_then(|target| {
-                    target
-                        .dp_rank
-                        .map(|rank| WorkerWithDpRank::new(target.worker_id, rank))
-                }),
+            affinity_target: target,
+            pinned_worker: target.and_then(|target| {
+                target
+                    .dp_rank
+                    .map(|rank| WorkerWithDpRank::new(target.worker_id, rank))
+            }),
             allowed_worker_ids: None,
             routing_constraints: RoutingConstraints::default(),
             shared_cache_hits: None,
-            resp_tx: None,
         }
     }
+}
+
+type NativeScheduler =
+    LocalScheduler<NoopSequencePublisher, ReplayWorkerConfig, DefaultWorkerSelector>;
+
+struct PendingAdmission {
+    uuid: Uuid,
+    future:
+        Pin<Box<dyn Future<Output = Result<(AdmittedSchedulingResponse, Option<Hold>)>> + Send>>,
+    group_key: Option<String>,
+    isl_blocks: u32,
+    #[cfg(test)]
+    snapshot: OfflinePendingRequestSnapshot,
 }
 
 struct OfflineReplayRouter {
     config: KvRouterConfig,
     block_size: u32,
     dp_size: u32,
-    profile: PolicyProfile,
     worker_config_template: ReplayWorkerConfig,
     workers_with_configs: HashMap<WorkerId, ReplayWorkerConfig>,
     slots: Arc<ActiveSequencesMultiWorker<NoopSequencePublisher>>,
-    selector: DefaultWorkerSelector,
-    pending: PolicyQueue<PendingRequest>,
+    scheduler: Arc<NativeScheduler>,
+    workers_tx: watch::Sender<HashMap<WorkerId, ReplayWorkerConfig>>,
+    pending: Vec<PendingAdmission>,
+    bookings: HashMap<Uuid, SchedulerBookingDescriptor>,
+    runtime: ReplayRuntime,
     indexer: SyncReplayIndexer,
-    prefill_load_estimator: Option<ReplayPrefillLoadEstimator>,
     decay_time_epoch: Instant,
     tracking_hash: TrackingHashContext,
     affinity: Option<ReplayAffinity>,
@@ -517,9 +432,7 @@ impl<Request: PlacementRequestView> PlacementPolicy<Request> for KvRouterPlaceme
     }
 
     fn observe(&mut self, observation: RouterEventBatch, now_ms: f64) -> Result<Vec<Placement>> {
-        if let Some(affinity) = &mut self.router.affinity {
-            affinity.advance(now_ms)?;
-        }
+        self.router.advance_time(now_ms)?;
         let effects = self.router.on_kv_events(observation.0)?;
         Ok(self.placements(effects.admissions))
     }
@@ -537,30 +450,17 @@ impl<Request: PlacementRequestView> PlacementPolicy<Request> for KvRouterPlaceme
     }
 
     fn dispatch_aborted(&mut self, request_id: Uuid, now_ms: f64) -> Result<()> {
+        self.router.advance_time(now_ms)?;
         if let Some(affinity) = &mut self.router.affinity {
-            affinity.advance(now_ms)?;
             affinity.release(request_id, true)?;
-            self.router
-                .slots
-                .free(&request_id.to_string(), self.router.decay_now(now_ms))?;
         }
+        self.router.free_booking(request_id)?;
         Ok(())
     }
 
     fn advance_clock(&mut self, now_ms: f64) -> Result<Vec<Placement>> {
-        let Some(affinity) = &mut self.router.affinity else {
-            return Ok(Vec::new());
-        };
-        affinity.advance(now_ms)?;
-        let reschedule = affinity.ready;
-        let ready = affinity.take_ready(&self.router.workers_with_configs)?;
-        let mut admissions = Vec::new();
-        for pending in ready {
-            admissions.extend(self.router.schedule_pending(pending, now_ms)?.admissions);
-        }
-        if reschedule {
-            admissions.extend(self.router.drain_pending(self.router.decay_now(now_ms))?);
-        }
+        self.router.advance_time(now_ms)?;
+        let admissions = self.router.collect_admissions()?;
         Ok(self.placements(admissions))
     }
 
@@ -630,6 +530,8 @@ impl OfflineReplayRouter {
         num_workers: usize,
         selector_seed: Option<u64>,
     ) -> Result<Self> {
+        let runtime = ReplayRuntime::new()?;
+        let _entered = runtime.enter();
         let config = replay_router_config(router_config);
         let tracking_hash = TrackingHashContext::from_config(&config)?;
         let worker_config_template = replay_worker_config(args);
@@ -640,22 +542,39 @@ impl OfflineReplayRouter {
             .configured_policy_profile()
             .map_err(anyhow::Error::from)?;
 
+        let (workers_tx, workers_rx) = watch::channel(workers_with_configs.clone());
+        let scheduler = Arc::new(LocalScheduler::new(
+            Arc::clone(&slots),
+            workers_rx,
+            profile,
+            args.block_size,
+            selector,
+            prefill_load_estimator,
+            None,
+            None,
+            None,
+            Duration::from_secs(60),
+            config.router_track_prefill_tokens,
+            CancellationToken::new(),
+            "replay",
+            false,
+        ));
+        let decay_time_epoch = runtime.epoch();
+        drop(_entered);
         Ok(Self {
             config,
             block_size: args.block_size,
             dp_size: args.dp_size.max(1),
-            profile: profile.clone(),
             worker_config_template,
             workers_with_configs,
+            workers_tx,
             slots,
-            selector,
-            pending: PolicyQueue::new(profile),
+            scheduler,
+            pending: Vec::new(),
+            bookings: HashMap::new(),
             indexer: SyncReplayIndexer::new(args.block_size),
-            prefill_load_estimator,
-            // This is only a base Instant for converting replay `now_ms` values into
-            // synthetic `Instant`s. All subsequent decay/accounting uses virtual replay
-            // time derived from this epoch, not wall-clock progression.
-            decay_time_epoch: Instant::now(),
+            decay_time_epoch,
+            runtime,
             tracking_hash,
             affinity: None,
         })
@@ -696,100 +615,146 @@ impl OfflineReplayRouter {
         session_id: Option<String>,
         now_ms: f64,
     ) -> Result<RouterEffects> {
-        let mut pending =
+        self.advance_time(now_ms)?;
+        let pending =
             self.build_pending_request(request, max_output_tokens, replay_hashes, session_id)?;
-        if let Some(affinity) = &mut self.affinity {
-            affinity.advance(now_ms)?;
-            if !affinity.acquire(&mut pending, &self.workers_with_configs)? {
-                affinity.wait(pending);
-                return Ok(RouterEffects::default());
-            }
-        }
-        self.schedule_pending(pending, now_ms)
+        let uuid = pending.uuid;
+        let group_key = pending.group_key.clone();
+        let table = self
+            .affinity
+            .as_ref()
+            .map(|affinity| affinity.table.clone());
+        let scheduler = Arc::clone(&self.scheduler);
+        let block_size = self.block_size;
+        let isl_blocks =
+            u32::try_from(pending.isl_tokens.div_ceil(block_size as usize)).unwrap_or(u32::MAX);
+        #[cfg(test)]
+        let snapshot = OfflinePendingRequestSnapshot {
+            uuid,
+            expected_output_tokens: pending.expected_output_tokens,
+            overlap_blocks_by_worker: pending
+                .overlaps
+                .tier_overlap_blocks
+                .device
+                .iter()
+                .map(|(worker, blocks)| (worker.worker_id as usize, *blocks as u32))
+                .collect(),
+        };
+        let key = group_key.clone();
+        let future = Box::pin(async move {
+            let hold = match (table, key) {
+                (Some(table), Some(key)) => Some(table.acquire(&key, None).await?),
+                _ => None,
+            };
+            let target = hold.as_ref().and_then(Hold::target);
+            let admitted = scheduler
+                .schedule_request_admitted(pending.scheduling_request(target))
+                .await?;
+            Ok((admitted, hold))
+        });
+        self.pending.push(PendingAdmission {
+            uuid,
+            future,
+            group_key,
+            isl_blocks,
+            #[cfg(test)]
+            snapshot,
+        });
+        Ok(RouterEffects {
+            admissions: self.collect_admissions()?,
+        })
     }
 
-    fn schedule_pending(
-        &mut self,
-        mut pending: PendingRequest,
-        now_ms: f64,
-    ) -> Result<RouterEffects> {
-        let decay_now = self.decay_now(now_ms);
-        let (class_index, snapshot) = match self
-            .profile
-            .direct_class_index(pending.policy_class.as_deref())
-        {
-            Some(class_index) => (class_index, None),
-            None => {
-                let snapshot = self.snapshot_for(&mut pending);
-                (
-                    self.profile.resolve_class_index(
-                        pending.policy_class.as_deref(),
-                        snapshot.uncached_tokens,
-                    ),
-                    Some(snapshot),
-                )
+    /// Poll native admission futures to quiescence, with the scheduler's own
+    /// update acknowledgement as the actor barrier. No simulator queue policy.
+    fn collect_admissions(&mut self) -> Result<Vec<WorkerAdmission>> {
+        let wake = Arc::new(WakeFlag::default());
+        let waker = wake.waker();
+        let mut context = TaskContext::from_waker(&waker);
+        let mut admissions = Vec::new();
+        loop {
+            wake.take();
+            let _entered = self.runtime.enter();
+            let mut index = 0;
+            while index < self.pending.len() {
+                let Poll::Ready(result) = self.pending[index].future.as_mut().poll(&mut context)
+                else {
+                    index += 1;
+                    continue;
+                };
+                let pending = self.pending.remove(index);
+                let (admitted, hold) = result?;
+                let selection = admitted.response;
+                let AdmissionAttempt::Tracked(attempt_id) = admitted.attempt else {
+                    anyhow::bail!("Dynamo returned an untracked simulator admission");
+                };
+                self.bookings.insert(
+                    pending.uuid,
+                    SchedulerBookingDescriptor {
+                        request_id: pending.uuid.to_string(),
+                        worker: selection.best_worker,
+                        attempt_id,
+                    },
+                );
+                let overlap_blocks = selection.effective_overlap_blocks.floor() as u32;
+                let best_available_overlap_blocks = (selection.max_raw_cached_tokens.unwrap_or(0)
+                    / self.block_size as usize)
+                    as u32;
+                if let Some(affinity) = &mut self.affinity {
+                    affinity.stage(
+                        pending.uuid,
+                        hold.context("native affinity admission has no hold")?,
+                        WorkerAffinityTarget {
+                            worker_id: selection.best_worker.worker_id,
+                            dp_rank: Some(selection.best_worker.dp_rank),
+                        },
+                        pending
+                            .group_key
+                            .as_deref()
+                            .context("native affinity admission has no group key")?,
+                        overlap_blocks,
+                        best_available_overlap_blocks,
+                    )?;
+                }
+                let worker_idx = usize::try_from(selection.best_worker.worker_id)?
+                    .checked_mul(self.dp_size as usize)
+                    .and_then(|base| base.checked_add(selection.best_worker.dp_rank as usize))
+                    .context("selected worker/rank index overflow")?;
+                admissions.push(WorkerAdmission {
+                    uuid: pending.uuid,
+                    worker_idx,
+                    overlap_blocks,
+                    best_available_overlap_blocks,
+                    isl_blocks: pending.isl_blocks,
+                });
             }
-        };
-        let class = self.profile.class(class_index);
-        let should_queue = class.queueing_enabled()
-            && (self.pending.has_backlog(class_index)
-                || Self::request_workers_busy(
-                    &pending,
-                    &self.slots.active_tokens(decay_now),
-                    &self.workers_with_configs,
-                    class,
-                ));
-
-        if should_queue {
-            let snapshot = snapshot.unwrap_or_else(|| self.snapshot_for(&mut pending));
-            let priority_jump = pending.priority_jump;
-            let strict_priority = pending.strict_priority;
-            self.pending
-                .enqueue(
-                    class_index,
-                    self.workers_with_configs
-                        .len()
-                        .saturating_mul(self.dp_size as usize),
-                    snapshot,
-                    now_ms.max(0.0) / 1000.0,
-                    priority_jump,
-                    strict_priority,
-                    pending
-                        .affinity_hold
-                        .as_ref()
-                        .and_then(Hold::target)
-                        .and_then(|target| {
-                            target.dp_rank.map(|dp| {
-                                WorkerPlacement::Exact(WorkerWithDpRank::new(target.worker_id, dp))
-                            })
-                        })
-                        .unwrap_or(WorkerPlacement::Any),
-                    pending,
-                )
-                .map_err(|(rejection, _)| anyhow::Error::new(rejection))?;
-            // Native Exact lanes can leave another worker/rank runnable even
-            // with backlog. Let PolicyQueue decide, without waiting for an
-            // unrelated completion on the busy affinity target.
-            return Ok(RouterEffects {
-                admissions: if self.affinity.is_some() {
-                    self.drain_pending(decay_now)?
-                } else {
-                    Vec::new()
-                },
-            });
+            drop(_entered);
+            self.runtime
+                .block_on(self.scheduler.admission_barrier())??;
+            if !wake.take() {
+                break;
+            }
         }
+        if let Some(affinity) = &mut self.affinity {
+            affinity.ready = false;
+        }
+        Ok(admissions)
+    }
 
-        let uuid = pending.uuid;
-        let outcome = self.admit_request(pending, decay_now)?;
-        Ok(RouterEffects {
-            admissions: vec![WorkerAdmission {
-                uuid,
-                worker_idx: outcome.worker_idx,
-                overlap_blocks: outcome.overlap_blocks,
-                best_available_overlap_blocks: outcome.best_available_overlap_blocks,
-                isl_blocks: outcome.isl_blocks,
-            }],
-        })
+    fn advance_time(&mut self, now_ms: f64) -> Result<()> {
+        self.runtime.advance_to_ms(now_ms)?;
+        if let Some(affinity) = &mut self.affinity {
+            affinity.advance(now_ms)?;
+        }
+        Ok(())
+    }
+
+    fn free_booking(&mut self, uuid: Uuid) -> Result<()> {
+        if let Some(booking) = self.bookings.remove(&uuid) {
+            self.runtime
+                .block_on(self.scheduler.free_if_booking(&booking))??;
+        }
+        Ok(())
     }
 
     fn on_kv_events(&mut self, events: Vec<RouterEvent>) -> Result<RouterEffects> {
@@ -804,10 +769,9 @@ impl OfflineReplayRouter {
             let worker_id = event.worker_id;
             let event_id = event.event.event_id;
             let dp_rank = event.event.dp_rank;
-            let summary = KvEventSummary::from_data(&event.event.data);
             self.indexer.apply_event(event).with_context(|| {
                 format!(
-                    "failed to apply replay KV event worker={worker_id} dp_rank={dp_rank} event_id={event_id} data={summary}"
+                    "failed to apply replay KV event worker={worker_id} dp_rank={dp_rank} event_id={event_id}"
                 )
             })?;
         }
@@ -815,50 +779,40 @@ impl OfflineReplayRouter {
     }
 
     fn on_prefill_completed(&mut self, uuid: Uuid, now_ms: f64) -> Result<RouterEffects> {
-        if let Some(affinity) = &mut self.affinity {
-            affinity.advance(now_ms)?;
+        self.advance_time(now_ms)?;
+        if let Some(booking) = self.bookings.get(&uuid) {
+            self.runtime
+                .block_on(self.scheduler.mark_prefill_completed_if_booking(booking))??;
         }
-        let decay_now = self.decay_now(now_ms);
-        self.slots
-            .mark_prefill_completed(&uuid.to_string(), decay_now)
-            .map_err(anyhow::Error::from)?;
         Ok(RouterEffects {
-            admissions: self.drain_pending(decay_now)?,
+            admissions: self.collect_admissions()?,
         })
     }
 
     fn on_request_completed(&mut self, uuid: Uuid, now_ms: f64) -> Result<RouterEffects> {
+        self.advance_time(now_ms)?;
         if let Some(affinity) = &mut self.affinity {
-            affinity.advance(now_ms)?;
             affinity.release(uuid, false)?;
         }
-        let decay_now = self.decay_now(now_ms);
-        self.slots
-            .free(&uuid.to_string(), decay_now)
-            .map_err(anyhow::Error::from)?;
+        self.free_booking(uuid)?;
         Ok(RouterEffects {
-            admissions: self.drain_pending(decay_now)?,
+            admissions: self.collect_admissions()?,
         })
     }
 
-    /// Cancel a request that has not yet been assigned to a worker.
     fn cancel_pending(&mut self, uuid: Uuid) -> bool {
-        let before = self.pending.pending_count();
-        self.pending.retain(|request| request.uuid != uuid);
-        let removed = self.pending.pending_count() != before;
+        let before = self.pending.len();
+        // Dropping the native lifecycle future cancels its admission lease.
+        self.pending.retain(|pending| pending.uuid != uuid);
+        let removed = self.pending.len() != before;
         if let Some(affinity) = &mut self.affinity {
             affinity.ready |= removed;
-            return affinity.cancel_waiter(uuid) || removed;
         }
         removed
     }
 
     fn pending_count(&self) -> usize {
-        self.pending.pending_count()
-            + self
-                .affinity
-                .as_ref()
-                .map_or(0, ReplayAffinity::waiting_count)
+        self.pending.len()
     }
 
     /// Register a new worker with the router without disturbing existing slot state.
@@ -879,6 +833,8 @@ impl OfflineReplayRouter {
             return Err(error.into());
         }
 
+        self.workers_tx
+            .send_replace(self.workers_with_configs.clone());
         Ok(())
     }
 
@@ -894,6 +850,8 @@ impl OfflineReplayRouter {
     fn remove_worker(&mut self, worker_id: usize) -> Result<()> {
         let wid = worker_id as WorkerId;
         self.workers_with_configs.remove(&wid);
+        self.workers_tx
+            .send_replace(self.workers_with_configs.clone());
         Ok(())
     }
 
@@ -909,45 +867,20 @@ impl OfflineReplayRouter {
     }
 
     fn on_topology_changed(&mut self, now_ms: f64) -> Result<RouterEffects> {
-        if self.workers_with_configs.is_empty() {
-            return Ok(RouterEffects::default());
-        }
-        let decay_now = self.decay_now(now_ms);
+        self.advance_time(now_ms)?;
         Ok(RouterEffects {
-            admissions: self.drain_pending(decay_now)?,
+            admissions: self.collect_admissions()?,
         })
     }
 
     #[cfg(test)]
     fn debug_snapshot(&self, now_ms: f64) -> OfflineRouterSnapshot {
         let decay_now = self.decay_now(now_ms);
-        let mut pending = self
+        let pending = self
             .pending
-            .entries()
-            .map(|entry| {
-                let mut overlap_blocks_by_worker = entry
-                    .payload()
-                    .overlaps
-                    .scores
-                    .iter()
-                    .map(|(worker, overlap)| (worker.worker_id as usize, *overlap))
-                    .collect::<Vec<_>>();
-                overlap_blocks_by_worker.sort_unstable_by_key(|(worker_id, _)| *worker_id);
-
-                (
-                    entry,
-                    OfflinePendingRequestSnapshot {
-                        uuid: entry.payload().uuid,
-                        expected_output_tokens: entry.payload().expected_output_tokens,
-                        overlap_blocks_by_worker,
-                    },
-                )
-            })
-            .collect::<Vec<_>>();
-        pending.sort_unstable_by(|(left_entry, _), (right_entry, _)| {
-            left_entry.cmp(right_entry).reverse()
-        });
-
+            .iter()
+            .map(|pending| pending.snapshot.clone())
+            .collect();
         let mut active_blocks_by_worker = self
             .slots
             .active_blocks()
@@ -965,13 +898,14 @@ impl OfflineReplayRouter {
         active_tokens_by_worker.sort_unstable_by_key(|(worker_id, _)| *worker_id);
 
         OfflineRouterSnapshot {
-            pending: pending.into_iter().map(|(_, snapshot)| snapshot).collect(),
+            pending,
             active_blocks_by_worker,
             active_tokens_by_worker,
             indexer: self.indexer.debug_snapshot(),
         }
     }
 
+    #[cfg(test)]
     fn decay_now(&self, now_ms: f64) -> Instant {
         self.decay_time_epoch + Duration::from_secs_f64(now_ms.max(0.0) / 1000.0)
     }
@@ -1045,12 +979,19 @@ impl OfflineReplayRouter {
             }
         };
 
+        let tiered = TieredMatchDetails {
+            device: MatchDetails {
+                overlap_scores: overlaps,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let overlaps = OverlapAnalysis::new(&self.config, self.block_size, &tiered).signals();
         Ok(PendingRequest {
             uuid,
             token_seq,
             isl_tokens: input_length,
             overlaps,
-            track_prefill_tokens: self.config.router_track_prefill_tokens,
             expected_output_tokens: Some(
                 u32::try_from(max_output_tokens)
                     .context("max_output_tokens does not fit into u32")?,
@@ -1064,7 +1005,6 @@ impl OfflineReplayRouter {
                 .map(|affinity| affinity.config.group_key(request, session_id.as_deref()))
                 .transpose()?,
             session_id,
-            affinity_hold: None,
         })
     }
 
@@ -1073,239 +1013,6 @@ impl OfflineReplayRouter {
             partition: RoutingPartitionRef::new("replay", "default"),
             block_size: self.block_size,
         }
-    }
-
-    fn admit_request(
-        &mut self,
-        mut request: PendingRequest,
-        decay_now: Instant,
-    ) -> Result<AdmitOutcome> {
-        let worker_loads = self
-            .slots
-            .project_worker_loads(request.token_seq.as_deref(), decay_now);
-        let mut scheduling_request =
-            request.scheduling_request(self.block_size as usize, worker_loads);
-        let eligibility = scheduling_request.eligibility();
-        let best_available_overlap_blocks = request
-            .overlaps
-            .scores
-            .iter()
-            .filter(|(worker, _)| {
-                self.workers_with_configs
-                    .get(&worker.worker_id)
-                    .is_some_and(|config| eligibility.allows_worker(worker.worker_id, config))
-                    && worker.dp_rank < self.dp_size
-            })
-            .map(|(_, overlap)| *overlap)
-            .max()
-            .unwrap_or(0);
-        let selection = self
-            .selector
-            .select_worker(WorkerSelectionInput::configured(
-                &self.workers_with_configs,
-                &scheduling_request,
-                eligibility,
-                self.block_size,
-            ))?;
-        let worker_id = usize::try_from(selection.worker.worker_id)
-            .map_err(|_| anyhow!("selected worker id does not fit into usize"))?;
-        let dp_rank = usize::try_from(selection.worker.dp_rank)
-            .map_err(|_| anyhow!("selected dp rank does not fit into usize"))?;
-        let worker_idx = worker_id
-            .checked_mul(self.dp_size as usize)
-            .and_then(|base| base.checked_add(dp_rank))
-            .ok_or_else(|| anyhow!("selected worker/rank index overflow"))?;
-        let request_id = request.request_id();
-        let prefill_load_hint = self.prefill_load_hint_for(
-            request.isl_tokens,
-            selection.cached_tokens,
-            request.track_prefill_tokens,
-        );
-
-        let isl_blocks = u32::try_from(request.isl_tokens.div_ceil(self.block_size as usize))
-            .unwrap_or(u32::MAX);
-        let overlap_blocks = selection.effective_overlap_blocks.floor() as u32;
-
-        self.slots
-            .add_request(
-                SequenceRequest {
-                    request_id,
-                    token_sequence: scheduling_request.token_seq.take(),
-                    track_prefill_tokens: request.track_prefill_tokens,
-                    expected_output_tokens: request.expected_output_tokens,
-                    prefill_load_hint,
-                    worker: selection.worker,
-                    lora_name: None,
-                },
-                decay_now,
-            )
-            .map_err(anyhow::Error::from)?;
-
-        if let Some(affinity) = &mut self.affinity {
-            affinity.stage(
-                request.uuid,
-                request
-                    .affinity_hold
-                    .take()
-                    .context("affinity admission has no hold")?,
-                WorkerAffinityTarget {
-                    worker_id: selection.worker.worker_id,
-                    dp_rank: Some(selection.worker.dp_rank),
-                },
-                request
-                    .group_key
-                    .as_deref()
-                    .context("affinity admission has no group key")?,
-                overlap_blocks,
-                best_available_overlap_blocks,
-            )?;
-        }
-        Ok(AdmitOutcome {
-            worker_idx,
-            overlap_blocks,
-            best_available_overlap_blocks,
-            isl_blocks,
-        })
-    }
-
-    fn drain_pending(&mut self, decay_now: Instant) -> Result<Vec<WorkerAdmission>> {
-        let mut admissions = Vec::new();
-        if self.affinity.is_some() {
-            self.pending.recheck_all_workers();
-        }
-        loop {
-            // Most completions find an empty queue, which never consults the
-            // predicate, so only snapshot active tokens once one is needed.
-            let mut active_tokens = None;
-            let slots = &self.slots;
-            let workers = &self.workers_with_configs;
-            let Some(popped) = self.pending.pop_next(|_, class, request| {
-                let active_tokens =
-                    active_tokens.get_or_insert_with(|| slots.active_tokens(decay_now));
-                !Self::request_workers_busy(request, active_tokens, workers, class)
-            }) else {
-                break;
-            };
-            let request = popped.into_payload();
-            let uuid = request.uuid;
-            let outcome = self.admit_request(request, decay_now)?;
-            admissions.push(WorkerAdmission {
-                uuid,
-                worker_idx: outcome.worker_idx,
-                overlap_blocks: outcome.overlap_blocks,
-                best_available_overlap_blocks: outcome.best_available_overlap_blocks,
-                isl_blocks: outcome.isl_blocks,
-            });
-        }
-
-        Ok(admissions)
-    }
-
-    fn request_workers_busy(
-        request: &PendingRequest,
-        active_tokens: &HashMap<WorkerWithDpRank, usize>,
-        workers: &HashMap<WorkerId, ReplayWorkerConfig>,
-        class: &PolicyClassConfig,
-    ) -> bool {
-        if let Some(target) = request.affinity_hold.as_ref().and_then(Hold::target) {
-            return workers.get(&target.worker_id).is_none_or(|config| {
-                let start = target.dp_rank.unwrap_or(config.data_parallel_start_rank());
-                let end = target
-                    .dp_rank
-                    .map_or(start.saturating_add(config.data_parallel_size()), |rank| {
-                        rank + 1
-                    });
-                (start..end).all(|rank| {
-                    class.worker_is_busy(
-                        active_tokens
-                            .get(&WorkerWithDpRank::new(target.worker_id, rank))
-                            .copied()
-                            .unwrap_or(0),
-                        config
-                            .max_num_batched_tokens()
-                            .unwrap_or(DEFAULT_MAX_BATCHED_TOKENS),
-                    )
-                })
-            });
-        }
-        Self::all_workers_busy_with(active_tokens, workers, class)
-    }
-
-    fn all_workers_busy_with(
-        active_tokens: &HashMap<WorkerWithDpRank, usize>,
-        workers_with_configs: &HashMap<WorkerId, ReplayWorkerConfig>,
-        class: &PolicyClassConfig,
-    ) -> bool {
-        workers_with_configs.iter().all(|(&worker_id, config)| {
-            let start = config.data_parallel_start_rank();
-            let end = start.saturating_add(config.data_parallel_size());
-            (start..end).all(|dp_rank| {
-                let worker = WorkerWithDpRank::new(worker_id, dp_rank);
-                let max_batched = config
-                    .max_num_batched_tokens()
-                    .unwrap_or(DEFAULT_MAX_BATCHED_TOKENS);
-                let tokens = active_tokens.get(&worker).copied().unwrap_or(0);
-                class.worker_is_busy(tokens, max_batched)
-            })
-        })
-    }
-
-    fn snapshot_for(&self, request: &mut PendingRequest) -> QueueSnapshot {
-        if self.affinity.is_some() {
-            let mut native =
-                request.scheduling_request(self.block_size as usize, FxHashMap::default());
-            let cached_tokens =
-                SchedulingContext::new(&native, &self.workers_with_configs).best_cached_tokens();
-            request.token_seq = native.token_seq.take();
-            return QueueSnapshot::new(request.isl_tokens, cached_tokens);
-        }
-        let cached_tokens = request
-            .overlaps
-            .scores
-            .iter()
-            .filter(|(worker, _)| self.workers_with_configs.contains_key(&worker.worker_id))
-            .map(|(_, overlap)| *overlap)
-            .max()
-            .unwrap_or(0) as usize
-            * self.block_size as usize;
-        QueueSnapshot::new(request.isl_tokens, cached_tokens)
-    }
-
-    fn prefill_load_hint_for(
-        &self,
-        isl_tokens: usize,
-        cached_tokens: usize,
-        track_prefill_tokens: bool,
-    ) -> Option<PrefillLoadHint> {
-        if !track_prefill_tokens {
-            return None;
-        }
-
-        let prefix = cached_tokens.min(isl_tokens);
-        let effective_isl = isl_tokens.saturating_sub(prefix);
-        if effective_isl == 0 {
-            return None;
-        }
-
-        let expected_prefill_duration = match &self.prefill_load_estimator {
-            Some(estimator) => match estimator.predict_prefill_duration(1, effective_isl, prefix) {
-                Ok(expected_prefill_duration) => Some(expected_prefill_duration),
-                Err(error) => {
-                    tracing::warn!(
-                        effective_isl,
-                        prefix,
-                        "failed to predict replay prefill duration for active load tracking: {error}"
-                    );
-                    None
-                }
-            },
-            None => None,
-        };
-
-        Some(PrefillLoadHint {
-            initial_effective_prefill_tokens: effective_isl,
-            expected_prefill_duration,
-        })
     }
 }
 
@@ -1322,7 +1029,6 @@ mod tests {
         WorkerId, compute_block_hash_for_seq,
     };
     use dynamo_kv_router::{PrefillLoadEstimator, TrackingHashAlgorithm};
-    use rustc_hash::FxHashMap;
     use serde_json::Value;
     use tempfile::NamedTempFile;
     use uuid::Uuid;
@@ -1480,7 +1186,7 @@ mod tests {
     fn session_identity_reaches_scheduling_request() {
         let router = OfflineReplayRouter::new(&replay_args(), None, None, 1).unwrap();
         let request = request(1, 7);
-        let mut pending = router
+        let pending = router
             .build_pending_request(
                 &request,
                 request.max_output_tokens,
@@ -1488,7 +1194,7 @@ mod tests {
                 Some("session-a".to_string()),
             )
             .unwrap();
-        let scheduling_request = pending.scheduling_request(64, FxHashMap::default());
+        let scheduling_request = pending.scheduling_request(None);
 
         assert_eq!(
             scheduling_request
@@ -1832,38 +1538,22 @@ models:
         let error = router
             .on_request_arrival(&ordinary_class_name, None, 0.0)
             .unwrap_err();
-        let rejection = error
-            .downcast_ref::<dynamo_kv_router::scheduling::QueueRejection>()
-            .expect("replay should preserve the typed queue rejection");
+        let dynamo_kv_router::scheduling::KvSchedulerError::QueueRejected(rejection) = error
+            .downcast_ref::<dynamo_kv_router::scheduling::KvSchedulerError>()
+            .expect("replay should preserve the native scheduler error")
+        else {
+            panic!("{error}")
+        };
         assert_eq!(rejection.policy_class, "latency_uncached");
         assert_eq!(rejection.current, 0);
         assert_eq!(rejection.limit, 0);
 
+        // The native actor rechecks old backlog when a worker becomes available.
         router.add_worker(1).unwrap();
-        let mut scaled_latency = request(5, 3);
-        scaled_latency.policy_class = Some("latency".to_string());
-        assert!(
-            router
-                .on_request_arrival(&scaled_latency, Some(cached_hashes.clone()), 0.0)
-                .unwrap()
-                .admissions
-                .is_empty(),
-            "a second discovered worker should raise the effective queue limit"
-        );
-        assert_eq!(router.pending_count(), 2);
-
-        router.remove_worker(1).unwrap();
-        let mut rejected_after_shrink = request(6, 3);
-        rejected_after_shrink.policy_class = Some("latency".to_string());
-        let error = router
-            .on_request_arrival(&rejected_after_shrink, Some(cached_hashes), 0.0)
-            .unwrap_err();
-        let rejection = error
-            .downcast_ref::<dynamo_kv_router::scheduling::QueueRejection>()
-            .expect("worker removal should retain the typed queue rejection");
-        assert_eq!(rejection.current, 2);
-        assert_eq!(rejection.limit, 1);
-        assert_eq!(router.pending_count(), 2);
+        let released = router.on_topology_changed(0.0).unwrap();
+        assert_eq!(released.admissions.len(), 1);
+        assert_eq!(released.admissions[0].uuid, Uuid::from_u128(3));
+        assert_eq!(router.pending_count(), 0);
     }
 
     #[test]
@@ -1927,11 +1617,12 @@ policy_classes:
     }
 
     #[test]
-    fn strict_priority_precedes_each_offline_queue_policy() {
-        for policy in [
-            RouterQueuePolicy::Fcfs,
-            RouterQueuePolicy::Lcfs,
-            RouterQueuePolicy::Wspt,
+    fn priorities_and_queue_order_reach_the_native_scheduler() {
+        for (policy, priority, expected) in [
+            (RouterQueuePolicy::Fcfs, 0, 2),
+            (RouterQueuePolicy::Lcfs, 0, 3),
+            (RouterQueuePolicy::Wspt, 0, 3),
+            (RouterQueuePolicy::Fcfs, 1, 3),
         ] {
             let mut router = OfflineReplayRouter::new(
                 &queueing_args(),
@@ -1944,80 +1635,16 @@ policy_classes:
                 .on_request_arrival(&request(1, 1), None, 0.0)
                 .unwrap();
             router
-                .on_request_arrival(&request_with_priorities(2, 2, 1, 1_000_000, 0), None, 0.0)
+                .on_request_arrival(&request_with_priorities(2, 2, 128, 0, 0), None, 0.0)
                 .unwrap();
             router
-                .on_request_arrival(&request_with_priorities(3, 3, 64, 0, 1), None, 1_000.0)
+                .on_request_arrival(&request_with_priorities(3, 3, 64, 0, priority), None, 1.0)
                 .unwrap();
-
-            let pending = router
-                .debug_snapshot(1_000.0)
-                .pending
-                .into_iter()
-                .map(|request| request.uuid)
-                .collect::<Vec<_>>();
-            assert_eq!(pending, vec![Uuid::from_u128(3), Uuid::from_u128(2)]);
+            let admitted = router
+                .on_request_completed(Uuid::from_u128(1), 2.0)
+                .unwrap();
+            assert_eq!(admitted.admissions[0].uuid, Uuid::from_u128(expected));
         }
-    }
-
-    #[test]
-    fn equal_strict_tiers_retain_offline_queue_policy_ordering() {
-        let cases = [
-            (RouterQueuePolicy::Fcfs, vec![2, 3]),
-            (RouterQueuePolicy::Lcfs, vec![3, 2]),
-            (RouterQueuePolicy::Wspt, vec![3, 2]),
-        ];
-
-        for (policy, expected) in cases {
-            let mut router = OfflineReplayRouter::new(
-                &queueing_args(),
-                Some(queueing_router_config_with_policy(policy)),
-                None,
-                1,
-            )
-            .unwrap();
-            router
-                .on_request_arrival(&request(1, 1), None, 0.0)
-                .unwrap();
-            router
-                .on_request_arrival(&request_with_priorities(2, 2, 64, 0, 4), None, 0.0)
-                .unwrap();
-            router
-                .on_request_arrival(&request_with_priorities(3, 3, 1, 0, 4), None, 100.0)
-                .unwrap();
-
-            let pending = router
-                .debug_snapshot(100.0)
-                .pending
-                .into_iter()
-                .map(|request| request.uuid.as_u128())
-                .collect::<Vec<_>>();
-            assert_eq!(pending, expected);
-        }
-    }
-
-    #[test]
-    fn soft_priority_orders_within_an_offline_strict_tier() {
-        let mut router =
-            OfflineReplayRouter::new(&queueing_args(), Some(queueing_router_config()), None, 1)
-                .unwrap();
-        router
-            .on_request_arrival(&request(1, 1), None, 0.0)
-            .unwrap();
-        router
-            .on_request_arrival(&request_with_priorities(2, 2, 64, 0, 2), None, 0.0)
-            .unwrap();
-        router
-            .on_request_arrival(&request_with_priorities(3, 3, 64, 1_000, 2), None, 100.0)
-            .unwrap();
-
-        let pending = router
-            .debug_snapshot(100.0)
-            .pending
-            .into_iter()
-            .map(|request| request.uuid)
-            .collect::<Vec<_>>();
-        assert_eq!(pending, vec![Uuid::from_u128(3), Uuid::from_u128(2)]);
     }
 
     #[test]
@@ -2209,7 +1836,7 @@ policy_classes:
     }
 
     #[test]
-    fn no_workers_preserves_pending_requests_during_completion_drain() {
+    fn removing_all_workers_preserves_native_no_endpoints_error() {
         let mut router =
             OfflineReplayRouter::new(&queueing_args(), Some(queueing_router_config()), None, 1)
                 .unwrap();
@@ -2223,16 +1850,14 @@ policy_classes:
         assert_eq!(router.pending_count(), 1);
 
         router.remove_worker(0).unwrap();
-        let effects = router
+        let error = router
             .on_request_completed(Uuid::from_u128(1), 0.0)
-            .unwrap();
-
-        assert!(effects.admissions.is_empty());
-        assert_eq!(router.pending_count(), 1);
-        assert_eq!(
-            router.debug_snapshot(0.0).pending[0].uuid,
-            Uuid::from_u128(2)
-        );
+            .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<dynamo_kv_router::scheduling::KvSchedulerError>(),
+            Some(dynamo_kv_router::scheduling::KvSchedulerError::NoEndpoints)
+        ));
+        assert_eq!(router.pending_count(), 0);
     }
 
     fn affinity_placement(dp_size: u32, queued: bool, capture: bool) -> super::KvRouterPlacement {
@@ -2424,48 +2049,6 @@ policy_classes:
             .unwrap();
         assert_eq!(decisions[1]["binding_reused"], true);
         assert_eq!(decisions[2]["binding_reused"], false);
-    }
-
-    #[test]
-    fn affinity_queue_cost_uses_bound_rank_not_another_ranks_cached_prefix() {
-        let mut placement = affinity_placement(2, true, true);
-        let target = immediate_target(affinity_place(&mut placement, 1, "a", 0.0));
-        affinity_commit(&mut placement, 1, 0.0);
-        let tokens_hash =
-            compute_block_hash_for_seq(&request(2, 7).tokens, 64, BlockHashOptions::default())[0].0;
-        placement
-            .router
-            .on_kv_events(vec![store_event_for_rank(
-                0,
-                (1 - target) as u32,
-                1,
-                tokens_hash,
-                StorageTier::Device,
-            )])
-            .unwrap();
-        let mut pending = placement
-            .router
-            .build_pending_request(&request(2, 7), 2, None, Some("a".into()))
-            .unwrap();
-        assert!(
-            placement
-                .router
-                .affinity
-                .as_ref()
-                .unwrap()
-                .acquire(&mut pending, &placement.router.workers_with_configs)
-                .unwrap()
-        );
-        let snapshot = placement.router.snapshot_for(&mut pending);
-        assert_eq!(
-            snapshot.cached_tokens, 0,
-            "another DP's cache cannot reduce a bound request's WSPT cost"
-        );
-        assert_eq!(snapshot.scheduling_cost_tokens, 64);
-        assert!(
-            pending.token_seq.is_some(),
-            "queue accounting must preserve booking hashes"
-        );
     }
 
     #[test]

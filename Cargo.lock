@@ -40,9 +40,6 @@ dependencies = [
  "blake3",
  "ddsketchy",
  "derive_builder",
- "dynamo-custom-policy-builtin",
- "dynamo-kv-router",
- "dynamo-tokens",
  "fixedbitset",
  "flate2",
  "indicatif",
@@ -64,10 +61,29 @@ dependencies = [
  "slotmap",
  "tempfile",
  "thiserror",
- "tokio",
  "tracing",
  "uuid",
  "xxhash-rust",
+]
+
+[[package]]
+name = "aisimulate-python"
+version = "0.13.0"
+dependencies = [
+ "aisimulate-core",
+ "anyhow",
+ "dynamo-custom-policy-builtin",
+ "dynamo-kv-router",
+ "dynamo-tokens",
+ "pyo3",
+ "rustc-hash",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -563,7 +579,7 @@ dependencies = [
 [[package]]
 name = "dynamo-custom-policy-builtin"
 version = "1.6.0"
-source = "git+https://github.com/ai-dynamo/dynamo.git?rev=094aaca91941421bb0dcb645b0f700a42d6de3ef#094aaca91941421bb0dcb645b0f700a42d6de3ef"
+source = "git+https://github.com/ai-dynamo/dynamo.git?rev=85ce615a409d61144c5b94ce74dae3f7291573dd#85ce615a409d61144c5b94ce74dae3f7291573dd"
 dependencies = [
  "async-trait",
  "dynamo-kv-router",
@@ -578,7 +594,7 @@ dependencies = [
 [[package]]
 name = "dynamo-kv-hashing"
 version = "1.6.0"
-source = "git+https://github.com/ai-dynamo/dynamo.git?rev=094aaca91941421bb0dcb645b0f700a42d6de3ef#094aaca91941421bb0dcb645b0f700a42d6de3ef"
+source = "git+https://github.com/ai-dynamo/dynamo.git?rev=85ce615a409d61144c5b94ce74dae3f7291573dd#85ce615a409d61144c5b94ce74dae3f7291573dd"
 dependencies = [
  "derive_builder",
  "dynamo-tokens",
@@ -590,7 +606,7 @@ dependencies = [
 [[package]]
 name = "dynamo-kv-router"
 version = "1.6.0"
-source = "git+https://github.com/ai-dynamo/dynamo.git?rev=094aaca91941421bb0dcb645b0f700a42d6de3ef#094aaca91941421bb0dcb645b0f700a42d6de3ef"
+source = "git+https://github.com/ai-dynamo/dynamo.git?rev=85ce615a409d61144c5b94ce74dae3f7291573dd#85ce615a409d61144c5b94ce74dae3f7291573dd"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -634,7 +650,7 @@ dependencies = [
 [[package]]
 name = "dynamo-tokens"
 version = "1.6.0"
-source = "git+https://github.com/ai-dynamo/dynamo.git?rev=094aaca91941421bb0dcb645b0f700a42d6de3ef#094aaca91941421bb0dcb645b0f700a42d6de3ef"
+source = "git+https://github.com/ai-dynamo/dynamo.git?rev=85ce615a409d61144c5b94ce74dae3f7291573dd#85ce615a409d61144c5b94ce74dae3f7291573dd"
 dependencies = [
  "bs58",
  "bytemuck",
@@ -650,7 +666,7 @@ dependencies = [
 [[package]]
 name = "dynamo-truthy"
 version = "1.6.0"
-source = "git+https://github.com/ai-dynamo/dynamo.git?rev=094aaca91941421bb0dcb645b0f700a42d6de3ef#094aaca91941421bb0dcb645b0f700a42d6de3ef"
+source = "git+https://github.com/ai-dynamo/dynamo.git?rev=85ce615a409d61144c5b94ce74dae3f7291573dd#85ce615a409d61144c5b94ce74dae3f7291573dd"
 dependencies = [
  "anyhow",
 ]
