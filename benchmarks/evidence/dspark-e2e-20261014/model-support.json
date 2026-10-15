@@ -365,6 +365,94 @@
       },
       "generic_scheduler_source_receipt": "source_pool_sources.json",
       "measurements": "No initialized V41 cache receipt at audit time. No fabricated group counts, pool capacities, timings or qualification."
+    },
+    "native_query_coverage_followup": {
+      "status": "Current native consumer is exact-only; no long-span or C4 collection is claimed.",
+      "consumer": "crates/core/src/perfmodel/perf_database/dsv41_native.rs:NativeDsv41Table::query",
+      "initial_probe": {
+        "sequence_count": 1,
+        "input_tokens": 1024,
+        "output_tokens": 16,
+        "sites": 7,
+        "repetitions": 5,
+        "requests": 35,
+        "purpose": "native hook/ownership diagnostic only"
+      },
+      "paired_scoring_gap": "Independent acceptance RNG reaches absolute KV positions absent from sparse observed rows. Extending output length alone does not guarantee exact lookup coverage.",
+      "required_strict_axes": [
+        "runtime image and revision",
+        "checkpoint/config digest",
+        "inclusive ownership site and layer",
+        "target/draft role",
+        "TP4/EP1",
+        "528-byte MXFP8 layout",
+        "decoder replay policy",
+        "causal flag",
+        "query width (target verify6, draft5)",
+        "sequence count (C1 and C4 separately)"
+      ],
+      "bounded_extension": {
+        "candidate_observation_window": "1024 input / 1056 output, separate C1 and C4 operator-only runs, all four ranks; not yet executed or qualified",
+        "kv_policy": "Implement bounded KV interpolation only after auditing compressor-visible row counts/ring phase, SWA and decoder-window caps, index/top-k regime and dispatch discontinuities. No extrapolation, query-width/causality interpolation or backend relabeling.",
+        "alternative": "Observe every required exact KV query with a source-verified controlled acceptance sweep; do not fill missing cells analytically.",
+        "heterogeneous_batches": "Current publisher rejects heterogeneous per-request physical identities. A C4 batch with independent acceptance may become heterogeneous; collect controlled homogeneous C4 slices or extend the typed contract before importing heterogeneous observations.",
+        "qualification": "Retain exact-hit/interpolated/missing coverage diagnostics and any homogeneous-query approximation separately from serving metric errors."
+      },
+      "source_audit": {
+        "decision": "Keep exact-only lookup. Current rows cannot establish safe whole-layer interpolation intervals; no numerical fitting or fallback was added.",
+        "runtime_revision": "ac9126e58aa7bbab1856ba6593ba4d5003fea516",
+        "runtime_image_digest": "sha256:3d17635c5aa0340e2f2502c067ce4b587d8e7dc678195e90b71142490dc6d71c",
+        "source_root": "https://github.com/vllm-project/vllm/tree/ac9126e58aa7bbab1856ba6593ba4d5003fea516/vllm/models/deepseek_v41",
+        "installed_file_sha256": {
+          "attention.py": "44b870805c1c796715d13029604428aa38a74dd1eebafbe1cc6879817b66d957",
+          "compressor.py": "cd125a3d727c847ad0907b1ad0ba8f0cd1c5c56dc5878275234204629f53a7b4",
+          "common/ops/fused_compress_quant_cache.py": "a3f81abbab1f507e441176222578f90056e6b4bc0063bb36681c230a84b3d969",
+          "nvidia/flashmla.py": "6bfcc91c278bae8f9c95d9ec4da12ef98112b9ccf9d22547743485759c258348",
+          "sparse_mla.py": "1b87aa3f27e7867b6508893da5f52a0f10944b59fd03aa58bd8c568f4e6aef16"
+        },
+        "boundaries": [
+          {
+            "source": "common/ops/fused_compress_quant_cache.py:148-205",
+            "fact": "CR2 handles the first-token closed group based on (position + 1) modulo 2; request-ring reads and writes also use position modulo runtime state capacity. Equal endpoint widths do not identify this work at an interior position."
+          },
+          {
+            "source": "attention.py:1452-1476",
+            "fact": "Indexer switches between fill-all and sparse index computation when floor(metadata.max_seq_len / compress_ratio) exceeds index_topk. Preserve the actual batch maximum, not just one request position."
+          },
+          {
+            "source": "nvidia/flashmla.py:214-255",
+            "fact": "Decode shares a FlashMLA planner per compression layer type within each step. The first layer call can initialize the plan; subsequent layers reuse it. Static backend/class metadata does not record this dynamic ownership or planner result."
+          },
+          {
+            "source": "vllm/v1/attention/backends/mla/sparse_swa.py:363-371,615-648",
+            "fact": "Prefill uses replay_start and window-capped visible prefix; decode uses causal/noncausal SWA widths. Preserve replay/window and query identities rather than interpolate across them."
+          }
+        ],
+        "missing_observations": [
+          "Runtime compressor ring capacity and phase",
+          "Actual indexer regime and batch maximum",
+          "FlashMLA planner initialization ownership and dispatch/split identity",
+          "Relevant SWA lengths, replay start and compressed row count"
+        ],
+        "current_row_limitation": "kernel_source contains static observed class/backend flags but no complete dynamic regime; NativeDsv41Table currently retains only key and latency.",
+        "regression": "Bracketing synthetic measurements must not authorize interior, extrapolated, mismatched scope, query, owner/causal, sequence count, replay or cache-layout queries.",
+        "validation": {
+          "command": "CARGO_TARGET_DIR=/tmp/aisim-dspark-warmup-tests CARGO_BUILD_JOBS=4 cargo test -p aisimulate-core --lib perf_database::dsv41_native::tests",
+          "passed": 3,
+          "failed": 0,
+          "scope": "Exact-table behavior and negative interpolation/identity tests only; no production estimation change or silicon timing claim."
+        }
+      },
+      "dense_exact_sweep_alternative": {
+        "status": "Source-supported collection proposal, not implemented or executed",
+        "configuration": "Fixed K5, adaptive verification false, synthetic_acceptance_length=1 (zero accepted drafts), equal 1024-token prompts, fixed 1056-token outputs; separate simultaneous C1 and C4 batches",
+        "source": "vllm/config/speculative.py:_acceptance_length_to_rates; vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py:583-586,968-975",
+        "reason": "All five conditional acceptance rates are zero, so each completed verify round emits exactly one replacement/bonus token. This can visit every successive absolute decode position without RNG gaps.",
+        "qualification": "Use only observed exact keys with all four TP ranks; confirm simultaneous homogeneous C4 admission and complete query sets. Different source tokens and zero-acceptance state remain operator-collection assumptions, not a new E2E workload.",
+        "current_collector_limits": "Hardcoded C1, 16 output tokens, AL3.51; no dense-sweep CLI yet.",
+        "preparation_blocker": "dflash/speculator.py fills rejected context suffix positions with zero and PAD_SLOT_ID while preserving padded shape. wrap_preparation reads those actual positions, but query_identity rejects nonconsecutive positions. Preparation requires explicit valid-row/mask identity before a complete table can be published; never replace padded positions with an invented contiguous range.",
+        "remaining_span_check": "Compare every canonical target/draft/preparation key against observed rows, including startup and final partial rounds. A 1056-output run is a candidate bound, not proof of complete coverage."
+      }
     }
   },
   "validation": {

@@ -286,5 +286,24 @@
       "missing_runs": 586
     },
     "scope": "P/D production used isolated clean b1 predictor; AgentX output identity changes are separately functionally verified. Full campaign and producer-matched AgentX validation remain unfinished. Remote jobs cannot be verified while corporate cluster DNS is unavailable."
+  },
+  "output_identity_host_and_v41_coverage_checkpoint": {
+    "date": "2026-10-15",
+    "base_revision": "5bf8f6e88c4547848fa53e1d429c7b4697bfdbf3",
+    "production_native_changes": false,
+    "v41_query_coverage": {
+      "tests_passed": 3,
+      "log_sha256": "75a1efa607a8f332b89fb2f3162214d3eec42c001d0442c7d5a3fbb367e349e0",
+      "scope": "Exact-only native V4.1 lookup; bracketing rows do not establish interior or boundary coverage."
+    },
+    "host_evidence": {
+      "path": "host-output-identity.json",
+      "sha256": "60afcb4cfe2498691db615a3c718aeb94b6723184ab0dcc9e7a4b5335f89d5ea",
+      "paired_cases": 5,
+      "repetitions_per_build": 5,
+      "warmup_per_case_build": 1,
+      "scope": "Release CLI and native Replay costs, unchanged work/lifecycle checks; not serving accuracy."
+    },
+    "remaining_collection": "Corporate DNS unavailable; six submitted jobs remain unverified. No new GPU job or accuracy coverage is claimed."
   }
 }

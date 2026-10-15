@@ -810,6 +810,53 @@ the grouped AgentX limitation above remains in force. CPU source/config evidence
 is preserved in `cpu-preflights-20261014.tar.gz`, indexed and hashed by
 `cpu-preflights.json`; it does not claim GPU execution or serving accuracy.
 
+The native V4.1 timing table currently requires exact absolute KV positions.
+Its initial observer is configured for only 35 C1 requests (seven site passes, five repeats,
+1024 input and 16 output tokens). That diagnostic cannot establish C4 or the KV
+span of a 1024-output serving window; no subsequent collection is claimed here.
+Independent acceptance RNG can miss observed positions even after extending the
+probe to 1056 outputs. `model-support.json` records the pending consumer work:
+bounded KV interpolation must preserve runtime/config/layout, ownership,
+query width, causal identity and sequence count, and explicitly handle
+compression/ring phase, SWA/decoder-window and index/kernel discontinuities.
+Exact observations of every required KV position are another valid route.
+
+The pinned source audit leaves interpolation disabled. Ratio-2 compression has
+a first-position parity branch and runtime ring modulus; the indexer changes
+algorithm at its compressed-length/top-k threshold. FlashMLA also shares a plan
+per compression layer type, initialized by the first call in each step. Current
+rows record static dispatch metadata, but not these dynamic regimes or planner
+ownership. Two bracketing KV measurements therefore do not establish a safe
+interval. `model-support.json` retains source anchors, installed file hashes and
+the missing observations. The Rust regression uses synthetic timings solely to
+verify that interior/boundary misses and identity mismatches remain errors.
+
+A dense exact-query sweep is an alternative: the pinned producer maps
+`synthetic_acceptance_length: 1` to zero accepted drafts and one committed token
+per round, while keeping K5 and adaptive verification disabled. Equal prompts
+and output limits in a simultaneously admitted C4 batch can preserve homogeneous
+positions. This requires explicit collector controls; the current collector is
+hardcoded to C1, 16 outputs and AL3.51. Candidate 1056-output C1/C4 runs still
+need observed-key coverage checks for startup, draft offsets and final rounds.
+They are operator measurements, not a replacement acceptance policy for E2E.
+
+There is a separate preparation-identity blocker. The pinned producer preserves
+the full padded target span but assigns zero positions and invalid slots to
+rejected context rows. The observer correctly reads those positions; its current
+consecutive-position contract cannot publish that preparation call. This can
+affect AL3.51 as well as zero acceptance. Add explicit valid-row/mask identity
+before claiming complete stage coverage; do not invent contiguous positions or
+silently drop the rejected rows. No dense sweep or complete stage table is
+claimed here.
+
+C4 also needs its own physical sequence-count slice. The current publisher
+rejects heterogeneous per-request identities, so independent per-request
+acceptance cannot be silently reduced to a homogeneous observation. A controlled
+homogeneous operator run or a typed heterogeneous contract is required. Record
+exact/interpolated/missing query coverage and any homogeneous-query modeling
+approximation separately from E2E timing errors. These are pending qualification
+steps; neither SOL fallback nor a neighboring backend can fill the gaps.
+
 The first P/D production window 2258192 completed 128/128 requests, after eight
 warmups. Every P engine completed one warmup and 16 measured requests; D completed
 8 warmups and 128 measured requests. `pd-transfer-production-2258192.json` retains

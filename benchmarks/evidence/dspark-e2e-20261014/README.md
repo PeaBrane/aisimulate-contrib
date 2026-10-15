@@ -169,6 +169,18 @@ release binaries, identical dependencies, one CPU thread, and the same workload;
 one warmup per case/build was excluded. This measures the incremental schema30
 implementation, not the total DSpark feature overhead or serving accuracy.
 
+The later output-identity check compares clean `b1c56e9c` and `5bf8f6e8` in
+[`host-output-identity.json`](host-output-identity.json), with full samples and
+raw CLI artifacts in its two hashed archives. Five alternating repetitions
+preserve request/token totals, prefix metrics and lifecycle digests. Full CLI
+median changes are +3.31% control, +0.37% AgentX and +1.21% AgentX DSpark;
+native Replay changes are -2.72%, +0.46% and -0.32%. Sample ranges overlap.
+An original exact-token CPU stress fixture adds 256 requests and 32,768 output
+tokens per run, exercising unknown output identities. Its native changes are
++1.49% without speculation and -1.89% with DSpark, also within overlapping
+ranges. This fixture is not a real AgentX measurement. No substantial native
+regression is established; CLI startup/preparation variability is retained.
+
 ## Matching and progression
 
 Serving identity is frozen before each measurement. Exact token IDs, runtime

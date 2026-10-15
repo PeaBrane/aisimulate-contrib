@@ -262,6 +262,55 @@ mod tests {
     }
 
     #[test]
+    fn bracketing_native_rows_do_not_establish_a_safe_kv_interpolation_interval() {
+        // These are deliberately synthetic timings, not silicon evidence. Even
+        // two neighboring measurements do not establish the omitted compressor,
+        // indexer and attention-planner execution identity at an interior point.
+        let mut left = key();
+        left.past_kv_tokens = 1022;
+        let mut right = left.clone();
+        right.past_kv_tokens = 1026;
+        let table = NativeDsv41Table {
+            path: None,
+            rows: OnceLock::from(Ok(BTreeMap::from([
+                (left.clone(), 2.0),
+                (right.clone(), 6.0),
+            ]))),
+        };
+        assert_eq!(table.query(&left).unwrap(), 2.0);
+        assert_eq!(table.query(&right).unwrap(), 6.0);
+        // Include both parities, a possible ring wrap, and either exterior.
+        for past in [1021, 1023, 1024, 1025, 1027] {
+            let mut missing = left.clone();
+            missing.past_kv_tokens = past;
+            assert!(matches!(
+                table.query(&missing),
+                Err(AicError::PerfDatabase(_))
+            ));
+        }
+        for axis in ["config", "layout", "owner", "replay", "sequence", "query"] {
+            let mut other = left.clone();
+            match axis {
+                "config" => other.scope.config_sha256 = "b".repeat(64),
+                "layout" => other.scope.kv_cache_layout = "sglang_584".into(),
+                "owner" => {
+                    other.scope.draft = true;
+                    other.scope.layer_id = 40;
+                    other.causal = false;
+                }
+                "replay" => other.scope.decoder_replay = false,
+                "sequence" => other.sequence_count = 4,
+                "query" => {
+                    other.query_width = 5;
+                    other.scope.query_tokens = 5;
+                }
+                _ => unreachable!(),
+            }
+            assert!(table.query(&other).is_err(), "must retain {axis} identity");
+        }
+    }
+
+    #[test]
     fn native_layer_rejects_wrong_runtime_local_compute_partial_ranks_and_duplicates() {
         for (revision, scope, ranks, duplicate) in [
             ("other", "dsv41_native_stage_inclusive", 4, false),

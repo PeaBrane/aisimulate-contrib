@@ -1350,6 +1350,15 @@ Additional original paths are `vllm/models/deepseek_v41/common/engram.py`,
 `vllm/models/deepseek_v41/nvidia/flashmla.py`,
 `vllm/v1/attention/backends/mla/sparse_swa.py`,
 `vllm/v1/worker/worker_base.py`, and `vllm/entrypoints/llm.py`.
+The KV-coverage audit and exact-only regression in
+`benchmarks/evidence/dspark-e2e-20261014/{COLLECTION.md,model-support.json}` and
+`crates/core/src/perfmodel/perf_database/dsv41_native.rs` also derive execution
+boundaries from the same pinned runtime's
+`vllm/models/deepseek_v41/{compressor,sparse_mla}.py` and
+`vllm/models/deepseek_v41/common/ops/fused_compress_quant_cache.py`.
+These are modified contract descriptions and original regression fixtures;
+the upstream kernels are not copied. Source revision and Apache-2.0 attribution
+are the same as the native observation adapters above.
 
 The native Kimi observation adapters `collect_kimi_native.py`,
 `kimi_native_contract.py`, `kimi_native_observer.py`, and
