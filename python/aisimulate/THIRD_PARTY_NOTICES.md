@@ -1360,8 +1360,9 @@ and native consumers `crates/core/src/perfmodel/operators/mla.rs`,
 `crates/core/src/perfmodel/perf_database/dsv41_native.rs`, independently adapt
 these same pinned execution contracts. They preserve per-module ownership,
 query geometry and collective boundaries; no serving kernels are copied.
-Additional original paths are `vllm/model_executor/layers/attention/mla_attention.py`
-`vllm/v1/worker/gpu/spec_decode/dspark/utils.py`, and
+Additional original paths are `vllm/model_executor/layers/attention/mla_attention.py`,
+`vllm/v1/attention/backends/mla/prefill/{selector,base,registry,trtllm_ragged}.py`,
+`vllm/config/attention.py`, `vllm/v1/worker/gpu/spec_decode/dspark/utils.py`, and
 `vllm/models/deepseek_v41/decoder_replay_layers.py`. These adapters and
 their derived contract documentation are modified. Copyright contributors to
 the vLLM project and NVIDIA CORPORATION & AFFILIATES. Apache-2.0.
@@ -1408,10 +1409,11 @@ source under `vllm/models/deepseek_v4/`. Copyright contributors to the vLLM
 project. Apache-2.0, source and license URLs above; no serving kernels are copied.
 
 The original CPU cache-receipt adapter
-`benchmarks/evidence/dspark-e2e-20261014/reconcile_pro_cache.py`, its tests and
-adjacent README adapt the shared allocation and scheduling contracts in
+`benchmarks/evidence/dspark-e2e-20261014/reconcile_pro_cache.py`, its tests,
+`agentx-pro-context-capacity-plan.json` and adjacent README adapt the shared
+allocation and scheduling contracts in
 `vllm/v1/kv_cache_interface.py`, `vllm/config/vllm.py`, and
-`vllm/v1/core/sched/scheduler.py` at revision
+`vllm/v1/core/{kv_cache_utils.py,sched/scheduler.py}` at revision
 `ac9126e58aa7bbab1856ba6593ba4d5003fea516` (source and license URLs above).
 These are modified derivations; no runtime allocator is copied. Copyright
 contributors to the vLLM project. Apache-2.0.

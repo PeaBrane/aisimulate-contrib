@@ -13,7 +13,7 @@ import inspect
 import json
 from pathlib import Path
 
-from collector.vllm.kimi_native_contract import physical_identity
+from collector.vllm.kimi_native_contract import PREFILL_BACKEND, physical_identity
 
 
 class KimiObserverWorker:
@@ -37,6 +37,7 @@ class KimiObserverWorker:
             or parallel.tensor_parallel_size != 8
             or parallel.enable_expert_parallel
             or not self.vllm_config.attention_config.use_prefill_query_quantization
+            or getattr(self.vllm_config.attention_config.mla_prefill_backend, "name", None) != PREFILL_BACKEND
         ):
             raise ValueError("native Kimi observer requires eager TP8 EP1 fixed DSpark K2 and FP8 prefill queries")
         torch = importlib.import_module("torch")
@@ -79,7 +80,11 @@ class KimiObserverWorker:
                 if kv_dtype not in ("fp8", "fp8_e4m3"):
                     raise ValueError(f"unsupported native MLA cache dtype: {kv_dtype}")
                 backend = layer.attn_backend.get_name()
+                if backend != "FLASHINFER_MLA" or layer.prefill_backend.get_name() != PREFILL_BACKEND:
+                    raise ValueError("native Kimi actual attention backend differs from the pinned contract")
                 if metadata.num_prefills:
+                    if metadata.prefill.q_data_type != torch.float8_e4m3fn:
+                        raise ValueError("native Kimi prefill metadata did not select FP8 queries")
                     prefill = layer.prefill_backend
                     backend += "/" + type(prefill).__module__ + "." + type(prefill).__qualname__
                 start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
@@ -99,6 +104,7 @@ class KimiObserverWorker:
                     "gemm_quant_mode": "bfloat16",
                     "kv_cache_dtype": "fp8",
                     "prefill_query_quantization": True,
+                    "prefill_backend": layer.prefill_backend.get_name(),
                     "kernel_source": backend,
                     "layer_name": layer.layer_name,
                     "gemm_reduce_scatter": layer.gemm_rs_ar is not None,

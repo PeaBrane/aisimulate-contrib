@@ -100,6 +100,19 @@ class CollectionTests(unittest.TestCase):
             config = json.loads(command[command.index("--speculative-config") + 1])
             self.assertEqual(config["synthetic_acceptance_length"], 3.77)
 
+    def test_kimi_fp8_prefill_uses_compatible_explicit_backend(self):
+        with (
+            patch("serve_smoke.inspect_checkpoint", return_value={"path": "/pinned/model"}),
+            patch("serve_smoke.checkpoint_path", return_value=Path("/pinned/draft")),
+        ):
+            command, _, _ = server_command("kimi-k3", 2, 8010)
+        config = json.loads(command[command.index("--attention-config") + 1])
+        self.assertTrue(config["use_prefill_query_quantization"])
+        self.assertEqual(config["mla_prefill_backend"], "TRTLLM_RAGGED")
+        self.assertEqual(command[command.index("--attention-backend") + 1], "FLASHINFER_MLA")
+        draft = json.loads(command[command.index("--speculative-config") + 1])
+        self.assertEqual(draft["attention_backend"], "FLASHINFER_MLA")
+
     def test_entrypoint_forwards_loader_and_internal_startup_deadline(self):
         with tempfile.TemporaryDirectory() as temp:
             argv = [

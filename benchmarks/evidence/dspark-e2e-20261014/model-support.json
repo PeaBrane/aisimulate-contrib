@@ -93,6 +93,63 @@
       "ep_support": "EP1 only; different collective ownership rejected",
       "prefill_query_precision": "FP8 after BF16 projection; use_prefill_query_quantization required and validated by producer and consumer",
       "loader_precision_identity_test": "passed"
+    },
+    "prefill_backend_audit": {
+      "status": "source-qualified explicit backend; installed hashes match; final API receipt and GPU smoke pending",
+      "failed_job": "790797",
+      "failed_run": "raw/kimi-query-prefill-failed-790797",
+      "failure": "Automatic FLASH_ATTN prefill is incompatible with plain FP8 KV query quantization; flag was present but effective query remained model dtype, triggering Kimi fused prefill assertion. No request measurements.",
+      "runtime_revision": "ac9126e58aa7bbab1856ba6593ba4d5003fea516",
+      "proposed_serving_and_collector_config": {
+        "attention_backend": "FLASHINFER_MLA",
+        "draft_attention_backend": "FLASHINFER_MLA",
+        "kv_cache_dtype": "fp8",
+        "attention_config": {
+          "use_prefill_query_quantization": true,
+          "mla_prefill_backend": "TRTLLM_RAGGED"
+        }
+      },
+      "proof": [
+        "prefill/selector.py prioritizes FLASH_ATTN for geometry128/64/128 on SM10; explicit override is validated and honored.",
+        "mla_attention.py backend_supports_prefill_query_quantization allows TRTLLM_RAGGED on capability family100, but excludes FLASH_ATTN.",
+        "prefill/trtllm_ragged.py declares geometry128/64/128 and SM10 support; actual dependency availability and GPU invocation require validation."
+      ],
+      "sources": [
+        {
+          "path": "vllm/config/attention.py",
+          "sha256": "07eed9b986d37c3bdb9c2f9a6bdea45e436fac824cd098a1e833a839e6bb6092"
+        },
+        {
+          "path": "vllm/model_executor/layers/attention/mla_attention.py",
+          "sha256": "b86871e2204c02f31fd37d6e63a330e73d96419cb239722ac6a1f5562e9c3df8"
+        },
+        {
+          "path": "vllm/v1/attention/backends/mla/prefill/__init__.py",
+          "sha256": "903630eb705dd175bf4ae4558a4bcaa07c110056b6a11eb830fdd2fb21b3c48a"
+        },
+        {
+          "path": "vllm/v1/attention/backends/mla/prefill/base.py",
+          "sha256": "138bf3ddaf5a94c3cdbc4e08ac676edcae84b32fc76625e546f3b47f7d8b82ec"
+        },
+        {
+          "path": "vllm/v1/attention/backends/mla/prefill/flash_attn.py",
+          "sha256": "5e648c82c82e5f81fe11458eb82b9f90b50fc06df2ade3bf111ee6b7a2ee8481"
+        },
+        {
+          "path": "vllm/v1/attention/backends/mla/prefill/registry.py",
+          "sha256": "c466be9527ed8e84f237b29583bd76a66452e7f43fa9289d1820f9649d6ba031"
+        },
+        {
+          "path": "vllm/v1/attention/backends/mla/prefill/selector.py",
+          "sha256": "85db3cb08715287aecf64d7f34bf86b58f18db53140185c49dc979d3537a0b28"
+        },
+        {
+          "path": "vllm/v1/attention/backends/mla/prefill/trtllm_ragged.py",
+          "sha256": "9e13ea6f6a25accedd918c0de64bbb812ccb20ffb95350ab018a6e76d493789b"
+        }
+      ],
+      "measurement_contract": "Target/draft FLASHINFER_MLA and TRTLLM_RAGGED prefill are fixed admitted identities. Observer checks actual selected backend and actual FP8 prefill query dtype. Other backend rows are rejected; no silent fallback or precision change.",
+      "installed_source_audit": "All six added/checked source files exactly match pinned upstream; exported by CPU791157 under raw/kimi-ragged-preflight. API receipt serialization failed after validation; corrected CPU receipt pending."
     }
   },
   "v41": {

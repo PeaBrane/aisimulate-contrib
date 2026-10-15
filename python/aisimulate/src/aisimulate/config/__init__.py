@@ -11,12 +11,25 @@ from .engine import (
     EnginePredictionConfig,
     EngineRecommendationConfig,
 )
-from .traffic import AgenticProfileOptions, AgenticSnapshotOptions, TrafficPredictionConfig, TrafficRecommendationConfig
+from .traffic import (
+    AgenticGraphIdentity,
+    AgenticGraphSource,
+    AgenticProfileOptions,
+    AgenticSampledLane,
+    AgenticSampledSnapshot,
+    AgenticSnapshotOptions,
+    TrafficPredictionConfig,
+    TrafficRecommendationConfig,
+)
 
 __all__ = [
     "AFDSearchRecommendationConfig",
     "AFDTopologyPredictionConfig",
+    "AgenticGraphIdentity",
+    "AgenticGraphSource",
     "AgenticProfileOptions",
+    "AgenticSampledLane",
+    "AgenticSampledSnapshot",
     "AgenticSnapshotOptions",
     "CorePredictionConfig",
     "CoreRecommendationConfig",

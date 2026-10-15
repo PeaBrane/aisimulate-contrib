@@ -25,7 +25,9 @@ Measured TTFT is 631.20 ms, TPOT 1.87 ms and throughput 402.25 tokens/s.
 Both requests returned exactly 1024 client-visible output tokens. This is a
 functional smoke, excluded from production MAPE; the measured request used a
 different P engine from warmup, so cold-peer setup may affect its latency.
-All 16 rank cache receipts, requests, metrics and logs are preserved in
+The [paired diagnostic](smoke-pro-pd/README.md) predicts TTFT 134.13 ms and
+TPOT 1.98 ms, with transfer latency explicitly unmodeled. All 16 rank cache
+receipts, requests, metrics and logs are preserved in
 `pd-smoke-2257933.tar.gz` (SHA256
 `7e055103aa13718e4fb837e64c5eee2d654a37a7d39ba4ac405acf6080a7c028`).
 Extract it at this directory to restore `raw/pd-2257933/`.
@@ -95,6 +97,16 @@ eight ranks' cache layouts. Production uses the pinned
 runtime's default graph policy after a separate graph smoke, with a fresh cache
 receipt and identity. Model/GPU identities are retained; resource retries are
 not treated as completed coverage.
+
+Kimi job790797 completed eager weight loading but failed before requests: the
+automatic MLA prefill backend could not quantize prefill queries for FP8 KV.
+The query-quantization flag was present; the backend also needs an explicit
+compatible selection. The failed launch and logs are retained in
+`kimi-prefill-failed-790797.tar.gz` (SHA256
+`95e17271eb1d6f60eadb81e359e2e8fd55b635f001665da4a23eed8d5e95bf6f`).
+It contributes zero measured requests and no accuracy result. The next serving
+and collector configurations explicitly pin `TRTLLM_RAGGED` prefill and
+`FLASHINFER_MLA` target/draft attention, with source/API checks before GPU retry.
 
 `reconcile_pro_cache.py` checks the Pro TP8/PP1 cache receipt against the pinned
 runtime's shared-pool contract. Tensor descriptors overlay one allocation;

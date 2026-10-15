@@ -398,7 +398,8 @@ pub struct AgenticPlayOutcome {
     pub failure_status: Option<crate::replay::ReplayTerminalStatus>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AgenticGraphIdentity {
     pub source: AgenticSourceProvenance,
     pub graph_digest: String,

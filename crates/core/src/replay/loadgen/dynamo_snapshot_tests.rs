@@ -55,7 +55,13 @@ fn graph() -> ValidatedAgenticGraph {
 fn dynamo_snapshot_uses_original_intervals_for_history_and_frontier() {
     let graph = graph();
     let prepared = graph
-        .prepare_snapshots(1, AgenticSnapshotOptions { seed: 42 })
+        .prepare_snapshots(
+            1,
+            AgenticSnapshotOptions {
+                seed: 42,
+                sampled: None,
+            },
+        )
         .unwrap();
     let sampled = &prepared.snapshots()[0];
     assert!((500.0..1500.0).contains(&sampled.t_star_ms));
@@ -125,7 +131,13 @@ fn dynamo_snapshot_uses_original_intervals_for_history_and_frontier() {
 #[test]
 fn dynamo_snapshot_live_dependencies_use_actual_completion_after_the_cut() {
     let prepared = graph()
-        .prepare_snapshots(1, AgenticSnapshotOptions { seed: 0 })
+        .prepare_snapshots(
+            1,
+            AgenticSnapshotOptions {
+                seed: 0,
+                sampled: None,
+            },
+        )
         .unwrap();
     for cut_ms in [600.0, 1000.0] {
         for speedup in [1.0, 2.0] {

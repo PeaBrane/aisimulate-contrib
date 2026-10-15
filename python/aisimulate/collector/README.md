@@ -658,6 +658,13 @@ Plain FP8 KV requires `attention_config.use_prefill_query_quantization=true`:
 the native prefill path casts projected Q/K/V to FP8. The collector sets and
 validates this policy and records it in the receipt and table; BF16 projection
 weights do not imply BF16 prefill attention inputs.
+Both serving and collection explicitly select `mla_prefill_backend=TRTLLM_RAGGED`
+with `FLASHINFER_MLA` target and draft attention. At the pinned revision, automatic
+selection chooses `FLASH_ATTN` for Kimi's 128/64/128 head geometry, but that
+backend cannot enable FP8 prefill queries. The selected TRT-LLM backend declares
+support for this geometry on SM10 devices. The observer checks the actual
+backend and prefill query dtype; imported tables admit only this explicit
+prefill backend. The failed automatic-selection run remains separate evidence.
 The default operator probe collects sequence counts 1 and 4 with 1056 output
 tokens. Its 32 extra tokens cover speculative lookahead at the end of the
 separate 1024-token E2E scoring window. Use `--sequence-counts` and
@@ -686,7 +693,9 @@ outside that interval fail explicitly. It is separate from historical partial
 MLA module tables. Measurements are operation coverage, not E2E accuracy results.
 
 The collector source hash manifest is derived from the immutable runtime files
-`vllm/models/kimi_k3/nvidia/{mla.py,model.py,dspark_mla.py}`. A runtime upgrade
+`vllm/models/kimi_k3/nvidia/{mla.py,model.py,dspark_mla.py}`, the shared MLA
+precision policy, attention configuration and MLA prefill selector/backend.
+The exported installed files match the pinned upstream hashes. A runtime upgrade
 requires a new source/metadata audit and regeneration of these hashes, rather than
 relaxing the source check. Initial GPU execution and consumer-query validation
 remain required before treating a newly collected table as qualified evidence.

@@ -82,7 +82,13 @@ fn request<'a>(play: &'a AgenticPlaySnapshot, source: &str) -> &'a AgenticSnapsh
 
 fn prepare(graph: &ValidatedAgenticGraph, cut: f64) -> AgenticPlaySnapshot {
     graph
-        .prepare_snapshots(1, AgenticSnapshotOptions { seed: 42 })
+        .prepare_snapshots(
+            1,
+            AgenticSnapshotOptions {
+                seed: 42,
+                sampled: None,
+            },
+        )
         .unwrap()
         .context()
         .prepare_play(0, 0, Some(cut))
@@ -141,7 +147,13 @@ fn full_play_start_handles_nonzero_source_clocks_without_changing_absolute_cuts(
     // Weka normalizes its nonzero source clock; Mooncake retains absolute starts.
     for (graph, first_ms) in [(mooncake, 10_000.0), (weka, 0.0)] {
         let prepared = graph
-            .prepare_snapshots(1, AgenticSnapshotOptions { seed: 42 })
+            .prepare_snapshots(
+                1,
+                AgenticSnapshotOptions {
+                    seed: 42,
+                    sampled: None,
+                },
+            )
             .unwrap();
         let context = prepared.context();
         let play = context.prepare_play_from_start(0, 1).unwrap();
@@ -402,10 +414,22 @@ fn cycle_graph() -> ValidatedAgenticGraph {
 fn seeded_snapshots_are_repeatable_and_cycle_lanes_without_completion_order() {
     let graph = cycle_graph();
     let first = graph
-        .prepare_snapshots(3, AgenticSnapshotOptions { seed: 42 })
+        .prepare_snapshots(
+            3,
+            AgenticSnapshotOptions {
+                seed: 42,
+                sampled: None,
+            },
+        )
         .unwrap();
     let second = graph
-        .prepare_snapshots(3, AgenticSnapshotOptions { seed: 42 })
+        .prepare_snapshots(
+            3,
+            AgenticSnapshotOptions {
+                seed: 42,
+                sampled: None,
+            },
+        )
         .unwrap();
     assert_eq!(
         serde_json::to_vec(first.snapshots()).unwrap(),
@@ -426,7 +450,13 @@ fn seeded_snapshots_are_repeatable_and_cycle_lanes_without_completion_order() {
             .all(|snapshot| (25.0..75.0).contains(&snapshot.t_star_ms))
     );
     let changed = graph
-        .prepare_snapshots(3, AgenticSnapshotOptions { seed: 43 })
+        .prepare_snapshots(
+            3,
+            AgenticSnapshotOptions {
+                seed: 43,
+                sampled: None,
+            },
+        )
         .unwrap();
     assert_ne!(
         first.snapshots()[0].t_star_ms,
@@ -466,7 +496,13 @@ fn seeded_snapshots_are_repeatable_and_cycle_lanes_without_completion_order() {
 fn single_start_and_missing_or_zero_api_duration_preserve_provenance() {
     let single = graph(vec![row("only", "main", 0.0, None)]);
     let prepared = single
-        .prepare_snapshots(2, AgenticSnapshotOptions { seed: 3 })
+        .prepare_snapshots(
+            2,
+            AgenticSnapshotOptions {
+                seed: 3,
+                sampled: None,
+            },
+        )
         .unwrap();
     for snapshot in prepared.snapshots() {
         assert_eq!(snapshot.t_star_ms, 0.0);
@@ -494,7 +530,13 @@ fn single_start_and_missing_or_zero_api_duration_preserve_provenance() {
 fn snapshots_retain_full_graph_outputs_and_logical_prompt_views() {
     let graph = boundary_graph();
     let prepared = graph
-        .prepare_snapshots(1, AgenticSnapshotOptions { seed: 8 })
+        .prepare_snapshots(
+            1,
+            AgenticSnapshotOptions {
+                seed: 8,
+                sampled: None,
+            },
+        )
         .unwrap();
     let zero = prepared.context().prepare_play(0, 0, Some(0.0)).unwrap();
     let cut = prepared.context().prepare_play(0, 0, Some(100.0)).unwrap();
@@ -583,7 +625,13 @@ fn encounter_allocated_prompt_preserves_full_width_source_ids_and_lane_offsets()
     authored.hash_ids = Some(vec![u64::MAX - 1, 0, 1_u64 << 32, u64::MAX, 7]);
     let graph = graph(vec![authored]);
     let prepared = graph
-        .prepare_snapshots(2, AgenticSnapshotOptions { seed: 42 })
+        .prepare_snapshots(
+            2,
+            AgenticSnapshotOptions {
+                seed: 42,
+                sampled: None,
+            },
+        )
         .unwrap();
     let play = prepared.context().prepare_play(0, 0, Some(0.0)).unwrap();
     let mut expected = [vec![0; 64], vec![1; 64], vec![2; 64], vec![3; 64]].concat();
@@ -601,11 +649,23 @@ fn invalid_snapshot_inputs_and_exhausted_identity_ranges_fail_before_execution()
     let graph = cycle_graph();
     assert!(
         graph
-            .prepare_snapshots(0, AgenticSnapshotOptions { seed: 1 })
+            .prepare_snapshots(
+                0,
+                AgenticSnapshotOptions {
+                    seed: 1,
+                    sampled: None
+                }
+            )
             .is_err()
     );
     let prepared = graph
-        .prepare_snapshots(2, AgenticSnapshotOptions { seed: 1 })
+        .prepare_snapshots(
+            2,
+            AgenticSnapshotOptions {
+                seed: 1,
+                sampled: None,
+            },
+        )
         .unwrap();
     let context = prepared.context();
     for cut in [-1.0, 101.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
@@ -625,7 +685,13 @@ fn invalid_snapshot_inputs_and_exhausted_identity_ranges_fail_before_execution()
     assert!(PreparedAgenticSnapshots::from_plays(Vec::new()).is_err());
     assert!(PreparedAgenticSnapshots::from_plays(vec![play.clone(), play.clone()]).is_err());
     let independent = graph
-        .prepare_snapshots(2, AgenticSnapshotOptions { seed: 1 })
+        .prepare_snapshots(
+            2,
+            AgenticSnapshotOptions {
+                seed: 1,
+                sampled: None,
+            },
+        )
         .unwrap();
     let other_context = independent.context().prepare_play(1, 0, Some(0.0)).unwrap();
     assert!(PreparedAgenticSnapshots::from_plays(vec![play.clone(), other_context]).is_err());
@@ -648,7 +714,13 @@ fn overflowing_recorded_intervals_and_dependency_deadlines_are_rejected() {
     ]);
     assert!(
         interval
-            .prepare_snapshots(1, AgenticSnapshotOptions { seed: 1 })
+            .prepare_snapshots(
+                1,
+                AgenticSnapshotOptions {
+                    seed: 1,
+                    sampled: None
+                }
+            )
             .is_err()
     );
     let root = row("first", "main", 0.0, Some(1.0e308));
@@ -662,7 +734,13 @@ fn overflowing_recorded_intervals_and_dependency_deadlines_are_rejected() {
     let deadline = graph(vec![root, last]);
     assert!(
         deadline
-            .prepare_snapshots(1, AgenticSnapshotOptions { seed: 1 })
+            .prepare_snapshots(
+                1,
+                AgenticSnapshotOptions {
+                    seed: 1,
+                    sampled: None
+                }
+            )
             .is_err()
     );
 }
@@ -679,7 +757,13 @@ fn historical_request_cannot_depend_on_a_request_not_started_at_the_cut() {
     ));
     let graph = graph(vec![source, historical]);
     let error = graph
-        .prepare_snapshots(1, AgenticSnapshotOptions { seed: 1 })
+        .prepare_snapshots(
+            1,
+            AgenticSnapshotOptions {
+                seed: 1,
+                sampled: None,
+            },
+        )
         .unwrap_err();
     assert!(
         error
@@ -946,7 +1030,13 @@ fn exact_agentic_tokens_survive_snapshot_recycling_and_primer_warmup() {
     future.not_before_ms = 100.0;
     let graph = graph(vec![history, future]);
     let context = graph
-        .prepare_snapshots(1, AgenticSnapshotOptions { seed: 42 })
+        .prepare_snapshots(
+            1,
+            AgenticSnapshotOptions {
+                seed: 42,
+                sampled: None,
+            },
+        )
         .unwrap()
         .context()
         .clone();
@@ -1061,4 +1151,218 @@ fn exact_agentic_tokens_reject_mixed_synthetic_identity_to_avoid_false_cache_hit
             ValidatedAgenticGraph::from_agentic_mooncake_rows(header.clone(), rows).unwrap_err();
         assert!(error.to_string().contains("cannot mix"));
     }
+}
+
+fn sampled_options(
+    graph: &ValidatedAgenticGraph,
+    lanes: Vec<AgenticSampledLane>,
+) -> AgenticSnapshotOptions {
+    AgenticSnapshotOptions {
+        seed: 42,
+        sampled: Some(AgenticSampledSnapshot {
+            graph: graph.identity(),
+            lanes,
+            provenance: BTreeMap::from([(
+                "producer_revision".into(),
+                "immutable-fixture-pin".into(),
+            )]),
+        }),
+    }
+}
+
+fn sampled_lane() -> AgenticSampledLane {
+    AgenticSampledLane {
+        lane_id: 0,
+        play_ordinal: 3,
+        source_play_id: "play".into(),
+        t_star_ms: 50.0,
+        session_ids: BTreeMap::from([("conversation".into(), "producer-session".into())]),
+    }
+}
+
+#[test]
+fn external_sampled_cut_preserves_pins_identity_timers_and_real_warmup() {
+    let graph = graph(vec![
+        row("history", "conversation", 0.0, Some(10.0)),
+        row("future", "conversation", 100.0, Some(10.0)),
+    ]);
+    let options = sampled_options(&graph, vec![sampled_lane()]);
+    let encoded = serde_json::to_string(&options).unwrap();
+    let decoded: AgenticSnapshotOptions = serde_json::from_str(&encoded).unwrap();
+    assert_eq!(options, decoded);
+    let prepared = graph.prepare_snapshots(1, decoded).unwrap();
+    let evidence = &prepared.snapshots()[0];
+    assert_eq!(evidence.t_star_ms, 50.0);
+    assert_eq!(evidence.play_ordinal, 3);
+    assert_eq!(evidence.graph, graph.identity());
+    assert_eq!(
+        evidence.sampled.as_ref().unwrap().session_ids["conversation"],
+        "producer-session"
+    );
+    assert_eq!(
+        evidence.sampling_provenance.as_ref().unwrap()["producer_revision"],
+        "immutable-fixture-pin"
+    );
+    assert!(
+        evidence
+            .requests
+            .iter()
+            .all(|request| request.identity.conversation_id == "producer-session")
+    );
+    assert_eq!(evidence.primers[0].conversation_id, "producer-session");
+    let mut profile =
+        WorkloadDriver::new_agentic_snapshots(prepared.clone(), 64, true, 1.0).unwrap();
+    assert!(profile.pop_ready(49.0, 1).is_empty());
+    let request = profile.pop_ready(50.0, 1).pop().unwrap();
+    assert_eq!(request.session_id, "producer-session");
+    assert_eq!(request.authored_request_id.as_deref(), Some("future"));
+    let mut warmup = WorkloadDriver::new_agentic_warmup(prepared, 64, true, 1.0).unwrap();
+    let primer = warmup.pop_ready(0.0, 1).pop().unwrap();
+    assert_eq!(primer.session_id, "producer-session");
+    assert_eq!(primer.request.max_output_tokens, 1);
+    assert!(warmup.agentic_phase_evidence().is_some());
+}
+
+#[test]
+fn external_sampled_cut_rejects_wrong_graph_play_lane_and_identity() {
+    let graph = graph(vec![
+        row("history", "conversation", 0.0, Some(1.0)),
+        row("future", "conversation", 100.0, Some(1.0)),
+    ]);
+    let mut bad_graph = sampled_options(&graph, vec![sampled_lane()]);
+    bad_graph.sampled.as_mut().unwrap().graph.source.digest = "wrong-pin".into();
+    assert!(
+        graph
+            .prepare_snapshots(1, bad_graph)
+            .unwrap_err()
+            .to_string()
+            .contains("graph identity")
+    );
+    for (lane, expected) in [
+        (
+            AgenticSampledLane {
+                source_play_id: "missing".into(),
+                ..sampled_lane()
+            },
+            "source_play_id",
+        ),
+        (
+            AgenticSampledLane {
+                lane_id: 1,
+                ..sampled_lane()
+            },
+            "lane_id",
+        ),
+        (
+            AgenticSampledLane {
+                t_star_ms: f64::NAN,
+                ..sampled_lane()
+            },
+            "cut must lie",
+        ),
+        (
+            AgenticSampledLane {
+                t_star_ms: 101.0,
+                ..sampled_lane()
+            },
+            "cut must lie",
+        ),
+        (
+            AgenticSampledLane {
+                session_ids: BTreeMap::from([("wrong-play-session".into(), "id".into())]),
+                ..sampled_lane()
+            },
+            "different source play",
+        ),
+        (
+            AgenticSampledLane {
+                session_ids: BTreeMap::from([("conversation".into(), " ".into())]),
+                ..sampled_lane()
+            },
+            "nonempty",
+        ),
+        (
+            AgenticSampledLane {
+                session_ids: BTreeMap::from([(
+                    "conversation".into(),
+                    "agentic-v1:collision".into(),
+                )]),
+                ..sampled_lane()
+            },
+            "reserved native identity",
+        ),
+    ] {
+        let error = graph
+            .prepare_snapshots(1, sampled_options(&graph, vec![lane]))
+            .unwrap_err();
+        assert!(error.to_string().contains(expected), "{error}");
+    }
+    let duplicate = vec![sampled_lane(), sampled_lane()];
+    assert!(
+        graph
+            .prepare_snapshots(2, sampled_options(&graph, duplicate))
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate lane")
+    );
+    let alias = vec![
+        sampled_lane(),
+        AgenticSampledLane {
+            lane_id: 1,
+            ..sampled_lane()
+        },
+    ];
+    assert!(
+        graph
+            .prepare_snapshots(2, sampled_options(&graph, alias))
+            .unwrap_err()
+            .to_string()
+            .contains("unique across lanes")
+    );
+}
+
+#[test]
+fn external_sampled_cut_selects_source_play_and_leaves_unmapped_ids_explicit() {
+    let first = row("first", "other", 0.0, Some(1.0));
+    let mut second = row("second", "future-session", 0.0, Some(1.0));
+    second.play_id = "second-play".into();
+    let graph = graph(vec![first, second]);
+    let lane = AgenticSampledLane {
+        source_play_id: "second-play".into(),
+        t_star_ms: 0.0,
+        session_ids: BTreeMap::new(),
+        ..sampled_lane()
+    };
+    let prepared = graph
+        .prepare_snapshots(1, sampled_options(&graph, vec![lane]))
+        .unwrap();
+    let evidence = &prepared.snapshots()[0];
+    assert_eq!(evidence.source_play_id, "second-play");
+    assert!(evidence.sampled.as_ref().unwrap().session_ids.is_empty());
+    assert!(
+        evidence.requests[0]
+            .identity
+            .conversation_id
+            .contains(":conversation:future-session")
+    );
+    let legacy = graph
+        .prepare_snapshots(
+            1,
+            AgenticSnapshotOptions {
+                seed: 42,
+                sampled: None,
+            },
+        )
+        .unwrap();
+    let serialized = serde_json::to_value(&legacy.snapshots()[0]).unwrap();
+    assert!(serialized.get("sampled").is_none());
+    assert!(serialized.get("sampling_provenance").is_none());
+    assert_eq!(
+        serde_json::to_value(AgenticSnapshotOptions {
+            seed: 42,
+            sampled: None
+        })
+        .unwrap(),
+        serde_json::json!({"seed":42})
+    );
 }

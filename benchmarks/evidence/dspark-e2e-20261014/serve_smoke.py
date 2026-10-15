@@ -91,7 +91,12 @@ def server_command(
     if model_key == "v4-pro":
         command += ["--attention-backend", "FLASHMLA_SPARSE_DSV4"]
     if model_key == "kimi-k3":
-        command += ["--attention-config", '{"use_prefill_query_quantization":true}']
+        command += [
+            "--attention-backend",
+            "FLASHINFER_MLA",
+            "--attention-config",
+            '{"use_prefill_query_quantization":true,"mla_prefill_backend":"TRTLLM_RAGGED"}',
+        ]
     if model_key == "v41-flash":
         command += [
             "--tokenizer-mode",

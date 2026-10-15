@@ -15,6 +15,7 @@ from pathlib import Path
 
 from collector.vllm.kimi_native_contract import (
     DRAFT_CONFIG_SHA256,
+    PREFILL_BACKEND,
     RUNTIME_REVISION,
     TARGET_CONFIG_SHA256,
     table_rows,
@@ -42,6 +43,7 @@ def run(args):
             "prefill_query_after_projection": "fp8",
             "kv_cache": "fp8",
             "prefill_query_quantization": True,
+            "prefill_backend": PREFILL_BACKEND,
         },
     }
     llm, installed = None, False
@@ -73,7 +75,15 @@ def run(args):
             "safetensors_load_strategy": "eager",
             "skip_tokenizer_init": True,
             "kv_cache_dtype": "fp8",
-            "attention_config": {"use_prefill_query_quantization": True},
+            "attention_backend": "FLASHINFER_MLA",
+            # Match the explicit serving configuration. At ac9126,
+            # prefill/selector.py:151-171 honors this override and
+            # mla_attention.py:1882-1912 excludes automatic FLASH_ATTN
+            # from FP8 prefill query support on Blackwell.
+            "attention_config": {
+                "use_prefill_query_quantization": True,
+                "mla_prefill_backend": PREFILL_BACKEND,
+            },
             "enforce_eager": True,
             "enable_prefix_caching": False,
             "max_model_len": 16384,

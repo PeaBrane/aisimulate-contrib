@@ -314,6 +314,11 @@ Kimi FP8 KV requires `attention_config.use_prefill_query_quantization=true` in
 the pinned runtime. The first eager startup reached native warmup and rejected
 the missing flag; its failure is retained. Corrected launches explicitly enable
 it, preserving BF16 projection weights and the runtime's FP8 prefill query path.
+Attempt790797 completed weight loading but showed that the default `FLASH_ATTN`
+MLA prefill selector still rejects FP8 query execution. The next candidate pins
+`mla_prefill_backend: TRTLLM_RAGGED` with query quantization enabled, and
+`FLASHINFER_MLA` for target and draft attention. CPU configuration/source checks
+precede another GPU attempt; this is not yet a successful Kimi measurement.
 
 ## Phase B AgentX entrypoint
 
@@ -366,6 +371,17 @@ uv pip install --python /work/agentx-venv/bin/python -e /work/dspark-agentx-plug
 Inside an already allocated, pinned-image worker, the following starts an
 aggregated Pro service; it does not submit a job. Run only after the context
 identity change and matching anchor are selected for that deployment.
+
+`agentx-pro-context-capacity-plan.json` records a source-derived 1M-context
+startup calculation using the measured Pro P/D storage geometry. The installed
+cache-interface and allocation sources match the pinned upstream hashes.
+At an 8192-token scheduling budget, one maximum-length request requires about
+14.42 GiB, below the observed D pool's 42.03 GiB. P has about 10.22 GiB; a
+2048-token P budget reduces the startup requirement to about 7.74 GiB. This is
+only a launch candidate: context changes can alter graph/activation reservation,
+so both effective pools must be remeasured. It does not qualify concurrent
+AgentX cache occupancy or prefix reuse. A new fixed-length anchor must retain
+the candidate context and role-specific budgets; do not change an active run.
 
 ```bash
 python serve_role.py --model-key v4-pro --role agg --k 6 --port 8010 \
@@ -601,10 +617,13 @@ parse, external plugin resolution and CPU tests. The original fixtures cover a
 live fork/join handoff, dependency/marker preservation, missing and invalid IDs,
 context overflow, duplicate raw records and truncated JSONL. No GPU profile or
 paired AgentX result is claimed. Remaining native consumer work is explicit:
-AgenticMooncake now accepts exact input/output token arrays as well as hash-based
-prefixes, but not an externally supplied sampled frontier; captured dependencies/idle caps,
+AgenticMooncake accepts exact input/output token arrays as well as hash-based
+prefixes. The canonical snapshot API also accepts externally selected initial
+source plays, cuts and producer session mappings, bound to the full source graph
+identity and retained provenance. It executes native warmup rather than restoring
+a captured post-warmup frontier or cache. Captured dependencies/idle caps,
 recycling and stop/cancellation cohorts still need canonical graph lowering and
-integration tests. `capture-audit.json` therefore always remains unscored.
+a comparison of the actual native warmup frontier with the producer handoff. `capture-audit.json` therefore always remains unscored.
 
 Capture API anchors are
 [SemiAnalysisAI/aiperf@754356e9](https://github.com/SemiAnalysisAI/aiperf/tree/754356e9a39acc6cc6afb242d123bb57c3fb6f75/src/aiperf):

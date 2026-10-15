@@ -2829,3 +2829,133 @@ def test_agentic_exact_tokens_native_rejects_ambiguous_or_invalid_rows(tmp_path,
                 }
             )
         )
+
+
+def _sampled_snapshot_fixture():
+    return {
+        "seed": 42,
+        "sampled": {
+            "graph": {
+                "source": {"format": "original-test", "digest": "immutable-corpus-pin"},
+                "graph_digest": "a" * 64,
+                "block_size": 4,
+                "node_count": 2,
+                "play_count": 1,
+                "source_models": ["test-model"],
+            },
+            "lanes": [
+                {
+                    "lane_id": 0,
+                    "play_ordinal": 3,
+                    "source_play_id": "play",
+                    "t_star_ms": 50.0,
+                    "session_ids": {"source-session": "producer-session"},
+                }
+            ],
+            "provenance": {"producer_revision": "immutable-producer-pin"},
+        },
+    }
+
+
+def test_external_sampled_snapshot_python_roundtrip_and_runner_forwarding():
+    from aisimulate.config.traffic import AgenticSnapshotOptions
+
+    options = _sampled_snapshot_fixture()
+    typed = AgenticSnapshotOptions.model_validate(options)
+    assert AgenticSnapshotOptions.model_validate_json(typed.model_dump_json()).model_dump(mode="json") == options
+    runtime = RecordingRuntime()
+    EngineReplayRunnerFactory(runtime=runtime).create(0).run(
+        _spec(
+            workload={
+                "source_type": "trace",
+                "load_type": "trace_timestamps",
+                "trace_path": "corpus",
+                "trace_format": "agentic_mooncake",
+                "agentic_lanes": 1,
+                "agentic_snapshot": options,
+            }
+        )
+    )
+    assert runtime.execution_spec["traffic"]["agentic_snapshot"] == options
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("lane_id", True),
+        ("play_ordinal", -1),
+        ("t_star_ms", float("inf")),
+        ("session_ids", {"source-session": 12}),
+        ("unknown_field", 1),
+    ],
+)
+def test_external_sampled_snapshot_rejects_malformed_values_before_native(field, value):
+    options = _sampled_snapshot_fixture()
+    options["sampled"]["lanes"][0][field] = value
+    runtime = RecordingRuntime()
+    with pytest.raises(ValueError, match="agentic_snapshot"):
+        EngineReplayRunnerFactory(runtime=runtime).create(0).run(
+            _spec(
+                workload={
+                    "source_type": "trace",
+                    "load_type": "trace_timestamps",
+                    "trace_path": "corpus",
+                    "trace_format": "agentic_mooncake",
+                    "agentic_lanes": 1,
+                    "agentic_snapshot": options,
+                }
+            )
+        )
+    assert runtime.execution_spec is None
+
+
+def test_external_sampled_snapshot_native_uses_supplied_cut_and_graph_identity(tmp_path):
+    pytest.importorskip("aisimulate._runtime")
+    path = tmp_path / "sampled.jsonl"
+    header = {
+        "schema": "dynamo.agentic_mooncake",
+        "version": 2,
+        "block_size": 4,
+        "hash_id_scope": "local",
+        "source": {"format": "original-test", "digest": "immutable-fixture"},
+    }
+    rows = [header] + [
+        {
+            "request_id": name,
+            "play_id": "play",
+            "session_id": "source-session",
+            "model": "test-model",
+            "input_length": 8,
+            "input_token_ids": list(range(8)),
+            "output_length": 1,
+            "output_token_ids": [20],
+            "not_before_ms": at_ms,
+            "recorded_api_time_ms": 5,
+        }
+        for name, at_ms in [("history", 0), ("future", 100)]
+    ]
+    path.write_text("\n".join(map(json.dumps, rows)) + "\n")
+    workload = {
+        "source_type": "trace",
+        "load_type": "trace_timestamps",
+        "trace_path": str(path),
+        "trace_format": "agentic_mooncake",
+        "agentic_lanes": 1,
+        "agentic_snapshot": {"seed": 42},
+    }
+    runner = EngineReplayRunnerFactory().create(0)
+    baseline = runner.run(_spec(deployment=_inline_token_deployment("agg"), workload=workload))
+    options = _sampled_snapshot_fixture()
+    options["sampled"]["graph"] = baseline.metadata["agentic_snapshots"][0]["graph"]
+    workload = {**workload, "agentic_snapshot": options, "agentic_warmup": True}
+    result = runner.run(_spec(deployment=_inline_token_deployment("agg"), workload=workload))
+    snapshot = result.metadata["agentic_snapshots"][0]
+    assert snapshot["t_star_ms"] == 50
+    assert snapshot["play_ordinal"] == 3
+    assert snapshot["sampled"] == options["sampled"]["lanes"][0]
+    assert snapshot["sampling_provenance"] == options["sampled"]["provenance"]
+    assert all(request["identity"]["conversation_id"] == "producer-session" for request in snapshot["requests"])
+    assert result.metadata["agentic_phases"]["profile_start_ms"] > 0
+    options["sampled"]["graph"]["source"]["digest"] = "changed-corpus"
+    with pytest.raises(RuntimeError, match="graph identity does not match"):
+        runner.run(_spec(deployment=_inline_token_deployment("agg"), workload=workload))

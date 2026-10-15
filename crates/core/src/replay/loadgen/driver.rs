@@ -5328,7 +5328,13 @@ mod tests {
         )
         .unwrap();
         let prepared = graph
-            .prepare_snapshots(lanes, AgenticSnapshotOptions { seed: 42 })
+            .prepare_snapshots(
+                lanes,
+                AgenticSnapshotOptions {
+                    seed: 42,
+                    sampled: None,
+                },
+            )
             .unwrap();
         // Tests start at the source origin, independently of initial cut sampling.
         let plays = (0..lanes)

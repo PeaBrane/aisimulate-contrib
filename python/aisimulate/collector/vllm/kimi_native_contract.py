@@ -15,6 +15,8 @@ from statistics import median
 RUNTIME_REVISION = "ac9126e58aa7bbab1856ba6593ba4d5003fea516"
 TARGET_CONFIG_SHA256 = "9710e121a58d03ac92c8d6da287a19541994319afbbe6d6202af001ffd379213"
 DRAFT_CONFIG_SHA256 = "5a3c2f4f91c965ed93b14de5f12a4e9c17fd98d8c99916ed2deb26ce8702f970"
+PREFILL_BACKEND = "TRTLLM_RAGGED"
+PREFILL_KERNEL = "FLASHINFER_MLA/vllm.v1.attention.backends.mla.prefill.trtllm_ragged.TrtllmRaggedPrefillBackend"
 
 
 def physical_identity(row):
@@ -54,6 +56,8 @@ def physical_identity(row):
         raise ValueError("initial native Kimi collector requires actual BF16 projections and FP8 cache")
     if row["prefill_query_quantization"] is not True:
         raise ValueError("native Kimi FP8 cache requires FP8 prefill queries after BF16 projections")
+    if row.get("prefill_backend") != PREFILL_BACKEND:
+        raise ValueError("native Kimi requires the explicit TRTLLM_RAGGED prefill backend")
     if row["tp_size"] != 8 or row["num_heads"] != (8 if draft else 12):
         raise ValueError("native Kimi MLA head geometry mismatch")
     return {
@@ -112,6 +116,10 @@ def table_rows(rank_payloads, sequence_counts=(1,)):
             raise ValueError("native MLA kernel identity changes within a physical timing key")
         kernels[key] = kernel
         physical[(identity, total, kernel)].append(max(v[3] for v in ranks.values()))
+    for identity, _, kernel in physical:
+        expected = PREFILL_KERNEL if json.loads(identity)["is_context"] else "FLASHINFER_MLA"
+        if json.loads(kernel)["attention"] != expected:
+            raise ValueError("native MLA actual kernel differs from the pinned attention backend")
     rows = [
         {
             "identity": identity,
@@ -122,6 +130,7 @@ def table_rows(rank_payloads, sequence_counts=(1,)):
             "rank_count": 8,
             "use_cuda_graph": False,
             "prefill_query_quantization": True,
+            "prefill_backend": PREFILL_BACKEND,
             "runtime_revision": RUNTIME_REVISION,
             "measurement_scope": "kimi_native_mla_inclusive",
             "target_config_sha256": TARGET_CONFIG_SHA256,

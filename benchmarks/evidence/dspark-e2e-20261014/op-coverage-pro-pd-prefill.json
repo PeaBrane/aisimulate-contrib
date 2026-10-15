@@ -2780,5 +2780,81 @@
     "paired_measurement_records": 0,
     "mape": null,
     "missing_query_errors": []
+  },
+  "uneven_dp_cost_model_cause": {
+    "status": "source-proven approximation; not a missing-table or pair-identity gate",
+    "runtime_revision": "ac9126e58aa7bbab1856ba6593ba4d5003fea516",
+    "runtime_sources": [
+      {
+        "path": "vllm/v1/worker/gpu/dp_utils.py",
+        "sha256": "b81a663c7e736f93c7be6ff7b6facebeb93ee4a52c280163b2ba9146fe33c341",
+        "anchors": "157-172 eager keeps actual rank counts; 178-211 graph synchronizes padded count"
+      },
+      {
+        "path": "vllm/v1/worker/gpu_worker.py",
+        "sha256": "9621d277b53ef85e7b9611d1c148d079babfa1d8233b09309c19a7ee32c080f1",
+        "anchors": "1390-1392 idle dummy starts with one token"
+      },
+      {
+        "path": "vllm/v1/worker/gpu/model_runner.py",
+        "sha256": "5fdae42c96977ddbdc2bf1363a5f16b0760a2288a68991ece31c9537932fd1a8",
+        "anchors": "818-828 uniform dummy raises count to K+1"
+      },
+      {
+        "path": "vllm/distributed/device_communicators/all2all.py",
+        "sha256": "88c58190bc524b1be8505a981adbad0c2b74a76c5a701fb7c393d75b614e443c",
+        "anchors": "72-82 DPMetadata sizes; 125-137 variable all-gather"
+      },
+      {
+        "path": "vllm/forward_context.py",
+        "sha256": "8dab5a4dee60e46c4e52821667321c9f05c793578af49cddbdb204cf9324c403",
+        "anchors": "81-125 DPMetadata preserves per-rank counts"
+      }
+    ],
+    "runtime_log": {
+      "path": "raw/pd-2257933/prefill.log",
+      "sha256": "6604143182c9608a19c61b9325d2cee40b5fb58ddc702e1b085db057061fbbc9",
+      "max_graph_capture_tokens": 896,
+      "max_num_batched_tokens": 8192,
+      "collective": "AgRsAll2AllManager; MoEPrepareAndFinalizeNaiveDPEPModular"
+    },
+    "cost_contract": "Current MoeOp multiplies local token count by attention_dp_size=8; independent Replay rank execution does not expose the synchronized sum of actual expert-token counts.",
+    "examples": [
+      {
+        "active_dp_ranks": 1,
+        "local_prompt_tokens": 1024,
+        "idle_rank_dummy_tokens": 7,
+        "source_derived_expert_input_rows": 1073,
+        "current_active_rank_model_rows": 8192
+      },
+      {
+        "active_dp_ranks": 4,
+        "local_prompt_tokens": 1024,
+        "idle_rank_dummy_tokens": 7,
+        "source_derived_expert_input_rows": 4124,
+        "current_active_rank_model_rows": 8192
+      },
+      {
+        "active_dp_ranks": 1,
+        "local_prompt_tokens": 8192,
+        "idle_rank_dummy_tokens": 7,
+        "source_derived_expert_input_rows": 8241,
+        "current_active_rank_model_rows": 65536
+      },
+      {
+        "active_dp_ranks": 4,
+        "local_prompt_tokens": 8192,
+        "idle_rank_dummy_tokens": 7,
+        "source_derived_expert_input_rows": 32796,
+        "current_active_rank_model_rows": 65536
+      }
+    ],
+    "example_scope": "Homogeneous simultaneous active prefill ranks, remaining ranks in uniform dummy execution. Source-derived shape examples, not measured schedule reconstruction. ISL1024/8192 exceed graph capture896, so eager DP synchronization keeps unequal counts.",
+    "limitations": [
+      "Actual arrival/rank synchronization and mixed prefill/decode steps may differ from examples.",
+      "Draft proposal has separate DP synchronization and is not corrected by a target-prefill ratio.",
+      "Graph-mode steps pad counts across ranks and must retain their distinct policy."
+    ],
+    "future_fix": "Grouped-rank step preparation with an explicit global expert-token count separate from local attention tokens. No DP1 substitution, fitted factor, or parallel API added."
   }
 }

@@ -6,9 +6,9 @@
 from __future__ import annotations
 
 import math
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, field_validator, model_serializer, model_validator
 
 from .common import Choices, IntegerRange, NumericRange, StrictModel
 
@@ -111,10 +111,50 @@ class TrafficStop(StrictModel):
     max_virtual_time_seconds: PositiveFloat | None = None
 
 
+class AgenticGraphSource(StrictModel):
+    format: Annotated[str, Field(strict=True, min_length=1)]
+    digest: Annotated[str, Field(strict=True, min_length=1)]
+
+
+class AgenticGraphIdentity(StrictModel):
+    source: AgenticGraphSource
+    graph_digest: Annotated[str, Field(strict=True, min_length=1)]
+    block_size: PositiveInt
+    node_count: PositiveInt
+    play_count: PositiveInt
+    source_models: list[Annotated[str, Field(strict=True)]]
+
+
+class AgenticSampledLane(StrictModel):
+    lane_id: NonNegativeInt
+    play_ordinal: Annotated[int, Field(strict=True, ge=0, le=0xFFFF_FFFF_FFFF_FFFF)]
+    source_play_id: Annotated[str, Field(strict=True, min_length=1)]
+    t_star_ms: NonNegativeFloat
+    session_ids: dict[Annotated[str, Field(strict=True)], Annotated[str, Field(strict=True)]] = Field(
+        default_factory=dict
+    )
+
+
+class AgenticSampledSnapshot(StrictModel):
+    graph: AgenticGraphIdentity
+    lanes: list[AgenticSampledLane]
+    provenance: dict[Annotated[str, Field(strict=True)], Annotated[str, Field(strict=True)]] = Field(
+        default_factory=dict
+    )
+
+
 class AgenticSnapshotOptions(StrictModel):
-    """Seed for deterministic initial AgentX request-boundary snapshots."""
+    """Seeded or externally selected initial cuts; Rust validates graph membership."""
 
     seed: int = Field(strict=True, ge=0, le=0xFFFF_FFFF_FFFF_FFFF)
+    sampled: AgenticSampledSnapshot | None = None
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_sampled(self, handler: Any) -> dict[str, Any]:
+        payload = handler(self)
+        if payload.get("sampled") is None:
+            payload.pop("sampled", None)
+        return payload
 
 
 class AgenticProfileOptions(StrictModel):

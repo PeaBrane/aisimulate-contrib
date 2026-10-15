@@ -125,5 +125,65 @@
       "git diff --check passed"
     ],
     "serving_scope": "One qualified production pair (128 requests) plus three one-request diagnostic smokes. First P/D smoke completed; production P/D and AgentX scoring remain pending."
+  },
+  "sampled_cut_checkpoint": {
+    "base_revision": "9e0338ed5ac588bd07aa547dc5a95f78992398ef",
+    "native_sha256": "789bf1c1873ddf3d3a9c129e5df9bcbe1440c7cdfb08f7876bf282d0ecae287d",
+    "checks": [
+      {
+        "check": "Rust workspace",
+        "log_sha256": "08c0a32ea62253b796b09b8a3c7b854502732d4c7c86050ae6e2256210393011",
+        "results": [
+          "test result: ok. 2007 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 90.35s",
+          "test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.54s",
+          "test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s",
+          "test result: ok. 53 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s",
+          "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s",
+          "test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s",
+          "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s",
+          "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s",
+          "test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s",
+          "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s"
+        ]
+      },
+      {
+        "check": "Python complete Runner API",
+        "log_sha256": "d8ed1035f06881d6b9b8bd8f72c8d4d9c9e23f44285fc0d189dd7ac43c02c00b",
+        "results": [
+          "498 passed in 15.49s"
+        ]
+      },
+      {
+        "check": "Kimi backend and collection contracts",
+        "log_sha256": "73a1c37d18290a4ee6cde9e5331947782f68de9f7b24444240482261c5c76fb7",
+        "results": [
+          "28 passed in 0.21s"
+        ]
+      },
+      {
+        "check": "Rust public API",
+        "log_sha256": "060fb5d5c812420db6c28c3b9ffcff18c963e7a5d1203dfc4d8ebe36d0661066",
+        "results": [
+          "test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+        ]
+      }
+    ],
+    "additional_checks": [
+      "Rust loadgen 201 passed",
+      "Legacy CLI snapshot and recommendation configuration 20 passed",
+      "Affected Python Ruff check/format passed",
+      "cargo fmt passed",
+      "Packaged legal copies match",
+      "Release artifact contract check-only passed"
+    ],
+    "scope": "Initial external cuts and session mapping are functional. Full producer warmup frontier/recycling alignment and AgentX paired scoring remain unfinished. One production fixed-length pair remains qualified; PD smoke prediction is diagnostic only."
   }
 }

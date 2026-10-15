@@ -71,7 +71,7 @@ the current SA convention.
 | `traffic.load.fraction` | `null` | `-` | `-` | Positive finite number; `kv_capacity_fraction` only and may exceed `1`. |
 | `traffic.load.speedup` | `1` | `-` | `-` | Positive; trace timestamp load only. |
 | `traffic.load.agentic_lanes` | `null` | `x` | `-` | Positive integer; `weka`, `agentic_mooncake`, or agentic `dynamo` timestamp replay only. |
-| `traffic.load.agentic_snapshot` | `null` (unset) | `x` | `-` | Optional object `{seed: u64}`; required `seed` is an unsigned 64-bit integer (`0` through `2^64 - 1`). Requires `traffic.load.type: trace_timestamps` and positive `agentic_lanes`; supported formats are `weka`, `agentic_mooncake`, and agentic `dynamo`. Unset preserves turn-zero execution. See [snapshot](#agentic-snapshot). |
+| `traffic.load.agentic_snapshot` | `null` (unset) | `x` | `-` | Optional object `{seed: u64, sampled?: object}`; required `seed` is an unsigned 64-bit integer (`0` through `2^64 - 1`). Requires `traffic.load.type: trace_timestamps` and positive `agentic_lanes`; supported formats are `weka`, `agentic_mooncake`, and agentic `dynamo`. Unset preserves turn-zero execution. See [snapshot](#agentic-snapshot). |
 | `traffic.load.agentic_warmup` | `false` | `x` | `-` | Optional boolean; `true` requires `agentic_snapshot` and positive `agentic_lanes`. Primes caches before measurement; see [warmup](#agentic-warmup). |
 | `traffic.load.agentic_warmup_policy` | `primer` | `x` | `-` | `primer` repeats saved prefixes; `live_trajectories` advances one-token live requests through the DAG. The live policy requires `agentic_warmup: true` and `agentic_profile`. |
 | `traffic.load.agentic_profile` | `null` (unset) | `x` | `-` | Optional object; `{}` enables continuous lane replenishment with the defaults below. Requires `trace_timestamps`, positive `agentic_lanes`, and `agentic_snapshot`; cannot be combined with `traffic.stop.max_virtual_time_seconds`. Unset preserves finite replay. See [continuous profile](#agentic-profile). |
@@ -320,6 +320,45 @@ integer.
 A snapshot is cut at request boundaries. It does not model partial decode
 progress or restore an engine checkpoint: without warmup, the caches start
 empty.
+
+To use an external sampler's initial selection, set `agentic_snapshot.sampled`.
+Rust validates the complete source graph identity before applying any selection.
+Use `ValidatedAgenticGraph::identity()` from the native importer, or the `graph`
+object in `agentic_snapshots` from a prior run of that exact graph. Do not invent
+or copy a digest from a different corpus revision. The seed remains part of
+native incarnation identity; the supplied cuts replace only the initial random
+selection. Future recycling retains the configured native policy.
+
+| `agentic_snapshot.sampled` field | Required | Semantics |
+|---|---|---|
+| `graph` | Yes | Complete native identity: `source: {format, digest}`, `graph_digest`, `block_size`, `node_count`, `play_count`, and `source_models`. Every field must equal the loaded graph. |
+| `lanes` | Yes | Exactly one initial selection for each configured lane; order is immaterial. |
+| `provenance` | No | String map of immutable producer, corpus and runtime pins. Keys and values must be nonempty. Retained in snapshot evidence; it does not select or download runtime/model revisions. |
+
+| Each `sampled.lanes[]` field | Required | Semantics |
+|---|---|---|
+| `lane_id` | Yes | Unique integer in `[0, agentic_lanes)`. |
+| `play_ordinal` | Yes | Unsigned incarnation ordinal; existing request/token namespace limits apply. Does not imply that prior incarnations have warmed cache. |
+| `source_play_id` | Yes | Known source graph play. Different lanes may select the same source play. |
+| `t_star_ms` | Yes | Finite cut within that play's first/last recorded request starts, in the graph's source-clock coordinates before `speedup`. |
+| `session_ids` | No | Source conversation ID to producer correlation ID. Keys must belong to the selected play; values must be nonempty and unique across selected lanes. The `agentic-v1:` prefix is reserved for native IDs. |
+
+The selected source, cut, complete mapping and provenance are retained in each
+snapshot's `sampled` and `sampling_provenance` fields; default seed-only evidence
+omits those fields. Supplied conversation IDs propagate to request and primer
+identities. Unmapped conversations keep visibly native-generated IDs. A partial
+map is valid for simulation, but measured scoring must verify the actual
+producer identity for **every measured request**; native-generated IDs are not
+silently qualified as producer matches. Session mapping alone does not establish
+request-payload, output-stop or acceptance equivalence.
+
+This input does not restore an arbitrary warmup frontier, branch state or cache.
+With warmup enabled, Replay executes preparation from the selected initial cut;
+compare its resulting dependency frontier against the captured producer
+handoff before scoring. Dependency completion and residual source-clock delays
+drive Replay. Measured dispatch/response timestamps are never imported as an
+arrival schedule. Exact token inputs must already include the appropriate
+per-incarnation cache markers; changing session IDs does not rewrite tokens.
 
 <a id="agentic-warmup"></a>
 

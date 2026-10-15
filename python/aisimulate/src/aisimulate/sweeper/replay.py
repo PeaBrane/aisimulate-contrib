@@ -16,7 +16,7 @@ from typing import Any, Protocol, runtime_checkable
 from pydantic import BaseModel
 
 from ..config.common import ENGINE_MODEL_CONTROL_FIELDS, is_active_engine_model_control
-from ..config.traffic import AgenticProfileOptions
+from ..config.traffic import AgenticProfileOptions, AgenticSnapshotOptions
 from ..fpm_profile import load_fpm_profile
 from ..power import POWER_FIELDS, normalize_power_summary
 from .provider import AdapterReplaySpec, JSONValue, RuntimeHookSpec
@@ -520,13 +520,12 @@ class RunnerCapabilities:
             if not self.supports_agentic_warmup:
                 raise ValueError("runner does not support agentic warmup")
         if agentic_snapshot is not None:
-            if (
-                not isinstance(agentic_snapshot, Mapping)
-                or set(agentic_snapshot) != {"seed"}
-                or type(agentic_snapshot["seed"]) is not int
-                or not 0 <= agentic_snapshot["seed"] <= 0xFFFF_FFFF_FFFF_FFFF
-            ):
-                raise ValueError("agentic_snapshot requires exactly one unsigned 64-bit integer seed")
+            if not isinstance(agentic_snapshot, Mapping):
+                raise ValueError("agentic_snapshot requires an unsigned 64-bit integer seed and optional sampled cuts")
+            try:
+                AgenticSnapshotOptions.model_validate(agentic_snapshot)
+            except ValueError as error:
+                raise ValueError(f"invalid agentic_snapshot: {error}") from error
             if agentic_lanes is None or spec.workload.get("load_type") != "trace_timestamps":
                 raise ValueError("agentic_snapshot requires trace_timestamps load with positive agentic_lanes")
             if spec.workload.get("source_type") != "trace" or spec.workload.get("replay_concurrency") is not None:

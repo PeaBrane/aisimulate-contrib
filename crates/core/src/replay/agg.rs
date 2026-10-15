@@ -1709,7 +1709,13 @@ mod agentic_warmup_tests {
         )
         .unwrap();
         let prepared = graph
-            .prepare_snapshots(1, AgenticSnapshotOptions { seed: 42 })
+            .prepare_snapshots(
+                1,
+                AgenticSnapshotOptions {
+                    seed: 42,
+                    sampled: None,
+                },
+            )
             .unwrap();
         let play = prepared.context().prepare_play(0, 0, Some(50.0)).unwrap();
         let driver = WorkloadDriver::new_agentic_warmup_with_policy(
@@ -1914,7 +1920,13 @@ mod agentic_warmup_tests {
         )
         .unwrap();
         let prepared = graph
-            .prepare_snapshots(1, AgenticSnapshotOptions { seed: 42 })
+            .prepare_snapshots(
+                1,
+                AgenticSnapshotOptions {
+                    seed: 42,
+                    sampled: None,
+                },
+            )
             .unwrap();
         let play = prepared.context().prepare_play_from_start(0, 0).unwrap();
         let driver = WorkloadDriver::new_agentic_snapshots(

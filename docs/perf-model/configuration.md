@@ -160,6 +160,10 @@ weight inventory retain that BF16 identity; an FP8 MLA table cannot match it.
 With plain FP8 KV, the pinned native prefill path quantizes projected Q/K/V to
 FP8 and requires `use_prefill_query_quantization=true`. This fixed native scope
 uses BF16 projection weights and FP8 prefill attention inputs, separately.
+The admitted native table also pins `TRTLLM_RAGGED` prefill and
+`FLASHINFER_MLA` target/draft attention. The serving configuration must select
+this prefill backend explicitly: the pinned automatic `FLASH_ATTN` selection
+cannot enable FP8 prefill queries. Other prefill backends cannot reuse these rows.
 This native DSpark path currently requires EP1; expert/sequence parallel
 collective ownership needs separately qualified measurements.
 Only total KV length interpolates, within the measured interval; widths,

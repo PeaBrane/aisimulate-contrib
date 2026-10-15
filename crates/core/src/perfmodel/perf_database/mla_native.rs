@@ -123,6 +123,7 @@ impl NativeMlaTable {
         let ranks = reader.col("rank_count")?;
         let graph = reader.col("use_cuda_graph")?;
         let prefill_quant = reader.col("prefill_query_quantization")?;
+        let prefill_backend = reader.col("prefill_backend")?;
         let mut image_identity: Option<String> = None;
         let mut raw: BTreeMap<NativeMlaKey, BTreeMap<u32, LeafValue>> = BTreeMap::new();
         for row in reader.rows()? {
@@ -142,6 +143,7 @@ impl NativeMlaTable {
                 || row.u32(ranks)? != 8
                 || row.bool_strict(graph)?
                 || !row.bool_strict(prefill_quant)?
+                || row.str(prefill_backend)? != "TRTLLM_RAGGED"
             {
                 return Err(invalid(
                     "native MLA runtime, scope or kernel identity mismatch",
@@ -156,6 +158,22 @@ impl NativeMlaTable {
             image_identity = Some(digest.to_owned());
             let key: NativeMlaKey = serde_json::from_str(&row.str_owned(identity)?)
                 .map_err(|e| invalid(e.to_string()))?;
+            let kernel: serde_json::Value =
+                serde_json::from_str(row.str(source)?).map_err(|e| invalid(e.to_string()))?;
+            let expected_attention = if key.is_context {
+                "FLASHINFER_MLA/vllm.v1.attention.backends.mla.prefill.trtllm_ragged.TrtllmRaggedPrefillBackend"
+            } else {
+                "FLASHINFER_MLA"
+            };
+            if kernel.get("attention").and_then(serde_json::Value::as_str)
+                != Some(expected_attention)
+                || kernel
+                    .get("gemm_reduce_scatter")
+                    .and_then(serde_json::Value::as_bool)
+                    .is_none()
+            {
+                return Err(invalid("native MLA attention backend identity mismatch"));
+            }
             let total = row.u32(kv)?;
             let value = row.f64(latency)?;
             if key.causal == key.draft
@@ -206,11 +224,65 @@ mod tests {
     #[test]
     fn native_mla_loader_requires_pinned_precision_configs_and_all_ranks() {
         let identity = r#"{"draft":true,"causal":false,"is_context":false,"query_tokens":2,"sequence_count":1,"num_heads":8,"tensor_parallel_size":8,"kv_cache_dtype":"fp8","gemm_quant_mode":"bfloat16"}"#;
-        for (prefill_quant, target_hash, ranks, valid) in [
-            (true, TARGET_CONFIG_SHA256, 8, true),
-            (false, TARGET_CONFIG_SHA256, 8, false),
-            (true, "other-checkpoint", 8, false),
-            (true, TARGET_CONFIG_SHA256, 7, false),
+        let valid_kernel = r#"{"attention":"FLASHINFER_MLA","gemm_reduce_scatter":false}"#;
+        let other_kernel = r#"{"attention":"FLASH_ATTN","gemm_reduce_scatter":false}"#;
+        for (prefill_quant, prefill_backend, target_hash, ranks, kernel, valid) in [
+            (
+                true,
+                "TRTLLM_RAGGED",
+                TARGET_CONFIG_SHA256,
+                8,
+                valid_kernel,
+                true,
+            ),
+            (
+                true,
+                "TRTLLM_RAGGED",
+                TARGET_CONFIG_SHA256,
+                8,
+                other_kernel,
+                false,
+            ),
+            (
+                false,
+                "TRTLLM_RAGGED",
+                TARGET_CONFIG_SHA256,
+                8,
+                valid_kernel,
+                false,
+            ),
+            (
+                true,
+                "FLASH_ATTN",
+                TARGET_CONFIG_SHA256,
+                8,
+                valid_kernel,
+                false,
+            ),
+            (
+                true,
+                "FLASHINFER",
+                TARGET_CONFIG_SHA256,
+                8,
+                valid_kernel,
+                false,
+            ),
+            (
+                true,
+                "TRTLLM_RAGGED",
+                "other-checkpoint",
+                8,
+                valid_kernel,
+                false,
+            ),
+            (
+                true,
+                "TRTLLM_RAGGED",
+                TARGET_CONFIG_SHA256,
+                7,
+                valid_kernel,
+                false,
+            ),
         ] {
             let root = tempfile::tempdir().unwrap();
             let path = root.path().join(BASENAME);
@@ -222,7 +294,7 @@ mod tests {
                     Col::F64("latency", vec![1.0]),
                     Col::Str("runtime_revision", vec![RUNTIME_REVISION]),
                     Col::Str("measurement_scope", vec!["kimi_native_mla_inclusive"]),
-                    Col::Str("kernel_source", vec!["FLASHINFER_MLA"]),
+                    Col::Str("kernel_source", vec![kernel]),
                     Col::Str("target_config_sha256", vec![target_hash]),
                     Col::Str("draft_config_sha256", vec![DRAFT_CONFIG_SHA256]),
                     Col::Str(
@@ -235,6 +307,7 @@ mod tests {
                     Col::I64("rank_count", vec![ranks]),
                     Col::Bool("use_cuda_graph", vec![false]),
                     Col::Bool("prefill_query_quantization", vec![prefill_quant]),
+                    Col::Str("prefill_backend", vec![prefill_backend]),
                 ],
             );
             let table = NativeMlaTable {

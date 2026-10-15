@@ -24,10 +24,36 @@ use crate::replay::AgenticRuntimeIdentity;
 
 pub const AGENTIC_SNAPSHOT_SCHEMA_V1: &str = "aisimulate.agentic.snapshot.v1";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgenticSnapshotOptions {
     pub seed: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampled: Option<AgenticSampledSnapshot>,
+}
+
+/// An external sampler's selected initial cuts, not a saved engine frontier.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgenticSampledSnapshot {
+    pub graph: AgenticGraphIdentity,
+    pub lanes: Vec<AgenticSampledLane>,
+    /// Immutable producer/corpus/runtime pins supplied by the capture adapter.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub provenance: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgenticSampledLane {
+    pub lane_id: usize,
+    pub play_ordinal: u64,
+    pub source_play_id: String,
+    pub t_star_ms: f64,
+    /// Source conversation -> producer correlation ID. Unmapped sessions keep
+    /// native IDs and must not be called producer-matched by a scoring adapter.
+    #[serde(default)]
+    pub session_ids: BTreeMap<String, String>,
 }
 
 /// Recorded provenance and the independent benchmark request boundary.
@@ -67,6 +93,10 @@ pub struct AgenticSnapshotEvidence {
     pub recorded_last_start_ms: f64,
     pub requests: Vec<AgenticSnapshotRequest>,
     pub primers: Vec<AgenticPrimer>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sampled: Option<AgenticSampledLane>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sampling_provenance: Option<BTreeMap<String, String>>,
 }
 
 /// Immutable corpus compilation retained by all views of a replay instance.
@@ -229,14 +259,105 @@ impl ValidatedAgenticGraph {
             recorded_intervals,
             token_stride,
         });
-        let plays = (0..lanes)
-            .map(|lane| context.prepare_play(lane, 0, None))
-            .collect::<Result<Vec<_>>>()?;
+        let plays = if let Some(sampled) = options.sampled {
+            context.prepare_sampled_lanes(sampled)?
+        } else {
+            (0..lanes)
+                .map(|lane| context.prepare_play(lane, 0, None))
+                .collect::<Result<Vec<_>>>()?
+        };
         PreparedAgenticSnapshots::from_plays(plays)
     }
 }
 
 impl AgenticReplayContext {
+    fn prepare_sampled_lanes(
+        self: &Arc<Self>,
+        sampled: AgenticSampledSnapshot,
+    ) -> Result<Vec<AgenticPlaySnapshot>> {
+        if sampled.graph != self.graph_identity {
+            bail!("sampled snapshot graph identity does not match the loaded source graph");
+        }
+        if sampled.lanes.len() != self.lanes {
+            bail!("sampled snapshot must specify exactly one selection per configured lane");
+        }
+        if sampled
+            .provenance
+            .iter()
+            .any(|(key, value)| key.trim().is_empty() || value.trim().is_empty())
+        {
+            bail!("sampled snapshot provenance pins must be nonempty");
+        }
+        let mut lane_ids = BTreeSet::new();
+        let mut producer_ids = BTreeSet::new();
+        let by_play = self
+            .graph
+            .plays
+            .iter()
+            .enumerate()
+            .map(|(index, play)| (play.play_id.as_str(), index))
+            .collect::<FxHashMap<_, _>>();
+        let mut plays = Vec::with_capacity(self.lanes);
+        for selection in sampled.lanes {
+            if selection.lane_id >= self.lanes || !lane_ids.insert(selection.lane_id) {
+                bail!("sampled snapshot has an invalid or duplicate lane_id");
+            }
+            let index = *by_play
+                .get(selection.source_play_id.as_str())
+                .context("sampled snapshot references unknown source_play_id")?;
+            let sessions = self.graph.plays[index]
+                .nodes
+                .iter()
+                .map(|&node| self.graph.nodes[node].session_id.as_str())
+                .collect::<BTreeSet<_>>();
+            for (source, producer) in &selection.session_ids {
+                if !sessions.contains(source.as_str()) {
+                    bail!(
+                        "sampled session identity belongs to an unknown or different source play"
+                    );
+                }
+                if producer.trim().is_empty() || !producer_ids.insert(producer.clone()) {
+                    bail!("sampled producer session IDs must be nonempty and unique across lanes");
+                }
+                if producer.starts_with("agentic-v1:") {
+                    bail!(
+                        "sampled producer session ID uses the reserved native identity namespace"
+                    );
+                }
+            }
+            let mut play = self.prepare_play_with_cut(
+                selection.lane_id,
+                selection.play_ordinal,
+                PlayCut::Absolute(selection.t_star_ms),
+                Some(index),
+            )?;
+            // Apply identities only after cut validation. No source timestamps,
+            // dependencies, prompt tokens or physical cache state are modified.
+            for request in &mut play.evidence.requests {
+                let source_index = self.index_by_id[&request.source_request_id];
+                if let Some(producer) = selection
+                    .session_ids
+                    .get(&self.graph.nodes[source_index].session_id)
+                {
+                    request.identity.conversation_id = producer.clone();
+                }
+            }
+            for primer in &mut play.evidence.primers {
+                let source_index = self.index_by_id[&primer.source_request_id];
+                if let Some(producer) = selection
+                    .session_ids
+                    .get(&self.graph.nodes[source_index].session_id)
+                {
+                    primer.conversation_id = producer.clone();
+                }
+            }
+            play.evidence.sampled = Some(selection);
+            play.evidence.sampling_provenance = Some(sampled.provenance.clone());
+            plays.push(play);
+        }
+        plays.sort_by_key(|play| play.evidence.lane_id);
+        Ok(plays)
+    }
     pub fn graph_identity(&self) -> AgenticGraphIdentity {
         self.graph_identity.clone()
     }
@@ -394,6 +515,8 @@ impl AgenticReplayContext {
                 recorded_last_start_ms: last,
                 requests: Vec::new(),
                 primers: Vec::new(),
+                sampled: None,
+                sampling_provenance: None,
             },
         };
         let index_by_id = play
@@ -494,7 +617,12 @@ impl AgenticPlaySnapshot {
         format!("{}:request:{source}", self.evidence.play_id)
     }
     fn instance_conversation_id(&self, source: &str) -> String {
-        format!("{}:conversation:{source}", self.evidence.play_id)
+        self.evidence
+            .sampled
+            .as_ref()
+            .and_then(|selection| selection.session_ids.get(source))
+            .cloned()
+            .unwrap_or_else(|| format!("{}:conversation:{source}", self.evidence.play_id))
     }
     pub(super) fn source_index(&self, request_id: &str) -> Result<usize> {
         self.context

@@ -408,7 +408,13 @@ fn agentx_g2_restores_evicted_parent_after_tool_gap_and_join(
 
 fn g2_snapshot_driver(warmup: bool, from_start: bool) -> WorkloadDriver {
     let prepared = g2_graph()
-        .prepare_snapshots(1, AgenticSnapshotOptions { seed: 42 })
+        .prepare_snapshots(
+            1,
+            AgenticSnapshotOptions {
+                seed: 42,
+                sampled: None,
+            },
+        )
         .unwrap();
     let play = if from_start {
         prepared.context().prepare_play_from_start(0, 0).unwrap()
@@ -555,7 +561,13 @@ fn snapshot_pin_report(
     disaggregated: bool,
 ) -> ReplayReport {
     let prepared = graph
-        .prepare_snapshots(3, AgenticSnapshotOptions { seed: 42 })
+        .prepare_snapshots(
+            3,
+            AgenticSnapshotOptions {
+                seed: 42,
+                sampled: None,
+            },
+        )
         .unwrap();
     // "profile" profiles after warmup; "profile-cold" profiles straight from
     // the snapshot without warmup's timer rebasing.

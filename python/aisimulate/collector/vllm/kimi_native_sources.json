@@ -2,5 +2,10 @@
   "vllm.models.kimi_k3.nvidia.mla": "613d03689525acadbd3c9d271ede3615fe043ff9417dfb1230a7d86581cf336a",
   "vllm.models.kimi_k3.nvidia.model": "2b1d9629f810926a98e9ae05582afcceda02e372bb0a4afd7aa95c60d4931c74",
   "vllm.models.kimi_k3.nvidia.dspark_mla": "adfe621d7fbb89616e207118000c9f61201b2ff4af9b8d43387d71eec0344121",
-  "vllm.model_executor.layers.attention.mla_attention": "b86871e2204c02f31fd37d6e63a330e73d96419cb239722ac6a1f5562e9c3df8"
+  "vllm.model_executor.layers.attention.mla_attention": "b86871e2204c02f31fd37d6e63a330e73d96419cb239722ac6a1f5562e9c3df8",
+  "vllm.v1.attention.backends.mla.prefill.selector": "85db3cb08715287aecf64d7f34bf86b58f18db53140185c49dc979d3537a0b28",
+  "vllm.v1.attention.backends.mla.prefill.base": "138bf3ddaf5a94c3cdbc4e08ac676edcae84b32fc76625e546f3b47f7d8b82ec",
+  "vllm.v1.attention.backends.mla.prefill.registry": "c466be9527ed8e84f237b29583bd76a66452e7f43fa9289d1820f9649d6ba031",
+  "vllm.v1.attention.backends.mla.prefill.trtllm_ragged": "9e13ea6f6a25accedd918c0de64bbb812ccb20ffb95350ab018a6e76d493789b",
+  "vllm.config.attention": "07eed9b986d37c3bdb9c2f9a6bdea45e436fac824cd098a1e833a839e6bb6092"
 }

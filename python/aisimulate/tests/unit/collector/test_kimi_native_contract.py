@@ -5,7 +5,7 @@ import copy
 import json
 
 import pytest
-from collector.vllm.kimi_native_contract import physical_identity, table_rows
+from collector.vllm.kimi_native_contract import PREFILL_KERNEL, physical_identity, table_rows
 
 pytestmark = pytest.mark.unit
 
@@ -24,9 +24,10 @@ def row(draft=False, width=3, prefill=False):
         "gemm_quant_mode": "bfloat16",
         "kv_cache_dtype": "fp8",
         "prefill_query_quantization": True,
+        "prefill_backend": "TRTLLM_RAGGED",
         "sample_id": "0",
         "invocation_id": 0,
-        "kernel_source": "FLASHINFER_MLA",
+        "kernel_source": PREFILL_KERNEL if prefill else "FLASHINFER_MLA",
         "gemm_reduce_scatter": not draft,
         "latency_ms": 1.0,
     }
@@ -58,6 +59,8 @@ def test_width_sequence_causal_and_kv_are_distinct():
         {"causal": 1},
         {"num_prefills": -1, "num_decodes": 2},
         {"prefill_query_quantization": False},
+        {"prefill_backend": "FLASH_ATTN"},
+        {"prefill_backend": None},
     ],
 )
 def test_wrong_native_contract_fails(change):
@@ -103,3 +106,8 @@ def test_rank_aggregation_does_not_sum_layers_or_ranks():
         table_rows(broken)
     with pytest.raises(ValueError, match="sequence-count"):
         table_rows(payloads, sequence_counts=(1, 4))
+    broken = copy.deepcopy(payloads)
+    for payload in broken:
+        payload["rows"][0]["kernel_source"] = "FLASHINFER_MLA/FlashAttention"
+    with pytest.raises(ValueError, match="actual kernel"):
+        table_rows(broken)
