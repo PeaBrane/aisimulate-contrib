@@ -6,6 +6,7 @@ import dataclasses
 import hashlib
 import io
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -13,7 +14,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from acceptance import measured_acceptance
-from campaign import cells
+from campaign import MODELS, cells
 from collect_fixed import one_request
 from freeze_acceptance import freeze
 from pd_driver import load_role_receipts, selected_windows
@@ -21,6 +22,7 @@ from runtime_receipt import DsparkReceiptWorker, primitive
 from serve_role import main as role_main
 from serve_smoke import main as serve_main
 from serve_smoke import server_command
+from window_plan import execute_runs, select_runs
 
 
 def snapshot(rounds, proposed, accepted, positions):
@@ -37,6 +39,164 @@ def snapshot(rounds, proposed, accepted, positions):
 
 
 class CollectionTests(unittest.TestCase):
+    def selection_args(self, **overrides):
+        return SimpleNamespace(
+            **{
+                "model_key": "v4-pro",
+                "k": 6,
+                "mode": "sweep",
+                "cell_id": None,
+                "window": None,
+                "input_length": None,
+                "concurrency": None,
+                "repetition": None,
+                "completed_runs": None,
+                **overrides,
+            }
+        )
+
+    def test_full_matrix_selection_and_completed_exclusion(self):
+        plans = []
+        for model_key, model in MODELS.items():
+            for k in model["k"]:
+                for deployment in ["agg", "disagg"]:
+                    for acceptance in ["real", "synthetic"]:
+                        plans += select_runs(self.selection_args(model_key=model_key, k=k), deployment, acceptance)
+        self.assertEqual(len(plans), 588)
+        self.assertEqual(len({r["cell"]["cell_id"] for r in plans}), 196)
+        self.assertEqual(sum(r["cell"]["expected_requests"] for r in plans), 153600)
+        with tempfile.TemporaryDirectory() as temp:
+            done = Path(temp) / "completed.json"
+            done.write_text(
+                json.dumps(
+                    {
+                        "schema": "dspark-completed-runs-v1",
+                        "completed": [
+                            {"cell_id": r["cell"]["cell_id"], "repetition": r["repetition"]} for r in plans[:13]
+                        ],
+                    }
+                )
+            )
+            remaining = []
+            for model_key, model in MODELS.items():
+                for k in model["k"]:
+                    for deployment in ["agg", "disagg"]:
+                        for acceptance in ["real", "synthetic"]:
+                            remaining += select_runs(
+                                self.selection_args(model_key=model_key, k=k, completed_runs=done),
+                                deployment,
+                                acceptance,
+                            )
+            self.assertEqual(len(remaining), 575)
+            self.assertFalse(
+                {(r["cell"]["cell_id"], r["repetition"]) for r in plans[:13]}
+                & {(r["cell"]["cell_id"], r["repetition"]) for r in remaining}
+            )
+            with self.assertRaises(ValueError):
+                select_runs(self.selection_args(mode="pilot", completed_runs=done), "agg", "real")
+
+    def test_expanded_anchor_selection_and_family_guard(self):
+        args = self.selection_args(input_length=[8192], concurrency=[8])
+        selected = select_runs(args, "disagg", "real")
+        self.assertEqual(len(selected), 3)
+        self.assertTrue(all(r["cell"]["input_length"] == 8192 and r["cell"]["concurrency"] == 8 for r in selected))
+        self.assertEqual(select_runs(args, "agg", "real"), [])
+        args.cell_id = ["v41-flash-agg-k5-i1024-o1024-c1-real"]
+        with self.assertRaises(ValueError):
+            select_runs(args, "disagg", "real")
+        with self.assertRaises(ValueError):
+            select_runs(self.selection_args(mode="initial", input_length=[8192]), "agg", "real")
+
+    def test_sweep_smoke_failure_prevents_production(self):
+        plan = select_runs(self.selection_args(input_length=[8192], concurrency=[64], repetition=[1]), "agg", "real")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            with (
+                patch("window_plan.subprocess.run", side_effect=subprocess.CalledProcessError(1, ["client"])) as run,
+                self.assertRaises(subprocess.CalledProcessError),
+            ):
+                execute_runs(
+                    plan,
+                    mode="sweep",
+                    output=root,
+                    source_dir=Path(__file__).parent,
+                    model_key="v4-pro",
+                    k=6,
+                    identity_path=root / "identity.json",
+                    endpoint="http://localhost",
+                    metrics_urls=["http://localhost/metrics"],
+                )
+            self.assertEqual(run.call_count, 1)
+            state = json.loads((root / "window-status.json").read_text())["windows"]
+            self.assertEqual([r["status"] for r in state], ["failed", "pending"])
+            self.assertEqual(state[1]["cell"]["expected_requests"], 640)
+
+    def test_sweep_executes_exact_matrix_windows_after_smoke(self):
+        plan = select_runs(self.selection_args(input_length=[8192], concurrency=[64], repetition=[1]), "agg", "real")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+
+            def fake_run(command, check):
+                if Path(command[1]).name == "collect_fixed.py":
+                    destination = Path(command[command.index("--output") + 1])
+                    destination.mkdir()
+                    count = 1 if "--smoke" in command else 640
+                    (destination / "summary.json").write_text(
+                        json.dumps(
+                            {"status": "success", "metrics": {"completed_requests": count, "failed_requests": 0}}
+                        )
+                    )
+
+            with patch("window_plan.subprocess.run", side_effect=fake_run) as run:
+                rows = execute_runs(
+                    plan,
+                    mode="sweep",
+                    output=root,
+                    source_dir=Path(__file__).parent,
+                    model_key="v4-pro",
+                    k=6,
+                    identity_path=root / "identity.json",
+                    endpoint="http://localhost",
+                    metrics_urls=["http://localhost/metrics"],
+                )
+            self.assertEqual(run.call_count, 4)
+            self.assertEqual([r["status"] for r in rows], ["success", "success"])
+            self.assertEqual(rows[1]["output"], "sweep-i8192-o1024-c64-r1")
+
+    def test_role_forwards_loader_timeout_and_asymmetric_batch_context(self):
+        with tempfile.TemporaryDirectory() as temp:
+            argv = [
+                "serve_role.py",
+                "--model-key",
+                "v4-pro",
+                "--role",
+                "prefill",
+                "--k",
+                "6",
+                "--port",
+                "8010",
+                "--output",
+                temp,
+                "--preflight-only",
+                "--context-length",
+                "1048576",
+                "--max-batched-tokens",
+                "2048",
+                "--load-strategy",
+                "eager",
+                "--startup-timeout",
+                "6000",
+            ]
+            with (
+                patch("sys.argv", argv),
+                patch("serve_role.server_command", return_value=(["server"], {}, {})) as build,
+            ):
+                role_main()
+            self.assertEqual(build.call_args.kwargs["max_batched_tokens"], 2048)
+            self.assertEqual(build.call_args.kwargs["context_length"], 1048576)
+            self.assertEqual(build.call_args.kwargs["load_strategy"], "eager")
+            self.assertEqual(build.call_args.kwargs["startup_timeout_s"], 6000)
+
     def test_explicit_windows_resume_without_repeating_completed_point(self):
         windows = [(1, 2), (1, 3), (4, 1), (4, 2), (4, 3)]
         self.assertEqual(selected_windows("initial", windows=windows), windows)

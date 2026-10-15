@@ -423,8 +423,9 @@
     "loader_sha256": "d2bd051eb17b60c89d64701ea08ab9f37da422c351ed6640b1628427356e164f"
   },
   "remaining_execution_gates": [
-    "Actual qualified prefix-disabled fixed pairs with the same context limit, separately for each model/deployment/concurrency.",
-    "Pinned native formatter/source context preflight; Pro witness is available. Native runtime validates every sampled request without truncation/filtering."
+    "Native functional prefix-disabled1M fixed anchors with matching runtime/context/role scheduling limits and explicit acceptance control, per model/deployment/concurrency. Collection-only does not require Replay qualification.",
+    "Pinned native formatter/source preflight witnesses now available for Pro, V41 and Kimi. Runtime must validate sampled requests without truncation/filtering; unsampled payloads remain unverified.",
+    "Actual prefix-enabled all-worker receipts; full profiles additionally require reviewed actual C1/C4 native pilot lifecycle evidence."
   ],
   "remaining_scoring_gates": [
     "Actual sampled snapshot/frontier, generated token/prefix identity, warmup cleanup, acceptance/routing and metric cohort parity."
@@ -443,5 +444,6 @@
   "native_context_preflight": {
     "path": "agentx-context-preflight-pro.json",
     "sha256": "670adcc8e90da5c065f66bd9860883c090bf4386b0ca5c0f9a72bf6c57bbd0bb"
-  }
+  },
+  "collection_readiness": "agentx-collection-readiness.json"
 }

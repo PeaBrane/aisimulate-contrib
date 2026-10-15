@@ -25,6 +25,9 @@ def main():
     acceptance.add_argument("--synthetic-control", type=Path)
     parser.add_argument("--prefix-cache", action="store_true")
     parser.add_argument("--context-length", type=int, default=16384)
+    parser.add_argument("--max-batched-tokens", type=int, default=8192)
+    parser.add_argument("--load-strategy", choices=["eager"])
+    parser.add_argument("--startup-timeout", type=int, default=3600)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.90)
     parser.add_argument("--observe-source-pool", action="store_true")
     parser.add_argument(
@@ -35,6 +38,8 @@ def main():
     parser.add_argument("--preflight-only", action="store_true", help="Resolve identity without GPU access")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    if args.startup_timeout <= 0:
+        parser.error("startup timeout must be positive")
     if args.k not in MODELS[args.model_key]["k"]:
         parser.error("K must belong to the approved matrix")
     if args.observe_source_pool and (args.model_key != "v4-pro" or args.role == "agg" or args.prefix_cache):
@@ -75,6 +80,9 @@ def main():
         prefix_cache=args.prefix_cache,
         context_length=args.context_length,
         gpu_memory_utilization=args.gpu_memory_utilization,
+        max_batched_tokens=args.max_batched_tokens,
+        load_strategy=args.load_strategy,
+        startup_timeout_s=args.startup_timeout,
     )
     observer = {"enabled": args.observe_source_pool}
     if args.observe_source_pool:
@@ -105,6 +113,7 @@ def main():
                         "VLLM_SERVER_DEV_MODE",
                         "VLLM_USE_V2_MODEL_RUNNER",
                         "VLLM_USE_RUST_FRONTEND",
+                        "VLLM_ENGINE_READY_TIMEOUT_S",
                         "AISIM_POOL_OBSERVER_DIR",
                         "AISIM_POOL_OBSERVER_ROLE",
                         "AISIM_POOL_OBSERVER_RUN_ID",

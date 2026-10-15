@@ -10,7 +10,15 @@ from pathlib import Path
 from unittest.mock import patch
 
 from agentx_context_audit import inspect_requests
-from agentx_phaseb import CORPUS, context_gate, fixed_gate, producer_command
+from agentx_phaseb import (
+    CORPUS,
+    PRODUCER,
+    acceptance_contract,
+    context_gate,
+    fixed_gate,
+    producer_command,
+    profile_gate,
+)
 from agentx_server import validate_role
 from campaign import IMAGE, MODELS, RUNTIME_REVISION, cells
 from compare import CONTRACT, METRICS
@@ -34,7 +42,15 @@ class PhaseBTests(unittest.TestCase):
             "model": MODELS["v4-pro"],
             "image": IMAGE,
             "runtime_revision": RUNTIME_REVISION,
-            "server_command": ["serve", "--max-model-len", "16384"],
+            "server_command": [
+                "serve",
+                "--max-model-len",
+                "16384",
+                "--max-num-seqs",
+                "64",
+                "--max-num-batched-tokens",
+                "8192",
+            ],
             "phase": "initial",
         }
         (root / "identity.json").write_text(json.dumps(identity))
@@ -87,6 +103,67 @@ class PhaseBTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "prediction_unqualified"):
                 fixed_gate([pair], "v4-pro", "agg", 6, (1,))
 
+    def test_collection_gate_accepts_native_anchor_without_simulator_capacity_proof(self):
+        with tempfile.TemporaryDirectory() as directory:
+            measured, predicted = self.pair(Path(directory) / "native")
+            predicted.unlink()
+            identity_path = measured.parent / "identity.json"
+            identity = json.loads(identity_path.read_text())
+            identity["server_command"] = [
+                "serve",
+                "--max-model-len",
+                "1048576",
+                "--max-num-seqs",
+                "64",
+                "--max-num-batched-tokens",
+                "8192",
+                "--no-enable-prefix-caching",
+                "--speculative-config",
+                json.dumps({"method": "dspark", "num_speculative_tokens": 6, "enable_adaptive_verification": False}),
+            ]
+            identity_path.write_text(json.dumps(identity))
+            record = json.loads(measured.read_text())
+            record["identity_sha256"] = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+            record["qualification"] = {"eligible": False, "reasons": ["Replay grouped cache is unsupported"]}
+            measured.write_text(json.dumps(record))
+            result = fixed_gate([(measured, None)], "v4-pro", "agg", 6, (1,), collection_only=True)
+            self.assertEqual(result[0]["gate"], "native_functional_collection")
+            self.assertFalse(result[0]["prefix_cache"])
+            self.assertEqual(result[0]["max_model_len"], 1048576)
+            self.assertEqual(len(result[0]["artifacts"]), 3)
+            with self.assertRaisesRegex(ValueError, "measurement_unqualified"):
+                fixed_gate([(measured, None)], "v4-pro", "agg", 6, (1,))
+            record["metrics"]["failed_requests"] = 1
+            measured.write_text(json.dumps(record))
+            with self.assertRaisesRegex(ValueError, "native fixed anchor is incomplete"):
+                fixed_gate([(measured, None)], "v4-pro", "agg", 6, (1,), collection_only=True)
+
+    def test_collection_gate_rejects_prefix_enabled_or_adaptive_anchor(self):
+        with tempfile.TemporaryDirectory() as directory:
+            measured, _ = self.pair(Path(directory) / "native")
+            path = measured.parent / "identity.json"
+            identity = json.loads(path.read_text())
+            for prefix, adaptive, error in [
+                ("--enable-prefix-caching", False, "disable prefix caching"),
+                ("--no-enable-prefix-caching", True, "matching fixed DSpark"),
+            ]:
+                identity["server_command"] = [
+                    "serve",
+                    "--max-model-len",
+                    "1048576",
+                    prefix,
+                    "--speculative-config",
+                    json.dumps(
+                        {"method": "dspark", "num_speculative_tokens": 6, "enable_adaptive_verification": adaptive}
+                    ),
+                ]
+                path.write_text(json.dumps(identity))
+                record = json.loads(measured.read_text())
+                record["identity_sha256"] = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+                measured.write_text(json.dumps(record))
+                with self.assertRaisesRegex(ValueError, error):
+                    fixed_gate([(measured, None)], "v4-pro", "agg", 6, (1,), collection_only=True)
+
     def test_source_context_counts_children_and_minimum_one_output(self):
         state = dict.fromkeys(
             (
@@ -115,6 +192,63 @@ class PhaseBTests(unittest.TestCase):
         self.assertEqual(state["over_16384"], 2)
         self.assertEqual(state["over_1048576"], 0)
 
+    def test_profile_needs_reviewed_native_pilots_with_same_context_and_producer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            evidence = root / "original-cpu-fixture.json"
+            evidence.write_text('{"fixture":"native lifecycle test only"}')
+            checks = []
+            for concurrency in (1, 4):
+                run_path = root / f"run-c{concurrency}.json"
+                run_path.write_text(
+                    json.dumps(
+                        {
+                            "status": "completed_client_run",
+                            "identity": {
+                                "model_key": "v4-pro",
+                                "deployment": "agg",
+                                "k": 6,
+                                "phase": "pilot",
+                                "concurrency": concurrency,
+                                "producer_revision": PRODUCER,
+                                "corpus": CORPUS,
+                                "max_model_len": 1048576,
+                                "collection_only": True,
+                            },
+                        }
+                    )
+                )
+                check = root / f"check-c{concurrency}.json"
+                check.write_text(
+                    json.dumps(
+                        {
+                            "run_receipt": run_path.name,
+                            "run_receipt_sha256": hashlib.sha256(run_path.read_bytes()).hexdigest(),
+                            "checks": dict.fromkeys(
+                                ("dependencies", "fork_join", "warmup_frontier", "prefix_reuse", "stop_and_cancel"),
+                                True,
+                            ),
+                            "evidence": [
+                                {"path": evidence.name, "sha256": hashlib.sha256(evidence.read_bytes()).hexdigest()}
+                            ],
+                        }
+                    )
+                )
+                checks.append(check)
+            self.assertEqual(len(profile_gate(checks, "v4-pro", "agg", 6, max_model_len=1048576)), 2)
+            with self.assertRaisesRegex(ValueError, "C1 and C4"):
+                profile_gate(checks[:1], "v4-pro", "agg", 6, max_model_len=1048576)
+            with self.assertRaisesRegex(ValueError, "context differs"):
+                profile_gate(checks, "v4-pro", "agg", 6, max_model_len=16384)
+            run = json.loads(run_path.read_text())
+            run["identity"]["producer_revision"] = "other"
+            run_path.write_text(json.dumps(run))
+            record = json.loads(check.read_text())
+            record["run_receipt_sha256"] = hashlib.sha256(run_path.read_bytes()).hexdigest()
+            check.write_text(json.dumps(record))
+            with self.assertRaisesRegex(ValueError, "producer, corpus"):
+                profile_gate(checks, "v4-pro", "agg", 6, max_model_len=1048576)
+
     def test_native_runtime_policy_uses_real_source_and_formatter_witness(self):
         path = Path(__file__).with_name("agentx-context-preflight-pro.json")
         result = context_gate(
@@ -124,6 +258,23 @@ class PhaseBTests(unittest.TestCase):
             "v4-pro",
         )
         self.assertEqual(result["validation_policy"], "native_runtime_per_request")
+        with self.assertRaisesRegex(ValueError, "scheduling limits differ"):
+            context_gate(
+                path,
+                {
+                    "max_model_len": 1048576,
+                    "prefix_cache": True,
+                    "scheduling_limits": {"prefill": {"max_sequences": 64, "max_batched_tokens": 2048}},
+                },
+                [
+                    {
+                        "max_model_len": 1048576,
+                        "prefix_cache": False,
+                        "scheduling_limits": {"prefill": {"max_sequences": 64, "max_batched_tokens": 8192}},
+                    }
+                ],
+                "v4-pro",
+            )
         with self.assertRaisesRegex(ValueError, "context limit"):
             context_gate(
                 path,
@@ -184,6 +335,51 @@ class PhaseBTests(unittest.TestCase):
         validate_role(identity, "v4-pro", 6, "agg")
         with self.assertRaises(ValueError):
             validate_role(identity, "v4-pro", 3, "agg")
+
+    def test_reference_synthetic_server_is_explicit_and_identity_checked(self):
+        for model_key, model in MODELS.items():
+            k = model["reference_k"]
+            with (
+                patch("serve_smoke.inspect_checkpoint", return_value={"path": "/checkpoint"}),
+                patch("serve_smoke.checkpoint_path", return_value=Path("/draft")),
+            ):
+                command, _, _ = server_command(
+                    model_key,
+                    k,
+                    8000,
+                    synthetic_al=model["reference_al"],
+                    prefix_cache=True,
+                    context_length=1048576,
+                    graph_policy="runtime-default",
+                )
+            contract = acceptance_contract(model_key, k, "synthetic")
+            control = {key: value for key, value in contract.items() if key not in ("kind", "rejection_sample_method")}
+            identity = {
+                "command": command,
+                "prefix_cache": True,
+                "graph_policy": "runtime-default",
+                "synthetic_control": control,
+            }
+            validate_role(identity, model_key, k, "agg", "synthetic")
+            with self.assertRaisesRegex(ValueError, "acceptance method"):
+                validate_role(identity, model_key, k, "agg")
+            for key, bad in [("frozen_before_measurement", False), ("accepted_tokens", 0), ("producer", "other")]:
+                changed = {**identity, "synthetic_control": {**control, key: bad}}
+                with self.assertRaisesRegex(ValueError, "frozen reference identity"):
+                    validate_role(changed, model_key, k, "agg", "synthetic")
+            spec = json.loads(command[command.index("--speculative-config") + 1])
+            spec["synthetic_acceptance_length"] = 1.0
+            command[command.index("--speculative-config") + 1] = json.dumps(spec)
+            with self.assertRaisesRegex(ValueError, "frozen reference identity"):
+                validate_role(identity, model_key, k, "agg", "synthetic")
+        with self.assertRaisesRegex(ValueError, "reference K"):
+            acceptance_contract("v4-pro", 3, "synthetic")
+
+    def test_synthetic_pilot_cannot_borrow_real_anchor(self):
+        with tempfile.TemporaryDirectory() as directory:
+            measured, _ = self.pair(Path(directory) / "native")
+            with self.assertRaisesRegex(ValueError, "anchor acceptance differs"):
+                fixed_gate([(measured, None)], "v4-pro", "agg", 6, (1,), collection_only=True, acceptance="synthetic")
 
     def test_context_requires_verified_full_payloads_and_matched_anchor(self):
         with self.assertRaisesRegex(ValueError, "context audit"):

@@ -1451,6 +1451,22 @@ above. These are modified contract descriptions; no serving source is copied.
 Copyright contributors to the vLLM project. Apache-2.0, source revision and
 license URLs above. The audit preserves installed source hashes and line anchors.
 
+The campaign runtime feasibility and control descriptions in
+`benchmarks/evidence/dspark-e2e-20261014/runtime-collection-feasibility.json`,
+`pro-pd-followup-independent-review.json`, `freeze_acceptance.py`, and
+`synthetic-control-v4-pro-k3.json`, together with the launch-contract portions of
+`serve_smoke.py`, `serve_role.py`, `pd_driver.py`, `agg-smoke.sh`, `pd-smoke.sh`,
+`submit_matrix.py`, their tests, and frozen `queue-20261015/` launch manifests,
+are original, modified adaptations of those pinned vLLM configuration and
+transfer contracts. Additional original paths are `vllm/config/speculative.py`
+(the bonus-inclusive synthetic acceptance length and minimum-variance schedule),
+`vllm/config/attention.py`, and
+`vllm/distributed/kv_transfer/kv_connector/v1/nixl/{base_scheduler,base_worker}.py`.
+The feasibility record identifies the installed model and draft source hashes
+in the immutable image above. Measured pilot values are campaign observations;
+no upstream measurements or implementation are copied. Copyright contributors
+to the vLLM project; Apache-2.0, source revision and license URLs above.
+
 The P/D collection client
 `benchmarks/evidence/dspark-fixed-20261014/collect_pd.py` adapts (modified) the
 Mooncake HTTP handshake from
@@ -1500,7 +1516,7 @@ License: https://github.com/SemiAnalysisAI/aiperf/blob/754356e9a39acc6cc6afb242d
 The campaign entrypoints, context probes and capture adapters under
 `benchmarks/evidence/dspark-e2e-20261014/` (`agentx_phaseb.py`,
 `agentx_server.py`, `agentx_context_audit.py`, `agentx_capture.py`,
-`agentx_import.py`, `agentx_native_inputs.py`, their tests,
+`agentx_import.py`, `agentx_native_inputs.py`, `agentx_run.py`, `agentx-run.sh`, their tests,
 and `agentx_corpus_pin/`) are original, modified adaptations of the same pinned
 producer's configuration, dataset, lifecycle and export contracts. Their adjacent
 manifests and documentation derive identity and lifecycle facts from those sources.
@@ -1520,12 +1536,21 @@ Original paths at that revision, under `src/aiperf/`:
 - `config/resolution/plan.py` and `config/flags/cli_config.py`
 - `plugin/plugins.yaml`
 
-The optional diagnostic token-echo contract and native Pro formatter probe also
+The optional diagnostic token-echo contract and native Pro/V4.1/Kimi formatter probes also
 follow vLLM `ac9126e58aa7bbab1856ba6593ba4d5003fea516`, paths
 `vllm/entrypoints/openai/chat_completion/{protocol,serving}.py` and
-`vllm/tokenizers/{deepseek_v4,deepseek_v4_encoding}.py`. Copyright contributors to the vLLM
-project; Apache-2.0. These are modified contract adaptations; the native formatter
-is imported externally, not copied into this repository.
+`vllm/tokenizers/{deepseek_v4,deepseek_v4_encoding,deepseek_v41,deepseek_v41_encoding}.py`,
+`vllm/tokenizers/{registry,hf}.py`, and
+`vllm/renderers/{kimi_k3,params,registry}.py`.
+The P/D lifecycle wrapper `agentx_run.py` invokes the unmodified proxy from
+`tests/v1/kv_connector/nixl_integration/toy_proxy_server.py` at the same revision.
+Derived files include `agentx_corpus_pin/probe_native_context.py`,
+`agentx-native-context-v41-probe.json`, `agentx-context-preflight-v41.json`,
+`agentx-native-context-kimi-probe.json`, `agentx-context-preflight-kimi.json`, and
+`agentx-collection-readiness.json` under the campaign directory above, alongside
+the existing Pro context witnesses. Copyright contributors to the vLLM project;
+Apache-2.0. These are modified contract adaptations; the native formatters are
+imported externally, not copied into this repository.
 Source: https://github.com/vllm-project/vllm/tree/ac9126e58aa7bbab1856ba6593ba4d5003fea516
 License: https://github.com/vllm-project/vllm/blob/ac9126e58aa7bbab1856ba6593ba4d5003fea516/LICENSE
 
@@ -1533,3 +1558,75 @@ Corpus identity: `semianalysisai/cc-traces-weka-062126` at
 `23f152f6f0f9399a85901b89a6458def0ef16729`; its README declares Apache-2.0.
 Evidence stores hashes, counts and bounds, not the source dataset.
 Source: https://huggingface.co/datasets/semianalysisai/cc-traces-weka-062126/tree/23f152f6f0f9399a85901b89a6458def0ef16729
+
+## External Kimi K3 tokenizer used by the AgentX CPU witness
+
+`benchmarks/evidence/dspark-e2e-20261014/agentx_corpus_pin/probe_native_context.py`
+invokes the externally installed tokenizer from `moonshotai/Kimi-K3` at immutable
+revision `f831ab66814297da540d832a5235f8e904f29d06`. The imported original paths are
+`tokenization_kimi.py` and `encoding_k3.py`; the adjacent Kimi context witness and
+preflight JSON files record their identities and measured token counts. The
+original harness adapts the Apache-2.0 vLLM renderer call contract documented
+above. No Moonshot tokenizer or XTML implementation is copied, modified or
+vendored into AISimulate. The external model repository uses the custom Kimi K3
+License, not Apache-2.0 or MIT. Copyright (c) 2026 Moonshot AI.
+
+Source: https://huggingface.co/moonshotai/Kimi-K3/tree/f831ab66814297da540d832a5235f8e904f29d06
+License: https://huggingface.co/moonshotai/Kimi-K3/blob/f831ab66814297da540d832a5235f8e904f29d06/LICENSE
+
+The upstream license is reproduced for the external dependency identity:
+
+```text
+Kimi K3 License
+
+Copyright (c) 2026 Moonshot AI
+
+Permission is hereby granted, free of charge, to any person (the "Licensee")
+obtaining a copy of this software — including the model weights, parameters,
+configuration files, inference and training code, and associated documentation
+(collectively, the "Software") — to deal in the Software without restriction.
+This includes, without limitation, the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of the Software; to run,
+deploy, fine-tune, or otherwise modify the Software and create derivative works
+from it; and to permit persons to whom the Software is furnished to do so, in
+each case subject to the following conditions:
+
+1. The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software. Licensee's use of the
+Software must comply with applicable laws and regulations.
+
+2. "Model as a Service" means giving a third party access to language model
+inference or fine-tuning (e.g., via API) in a manner that allows such third
+party to exercise meaningful control over the inputs, parameters, or training
+data. This does not include (a) end-user products with model capabilities solely
+embedded within specific features or harnesses, or (b) mere relaying of requests
+to models hosted by others.
+
+If the Licensee or any of its affiliates operates a Model as a Service business,
+and the aggregate revenue of the Licensee and its affiliates exceeds 20 million
+US dollars (or the equivalent in other currencies) in total over any consecutive
+12 months, the Licensee must enter into a separate agreement with Moonshot AI
+before using the Software or its derivative works for any commercial purpose.
+
+3. If the Software (or any derivative works thereof) is used for any of the
+Licensee's commercial products or services that have more than 100 million
+monthly active users, or more than 20 million US dollars (or equivalent in other
+currencies) in monthly revenue, "Kimi K3" must be prominently displayed on the
+user interface of such product or service.
+
+4. The requirements set forth in Sections 2 and 3 do not apply to: (a) internal
+use of the Software, defined as any use that does not make the Software, its
+outputs, or its underlying capabilities available to third parties; or (b) any
+use of the Software accessed through Moonshot AI's official products or
+certified inference partners.
+
+5. THE SOFTWARE AND ANY OUTPUT AND RESULTS THEREFROM ARE PROVIDED ON AN “AS IS”
+BASIS, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
+LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE
+AND NONINFRINGEMENT. IN NO EVENT SHALL MOONSHOT AI OR ITS AFFILIATES OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+For any questions regarding this license, please contact <license@moonshot.ai>.
+```

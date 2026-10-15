@@ -408,14 +408,34 @@ three pinned model configs declare 1,048,576 positions. This is the proposed
 explicit Phase B context limit; source lengths alone do not prove the final
 chat-template/tokenizer payload bound.
 
-Before executing AgentX, collect and score a separate fixed-length anchor with
-`--context-length 1048576` with prefix caching still disabled. Preserve the other serving settings.
+Before executing AgentX, collect a successful native fixed-length anchor with
+`--context-length 1048576` with prefix caching still disabled. Preserve other serving settings, including each role's scheduling budget.
+`--collection-only --fixed-measurement PATH` requires successful native records,
+not Replay qualification. The default `--fixed-pair` path still requires a
+qualified pair; neither path applies a numerical accuracy threshold.
 This anchor has a different serving identity and must not replace a 16K point
 in the initial campaign. The launcher defaults remain 16K/prefix-disabled.
 A native-formatter witness plus complete source bounds supports pilot preflight.
 The live server validates every sampled request with no filtering or truncation.
 All context failures must be retained and reviewed before scoring. Unsampled
 corpus payloads remain unverified; an exhaustive tokenizer pass is optional.
+
+`agentx-collection-readiness.json` lists all six deployment-specific native
+anchor entrypoints and explicit scheduling budgets. These are launch candidates,
+not submitted jobs or successful startup claims. The 12 pilots can follow their
+own native prerequisites; the 54 full profiles still require actual pilot review.
+Pro, V41 and Kimi native formatter witnesses bound the selected source-maximum
+request at 996,669, 996,616 and 996,832 tokens including requested output.
+CPU export job 2267423 completed successfully and resolved Kimi's actual renderer:
+its HF remote-code tokenizer handles XTML eagerly, with structural token IDs
+preserved. The witness invokes that pinned tokenizer at the audited plain-text
+renderer boundary; it does not issue a serving request. All six pinned producer
+model/phase CLI parses passed.
+
+Phase A high-concurrency collection also remains independent of scoring capacity
+proofs. The 16-requests/P bound used for specific completed 128-request windows
+must not be used as a general admission rule. Keep higher-concurrency measurements,
+preemptions and failures, and qualify them for Replay separately.
 
 Prepare the producer environment on the authorized CPU/client host:
 
@@ -448,8 +468,9 @@ the candidate context and role-specific budgets; do not change an active run.
 ```bash
 python serve_role.py --model-key v4-pro --role agg --k 6 --port 8010 \
   --graph-policy runtime-default --prefix-cache --context-length 1048576 \
+  --synthetic-al 3.77 --max-batched-tokens 8192 \
   --output /work/agentx-server
-python agentx_server.py --model-key v4-pro --deployment agg --k 6 \
+python agentx_server.py --model-key v4-pro --deployment agg --k 6 --acceptance synthetic \
   --role agg http://127.0.0.1:8010 /work/agentx-server/agg-identity.json \
   --output /work/agentx-server-receipt
 ```
@@ -462,20 +483,78 @@ and launch receipts. All worker receipt directories must be visible to every
 role. Preserve allocation/image, proxy and native-cache receipts alongside the
 client output; declared image metadata alone is not proof of the running OCI.
 
-A C1 pilot can advance once that model/deployment/K's C1 fixed anchor qualifies;
-C4 similarly requires its C4 anchor. No other model, deployment or numerical
+A C1 pilot can advance once that model/deployment/K's C1 native anchor succeeds;
+C4 similarly requires its C4 anchor. Missing simulation coverage does not block
+native collection. First use frozen reference controls: Pro K6/AL3.77,
+V41 K5/AL3.51 and Kimi K2/AL2.51. Role launchers, anchor receipts, server receipts
+and client identity must agree. Real acceptance remains a separate explicit
+choice; it cannot replace a synthetic anchor. No other model, deployment or numerical
 error threshold blocks this progress. Example preparation (add `--execute --context-audit agentx-context-preflight-pro.json`
-after the matching fixed anchor qualifies):
+after the matching native fixed anchor succeeds):
 
 ```bash
 python agentx_phaseb.py --model-key v4-pro --deployment agg --k 6 \
   --phase pilot --concurrency 1 --repetition 1 \
-  --fixed-pair /work/anchor-c1/summary.json /work/prediction-c1.json \
+  --collection-only --acceptance synthetic \
+  --fixed-measurement /work/anchor-c1/summary.json \
   --server-identity /work/agentx-server-receipt/identity.json \
   --producer-checkout /work/aiperf-agentx --aiperf /work/agentx-venv/bin/aiperf \
   --endpoint http://127.0.0.1:8010 --metrics-url http://127.0.0.1:8010/metrics \
   --output /work/agentx-pro-agg-c1-pilot
 ```
+
+The independent native anchors are frozen in `phaseb-queue-20261015/plan.json`
+and `anchor-source.tar.gz`; all runtime file hashes are checked before launch.
+`prepare_agentx_anchors.py` generates six jobs with C1/C4, repetition 1 only,
+reference synthetic controls, prefix caching disabled and context 1,048,576.
+It clears inherited campaign exclusions and never submits. Each platform's
+`submit_agentx_anchors.py --after-job JOB_ID` chains these jobs after the parent's
+fixed campaign queue and writes durable `submitted-PLATFORM.json` receipts.
+The archive and scripts are staged under the authorized personal storage root at
+`jobs/dspark-agentx-20261015/{anchors,anchor-bundle}` on B200 and B300. Staging
+and a successful CPU test do not establish native startup success.
+The parent submitted the four B200 anchors as 2267427–2267430 after fixed-campaign
+job 2267415, and the two B300 anchors as 797448–797449 after job 797447.
+Together with 50 fixed-campaign jobs, 56 GPU jobs are queued; this does not mean
+56 completed measurements. The 12 actual AgentX pilots and 54 full profiles
+remain unsubmitted, conditional on native anchor results, client preparation
+and pilot reviews. Submission receipts live beside the frozen anchor manifest.
+
+`agentx-run.sh` launches one AgentX client window in an existing allocation.
+It uses the same role resources as its anchor, enables prefix caching, captures
+all role receipts and invokes `agentx_run.py`. P/D uses the unchanged pinned
+NIXL proxy. The client environment and source bundle must be prepared on CPU
+first; no installer or corpus download is silently run on GPU workers. The
+orchestrator executes genuine anchor/context/server/pilot gates before the
+client, and stops on failure without generating passing review receipts.
+One window per job keeps the 6,000-second startup allowance, 1,800-second warmup
+allowance and one 3,600-second profile inside the four-hour allocation limit.
+
+For a Pro aggregated C1 pilot, export these values before running the wrapper
+inside its correctly sized allocation (all `/workspace` paths are container
+paths in the mounted personal storage root):
+
+```bash
+export DSPARK_MODEL_KEY=v4-pro DSPARK_AGENTX_DEPLOYMENT=agg
+export DSPARK_AGENTX_PHASE=pilot DSPARK_AGENTX_CONCURRENCY=1 DSPARK_AGENTX_REPETITION=1
+export DSPARK_AGENTX_ANCHOR_C1=/workspace/results/actual-anchor/initial-c1-r1/summary.json
+export DSPARK_AGENTX_CONTEXT_AUDIT=/workspace/jobs/agentx-client/agentx-context-preflight-pro.json
+export DSPARK_AGENTX_AIPERF=/workspace/jobs/agentx-client/venv/bin/aiperf
+export DSPARK_AGENTX_PRODUCER=/workspace/jobs/agentx-client/aiperf
+# DSPARK_BUNDLE_DIR is the host path to the frozen complete client/server bundle.
+bash "$DSPARK_BUNDLE_DIR/agentx-run.sh"
+```
+
+C4 uses its own anchor and `DSPARK_AGENTX_ANCHOR_C4`. Profiles additionally
+require both anchor paths and `DSPARK_AGENTX_PILOT_C1` / `DSPARK_AGENTX_PILOT_C4`
+pointing to actual reviewed pilot receipts. Repeat profiles at C1/C4/C16 and
+repetitions 1/2/3. These environment paths are examples to replace with real
+artifacts, not ready submission commands. The remote producer environment is
+not installed by the anchor staging step. Its Python environment must include
+Matplotlib because the existing validation adapter imports the comparison
+contract. No AgentX pilot or full profile has been submitted by these preparation
+tools: 12 pilots and 54 full profiles remain conditional. This does not block
+collecting the native fixed anchors or Phase A data.
 
 The exact command is parsed in the executable's own Python environment before
 execution. The manifest verifies the imported producer checkout and loader
@@ -490,8 +569,9 @@ scenario validation: 3,600 seconds at C1/C4/C16, three repetitions each.
 They require completed C1 and C4 pilots with hashed lifecycle evidence for
 `dependencies`, `fork_join`, `warmup_frontier`, `prefix_reuse`, and
 `stop_and_cancel`. Review receipts contain `run_receipt`, its SHA256, those
-boolean `checks`, and an `evidence` list of `{path, sha256}` artifacts. These
-receipts record evidence review; the tool never manufactures passing reviews.
+boolean `checks`, and an `evidence` list of `{path, sha256}` artifacts. These checks review actual producer/native lifecycle, not Replay equivalence.
+The pilot must match the profile producer, corpus, context and acceptance
+control. These receipts record evidence review; the tool never manufactures passing reviews.
 
 Both phases use seed 42, snapshot ratios 0.25–0.75, all 393 traces, prefix cache,
 10 warmup requests per lane after mandatory primers, zero idle warmup, and the
@@ -913,3 +993,86 @@ records from all four ranks. The Kimi native probe rejected the actual MLA
 projection precision against its BF16 observation contract. Neither produced an
 eligible imported timing table; neither failure receives a zero-error score.
 No jobs were resubmitted during this result-import and scoring pass.
+
+## Full fixed-length matrix execution
+
+`serve_smoke.py` (aggregated) and `pd_driver.py` (P/D) now support `--mode sweep`.
+The shared `window_plan.py` selects only canonical `matrix.json` cells. It covers
+both input lengths, C1/C4/C16/C64, and the Pro P/D 8192-token C8 anchor. Each
+selected cell retains its three repetitions and `max(128, 10 * concurrency)`
+measured requests. Input IDs and the 1024 client-visible outputs remain exact.
+Existing smoke, pilot, initial and explicit P/D `--window C REP` commands retain
+their previous behavior and directory names.
+
+Group launches by model, K, deployment, acceptance mode and input length. Workers
+remain loaded while windows run serially; acceptance is fixed for a server's
+lifetime. `--input-length`, `--cell-id`, `--concurrency` and `--repetition` are
+repeatable filters. Cells outside the launched model/K/deployment/acceptance are
+rejected. A Pro P/D 8192 group contains 15 windows because of C8; split the three
+C8 windows separately if a job budget allows at most 12. No selector changes the
+approved hardware, method, checkpoint, adaptive-off or external-offload-off policy.
+
+Before every sweep's production windows, the driver collects `startup-smoke/`
+with one warmup and one measured request using the selected input length. Exact
+completion and acceptance-counter extraction must succeed before production.
+These two requests are separate from production coverage and must be included
+when auditing cumulative per-engine counters. A failed smoke stops that group;
+a failed production window preserves its raw files and leaves later windows
+marked pending in `window-status.json`. This status tracks collection completion,
+not simulation accuracy or native cache qualification. High-concurrency cache
+pressure does not prevent collection; unsupported or failed cases remain visible.
+
+Skip already completed production repetitions with `--completed-runs PATH`:
+
+```json
+{"schema":"dspark-completed-runs-v1","completed":[
+  {"cell_id":"v4-pro-agg-k6-i1024-o1024-c1-synthetic","repetition":1}
+]}
+```
+
+The receipt is copied into the result and hashed in serving identity. Only
+successful completed production entries belong here; incomplete runs, smokes
+and independent acceptance pilots must not suppress production work. Pilots and
+smokes reject this exclusion flag. A fully excluded group must be omitted from
+submission. `--selection-only` prints the selected canonical cells and repetitions
+without checkpoint loading, server startup or GPU access; P/D uses
+`--acceptance real|synthetic` for this CPU-only selection.
+
+```bash
+python3 benchmarks/evidence/dspark-e2e-20261014/serve_smoke.py \
+  --model-key v4-pro --k 6 --mode sweep --input-length 8192 \
+  --synthetic-al 3.77 --completed-runs /path/completed.json \
+  --selection-only --output /tmp/selection-only
+```
+
+Both shell entrypoints use the explicitly frozen `DSPARK_BUNDLE_DIR` under the
+personal storage root. The aggregate container now runs that bundle rather than
+the mutable base jobs directory. Additional environment controls are:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `DSPARK_RUN_MODE` | `smoke` | Set `sweep` for canonical full-matrix selection. |
+| `DSPARK_INPUT_LENGTH` | Both in sweep | Select 1024 or 8192 input tokens. |
+| `DSPARK_CELL_IDS` | All matching cells | Space-separated explicit canonical cell IDs. |
+| `DSPARK_COMPLETED_RUNS` | None | Container-visible completed-production receipt. |
+| `DSPARK_CONCURRENCY` | All matching in sweep | Optional C1/4/8/16/64 filter; C8 exists only in its canonical anchor. |
+| `DSPARK_REPETITION` | All three in sweep | Optional repetition 1/2/3. |
+| `DSPARK_LOAD_STRATEGY` | Runtime default | Set `eager` for qualified Kimi loading; forwarded to both P/D roles. |
+| `DSPARK_STARTUP_TIMEOUT` | 3600 seconds | Worker and supervisor readiness deadline; use 6000 for qualified Kimi startup. |
+| `DSPARK_CONTEXT_LENGTH` | 16384 | Both role context limits; fixed matrix keeps this default. |
+| `DSPARK_PREFILL_MAX_BATCHED_TOKENS` | 8192 | P-only batch budget; reserved 1M AgentX anchors may explicitly use 2048. |
+| `DSPARK_DECODE_MAX_BATCHED_TOKENS` | 8192 | D-only batch budget. |
+
+Role identity records the effective commands and startup timeout environment.
+`server_command(..., max_batched_tokens=8192)` and `serve_role.py
+--max-batched-tokens` preserve fixed-matrix defaults while allowing the separate
+matched AgentX context anchor. Startup deadlines must fit the Slurm allocation
+with cleanup margin. P/D still allocates both roles together; the submission
+owner serializes jobs so each GPU platform has at most one collection job.
+
+Additional-K synthetic controls remain gated on a separate successful 128-request
+real pilot and `freeze_acceptance.py`. Freeze once per model/K/revision and reuse
+the same control across deployments. `--synthetic-control` validates the frozen
+identity; direct `--synthetic-al` accepts only the pinned reference K/AL. Full
+fixed-length submission does not bypass the separate AgentX lifecycle, context,
+prefix and matched-anchor gates.

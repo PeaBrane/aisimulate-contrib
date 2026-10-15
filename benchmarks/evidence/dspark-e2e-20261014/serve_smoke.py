@@ -18,6 +18,7 @@ from pathlib import Path
 from campaign import IMAGE, MODELS, RUNTIME_REVISION
 from collect_fixed import fetch
 from inspect_runtime import checkpoint_path, inspect_checkpoint
+from window_plan import add_selection_arguments, execute_runs, select_runs
 
 
 def server_command(
@@ -32,7 +33,10 @@ def server_command(
     startup_timeout_s=3600,
     context_length=16384,
     gpu_memory_utilization=0.90,
+    max_batched_tokens=8192,
 ):
+    if type(max_batched_tokens) is not int or max_batched_tokens <= 0:
+        raise ValueError("maximum batched tokens must be positive")
     if type(context_length) is not int or context_length <= 0:
         raise ValueError("context length must be positive")
     if not math.isfinite(gpu_memory_utilization) or not 0 < gpu_memory_utilization <= 1:
@@ -75,7 +79,7 @@ def server_command(
         "--max-num-seqs",
         "64",
         "--max-num-batched-tokens",
-        "8192",
+        str(max_batched_tokens),
         "--enable-prefix-caching" if prefix_cache else "--no-enable-prefix-caching",
         "--port",
         str(port),
@@ -151,12 +155,13 @@ def main():
     parser.add_argument("--port", type=int, default=8010)
     parser.add_argument("--context-length", type=int, default=16384)
     parser.add_argument("--prefix-cache", action="store_true")
-    parser.add_argument("--mode", choices=["smoke", "pilot", "initial"], default="smoke")
+    parser.add_argument("--mode", choices=["smoke", "pilot", "initial", "sweep"], default="smoke")
     parser.add_argument("--graph-policy", choices=["eager", "runtime-default"], default="eager")
     parser.add_argument("--load-strategy", choices=["eager"])
     parser.add_argument("--startup-timeout", type=int, default=3600)
-    parser.add_argument("--concurrency", type=int, choices=[1, 4], action="append")
+    parser.add_argument("--concurrency", type=int, choices=[1, 4, 8, 16, 64], action="append")
     parser.add_argument("--repetition", type=int, choices=[1, 2, 3], action="append")
+    add_selection_arguments(parser)
     acceptance = parser.add_mutually_exclusive_group()
     acceptance.add_argument("--synthetic-al", type=float)
     acceptance.add_argument("--synthetic-control", type=Path)
@@ -180,14 +185,32 @@ def main():
         ):
             parser.error("frozen control identity or accepted mean does not match model/K")
         args.synthetic_al = 1 + accepted
+    if (
+        control is None
+        and args.synthetic_al is not None
+        and (args.k != model["reference_k"] or args.synthetic_al != model["reference_al"])
+    ):
+        parser.error("non-reference synthetic AL needs a separately frozen pilot control")
     if args.mode == "pilot" and args.synthetic_al is not None:
         parser.error("pilots must measure real acceptance")
+    if args.mode == "sweep" and args.prefix_cache:
+        parser.error("fixed-length sweep requires prefix caching disabled")
+    acceptance_kind = "synthetic" if args.synthetic_al is not None else "real"
+    plan = select_runs(args, "agg", acceptance_kind)
+    if args.selection_only:
+        print(json.dumps(plan, indent=2))
+        return
+    if not plan:
+        raise ValueError("no uncompleted windows selected; skip this server launch")
     args.output.mkdir(parents=True, exist_ok=False)
+    if args.completed_runs:
+        shutil.copy2(args.completed_runs, args.output / "completed-runs.json")
     source_dir = args.output / "source"
     source_dir.mkdir()
     source_hashes = {}
     for name in (
         "serve_smoke.py",
+        "window_plan.py",
         "campaign.py",
         "collect_fixed.py",
         "acceptance.py",
@@ -236,6 +259,10 @@ def main():
         "external_kv_offload": False,
         "engram_cpu_offload": False,
         "phase": args.mode,
+        "window_selection": [{"cell_id": r["cell"]["cell_id"], "repetition": r["repetition"]} for r in plan],
+        "completed_runs_sha256": hashlib.sha256(args.completed_runs.read_bytes()).hexdigest()
+        if args.completed_runs
+        else None,
         "qualification": {
             "eligible": False,
             "reasons": ["effective cache and runtime qualification pending"],
@@ -317,46 +344,17 @@ def main():
                 ),
             }
             (args.output / "server-ready.json").write_text(json.dumps(ready, indent=2) + "\n")
-            concurrencies = args.concurrency or ([1, 4] if args.mode == "initial" else [1])
-            repetitions = args.repetition or ([1, 2, 3] if args.mode == "initial" else [1])
-            for concurrency in concurrencies:
-                for repetition in repetitions:
-                    cell_id = f"{args.model_key}-agg-k{args.k}-i1024-o1024-c{concurrency}-{acceptance}"
-                    run_output = args.output / f"{args.mode}-c{concurrency}-r{repetition}"
-                    client = [
-                        sys.executable,
-                        str(source_dir / "collect_fixed.py"),
-                        "--matrix",
-                        str(source_dir / "matrix.json"),
-                        "--cell-id",
-                        cell_id,
-                        "--identity",
-                        str(identity_path),
-                        "--endpoint",
-                        ready["endpoint"],
-                        "--metrics-url",
-                        ready["metrics_urls"][0],
-                        "--model",
-                        model["model"],
-                        "--output",
-                        str(run_output),
-                        "--repetition",
-                        str(repetition),
-                    ]
-                    if args.mode == "smoke":
-                        client.append("--smoke")
-                    subprocess.run(client, check=True)
-                    subprocess.run(
-                        [
-                            sys.executable,
-                            str(source_dir / "acceptance.py"),
-                            "--run",
-                            str(run_output),
-                            "--k",
-                            str(args.k),
-                        ],
-                        check=True,
-                    )
+            execute_runs(
+                plan,
+                mode=args.mode,
+                output=args.output,
+                source_dir=source_dir,
+                model_key=args.model_key,
+                k=args.k,
+                identity_path=identity_path,
+                endpoint=ready["endpoint"],
+                metrics_urls=ready["metrics_urls"],
+            )
             status["status"] = "success"
         except Exception as error:
             status.update(status="failed", error=f"{type(error).__name__}: {error}")

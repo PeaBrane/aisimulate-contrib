@@ -26,10 +26,26 @@ fi
 if [[ -n "${DSPARK_SYNTHETIC_AL:-}" ]]; then
   run_args+=(--synthetic-al "$DSPARK_SYNTHETIC_AL")
 fi
+if [[ -n "${DSPARK_INPUT_LENGTH:-}" ]]; then
+  run_args+=(--input-length "$DSPARK_INPUT_LENGTH")
+fi
+if [[ -n "${DSPARK_CELL_IDS:-}" ]]; then
+  read -r -a selected_cells <<< "$DSPARK_CELL_IDS"
+  for cell in "${selected_cells[@]}"; do run_args+=(--cell-id "$cell"); done
+fi
+if [[ -n "${DSPARK_COMPLETED_RUNS:-}" ]]; then
+  run_args+=(--completed-runs "$DSPARK_COMPLETED_RUNS")
+fi
+bundle="${DSPARK_BUNDLE_DIR:-$storage_root/jobs/dspark-e2e-20261014}"
+if [[ "$bundle" != "$storage_root/"* ]]; then
+  echo "DSPARK_BUNDLE_DIR must be under storage_root" >&2; exit 2
+fi
+container_bundle="/workspace/${bundle#"$storage_root/"}"
+run_args+=(--context-length "${DSPARK_CONTEXT_LENGTH:-16384}")
 srun --ntasks=1 \
   --container-image="$storage_root/images/vllm-ac9126e58aa7-3d17635c.sqsh" \
   --container-mounts="$storage_root:/workspace,/scratch/fsw/portfolios/coreai/projects/coreai_dlalgo_ci/artifacts/model:/scratch/fsw/portfolios/coreai/projects/coreai_dlalgo_ci/artifacts/model:ro" \
-  --container-workdir=/workspace/jobs/dspark-e2e-20261014 \
+  --container-workdir="$container_bundle" \
   --container-env=HF_HOME,XDG_CACHE_HOME \
   /usr/bin/python3 serve_smoke.py --model-key "$DSPARK_MODEL_KEY" --k "$DSPARK_K" \
   --output "/workspace/results/dspark-e2e-20261014/${DSPARK_RUN_MODE:-smoke}-$DSPARK_MODEL_KEY-k$DSPARK_K-$SLURM_JOB_ID" "${run_args[@]}"

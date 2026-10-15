@@ -12,6 +12,12 @@ still has one repetition. See the [grouped results](comparison/README.md) and
 P/D and does not establish V4.1, Kimi, AgentX or FPM accuracy. Functional tests
 and op-table query coverage are separate from serving accuracy.
 
+The [full collection queue](queue-20261015/README.md) expands to concurrency
+1/4/16/64 and both input lengths, including Pro P/D concurrency 8 anchors.
+It selects the remaining 575 production runs (151,936 requests), with separate
+additional-K acceptance pilots and AgentX context anchors. Queue receipts record
+submission; new measurements are scored only after record qualification.
+
 The [first production pair](pro-initial-c1-r1/README.md) uses Pro0813 on 8 B200,
 TP8/EP1, K6, synthetic AL3.77, 1024/1024 and concurrency1. All 128 requests
 completed, with zero failures. Measurements, frozen matching evidence, original

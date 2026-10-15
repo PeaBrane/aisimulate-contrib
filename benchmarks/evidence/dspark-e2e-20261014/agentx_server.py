@@ -6,13 +6,13 @@ import argparse
 import json
 from pathlib import Path
 
-from agentx_phaseb import digest, read_json
+from agentx_phaseb import acceptance_contract, digest, read_json, scheduling_limits, validate_acceptance
 from campaign import IMAGE, MODELS, RUNTIME_REVISION
 from collect_fixed import fetch
 from pd_driver import collect_role_receipts
 
 
-def validate_role(identity, model_key, k, role):
+def validate_role(identity, model_key, k, role, acceptance="real"):
     command = identity["command"]
     speculation = json.loads(command[command.index("--speculative-config") + 1])
     if (
@@ -23,12 +23,10 @@ def validate_role(identity, model_key, k, role):
         or speculation.get("method") != "dspark"
         or speculation.get("num_speculative_tokens") != k
         or speculation.get("enable_adaptive_verification") is not False
-        or speculation.get("rejection_sample_method") != "block"
         or identity.get("graph_policy") != "runtime-default"
     ):
-        raise ValueError(
-            "server must use matching fixed DSpark, real acceptance, prefix cache and runtime graph policy"
-        )
+        raise ValueError("server must use matching fixed DSpark, prefix cache and runtime graph policy")
+    validate_acceptance(command, identity.get("synthetic_control"), model_key, k, acceptance)
     tp = 1 if model_key == "v4-pro" and role == "prefill" else MODELS[model_key]["gpus_per_role"]
     if command[command.index("--tensor-parallel-size") + 1] != str(tp):
         raise ValueError("server role tensor parallel size differs")
@@ -39,6 +37,7 @@ def main():
     parser.add_argument("--model-key", choices=MODELS, required=True)
     parser.add_argument("--deployment", choices=("agg", "disagg"), required=True)
     parser.add_argument("--k", type=int, required=True)
+    parser.add_argument("--acceptance", choices=("real", "synthetic"), default="real")
     parser.add_argument(
         "--role",
         action="append",
@@ -54,7 +53,7 @@ def main():
     if args.k not in MODELS[args.model_key]["k"]:
         parser.error("K is outside the approved matrix")
     for role, (_, path) in roles.items():
-        validate_role(read_json(path), args.model_key, args.k, role)
+        validate_role(read_json(path), args.model_key, args.k, role, args.acceptance)
     limits = {
         int(read_json(path)["command"][read_json(path)["command"].index("--max-model-len") + 1])
         for _, path in roles.values()
@@ -87,9 +86,11 @@ def main():
         "model": MODELS[args.model_key],
         "deployment": args.deployment,
         "k": args.k,
+        "acceptance_control": acceptance_contract(args.model_key, args.k, args.acceptance),
         "image": IMAGE,
         "runtime_revision": RUNTIME_REVISION,
         "max_model_len": limits.pop(),
+        "scheduling_limits": scheduling_limits({"roles": {role: read_json(path) for role, (_, path) in roles.items()}}),
         "prefix_cache": True,
         "adaptive_verification": False,
         "external_kv_offload": False,

@@ -15,7 +15,7 @@ import subprocess
 from pathlib import Path
 
 from campaign import IMAGE, MODELS, RUNTIME_REVISION, cells
-from compare import METRICS, qualification_error
+from compare import CONTRACT, METRICS, qualification_error
 
 PRODUCER = "754356e9a39acc6cc6afb242d123bb57c3fb6f75"
 CORPUS = {
@@ -47,6 +47,55 @@ def context_limit(identity):
     if len(limits) != 1:
         raise ValueError("serving roles have different context limits")
     return limits.pop()
+
+
+def scheduling_limits(identity):
+    roles = {"agg": {"command": identity["server_command"]}} if "server_command" in identity else identity["roles"]
+    result = {}
+    for role, row in roles.items():
+        command = row["command"]
+        result[role] = {
+            name: int(command[command.index(flag) + 1])
+            for name, flag in (
+                ("max_sequences", "--max-num-seqs"),
+                ("max_batched_tokens", "--max-num-batched-tokens"),
+            )
+        }
+    return result
+
+
+def acceptance_contract(model_key, k, acceptance):
+    if acceptance == "real":
+        return {"kind": "real", "rejection_sample_method": "block"}
+    model = MODELS[model_key]
+    if acceptance != "synthetic" or k != model["reference_k"]:
+        raise ValueError("Phase B synthetic acceptance requires the frozen reference K")
+    return {
+        "kind": "synthetic",
+        "rejection_sample_method": "synthetic",
+        "synthetic_acceptance_length": model["reference_al"],
+        "accepted_tokens": model["reference_al"] - 1,
+        "frozen_before_measurement": True,
+        "source": f"AgentX result {model['reference_result']}",
+        "producer": f"vllm/config/speculative.py::_acceptance_length_to_rates@{RUNTIME_REVISION}",
+    }
+
+
+def validate_acceptance(command, control, model_key, k, acceptance):
+    expected = acceptance_contract(model_key, k, acceptance)
+    spec = json.loads(command[command.index("--speculative-config") + 1])
+    if spec.get("rejection_sample_method") != expected["rejection_sample_method"]:
+        raise ValueError("server acceptance method differs from requested Phase B control")
+    if acceptance == "synthetic":
+        if spec.get("synthetic_acceptance_length") != expected["synthetic_acceptance_length"] or any(
+            (control or {}).get(key) != value
+            for key, value in expected.items()
+            if key not in ("kind", "rejection_sample_method")
+        ):
+            raise ValueError("server synthetic control is not the frozen reference identity")
+    elif control is not None or spec.get("synthetic_acceptance_length") is not None:
+        raise ValueError("real acceptance cannot retain a synthetic control")
+    return expected
 
 
 def context_gate(path, server, fixed, model_key):
@@ -106,6 +155,10 @@ def context_gate(path, server, fixed, model_key):
         row["max_model_len"] != limit or row.get("prefix_cache") is not False for row in fixed
     ):
         raise ValueError("corpus, server context limit and qualified fixed anchors do not match")
+    if server.get("scheduling_limits") is not None and any(
+        row.get("scheduling_limits") != server["scheduling_limits"] for row in fixed
+    ):
+        raise ValueError("AgentX scheduling limits differ from native fixed anchors")
     for row in audit["evidence"]:
         if digest(Path(path).parent / row["path"]) != row["sha256"]:
             raise ValueError("corpus context audit evidence digest mismatch")
@@ -116,12 +169,15 @@ def context_gate(path, server, fixed, model_key):
     }
 
 
-def fixed_gate(pairs, model_key, deployment, k, required_concurrencies=(1, 4)):
-    """Require completed matched C1/C4 runs, independent of numerical error."""
+def fixed_gate(
+    pairs, model_key, deployment, k, required_concurrencies=(1, 4), *, collection_only=False, acceptance=None
+):
+    """Keep native collection readiness separate from paired scoring readiness."""
     matrix = {cell["cell_id"]: cell for cell in cells()}
     seen, receipts = set(), []
     for measured_path, predicted_path in pairs:
-        measured, predicted = read_json(measured_path), read_json(predicted_path)
+        measured = read_json(measured_path)
+        predicted = None if predicted_path is None else read_json(predicted_path)
         cell = matrix.get(measured.get("cell_id"))
         if cell is None or (
             cell["model_key"],
@@ -130,14 +186,29 @@ def fixed_gate(pairs, model_key, deployment, k, required_concurrencies=(1, 4)):
             cell["input_length"],
         ) != (model_key, deployment, k, 1024):
             raise ValueError("fixed-length pair does not match model/deployment/K/initial workload")
-        error = qualification_error(measured, predicted, cell["expected_requests"], cell["total_gpus"])
-        if error is not None:
-            raise ValueError(f"fixed-length gate failed: {error}")
-        if (predicted["cell_id"], predicted["repetition"]) != (
-            measured["cell_id"],
-            measured["repetition"],
-        ):
-            raise ValueError("fixed-length pair keys differ")
+        if acceptance is not None and cell["acceptance"] != acceptance:
+            raise ValueError("fixed anchor acceptance differs from Phase B control")
+        if collection_only:
+            if predicted is not None:
+                raise ValueError("collection-only anchors accept measurements, not prediction pairs")
+            if (
+                measured.get("status") != "success"
+                or measured.get("metrics_contract") != CONTRACT
+                or measured.get("expected_requests") != cell["expected_requests"]
+                or measured.get("total_gpus") != cell["total_gpus"]
+                or measured.get("metrics", {}).get("completed_requests") != cell["expected_requests"]
+                or measured.get("metrics", {}).get("failed_requests") != 0
+            ):
+                raise ValueError("native fixed anchor is incomplete or has a different measurement contract")
+        else:
+            error = qualification_error(measured, predicted, cell["expected_requests"], cell["total_gpus"])
+            if error is not None:
+                raise ValueError(f"fixed-length gate failed: {error}")
+            if (predicted["cell_id"], predicted["repetition"]) != (
+                measured["cell_id"],
+                measured["repetition"],
+            ):
+                raise ValueError("fixed-length pair keys differ")
         identity_path = Path(measured_path).parent / "identity.json"
         identity = read_json(identity_path)
         identity_hash = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
@@ -147,6 +218,14 @@ def fixed_gate(pairs, model_key, deployment, k, required_concurrencies=(1, 4)):
             raise ValueError("fixed-length model/image identity differs from campaign")
         if identity.get("runtime_revision") != RUNTIME_REVISION:
             raise ValueError("fixed-length serving runtime differs")
+        if acceptance is not None:
+            roles = (
+                [{"command": identity["server_command"], "synthetic_control": identity.get("synthetic_control")}]
+                if "server_command" in identity
+                else identity["roles"].values()
+            )
+            for role in roles:
+                validate_acceptance(role["command"], role.get("synthetic_control"), model_key, k, acceptance)
         records_path = Path(measured_path).parent / measured["request_records"]
         records = [json.loads(line) for line in records_path.read_text().splitlines() if line.strip()]
         if len(records) != cell["expected_requests"] or any(
@@ -156,7 +235,7 @@ def fixed_gate(pairs, model_key, deployment, k, required_concurrencies=(1, 4)):
             for row in records
         ):
             raise ValueError("fixed-length functional records are missing or incomplete")
-        for side in (measured, predicted):
+        for side in (measured,) if collection_only else (measured, predicted):
             if any(
                 type(side["metrics"].get(metric)) not in (int, float)
                 or not math.isfinite(side["metrics"][metric])
@@ -165,29 +244,47 @@ def fixed_gate(pairs, model_key, deployment, k, required_concurrencies=(1, 4)):
             ):
                 raise ValueError("qualified pair needs finite positive metrics, without an accuracy threshold")
         seen.add(cell["concurrency"])
+        prefix_cache = identity.get("prefix_cache")
+        if collection_only:
+            commands = (
+                [identity["server_command"]]
+                if "server_command" in identity
+                else [row["command"] for row in identity["roles"].values()]
+            )
+            if any(
+                "--no-enable-prefix-caching" not in command or "--enable-prefix-caching" in command
+                for command in commands
+            ):
+                raise ValueError("native fixed anchor must explicitly disable prefix caching in every role")
+            for command in commands:
+                spec = json.loads(command[command.index("--speculative-config") + 1])
+                if (
+                    spec.get("method") != "dspark"
+                    or spec.get("num_speculative_tokens") != k
+                    or spec.get("enable_adaptive_verification") is not False
+                ):
+                    raise ValueError("native fixed anchor must execute matching fixed DSpark")
+            prefix_cache = False
+        paths = [measured_path, identity_path, records_path]
+        if predicted_path is not None:
+            paths.append(predicted_path)
         receipts.append(
             {
                 "cell_id": cell["cell_id"],
                 "max_model_len": context_limit(identity),
-                "prefix_cache": identity.get("prefix_cache"),
+                "prefix_cache": prefix_cache,
+                "gate": "native_functional_collection" if collection_only else "qualified_prediction_pair",
+                "scheduling_limits": scheduling_limits(identity),
                 "repetition": measured["repetition"],
-                "artifacts": {
-                    str(Path(path).resolve()): digest(path)
-                    for path in (
-                        measured_path,
-                        predicted_path,
-                        identity_path,
-                        records_path,
-                    )
-                },
+                "artifacts": {str(Path(path).resolve()): digest(path) for path in paths},
             }
         )
     if not set(required_concurrencies) <= seen:
-        raise ValueError("Phase B requires actual qualified fixed-length pairs for the selected concurrency gate")
+        raise ValueError("Phase B requires completed fixed anchors for the selected concurrency gate")
     return receipts
 
 
-def profile_gate(paths, model_key, deployment, k):
+def profile_gate(paths, model_key, deployment, k, *, max_model_len=None, acceptance=None):
     seen = set()
     receipts = []
     for path in paths:
@@ -204,6 +301,16 @@ def profile_gate(paths, model_key, deployment, k):
             identity["phase"],
         ) != (model_key, deployment, k, "pilot"):
             raise ValueError("pilot belongs to another model/deployment/K")
+        if (
+            identity.get("producer_revision") != PRODUCER
+            or identity.get("corpus") != CORPUS
+            or (max_model_len is not None and identity.get("max_model_len") != max_model_len)
+        ):
+            raise ValueError("pilot producer, corpus or context differs from this profile")
+        if acceptance is not None and identity.get("acceptance_control") != acceptance_contract(
+            model_key, k, acceptance
+        ):
+            raise ValueError("pilot acceptance control differs from this profile")
         required = (
             "dependencies",
             "fork_join",
@@ -335,6 +442,7 @@ def main():
     parser.add_argument("--model-key", choices=MODELS, required=True)
     parser.add_argument("--deployment", choices=("agg", "disagg"), required=True)
     parser.add_argument("--k", type=int, required=True)
+    parser.add_argument("--acceptance", choices=("real", "synthetic"), default="real")
     parser.add_argument("--phase", choices=("pilot", "profile"), required=True)
     parser.add_argument("--concurrency", type=int, choices=(1, 4, 16), required=True)
     parser.add_argument("--repetition", type=int, choices=(1, 2, 3), default=1)
@@ -343,8 +451,14 @@ def main():
         type=Path,
         nargs=2,
         action="append",
-        required=True,
+        default=[],
         metavar=("MEASURED", "PREDICTED"),
+    )
+    parser.add_argument("--fixed-measurement", type=Path, action="append", default=[])
+    parser.add_argument(
+        "--collection-only",
+        action="store_true",
+        help="Collect silicon using native functional anchors without requiring simulator qualification",
     )
     parser.add_argument("--pilot-check", type=Path, action="append", default=[])
     parser.add_argument("--server-identity", type=Path, required=True)
@@ -367,14 +481,23 @@ def main():
     args = parser.parse_args()
     if args.k not in MODELS[args.model_key]["k"] or (args.phase == "pilot" and args.concurrency not in (1, 4)):
         parser.error("K or pilot concurrency is outside the approved matrix")
+    if args.collection_only:
+        if args.fixed_pair or not args.fixed_measurement:
+            parser.error("collection-only requires --fixed-measurement and excludes --fixed-pair")
+        anchors = [(path, None) for path in args.fixed_measurement]
+    else:
+        if args.fixed_measurement or not args.fixed_pair:
+            parser.error("paired validation requires --fixed-pair; native anchors need --collection-only")
+        anchors = args.fixed_pair
     fixed = fixed_gate(
-        args.fixed_pair,
+        anchors,
         args.model_key,
         args.deployment,
         args.k,
         (args.concurrency,) if args.phase == "pilot" else (1, 4),
+        collection_only=args.collection_only,
+        acceptance=args.acceptance,
     )
-    pilots = profile_gate(args.pilot_check, args.model_key, args.deployment, args.k) if args.phase == "profile" else []
     revision = subprocess.check_output(
         ["git", "-C", str(args.producer_checkout), "rev-parse", "HEAD"], text=True
     ).strip()
@@ -382,14 +505,18 @@ def main():
     if revision != PRODUCER or dirty.strip():
         raise ValueError("AgentX producer checkout must be clean at the immutable pin")
     server = read_json(args.server_identity)
+    if args.collection_only and not server.get("scheduling_limits"):
+        raise ValueError("collection-only requires a fresh server receipt with per-role scheduling limits")
     if (
         server.get("model") != MODELS[args.model_key]
         or server.get("deployment") != args.deployment
         or server.get("k") != args.k
+        or server.get("acceptance_control") != acceptance_contract(args.model_key, args.k, args.acceptance)
         or server.get("prefix_cache") is not True
         or server.get("adaptive_verification") is not False
         or server.get("external_kv_offload") is not False
         or server.get("image") != IMAGE
+        or server.get("runtime_revision") != RUNTIME_REVISION
         or not server.get("cache_receipts")
     ):
         raise ValueError(
@@ -398,6 +525,18 @@ def main():
     for receipt in server["cache_receipts"]:
         if digest(args.server_identity.parent / receipt["path"]) != receipt["sha256"]:
             raise ValueError("AgentX runtime cache receipt digest mismatch")
+    pilots = (
+        profile_gate(
+            args.pilot_check,
+            args.model_key,
+            args.deployment,
+            args.k,
+            max_model_len=server["max_model_len"],
+            acceptance=args.acceptance,
+        )
+        if args.phase == "profile"
+        else []
+    )
     context = (
         context_gate(args.context_audit, server, fixed, args.model_key) if args.execute or args.context_audit else None
     )
@@ -427,6 +566,7 @@ def main():
         "model_key": args.model_key,
         "deployment": args.deployment,
         "k": args.k,
+        "acceptance_control": server["acceptance_control"],
         "phase": args.phase,
         "concurrency": args.concurrency,
         "repetition": args.repetition,
@@ -434,6 +574,7 @@ def main():
         "corpus": CORPUS,
         "command": command,
         "fixed_length_gate": fixed,
+        "collection_only": args.collection_only,
         "pilot_gate": pilots,
         "server_identity_sha256": digest(args.server_identity),
         "strict_scenario_requested": args.phase == "profile",

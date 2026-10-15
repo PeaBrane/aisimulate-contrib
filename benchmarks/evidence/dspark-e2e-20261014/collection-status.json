@@ -925,12 +925,11 @@
   "results": "results/dspark-e2e-20261014",
   "runtime": "vllm/vllm-openai:nightly-dev-x86_64-cu130-ac9126e58aa7@sha256:3d17635c5aa0340e2f2502c067ce4b587d8e7dc678195e90b71142490dc6d71c",
   "pending": [
-    "Repair V4.1 native observation contract for masked/nonconsecutive query positions; no eligible timing table from2258242.",
-    "Resolve Kimi native MLA projection precision contract; graph smoke791280 succeeded but native table791291 failed.",
-    "Complete43 remaining initial configurations and remaining repetitions (131 initial production runs unscored).",
-    "Freeze K3 synthetic control from the separate completed128-request real pilot before K3 synthetic scoring.",
-    "Expanded matrix after initial paired coverage.",
-    "AgentX pilots after matched lifecycle/context qualification."
+    "Collect and qualify all575 remaining fixed-length runs; submission is not completion.",
+    "Repair V4.1 native observation contract and Kimi native MLA precision contract for prediction coverage; silicon serving collection proceeds independently.",
+    "Freeze V4.1 K3 and Kimi K3 controls from independent128-request pilots before their synthetic groups; Pro K3 control is already frozen.",
+    "Qualify high-concurrency P/D cache, rollback and transfer evidence before scoring; prior concurrency1/4 source-pool bound does not apply.",
+    "AgentX native context anchors, prefix/lifecycle-qualified pilots, then reviewed full profiles."
   ],
   "production_request_records": 1664,
   "smoke_request_records": 4,
@@ -969,10 +968,10 @@
   "paired_request_records": 1664,
   "paired_configurations": 5,
   "monitoring": {
-    "status": "restored",
-    "checked_utc": "2026-10-15T19:07:36Z",
-    "active_jobs_among_six": 0,
-    "source": "raw/status-check-20261015T1907Z.json",
+    "status": "submitted_and_verified",
+    "checked_utc": "2026-10-15T20:08:27.091587+00:00",
+    "active_campaign_gpu_jobs": 56,
+    "source": "queue-20261015/submission-verification.json",
     "unverified_jobs": []
   },
   "production_completed_runs": 13,
@@ -980,5 +979,22 @@
   "qualified_measurement_runs": 13,
   "pilot_request_records": 128,
   "record_count_scope": "Completed E2E records:1664 production +128 independent real-acceptance pilot +4 diagnostic smokes. Failed native operator observations are separate and not E2E request counts.",
-  "qualification_receipts": "qualification-20261015/index.json"
+  "qualification_receipts": "qualification-20261015/index.json",
+  "submission_campaign": {
+    "manifest": "queue-20261015/plan.json",
+    "receipts": [
+      "queue-20261015/submitted-b200.json",
+      "queue-20261015/submitted-b300.json",
+      "phaseb-queue-20261015/submitted-b200.json",
+      "phaseb-queue-20261015/submitted-b300.json"
+    ],
+    "scope": "All remaining fixed-length matrix cells; AgentX separately gated",
+    "remaining_production_runs": 575,
+    "remaining_production_requests": 151936,
+    "completed_production_runs_excluded": 13,
+    "gpu_jobs_submitted": 56,
+    "status": "All50 fixed-length sweep/pilot jobs and6 AgentX context anchors accepted by Slurm;66 AgentX client runs remain gated",
+    "completion_counts_unchanged": true,
+    "verification": "queue-20261015/submission-verification.json"
+  }
 }

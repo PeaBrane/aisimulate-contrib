@@ -29,7 +29,11 @@ container=(--container-image="$storage_root/images/vllm-ac9126e58aa7-3d17635c.sq
   --container-mounts="$storage_root:/workspace,/scratch/fsw/portfolios/coreai/projects/coreai_dlalgo_ci/artifacts/model:/scratch/fsw/portfolios/coreai/projects/coreai_dlalgo_ci/artifacts/model:ro"
   --container-workdir="$result/source"
   --container-env=HF_HOME,XDG_CACHE_HOME,VLLM_NIXL_SIDE_CHANNEL_HOST,VLLM_NIXL_SIDE_CHANNEL_PORT)
-role_args=()
+role_args=(--context-length "${DSPARK_CONTEXT_LENGTH:-16384}"
+  --startup-timeout "${DSPARK_STARTUP_TIMEOUT:-3600}")
+if [[ -n "${DSPARK_LOAD_STRATEGY:-}" ]]; then
+  role_args+=(--load-strategy "$DSPARK_LOAD_STRATEGY")
+fi
 if [[ "${DSPARK_OBSERVE_SOURCE_POOL:-0}" == 1 ]]; then
   role_args+=(--observe-source-pool)
 fi
@@ -39,7 +43,12 @@ fi
 if [[ -n "${DSPARK_SYNTHETIC_CONTROL:-}" ]]; then
   role_args+=(--synthetic-control "$DSPARK_SYNTHETIC_CONTROL")
 fi
-driver_args=(--mode "${DSPARK_RUN_MODE:-smoke}")
+driver_args=(--mode "${DSPARK_RUN_MODE:-smoke}" --startup-timeout "${DSPARK_STARTUP_TIMEOUT:-3600}")
+if [[ -n "${DSPARK_SYNTHETIC_AL:-}${DSPARK_SYNTHETIC_CONTROL:-}" ]]; then
+  driver_args+=(--acceptance synthetic)
+else
+  driver_args+=(--acceptance real)
+fi
 if [[ -n "${DSPARK_CONCURRENCY:-}" ]]; then
   driver_args+=(--concurrency "$DSPARK_CONCURRENCY")
 fi
@@ -49,12 +58,22 @@ fi
 if [[ -n "${DSPARK_WINDOWS:-}" ]]; then
   read -r -a selected_windows <<< "$DSPARK_WINDOWS"
   for window in "${selected_windows[@]}"; do
-    if [[ ! "$window" =~ ^[14]:[123]$ ]]; then
+    if [[ ! "$window" =~ ^(1|4|8|16|64):[123]$ ]]; then
       echo "Invalid DSPARK_WINDOWS entry: $window" >&2
       exit 2
     fi
     driver_args+=(--window "${window%:*}" "${window#*:}")
   done
+fi
+if [[ -n "${DSPARK_INPUT_LENGTH:-}" ]]; then
+  driver_args+=(--input-length "$DSPARK_INPUT_LENGTH")
+fi
+if [[ -n "${DSPARK_CELL_IDS:-}" ]]; then
+  read -r -a selected_cells <<< "$DSPARK_CELL_IDS"
+  for cell in "${selected_cells[@]}"; do driver_args+=(--cell-id "$cell"); done
+fi
+if [[ -n "${DSPARK_COMPLETED_RUNS:-}" ]]; then
+  driver_args+=(--completed-runs "$DSPARK_COMPLETED_RUNS")
 fi
 pids=()
 cleanup() { for pid in "${pids[@]}"; do kill "$pid" 2>/dev/null || true; done; wait || true; }
@@ -62,15 +81,17 @@ trap cleanup EXIT
 for role in prefill decode; do
   host="$prefill_host"; port=8010; side_port=5557
   gpu_memory_utilization="${DSPARK_PREFILL_GPU_MEMORY_UTILIZATION:-0.90}"
+  max_batched_tokens="${DSPARK_PREFILL_MAX_BATCHED_TOKENS:-8192}"
   if [[ "$role" == decode ]]; then
     host="$decode_host"; port=8020; side_port=5657
     gpu_memory_utilization="${DSPARK_DECODE_GPU_MEMORY_UTILIZATION:-0.90}"
+    max_batched_tokens="${DSPARK_DECODE_MAX_BATCHED_TOKENS:-8192}"
   fi
   export VLLM_NIXL_SIDE_CHANNEL_HOST="$host" VLLM_NIXL_SIDE_CHANNEL_PORT="$side_port"
   srun --nodes=1 --ntasks=1 --nodelist="$host" --exclusive --gres="gpu:$width" --cpus-per-task=24 --mem="$role_memory" \
     "${container[@]}" /usr/bin/python3 serve_role.py --model-key "$DSPARK_MODEL_KEY" \
     --role "$role" --k "$DSPARK_K" --port "$port" --output "$result" \
-    --gpu-memory-utilization "$gpu_memory_utilization" \
+    --gpu-memory-utilization "$gpu_memory_utilization" --max-batched-tokens "$max_batched_tokens" \
     --graph-policy "${DSPARK_GRAPH_POLICY:-runtime-default}" "${role_args[@]}" \
     > "$storage_root/${result#/workspace/}/$role.log" 2>&1 &
   pids+=("$!")

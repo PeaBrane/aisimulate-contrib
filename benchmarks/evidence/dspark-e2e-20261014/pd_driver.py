@@ -13,6 +13,7 @@ from pathlib import Path
 
 from campaign import IMAGE, MODELS, RUNTIME_REVISION
 from collect_fixed import fetch
+from window_plan import add_selection_arguments, execute_runs, select_runs
 
 PROXY_SHA256 = "1210e5525cc0c57f891734b682d3f8939aa7456a672bea16b44f03b6707136ff"
 PROXY_URL = f"https://raw.githubusercontent.com/vllm-project/vllm/{RUNTIME_REVISION}/tests/v1/kv_connector/nixl_integration/toy_proxy_server.py"
@@ -89,23 +90,30 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-key", choices=list(MODELS), required=True)
     parser.add_argument("--k", type=int, required=True)
-    parser.add_argument("--prefill-host", required=True)
-    parser.add_argument("--decode-host", required=True)
-    parser.add_argument("--proxy-script", type=Path, required=True)
-    parser.add_argument("--mode", choices=["smoke", "pilot", "initial"], default="smoke")
-    parser.add_argument("--concurrency", type=int, choices=[1, 4], action="append")
+    parser.add_argument("--prefill-host")
+    parser.add_argument("--decode-host")
+    parser.add_argument("--proxy-script", type=Path)
+    parser.add_argument("--mode", choices=["smoke", "pilot", "initial", "sweep"], default="smoke")
+    parser.add_argument("--concurrency", type=int, choices=[1, 4, 8, 16, 64], action="append")
     parser.add_argument("--repetition", type=int, choices=[1, 2, 3], action="append")
     parser.add_argument("--window", type=int, nargs=2, action="append", metavar=("CONCURRENCY", "REPETITION"))
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--acceptance", choices=["real", "synthetic"])
+    parser.add_argument("--startup-timeout", type=int, default=3600)
+    add_selection_arguments(parser)
     args = parser.parse_args()
-    windows = selected_windows(args.mode, args.concurrency, args.repetition, args.window)
+    if args.selection_only:
+        print(json.dumps(select_runs(args, "disagg", args.acceptance or "real"), indent=2))
+        return
+    if not args.prefill_host or not args.decode_host or not args.proxy_script or args.startup_timeout <= 0:
+        parser.error("P/D collection requires role hosts, proxy script and positive startup timeout")
     if hashlib.sha256(args.proxy_script.read_bytes()).hexdigest() != PROXY_SHA256:
         raise ValueError("NIXL proxy differs from pinned unmodified upstream source")
     prefill, decode = (
         f"http://{args.prefill_host}:8010",
         f"http://{args.decode_host}:8020",
     )
-    deadline = time.monotonic() + 3600
+    deadline = time.monotonic() + args.startup_timeout
     for endpoint in [prefill, decode]:
         wait_ready(endpoint + "/health", deadline)
     role_receipts = {
@@ -149,9 +157,22 @@ def main():
     acceptance = "synthetic" if controls[0] is not None else "real"
     if args.mode == "pilot" and acceptance != "real":
         raise ValueError("pilots require real acceptance")
+    if args.acceptance is not None and args.acceptance != acceptance:
+        raise ValueError("selected acceptance differs from launched P/D controls")
+    plan = select_runs(args, "disagg", acceptance)
+    if not plan:
+        raise ValueError("no uncompleted windows selected")
+    if args.mode == "sweep" and any(role.get("prefix_cache") for role in identity["roles"].values()):
+        raise ValueError("fixed-length sweep requires prefix caching disabled")
+    identity["window_selection"] = [{"cell_id": r["cell"]["cell_id"], "repetition": r["repetition"]} for r in plan]
+    identity["completed_runs_sha256"] = (
+        hashlib.sha256(args.completed_runs.read_bytes()).hexdigest() if args.completed_runs else None
+    )
     identity["phase"] = args.mode
     if controls[0] is not None:
         identity["synthetic_control"] = controls[0]
+    if args.completed_runs:
+        (args.output / "completed-runs.json").write_bytes(args.completed_runs.read_bytes())
     identity_path = args.output / "identity.json"
     identity_path.write_text(json.dumps(identity, indent=2) + "\n")
     proxy_command = [
@@ -184,49 +205,19 @@ def main():
                 "metrics_urls": [prefill + "/metrics", decode + "/metrics"],
             }
             (args.output / "server-ready.json").write_text(json.dumps(ready, indent=2) + "\n")
-            for concurrency, repetition in windows:
-                cell_id = f"{args.model_key}-disagg-k{args.k}-i1024-o1024-c{concurrency}-{acceptance}"
-                run_output = args.output / f"{args.mode}-c{concurrency}-r{repetition}"
-                client = [
-                    sys.executable,
-                    str(Path(__file__).with_name("collect_fixed.py")),
-                    "--matrix",
-                    str(Path(__file__).with_name("matrix.json")),
-                    "--cell-id",
-                    cell_id,
-                    "--identity",
-                    str(identity_path),
-                    "--endpoint",
-                    ready["endpoint"],
-                    "--tokenizer-endpoint",
-                    prefill,
-                    "--metrics-url",
-                    prefill + "/metrics",
-                    "--metrics-url",
-                    decode + "/metrics",
-                    "--model",
-                    MODELS[args.model_key]["model"],
-                    "--output",
-                    str(run_output),
-                    "--repetition",
-                    str(repetition),
-                ]
-                if args.mode == "smoke":
-                    client.append("--smoke")
-                subprocess.run(client, check=True)
-                subprocess.run(
-                    [
-                        sys.executable,
-                        str(Path(__file__).with_name("acceptance.py")),
-                        "--run",
-                        str(run_output),
-                        "--k",
-                        str(args.k),
-                        "--endpoint",
-                        decode + "/metrics",
-                    ],
-                    check=True,
-                )
+            execute_runs(
+                plan,
+                mode=args.mode,
+                output=args.output,
+                source_dir=Path(__file__).parent,
+                model_key=args.model_key,
+                k=args.k,
+                identity_path=identity_path,
+                endpoint=ready["endpoint"],
+                metrics_urls=ready["metrics_urls"],
+                tokenizer_endpoint=prefill,
+                acceptance_endpoint=decode + "/metrics",
+            )
         finally:
             proxy.terminate()
             try:
