@@ -275,6 +275,8 @@ shared:
     owners: [replay, maintainers]
   - glob: tests/test_runner.py
     owners: [replay, maintainers]
+  - glob: tests/test_native_router_cli.py
+    owners: [replay, maintainers]
   - glob: tests/test_traffic.py
     owners: [replay, maintainers]
   - glob: tests/e2e/
