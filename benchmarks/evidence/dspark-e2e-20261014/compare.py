@@ -223,7 +223,7 @@ def main():
     (args.output_dir / "report.json").write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
     if rows:
         with (args.output_dir / "paired.csv").open("w", newline="") as stream:
-            writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+            writer = csv.DictWriter(stream, fieldnames=list(rows[0]), lineterminator="\n")
             writer.writeheader()
             writer.writerows(rows)
     plot_pairs(rows, args.output_dir / "measured-vs-replay.png")

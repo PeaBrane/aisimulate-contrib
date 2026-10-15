@@ -38,6 +38,21 @@ def main():
     harness = roots["head"] / "python/aisimulate/tools/simulation_perf_gate"
     expand_cases = runpy.run_path(str(harness / "cases.py"))["expand_cases"]
     cases = {row["case_id"]: row for row in expand_cases()}
+    fixture = cases["agentx-vllm-aggregated"]["fixture"]
+    trace_path = harness / "fixtures/agentx.jsonl"
+    if digest(trace_path) != fixture["sha256"]:
+        raise ValueError("AgentX fixture hash does not match its manifest")
+    trace = [json.loads(line) for line in trace_path.read_text().splitlines() if line.strip()]
+    requests = []
+    pending = list(trace)
+    while pending:
+        event = pending.pop()
+        pending.extend(event.get("requests", []))
+        if "out" in event:
+            requests.append(event)
+    expected_agentx = (len(requests), sum(request["out"] for request in requests))
+    if expected_agentx != (fixture["requests"], fixture["output_tokens"]):
+        raise ValueError("AgentX fixture counts do not match its manifest")
     agentx = copy.deepcopy(cases["agentx-vllm-aggregated"]["config"])
     agentx["traffic"]["source"]["paths"] = [str(harness / "fixtures/agentx.jsonl")]
     agentx["engine"]["model"] = "deepseek-ai/DeepSeek-V4-Flash"
@@ -70,6 +85,7 @@ def main():
         "threads": 1,
         "trace_sha256": digest(harness / "fixtures/agentx.jsonl"),
         "config_sha256": {name: digest(out / f"{name}.yaml") for name in configurations},
+        "expected_agentx": {"requests": expected_agentx[0], "output_tokens": expected_agentx[1]},
         "identities": {},
         "runs": [],
     }
@@ -126,7 +142,7 @@ def main():
                     raise RuntimeError(f"{name}/{label} failed: {run.stderr[-2000:]}")
                 report = json.loads(run.stdout)
                 metrics = report.get("metrics", report.get("summary", report))
-                expected = (129, 114540) if name.startswith("agentx") else (128, 16384)
+                expected = expected_agentx if name.startswith("agentx") else (128, 16384)
                 observed = (metrics.get("completed_requests"), metrics.get("total_output_tokens"))
                 if observed != expected:
                     raise RuntimeError(f"{name}/{label}: incomplete work: {observed}, expected {expected}")

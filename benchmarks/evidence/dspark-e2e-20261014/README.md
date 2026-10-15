@@ -53,6 +53,13 @@ slow weight-loading observations and subsequent resource changes remain in the
 ledger. Fresh collection uses eager execution. Model/GPU identities are retained;
 resource retries are not treated as completed coverage.
 
+Host regression comparisons use the frozen performance-gate trace and verify
+its hash and recursively counted requests against its manifest before timing.
+The current fixture has 255 requests and 286,917 output tokens. The earlier
+129-request fixture's totals cannot validate this workload. The interrupted
+attempt in `host/failed-attempt.log` retains that mismatch; it is not a completed
+host comparison. Host wall time is separate from serving accuracy.
+
 ## Matching and progression
 
 Serving identity is frozen before each measurement. Exact token IDs, runtime

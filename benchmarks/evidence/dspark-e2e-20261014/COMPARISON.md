@@ -16,6 +16,8 @@ python/aisimulate/.venv/bin/python benchmarks/evidence/dspark-e2e-20261014/compa
 Omit either input list to report missing evidence. Outputs are `paired.csv`,
 `report.json`, and `measured-vs-replay.png`; source file hashes are retained.
 An empty campaign has unavailable errors, not zero MAPE.
+The CSV uses LF line endings so generated evidence also passes repository
+whitespace checks.
 
 ## Produce a paired prediction
 
