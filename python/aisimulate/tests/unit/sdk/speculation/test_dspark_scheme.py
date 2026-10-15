@@ -15,6 +15,7 @@ forward of N query tokens per round; verify width N + 1.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 import pytest
 
@@ -25,6 +26,7 @@ from aisimulate_core.sdk.memory.state import estimate_state_cache
 from aisimulate_core.sdk.rust_engine_step import RustForwardPassPerfModel
 from aisimulate_core.sdk.speculation import SpeculationConfig
 from aisimulate_core.sdk.speculation.dspark import DSparkScheme, draft_transfer_geometry
+from aisimulate_core.sdk.speculation.kimi_draft import native_mla_op
 from aisimulate_core.sdk.utils import _load_model_config_from_model_path
 
 pytestmark = pytest.mark.unit
@@ -143,6 +145,39 @@ class TestDraftOpGraph:
         assert not any("attention" in n or "moe" in n for n in names)
 
 
+def test_v4_pro_bundled_dspark_ignores_legacy_mtp_depth_and_keeps_native_ownership():
+    # Pro0813's actual legacy-MTP field is one; ac9126 DSpark uses three.
+    draft = DRAFT_CONFIG | {"model_type": "deepseek_v4", "num_nextn_predict_layers": 1}
+    cfg = _model_config(SpeculationConfig(kind="dspark", params={"num_draft_tokens": 6}, draft_config=draft))
+    cfg.moe_ep_size, cfg.moe_tp_size = 1, 8
+    model = models.get_model("deepseek-ai/DeepSeek-V4-Pro", cfg, "vllm")
+    scheme = model.spec_scheme
+    assert scheme.num_draft_layers == 3
+    preparation = {spec.op._name: spec.op for spec in scheme.build_draft_context_ops(model)}
+    wkv = json.loads(preparation["dspark_context_kv_proj"]._spec_json())["Gemm"]
+    assert (wkv["scale_factor"], wkv["n"], wkv["k"]) == (1, 1536, 7168)
+    assert preparation["dspark_context_kv_proj"].get_weights() == 1536 * 7168
+    draft_ops = {spec.op._name: spec for spec in scheme.build_draft_generation_ops(model)}
+    reduction = json.loads(draft_ops["dspark_attention_ar"].op._spec_json())["CustomAllReduce"]
+    assert reduction["scale_factor"] == 3
+    assert draft_ops["dspark_attention_ar"].tokens_per_request == 6
+    target_reduce = next(op for op in model.generation_ops if op._name == "generation_attention_ar")
+    assert json.loads(target_reduce._spec_json())["CustomAllReduce"]["scale_factor"] == 61
+    assert scheme.draft_kv_bytes_per_sequence(model, 1024) == 3 * 128 * 512
+    # Shared embedding/head remain target-owned; the fused context copy is new.
+    block_weights = sum(op.get_weights() for op in scheme._block_ops(model, is_context=False))
+    expected = block_weights + scheme._main_proj_op(model).get_weights()
+    expected += 2 * model._vocab_size * scheme.markov_rank * 2
+    expected += preparation["dspark_context_kv_proj"].get_weights()
+    assert scheme.draft_weights_bytes(model) == expected
+
+
+def test_v41_bundled_draft_depth_keeps_its_separate_runtime_fallback():
+    draft = DRAFT_CONFIG | {"model_type": "deepseek_v41_text", "num_nextn_predict_layers": 2}
+    scheme = DSparkScheme.from_configs(None, SpeculationConfig(kind="dspark", draft_config=draft))
+    assert scheme.num_draft_layers == 2
+
+
 class TestAccounting:
     def test_draft_weights_cross_check_against_index_diff(self):
         """Unique draft bytes ~= 10.9 GB (3 x 3.635 GB from the safetensors
@@ -203,6 +238,7 @@ def _kimi_model(depth=None):
         else SpeculationConfig(kind="dspark", params={"num_draft_tokens": depth}, draft_config=KIMI_DRAFT)
     )
     cfg.language_only = True
+    cfg.moe_ep_size, cfg.moe_tp_size = 1, 8
     return models.get_model("moonshotai/Kimi-K3", cfg, "vllm")
 
 
@@ -216,8 +252,17 @@ def test_kimi_canonical_draft_has_distinct_width_and_target_only_kv(depth):
     names = [op._name for op in model.generation_ops]
     assert "draft_dspark_context_kv_proj" in names
     assert "draft_attention" not in names  # legacy draft was not also injected
+    assert "generation_mla_downscale_gemm" not in names
+    assert "generation_mla_gate_gemm" not in names
+    assert "generation_mla_ar" not in names  # owned by native target module
     assert model.get_kvcache_elements_per_token() == target.get_kvcache_elements_per_token()
-    assert model.get_resident_weights_bytes() == target.get_resident_weights_bytes()
+    target_mla_weights = sum(op.get_weights() for op in target.context_ops if op._name.startswith("context_mla_"))
+    native = next(op for op in model.context_ops if op._name == "context_mla_native")
+    assert json.loads(native._spec_json())["MlaModuleContext"]["gemm_quant_mode"] == "bfloat16"
+    # Native source policy retains BF16 attention despite global FP8 settings.
+    assert model.get_resident_weights_bytes() == pytest.approx(
+        target.get_resident_weights_bytes() - target_mla_weights + native.get_weights()
+    )
     assert model.spec_scheme.draft_kv_bytes_per_sequence(model, 1024) == 5 * 576 * 1024
     assert 0 < model.spec_scheme.draft_weights_bytes(model) < 4e9
     context = {op._name for op in model.context_ops if op._name.startswith("draft_dspark_")}
@@ -233,6 +278,13 @@ def test_kimi_canonical_draft_has_distinct_width_and_target_only_kv(depth):
     assert proposals
     assert all(op["sequence_basis"] and op["denominator"] == 1 for op in proposals)
     assert not any("context_kv" in json.dumps(op) or "main_proj" in json.dumps(op) for op in proposals)
+    native = next(op["op"]["MlaModuleGeneration"] for op in proposals if "MlaModuleGeneration" in op["op"])
+    assert native["native_scope"] == {
+        "draft": True,
+        "query_tokens": depth,
+        "tensor_parallel_size": 8,
+        "kv_tokens_offset": 0,
+    }
 
 
 def test_kimi_draft_identity_rejects_wrong_geometry_and_quantization():
@@ -247,6 +299,21 @@ def test_kimi_draft_identity_rejects_wrong_geometry_and_quantization():
                 None,
                 SpeculationConfig(kind="dspark", params={"num_draft_tokens": 3}, draft_config=KIMI_DRAFT | override),
             )
+
+
+@pytest.mark.parametrize("geometry", [{"q_lora_rank": 768}, {"v_head_dim": 256}])
+def test_native_kimi_target_rejects_other_latent_geometry(geometry):
+    model = _kimi_model()
+    model.extra_params = replace(model.extra_params, **geometry)
+    with pytest.raises(ValueError, match="pinned target latent geometry"):
+        native_mla_op(model, name="test", count=1, draft=False, query_tokens=3)
+
+
+def test_native_kimi_target_rejects_other_collective_ownership():
+    model = _kimi_model()
+    model.config.moe_ep_size = 8
+    with pytest.raises(ValueError, match="requires EP1"):
+        native_mla_op(model, name="test", count=1, draft=False, query_tokens=3)
 
 
 @pytest.mark.parametrize("depth", [3, 5])

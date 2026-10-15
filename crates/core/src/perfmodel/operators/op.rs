@@ -330,14 +330,13 @@ impl Op {
                 o.group_a.iter().map(Op::weight_bytes).sum::<f64>()
                     + o.group_b.iter().map(Op::weight_bytes).sum::<f64>()
             }
+            Op::MlaModuleContext(o) | Op::MlaModuleGeneration(o) => o.native_weight_bytes(),
             Op::Elementwise(_)
             | Op::ContextAttention(_)
             | Op::GenerationAttention(_)
             | Op::EncoderAttention(_)
             | Op::ContextMla(_)
             | Op::GenerationMla(_)
-            | Op::MlaModuleContext(_)
-            | Op::MlaModuleGeneration(_)
             | Op::MlaBmm(_)
             | Op::MoeDispatch(_)
             | Op::CustomAllReduce(_)

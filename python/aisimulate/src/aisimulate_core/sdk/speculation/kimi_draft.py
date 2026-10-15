@@ -8,11 +8,53 @@
 
 """Artifact-derived Inferact MLA draft geometry, distinct from dense GQA drafts."""
 
+import json
 from dataclasses import dataclass, fields
 
 from aisimulate_core.sdk import common
 from aisimulate_core.sdk import operations as ops
 from aisimulate_core.sdk.speculation.base import positive_integer
+
+
+def native_mla_op(model, *, name, count, draft, query_tokens):
+    """Full pinned serving scope; causal and query width never use old tables."""
+    if model._hidden_size != 7168 or model._num_heads != 96:
+        raise ValueError("native Kimi MLA currently requires hidden size7168 and target heads96")
+    if model.config.moe_ep_size != 1:
+        raise ValueError(
+            "native Kimi DSpark MLA currently requires EP1; expert/sequence parallel "
+            "collective ownership needs separate measurements"
+        )
+    cfg = model.extra_params
+    if (cfg.q_lora_rank, cfg.kv_lora_rank, cfg.qk_nope_head_dim, cfg.qk_rope_head_dim, cfg.v_head_dim) != (
+        1536,
+        512,
+        128,
+        64,
+        128,
+    ):
+        raise ValueError("native Kimi MLA requires the pinned target latent geometry")
+    native_heads = 64 if draft else 96
+    return ops.MLAModule(
+        name,
+        count,
+        query_tokens == 0,
+        native_heads // model.config.tp_size,
+        model.config.kvcache_quant_mode,
+        common.FMHAQuantMode.bfloat16,
+        # The pinned compressed-tensors policy ignores self_attn.*; the
+        # target projections remain BF16 regardless of the MoE/GEMM policy.
+        common.GEMMQuantMode.bfloat16,
+        native_num_heads=native_heads,
+        native_scope_json=json.dumps(
+            {
+                "draft": draft,
+                "query_tokens": query_tokens,
+                "tensor_parallel_size": model.config.tp_size,
+                "kv_tokens_offset": 2 * query_tokens if draft else max(0, query_tokens - 1),
+            }
+        ),
+    )
 
 
 @dataclass(frozen=True)
@@ -76,20 +118,20 @@ class KimiDraftGeometry:
 
     def block_ops(self, model):
         h, n, tp = self.hidden_size, self.num_hidden_layers, model.config.tp_size
+        if h != 7168 or self.num_attention_heads != 64:
+            raise ValueError("native Inferact MLA scope requires hidden size7168 and draft heads64")
         if self.num_attention_heads % tp or self.intermediate_size % tp:
             raise ValueError("Kimi draft attention heads and intermediate width must divide TP")
         q = common.GEMMQuantMode.bfloat16
-        heads = self.num_attention_heads // tp
         return [
             ops.ElementWise("dspark_attn_norm", n, h, h, 0.8),
-            ops.GEMM("dspark_downscale", n, self.q_lora_rank + self.latent_width, h, q),
-            ops.GEMM("dspark_q_b", n, heads * (self.qk_nope_head_dim + self.qk_rope_head_dim), self.q_lora_rank, q),
-            ops.MLABmm("dspark_bmm_pre", n, heads, q, if_pre=True),
-            # The generic MLA table lacks a noncausal query-width axis: retain
-            # token-basis pricing and report that measurement gap explicitly.
-            ops.GenerationMLA("dspark_attention", n, heads, model.config.kvcache_quant_mode),
-            ops.MLABmm("dspark_bmm_post", n, heads, q, if_pre=False),
-            ops.GEMM("dspark_output", n, h, heads * self.v_head_dim, q),
+            native_mla_op(
+                model,
+                name="dspark_attention",
+                count=n,
+                draft=True,
+                query_tokens=model.config.speculation.params["num_draft_tokens"],
+            ),
             ops.CustomAllReduce("dspark_attention_ar", n, h, tp),
             ops.ElementWise("dspark_ffn_norm", n, h, h, 0.8),
             ops.GEMM("dspark_gate_up", n, 2 * self.intermediate_size // tp, h, q),

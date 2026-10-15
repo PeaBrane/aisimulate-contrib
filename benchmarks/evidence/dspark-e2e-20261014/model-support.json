@@ -16,7 +16,8 @@
       "vllm/v1/worker/gpu/spec_decode/dflash/speculator.py",
       "vllm/v1/worker/gpu/spec_decode/dspark/speculator.py",
       "vllm/v1/worker/gpu/spec_decode/rejection_sampler.py",
-      "vllm/v1/core/sched/scheduler.py"
+      "vllm/v1/core/sched/scheduler.py",
+      "vllm/model_executor/layers/attention/mla_attention.py"
     ]
   },
   "kimi": {
@@ -34,10 +35,65 @@
     "kda_convolution_window": "kernel_size - 1 + K",
     "kda_recurrent_shape_is_unchanged": true,
     "remaining_approximations": [
-      "MLA target/draft token-basis pricing lacks noncausal query-width measurements",
+      "native MLA measured table absent until GPU collector passes source/runtime qualification",
+      "standalone steady draft KV uses full-acceptance upper bound; no just-sampled rejection count",
+      "analytical MLA SOL excludes target collective and kernel fusion effects",
+      "draft output reduction remains modeled separately although native runtime fuses it into following normalization",
       "existing five-slot KDA cache model approximates runtime pool ownership",
       "independent recurrent rollback scratch and runtime page grouping are not measured"
-    ]
+    ],
+    "native_mla": {
+      "status": "implemented_cpu_contract_validated_gpu_collection_pending",
+      "scope": "complete native MultiHeadLatentAttention.forward; target includes output collective; draft excludes external reduction",
+      "projection_precision": "BF16, checkpoint self_attn ignore policy; overrides global non-attention GEMM policy",
+      "cache_precision": "FP8 E4M3",
+      "exact_axes": [
+        "target_or_draft",
+        "query_width",
+        "sequence_count",
+        "causal",
+        "local_heads",
+        "TP",
+        "weight_precision",
+        "cache_precision"
+      ],
+      "kv_axis": "inclusive total KV; bounded interpolation only; out-of-range fails",
+      "runtime_and_config_identity": "pinned runtime source and target/draft config SHA256, immutable image receipt, all 8 TP ranks, eager",
+      "initial_collector": {
+        "ISL": 1024,
+        "OSL": 1056,
+        "scored_e2e_OSL": 1024,
+        "sequence_counts": [
+          1,
+          4
+        ],
+        "K": 2,
+        "target_verify_width": 3,
+        "draft_query_width": 2
+      },
+      "gpu_records": 0,
+      "cpu_contract_tests_passed": 14,
+      "rust_scope_and_identity_tests_passed": 2,
+      "native_build": "schema31 release installed",
+      "canonical_kimi_tests_passed": 11,
+      "pinned_image_cpu_source_validation": {
+        "job": "790490",
+        "status": "passed",
+        "checks": [
+          "CLI help",
+          "worker import",
+          "all four immutable source hashes"
+        ],
+        "gpu_hooks_executed": false
+      },
+      "native_test_filter": {
+        "filter": "native_",
+        "passed": 55
+      },
+      "ep_support": "EP1 only; different collective ownership rejected",
+      "prefill_query_precision": "FP8 after BF16 projection; use_prefill_query_quantization required and validated by producer and consumer",
+      "loader_precision_identity_test": "passed"
+    }
   },
   "v41": {
     "model": "deepseek-ai/DeepSeek-V4.1-Flash",
@@ -203,5 +259,25 @@
     "remaining_approximations": [
       "Replay exposes output at pass completion; pinned runtime overlaps async output copy with draft proposal, which may affect TTFT."
     ]
+  },
+  "pro0813_audit": {
+    "runtime_revision": "ac9126e58aa7bbab1856ba6593ba4d5003fea516",
+    "status": "source_proven_fixes_tested_measurements_pending",
+    "report": "pro0813-attention-audit.md",
+    "fixed": [
+      "V4 DSpark defaults to three draft layers independently of legacy MTP nextn field",
+      "fused context WKV projection 7168->1536; duplicated resident weights counted",
+      "TP8/EP1 target and draft attention output reductions omitted by local-compute module tables are added"
+    ],
+    "remaining_causes": [
+      "vLLM 0.24 graph-basis tables differ from pinned ac9126 eager smoke",
+      "target verify width7 uses flattened token-basis lookup without independent query/sequence/causal identity",
+      "noncausal draft SWA width6 uses HCA latency and weight proxy; actual padded index width192 has no compressor",
+      "auxiliary hidden reconstruction, hc_head/final norm, logits gather and Markov sampling scopes incomplete or approximate",
+      "generic collective timing does not prove actual selected runtime collective cost"
+    ],
+    "kernel_evidence": "startup registration FLASHMLA_SPARSE_DSV4/DEEPSEEK_SPARSE_SWA, block256; FLASHINFER_TRTLLM_MXFP4_MXFP8 MoE; per-invocation tracing remains missing",
+    "tests_passed": 28,
+    "accuracy_claim": null
   }
 }

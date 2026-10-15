@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Contract checks for collected token bursts and acceptance-window accounting."""
 
+import dataclasses
 import hashlib
 import io
 import json
@@ -14,6 +15,7 @@ from acceptance import measured_acceptance
 from campaign import cells
 from collect_fixed import one_request
 from freeze_acceptance import freeze
+from runtime_receipt import primitive
 
 
 def snapshot(rounds, proposed, accepted, positions):
@@ -30,6 +32,23 @@ def snapshot(rounds, proposed, accepted, positions):
 
 
 class CollectionTests(unittest.TestCase):
+    def test_cache_receipt_preserves_computed_page_padding(self):
+        @dataclasses.dataclass
+        class PaddedState:
+            block_size: int = 1536
+            page_size_padded: int = 4096
+
+            @property
+            def page_size_bytes(self):
+                return self.page_size_padded
+
+        result = primitive(PaddedState())
+        self.assertEqual(result["type"], "PaddedState")
+        self.assertEqual(result["page_size_bytes"], 4096)
+        self.assertEqual(result["block_size"], 1536)
+        with self.assertRaisesRegex(TypeError, "unsupported cache receipt"):
+            primitive(object())
+
     def test_only_complete_separate_real_pilot_can_freeze_control(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

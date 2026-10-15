@@ -631,9 +631,20 @@ fn snapshot_warmup_and_profile_reports_are_pinned() {
                     let profile = report.agentic_profile.as_ref().unwrap();
                     assert!(profile.plays_started >= 6, "{name}: {profile:?}");
                 }
-                let report_json = serde_json::to_value(report.clone().with_wall_time_ms(0.0))
-                    .unwrap()
-                    .to_string();
+                let mut report_value =
+                    serde_json::to_value(report.clone().with_wall_time_ms(0.0)).unwrap();
+                if let Some(phases) = report_value
+                    .get_mut("agentic_phases")
+                    .and_then(serde_json::Value::as_object_mut)
+                {
+                    // Check the new policy metadata independently, preserving the
+                    // historical pins for every timing and lifecycle field.
+                    assert_eq!(
+                        phases.remove("warmup_policy"),
+                        Some(serde_json::json!("primer"))
+                    );
+                }
+                let report_json = report_value.to_string();
                 let per_request = serde_json::to_value(&report.per_request)
                     .unwrap()
                     .to_string();

@@ -11,11 +11,139 @@ Original adapter; no upstream implementation is copied.
 import hashlib
 import json
 import math
+from collections import defaultdict
 from itertools import pairwise
+from statistics import median
 
 RUNTIME_REVISION = "ac9126e58aa7bbab1856ba6593ba4d5003fea516"
 MODEL_REVISION = "5254448103b6254fc646dacbca1cbbf20e9216c1"
 MODEL_CONFIG_SHA256 = "8be45ce0476004a3f529fd896115a4a2e800a129ad2d3ec05b16050f52e21879"
+
+
+def config_identity_digest(raw_config):
+    """Canonical HF JSON excluding three SDK-inferred top-level quant aliases.
+
+    Original quantization_config/hf_quant_config and the complete architecture
+    remain included. No inferred defaults are added to a producer config.
+    """
+    return identity_digest(
+        {
+            key: value
+            for key, value in raw_config.items()
+            if key not in ("quant_algo", "kv_cache_quant_algo", "quant_dynamic")
+        }
+    )
+
+
+def stage_table_rows(rank_payloads, *, config_digest, image_digest):
+    """Pair all TP ranks before reducing repeated exact physical queries.
+
+    Auxiliary attention/mHC/Engram observations remain diagnostic and are not
+    summed with inclusive layer intervals. No width or KV interpolation occurs
+    during publication. Missing finalization/preparation is a publication error.
+    """
+    if len(rank_payloads) != 4 or {p["rank"] for p in rank_payloads} != set(range(4)):
+        raise ValueError("all four distinct native TP ranks are required")
+    invocations = defaultdict(dict)
+    for payload in rank_payloads:
+        if payload["failures"]:
+            raise ValueError("native failures prevent table publication")
+        validate_observations(payload["rows"])
+        for row in payload["rows"]:
+            if row["site"] not in ("layer", "finalize", "context_preparation", "input_preparation"):
+                continue
+            query = row["query_identity"]
+            if query is None or row["used_cuda_graph"] or type(row.get("decoder_replay")) is not bool:
+                raise ValueError("native stage requires observed eager query and replay policy")
+            cache = row.get("cache_identity", {})
+            if (
+                cache.get("kv_mxfp8") is not True
+                or cache.get("swa_bytes_per_token") != 528
+                or cache.get("record_width") != 528
+                or cache.get("tensor_dtype") != "torch.uint8"
+            ):
+                raise ValueError("native stage requires the observed 528-byte MXFP8 SWA cache")
+            requests = {canonical(request) for request in query["requests"]}
+            if len(requests) != 1:
+                raise ValueError("heterogeneous native stage requests need a separate physical contract")
+            request = query["requests"][0]
+            is_context = request["phase"] == "prefill"
+            identity = {
+                "scope": {
+                    "site": row["site"],
+                    "layer_id": row["layer_id"],
+                    "draft": row["owner"] == "draft",
+                    "tensor_parallel_size": 4,
+                    "expert_parallel_size": 1,
+                    "config_sha256": config_digest,
+                    "kv_cache_layout": "vllm_mxfp8",
+                    "decoder_replay": row["decoder_replay"],
+                    "query_tokens": 0 if is_context else request["query_width"],
+                },
+                "sequence_count": query["sequence_count"],
+                "query_width": request["query_width"],
+                "past_kv_tokens": request["past_kv_tokens"],
+                "is_context": is_context,
+                "causal": query["causal"],
+            }
+            dispatch = canonical(
+                {
+                    "callable": row["callable"],
+                    "attention": row.get("attention_identity"),
+                    "layer_execution": row["layer_execution"],
+                    "decode_swa_width": row.get("decode_swa_width"),
+                    "cache_identity": cache,
+                }
+            )
+            key = row["sample_id"], row["invocation_id"]
+            rank = payload["rank"]
+            if rank in invocations[key] or row["tp_rank"] != rank:
+                raise ValueError("duplicate or mislabeled native TP-rank invocation")
+            invocations[key][rank] = (canonical(identity), dispatch, row["latency_ms"])
+    grouped = defaultdict(list)
+    for ranks in invocations.values():
+        if set(ranks) != set(range(4)) or len({v[:2] for v in ranks.values()}) != 1:
+            raise ValueError("TP ranks disagree on native invocation identity or are missing")
+        identity, dispatch = next(iter(ranks.values()))[:2]
+        grouped[identity, dispatch].append(max(v[2] for v in ranks.values()))
+    rows = []
+    identities = set()
+    for (identity, dispatch), values in sorted(grouped.items()):
+        if identity in identities:
+            raise ValueError("one native physical key has conflicting runtime dispatch")
+        identities.add(identity)
+        rows.append(
+            {
+                "identity": identity,
+                "latency": median(values),
+                "sample_count": len(values),
+                "rank_count": 4,
+                "kernel_source": dispatch,
+                "runtime_revision": RUNTIME_REVISION,
+                "runtime_image_digest": image_digest,
+                "measurement_scope": "dsv41_native_stage_inclusive",
+                "used_cuda_graph": False,
+            }
+        )
+    keys = [json.loads(row["identity"]) for row in rows]
+    sites = {(k["scope"]["site"], k["scope"]["draft"]) for k in keys}
+    if (
+        not {
+            ("layer", False),
+            ("layer", True),
+            ("finalize", False),
+            ("finalize", True),
+            ("context_preparation", True),
+            ("input_preparation", False),
+            ("input_preparation", True),
+        }
+        <= sites
+    ):
+        raise ValueError("missing native layer, finalization or context preparation coverage")
+    layers = {k["scope"]["layer_id"] for k in keys if k["scope"]["site"] == "layer"}
+    if layers != set(range(43)):
+        raise ValueError("native table requires all 40 target and three draft layers")
+    return rows
 
 
 def canonical(value):
@@ -110,5 +238,5 @@ def coverage_summary(rows, failures):
         "observed_site_kinds": sorted({row["site"] for row in rows}),
         "missing_initial_shapes": [list(shape) for shape in sorted(required - observed)],
         "import_eligible": False,
-        "remaining_gate": "Map fused execution sites to the vLLM consumer graph before producing timing rows.",
+        "remaining_gate": "Require all TP ranks and complete native ownership before publishing timing rows.",
     }

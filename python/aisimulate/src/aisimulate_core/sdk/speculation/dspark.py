@@ -134,7 +134,7 @@ def draft_transfer_geometry(
         window = int(draft["sliding_window"])
     elif "dspark_block_size" in draft:
         target = _load_model_config_from_model_path(model_path)
-        per_token = int(draft.get("n_mtp_layers", 3) * target["head_dim"] * dtype_bytes)
+        per_token = int((draft.get("n_mtp_layers") or 3) * target["head_dim"] * dtype_bytes)
         window = int(target["sliding_window"])
     else:
         geometry = DenseDraftGeometry.from_hf_config(draft)
@@ -197,9 +197,13 @@ class DSparkScheme(SpecSchemeBase):
             # V4-style draft config (fields prefixed, geometry from target).
             block_size = draft_config["dspark_block_size"]
             geometry = None
-            num_draft_layers = params.get(
-                "num_draft_layers", draft_config.get("n_mtp_layers", draft_config.get("num_nextn_predict_layers", 3))
-            )
+            # V4 DSpark's bundled stack defaults to three layers, independently
+            # of legacy MTP's num_nextn_predict_layers (Pro0813 declares one).
+            # V4.1 explicitly adds that legacy field to its own fallback chain.
+            default_layers = draft_config.get("n_mtp_layers")
+            if not default_layers and draft_config.get("model_type") in ("deepseek_v41", "deepseek_v41_text"):
+                default_layers = draft_config.get("num_nextn_predict_layers")
+            num_draft_layers = params.get("num_draft_layers", default_layers or 3)
             if not draft_config.get("dspark_target_layer_ids"):
                 # Required: these are the target hidden-state taps feeding
                 # main_proj — an empty default would silently price the
@@ -322,7 +326,7 @@ class DSparkScheme(SpecSchemeBase):
         attn_cls = ops.ContextDeepSeekV4AttentionModule if is_context else ops.GenerationDeepSeekV4AttentionModule
         phase = "context" if is_context else "generation"
 
-        return [
+        block_ops = [
             attn_cls(
                 "dspark_attention",
                 n,
@@ -413,6 +417,11 @@ class DSparkScheme(SpecSchemeBase):
                 backend=model._backend_name,
             ),
         ]
+        if model._backend_name == "vllm" and cfg.moe_ep_size == 1 and tp_size == 8:
+            # Native wo_b is row-parallel. The historical module collector
+            # stubs TP collectives, so its local-compute table excludes this.
+            block_ops.insert(1, ops.CustomAllReduce("dspark_attention_ar", n, h, tp_size))
+        return block_ops
 
     def _main_proj_op(self, model):
         import aisimulate_core.sdk.operations as ops
@@ -488,22 +497,25 @@ class DSparkScheme(SpecSchemeBase):
         v4 = model.extra_params
         # Independent cost model of vLLM's context-KV preparation, modified from
         # the serving contract (Apache-2.0, copyright vLLM contributors):
-        # https://github.com/vllm-project/vllm/blob/c227aaa3f8edd02dae4583e27246430eebabfb25/vllm/models/deepseek_v4/nvidia/dspark.py
+        # https://github.com/vllm-project/vllm/blob/ac9126e58aa7bbab1856ba6593ba4d5003fea516/vllm/models/deepseek_v4/nvidia/dspark.py
         # No attention or MoE forward is executed over the context. Elementwise
         # norm/RoPE/quant/write remains an explicit bandwidth approximation.
+        fused_v4_wkv = model.model_family == "DEEPSEEKV4" and model._backend_name == "vllm"
         context_ops = [
             ops.ElementWise("dspark_main_norm", 1, h, h, 0.8),
             ops.GEMM(
                 "dspark_context_kv_proj",
-                self.num_draft_layers,
-                v4.q_lora_rank + v4.head_dim,
+                1 if fused_v4_wkv else self.num_draft_layers,
+                self.num_draft_layers * v4.head_dim if fused_v4_wkv else v4.q_lora_rank + v4.head_dim,
                 h,
                 model.config.gemm_quant_mode,
             ),
             ops.ElementWise("dspark_context_kv_store", self.num_draft_layers, v4.head_dim, v4.head_dim, 0.8),
         ]
         specs.extend(DraftOpSpec(op=op, tokens_per_request=1) for op in context_ops)
-        return specs
+        native_builder = getattr(model, "build_dspark_context_stage", None)
+        native_stage = native_builder([spec.op for spec in specs]) if native_builder is not None else None
+        return [DraftOpSpec(op=native_stage, tokens_per_request=1)] if native_stage is not None else specs
 
     def build_draft_prefill_ops(self, model) -> list[DraftOpSpec]:
         """One K-token proposal after prefill, without target verification.
@@ -527,6 +539,18 @@ class DSparkScheme(SpecSchemeBase):
 
         weight_ops = [] if self.kimi_geometry is not None else list(self._block_ops(model, is_context=False))
         weight_ops.append(self._main_proj_op(model))
+        if model.model_family == "DEEPSEEKV4" and model._backend_name == "vllm":
+            # ac9126 duplicates the per-layer WKV weights into one replicated
+            # cross-layer projection; these are separate resident allocations.
+            weight_ops.append(
+                ops.GEMM(
+                    "dspark_context_wkv_weights",
+                    1,
+                    self.num_draft_layers * model.extra_params.head_dim,
+                    model._hidden_size,
+                    model.config.gemm_quant_mode,
+                )
+            )
         # Markov head: embed (markov_w1) + bias (markov_w2), each vocab x rank,
         # replicated.
         weight_ops.append(

@@ -7,6 +7,7 @@ import aisimulate_core.sdk.operations as ops
 from aisimulate_core.sdk import common
 from aisimulate_core.sdk.models.base import BaseModel, register_model
 from aisimulate_core.sdk.models.blocks.vit import build_kimi_k3_encoder_ops
+from aisimulate_core.sdk.speculation.kimi_draft import native_mla_op
 
 
 @register_model("KIMIK3")
@@ -138,6 +139,26 @@ class KimiK3Model(BaseModel):
 
         self._build_context_ops()
         self._build_generation_ops()
+        if backend_name == "vllm" and self.config.speculation is not None and self.config.speculation.kind == "dspark":
+            # ac9126 native MLA includes downprojection/norms, output gate and
+            # output projection+collective. None may remain as an extra cost.
+            count = self._count_layer_types()["full"]
+            for phase, width in (
+                ("context", 0),
+                ("generation", self.config.speculation.params["num_draft_tokens"] + 1),
+            ):
+                original = getattr(self, f"{phase}_ops")
+                replacement = []
+                for op in original:
+                    if op._name == f"{phase}_mla_downscale_gemm":
+                        replacement.append(
+                            native_mla_op(
+                                self, name=f"{phase}_mla_native", count=count, draft=False, query_tokens=width
+                            )
+                        )
+                    elif not op._name.startswith(f"{phase}_mla_") or op._name == f"{phase}_mla_norm":
+                        replacement.append(op)
+                setattr(self, f"{phase}_ops", replacement)
         if cfg.vision_config is not None:
             self.encoder_config = cfg.vision_config
             # EPD language workers keep visual context sizing but host no ViT.

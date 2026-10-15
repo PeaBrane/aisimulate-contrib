@@ -191,6 +191,7 @@ pub mod communication;
 pub mod dsa;
 pub mod dsv4;
 pub mod dsv41;
+pub mod dsv41_native;
 pub mod dsv4_megamoe;
 pub mod fpm_forward;
 pub mod gemm;
@@ -198,6 +199,7 @@ pub mod glm53flash;
 mod interpolation;
 pub mod mhc;
 pub mod mla;
+pub mod mla_native;
 pub mod moe;
 pub mod moe_a2a;
 pub mod moe_expert_compute;
@@ -246,6 +248,7 @@ pub struct PerfTables {
     pub gemm: GemmTable,
     pub attention: AttentionTable,
     pub mla: MlaTable,
+    pub mla_native: mla_native::NativeMlaTable,
     pub moe: MoeTable,
     pub moe_a2a: MoeA2aTable,
     pub moe_expert_compute: MoeExpertComputeTable,
@@ -254,6 +257,7 @@ pub struct PerfTables {
     pub msa: MsaTable,
     pub dsv4: Dsv4Table,
     pub dsv41: Dsv41Table,
+    pub dsv41_native: dsv41_native::NativeDsv41Table,
     /// GLM-5.3-Flash sparse-MLA attention module (exact runtime only).
     pub glm53_attention: Glm53AttentionTable,
     pub dsv4_megamoe: Dsv4MegaMoeTable,
@@ -541,6 +545,8 @@ impl PerfDatabase {
             // Exact backend/version only: V41 module provenance must not be
             // inherited from legacy or sibling runtime measurements.
             dsv41: Dsv41Table::with_sources(&data_root, &resolver)?,
+            dsv41_native: dsv41_native::NativeDsv41Table::with_sources(&data_root, &resolver)?,
+            mla_native: mla_native::NativeMlaTable::with_sources(&data_root, &resolver)?,
             // Exact backend/version only, like V41: GLM attention is never
             // borrowed from sibling runtimes.
             glm53_attention: Glm53AttentionTable::with_sources(&data_root, &resolver)?,

@@ -5,6 +5,11 @@ V4-Pro P/D topology. **No qualified serving measurement/prediction pairs are
 available yet. MAPE and signed bias are unavailable, not zero.** Functional
 tests and op-table query coverage are separate from serving accuracy.
 
+A completed single-request Pro-0813 eager smoke and its unqualified Replay
+diagnostic are available in [`smoke-pro-eager/`](smoke-pro-eager/README.md).
+It is excluded from production MAPE; the observed large latency gap remains
+unresolved pending graph-enabled collection and operation-level qualification.
+
 ## Matrix and references
 
 All fresh runs use vLLM, fixed draft length, adaptive verification disabled,
@@ -37,6 +42,9 @@ Three repetitions measure `max(128, 10 × concurrency)` requests each.
   At most one GPU collection job runs per platform.
 - [`model-support.json`](model-support.json) records functional model coverage
   and remaining cache/operator approximations.
+- [`verification.json`](verification.json) records schema31 functional checks:
+  2,000 Rust library tests plus integration suites, 13 public API tests, 145
+  affected Python tests, and 107 ownership checks. These are not serving samples.
 - [`op-coverage.json`](op-coverage.json) records canonical `op_level` + `SILICON`
   + `fallback_policy: deny` construction/query checks. These CPU queries are
   predictions, not collected kernel or serving measurements.
@@ -50,8 +58,11 @@ Three repetitions measure `max(128, 10 × concurrency)` requests each.
 
 The initial 256 GB host-memory smoke attempts did not produce requests. Their
 slow weight-loading observations and subsequent resource changes remain in the
-ledger. Fresh collection uses eager execution. Model/GPU identities are retained;
-resource retries are not treated as completed coverage.
+ledger. The first eager Pro K=6 smoke completed one 1024/1024 request; it is
+diagnostic evidence, outside production coverage. Production uses the pinned
+runtime's default graph policy after a separate graph smoke, with a fresh cache
+receipt and identity. Model/GPU identities are retained; resource retries are
+not treated as completed coverage.
 
 Host regression comparisons use the frozen performance-gate trace and verify
 its hash and recursively counted requests against its manifest before timing.

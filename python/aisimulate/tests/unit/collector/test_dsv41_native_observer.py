@@ -1,11 +1,31 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import copy
+import json
+import shutil
+from pathlib import Path
 from types import SimpleNamespace
 
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
-from collector.vllm.dsv41_native_contract import coverage_summary, query_identity, validate_observations
+from collector.vllm.dsv41_native_contract import (
+    config_identity_digest,
+    coverage_summary,
+    query_identity,
+    stage_table_rows,
+    validate_observations,
+)
 from collector.vllm.dsv41_native_observer import NativeObserver
+
+from aisimulate_core.sdk import common, rust_engine_step
+from aisimulate_core.sdk.config import ModelConfig
+from aisimulate_core.sdk.errors import PerfDataNotAvailableError
+from aisimulate_core.sdk.models import get_model
+from aisimulate_core.sdk.perf_database import PerfDatabase
+from aisimulate_core.sdk.speculation import SpeculationConfig
+from aisimulate_core.sdk.utils import _load_model_config_from_model_path
 
 pytestmark = pytest.mark.unit
 
@@ -177,3 +197,184 @@ def test_nested_records_never_summed_or_imported():
     assert result["import_eligible"] is False
     with pytest.raises(ValueError, match="duplicate"):
         validate_observations([root, root])
+
+
+def test_final_tail_keeps_full_request_identity_after_bounded_decoder_replay(tmp_path):
+    cuda = SimpleNamespace(Event=Event, is_current_stream_capturing=lambda: False, synchronize=lambda: None)
+    full = SimpleNamespace(query_start_loc_cpu=Tensor([0, 1024]), num_decodes=0, num_prefills=1)
+    tail = SimpleNamespace(query_start_loc_cpu=Tensor([0, 128]), num_decodes=0, num_prefills=1)
+    context = SimpleNamespace(attn_metadata={"swa": full})
+    attn = SimpleNamespace(prefix="model.layers.39.attn", swa_cache_layer=SimpleNamespace(prefix="swa"))
+    observer = NativeObserver(SimpleNamespace(cuda=cuda), lambda: context, tmp_path, 0)
+
+    class Layer:
+        fuse_mhc_all_reduce = False
+
+        def __init__(self):
+            self.attn = attn
+
+        def forward(self, x, positions):
+            assert positions.tolist() == list(range(896, 1024))
+            return x
+
+    class Model:
+        use_sequence_parallel = False
+        decoder_replay_layers = object()
+
+        def __init__(self):
+            self.layers = [Layer()]
+
+        def forward(self, ids, positions):
+            context.attn_metadata = {"swa": tail}
+            self.layers[0].forward(None, positions[896:])
+            context.attn_metadata = {"swa": full}
+            return "native-full-row-result"
+
+    observer.wrap_root(Model, "forward", "target")
+    observer.wrap(Layer, "forward", "layer")
+    observer.begin("tail-0", "finalize")
+    try:
+        assert Model().forward(None, Tensor(range(1024))) == "native-full-row-result"
+        observer.finish()
+        rows = json.loads((tmp_path / "rank-0.json").read_text())["rows"]
+        assert len(rows) == 1  # No nested layer timing is added to the tail.
+        assert rows[0]["site"] == "finalize"
+        assert rows[0]["query_identity"]["requests"] == [
+            {"query_width": 1024, "past_kv_tokens": 0, "inclusive_kv_end": 1024, "phase": "prefill"}
+        ]
+        assert observer.frames == observer.roots == []
+    finally:
+        observer.restore()
+
+
+def native_stage_payloads():
+    cache = {"kv_mxfp8": True, "swa_bytes_per_token": 528, "record_width": 528, "tensor_dtype": "torch.uint8"}
+    payloads = []
+    sites = [("layer", layer) for layer in range(43)] + [
+        ("finalize", 39),
+        ("finalize", 42),
+        ("context_preparation", 40),
+        ("input_preparation", 0),
+        ("input_preparation", 40),
+    ]
+    for rank in range(4):
+        rows = []
+        for sample in range(2):
+            for site, layer in sites:
+                owner = "draft" if layer >= 40 else "target"
+                width = 5 if owner == "draft" else 6
+                rows.append(
+                    {
+                        "invocation_id": len(rows),
+                        "parent_invocation_id": None,
+                        "sample_id": f"{site}-{sample}",
+                        "tp_rank": rank,
+                        "site": site,
+                        "layer_id": layer,
+                        "owner": owner,
+                        "latency_ms": float((rank + 1) * (sample + 1)),
+                        "used_cuda_graph": False,
+                        "measurement_scope": "inclusive_native_site",
+                        "decoder_replay": True,
+                        "cache_identity": cache,
+                        "callable": f"observed.{site}",
+                        "layer_execution": {},
+                        "query_identity": query_identity(
+                            [0, width],
+                            list(range(1024, 1024 + width)),
+                            owner=owner,
+                            phase_counts={"num_decodes": 1, "num_prefills": 0},
+                            causal=owner == "target",
+                        ),
+                    }
+                )
+        payloads.append({"rank": rank, "rows": rows, "failures": []})
+    return payloads
+
+
+def test_native_stage_aggregation_uses_slowest_rank_then_repeat_median():
+    rows = stage_table_rows(native_stage_payloads(), config_digest="a" * 64, image_digest="sha256:" + "b" * 64)
+    assert len(rows) == 48
+    assert {row["latency"] for row in rows} == {6.0}
+    assert {row["sample_count"] for row in rows} == {2}
+    assert {row["rank_count"] for row in rows} == {4}
+    assert all(json.loads(row["identity"])["query_width"] in (5, 6) for row in rows)
+
+
+@pytest.mark.parametrize(
+    "fault", ["missing_rank", "shape_mismatch", "cache_layout", "missing_finalize", "failed_invocation"]
+)
+def test_native_stage_partial_or_conflicting_observations_cannot_publish(fault):
+    payloads = copy.deepcopy(native_stage_payloads())
+    if fault == "missing_rank":
+        payloads.pop()
+    elif fault == "shape_mismatch":
+        payloads[0]["rows"][0]["query_identity"]["requests"][0]["past_kv_tokens"] += 1
+    elif fault == "cache_layout":
+        payloads[0]["rows"][0]["cache_identity"]["record_width"] = 584
+    elif fault == "missing_finalize":
+        for payload in payloads:
+            payload["rows"] = [row for row in payload["rows"] if row["site"] != "finalize"]
+    else:
+        payloads[0]["failures"].append({"error": "observed native failure"})
+    with pytest.raises(ValueError):
+        stage_table_rows(payloads, config_digest="a" * 64, image_digest="sha256:" + "b" * 64)
+
+
+def test_config_digest_ignores_only_declared_sdk_aliases_and_preserves_geometry_quantization():
+    raw = {"text_config": {"hidden_size": 5120}, "quantization_config": {"quant_method": "fp8"}}
+    sdk = {**raw, "quant_algo": "FP8", "quant_dynamic": True, "kv_cache_quant_algo": "FP8"}
+    assert config_identity_digest(raw) == config_identity_digest(sdk)
+    assert config_identity_digest({**sdk, "text_config": {"hidden_size": 4096}}) != config_identity_digest(raw)
+    assert config_identity_digest({**sdk, "quantization_config": {"quant_method": "other"}}) != config_identity_digest(
+        raw
+    )
+
+
+def test_native_producer_rows_reach_real_model_stage_without_summing_children(tmp_path):
+    # CPU selection witnesses only: these timers are not silicon evidence.
+    model_name = "deepseek-ai/DeepSeek-V4.1-Flash"
+    raw = _load_model_config_from_model_path(model_name)
+    config = ModelConfig(
+        tp_size=4,
+        moe_tp_size=4,
+        moe_ep_size=1,
+        language_only=True,
+        system="b200_sxm",
+        decoder_replay=True,
+        fmha_quant_mode=common.FMHAQuantMode.bfloat16,
+        speculation=SpeculationConfig(kind="dspark", params={"num_draft_tokens": 5}, draft_config=raw),
+    )
+    model = get_model(model_name, config, "vllm")
+    layer = model.generation_ops[1]
+    scope = json.loads(layer._spec_json())["Dsv41Stage"]["native_scope"]
+    pristine = {
+        key: value for key, value in raw.items() if key not in ("quant_algo", "quant_dynamic", "kv_cache_quant_algo")
+    }
+    assert scope["config_sha256"] == config_identity_digest(pristine)
+    assert scope["query_tokens"] == 6
+    source = Path(__file__).resolve().parents[3] / "src/aisimulate_core/systems"
+    shutil.copy(source / "b200_sxm.yaml", tmp_path / "b200_sxm.yaml")
+    data = tmp_path / "data/b200_sxm/vllm/devac9126"
+    data.mkdir(parents=True)
+    rows = stage_table_rows(
+        native_stage_payloads(), config_digest=config_identity_digest(pristine), image_digest="sha256:" + "b" * 64
+    )
+    pq.write_table(pa.Table.from_pylist(rows), data / "dsv41_native_stage_perf.parquet")
+    db = PerfDatabase(
+        "b200_sxm",
+        "vllm",
+        "devac9126",
+        str(tmp_path),
+        database_mode="SILICON",
+        shared_layer=False,
+        strict_provenance=False,
+    )
+    # Isolate the real model stage at the private operator test boundary. The
+    # canonical constructor and full graph are covered by test_dspark_scheme.
+    model.context_ops = []
+    model.generation_ops = [layer]
+    handle = rust_engine_step._cached_engine_handle(model, db)
+    assert handle.predict_decode_latency(1, 1024) == pytest.approx(6.0)
+    with pytest.raises(PerfDataNotAvailableError, match="missing exact SILICON query"):
+        handle.predict_decode_latency(1, 1025)

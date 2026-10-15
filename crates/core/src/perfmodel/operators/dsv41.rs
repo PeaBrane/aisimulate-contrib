@@ -566,6 +566,12 @@ pub struct Dsv41StageOp {
     pub bounded: bool,
     pub window_size: u32,
     pub children: Vec<Op>,
+    #[serde(default)]
+    pub native_scope: Option<crate::perf_database::dsv41_native::NativeDsv41Scope>,
+    /// Added to RuntimeContext.s to obtain native inclusive KV length.
+    /// Draft steady state uses the explicit full-acceptance cost assumption.
+    #[serde(default)]
+    pub native_kv_tokens_offset: u32,
 }
 impl Dsv41StageOp {
     pub fn scope(&self, s: f64, prefix: f64) -> (f64, f64) {
@@ -590,6 +596,54 @@ impl Dsv41StageOp {
         scoped.prefix = prefix as u32;
         if self.is_context {
             scoped.num_tokens = ctx.batch_size * scoped.s;
+        }
+        if let Some(scope) = &self.native_scope
+            && !matches!(db.database_mode, DatabaseMode::Sol | DatabaseMode::SolFull)
+        {
+            if db.database_mode == DatabaseMode::Empirical {
+                return Err(AicError::EmpiricalNotImplemented(
+                    "V4.1 native stages have no empirical calibration".into(),
+                ));
+            }
+            let (sequences, width, past) = if self.is_context {
+                (scoped.batch_size, scoped.s, scoped.prefix)
+            } else {
+                if scope.query_tokens == 0 || scoped.batch_size % scope.query_tokens != 0 {
+                    return Err(AicError::ModelConfig(
+                        "V4.1 native stage requires an integral request/query-width split".into(),
+                    ));
+                }
+                (
+                    scoped.batch_size / scope.query_tokens,
+                    scope.query_tokens,
+                    scoped
+                        .s
+                        .checked_add(self.native_kv_tokens_offset)
+                        .and_then(|end| end.checked_sub(scope.query_tokens))
+                        .ok_or_else(|| {
+                            AicError::ModelConfig(
+                                "V4.1 native KV/query width overflow or underflow".into(),
+                            )
+                        })?,
+                )
+            };
+            if sequences == 0 || width == 0 {
+                return Ok(zero());
+            }
+            let key = crate::perf_database::dsv41_native::NativeDsv41Key {
+                scope: scope.clone(),
+                sequence_count: sequences,
+                query_width: width,
+                past_kv_tokens: past,
+                is_context: self.is_context,
+                causal: !scope.draft,
+            };
+            // Native fused ownership cannot fall back to the differently owned
+            // component table. Missing exact rows remain coverage gaps in HYBRID.
+            return db
+                .dsv41_native
+                .query(&key)
+                .map(|latency| PerformanceResult::new(latency, Source::Silicon));
         }
         let mut total = None;
         for op in &self.children {
@@ -1090,6 +1144,8 @@ mod tests {
     #[test]
     fn bounded_scope_preserves_absolute_position() {
         let stage = Dsv41StageOp {
+            native_scope: None,
+            native_kv_tokens_offset: 0,
             name: "tail".into(),
             is_context: true,
             decoder_replay: true,

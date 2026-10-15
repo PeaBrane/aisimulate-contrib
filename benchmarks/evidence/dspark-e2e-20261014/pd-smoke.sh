@@ -35,6 +35,7 @@ for role in prefill decode; do
   srun --nodes=1 --ntasks=1 --nodelist="$host" --exclusive --gres="gpu:$width" --cpus-per-task=24 --mem="$role_memory" \
     "${container[@]}" /usr/bin/python3 serve_role.py --model-key "$DSPARK_MODEL_KEY" \
     --role "$role" --k "$DSPARK_K" --port "$port" --output "$result" \
+    --graph-policy "${DSPARK_GRAPH_POLICY:-runtime-default}" \
     > "$storage_root/${result#/workspace/}/$role.log" 2>&1 &
   pids+=("$!")
 done

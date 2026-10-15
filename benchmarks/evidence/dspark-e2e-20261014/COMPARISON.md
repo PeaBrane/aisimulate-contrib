@@ -40,6 +40,14 @@ backend, graph policy, runtime/image and effective cache settings. Qualification
 must reconcile those settings with the resolved canonical model and explicitly
 retain differences in operator-table coverage and cache representation.
 
+Qualification establishes a reproducible, matched workload and serving setup;
+it does not require an exact cost model. Disclosed operator-table version reuse,
+attention approximations, and unmodeled host overhead remain part of the measured
+prediction error once the model, workload, topology and effective cache settings
+are reconciled. They must not exclude a complete pair merely because its error
+is large. A missing timing query that prevents Replay from completing, an unknown
+serving identity, or an unverified cache mapping remains an explicit gap.
+
 The predictor passes the measured input and output token IDs to native Engine
 Replay with the measured closed-loop request concurrency. It saves the resolved
 Replay specification, raw report, performance/memory diagnostics, source hashes

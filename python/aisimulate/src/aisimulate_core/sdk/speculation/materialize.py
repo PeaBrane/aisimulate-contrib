@@ -126,6 +126,11 @@ def materialize_spec_scheme(model) -> None:
             # Native composite operators have no Python attribute dictionary
             # or pickle protocol. Clone and carry width in the typed wrapper.
             child = json.loads(spec.op._spec_json())
+            stage = child.get("Dsv41Stage", {})
+            if (stage.get("native_scope") or {}).get("site") == "context_preparation":
+                stage["is_context"] = False
+                stage["native_scope"]["query_tokens"] = spec.tokens_per_request
+                stage["native_kv_tokens_offset"] = spec.tokens_per_request - 1
             next(iter(child.values()))["name"] = f"draft_{spec.op._name}"
             model.generation_ops.append(
                 core.op_from_spec_json(
@@ -174,6 +179,12 @@ def materialize_spec_scheme(model) -> None:
             op._scale_num_tokens = (op._scale_num_tokens or 1) * spec.tokens_per_request
             op._verify_query_tokens = spec.tokens_per_request
         child = json.loads(op._spec_json())
+        if child.get("Dsv41Stage", {}).get("native_scope") is not None:
+            child["Dsv41Stage"]["native_kv_tokens_offset"] = 0
+        native_mla = child.get("MlaModuleGeneration", {}).get("native_scope")
+        if native_mla is not None:
+            # Request-basis startup already carries prompt+K inclusive KV.
+            native_mla["kv_tokens_offset"] = 0
         next(iter(child.values()))["name"] = f"draft_proposal_{op._name}"
         model.context_ops.append(
             core.op_from_spec_json(

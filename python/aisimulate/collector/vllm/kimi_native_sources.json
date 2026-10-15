@@ -1,0 +1,6 @@
+{
+  "vllm.models.kimi_k3.nvidia.mla": "613d03689525acadbd3c9d271ede3615fe043ff9417dfb1230a7d86581cf336a",
+  "vllm.models.kimi_k3.nvidia.model": "2b1d9629f810926a98e9ae05582afcceda02e372bb0a4afd7aa95c60d4931c74",
+  "vllm.models.kimi_k3.nvidia.dspark_mla": "adfe621d7fbb89616e207118000c9f61201b2ff4af9b8d43387d71eec0344121",
+  "vllm.model_executor.layers.attention.mla_attention": "b86871e2204c02f31fd37d6e63a330e73d96419cb239722ac6a1f5562e9c3df8"
+}

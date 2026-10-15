@@ -379,6 +379,9 @@ impl Availability<'_> {
         );
         match op {
             Dsv41Stage(stage) => {
+                if stage.native_scope.is_some() && !sol {
+                    return self.exact("dsv41_native_stage_perf.parquet");
+                }
                 for child in &stage.children {
                     self.op(child)?;
                 }
@@ -443,6 +446,9 @@ impl Availability<'_> {
             EncoderAttention(_) => self.any(&["encoder_attention_perf.parquet"]),
             ContextMla(_) => self.any(&["context_mla_perf.parquet"]),
             GenerationMla(_) => self.any(&["generation_mla_perf.parquet"]),
+            MlaModuleContext(op) | MlaModuleGeneration(op) if op.native_scope.is_some() => {
+                self.any(&["mla_native_module_perf.parquet"])
+            }
             MlaModuleContext(_) => self.any(&["mla_context_module_perf.parquet"]),
             MlaModuleGeneration(_) => self.any(&["mla_generation_module_perf.parquet"]),
             MlaBmm(_) => self.any(&["mla_bmm_perf.parquet"]),
@@ -924,6 +930,8 @@ mod tests {
         use crate::operators::dsv41::{Dsv41LinearOp, Dsv41StageOp};
         let root = systems();
         let stage = Op::Dsv41Stage(Dsv41StageOp {
+            native_scope: None,
+            native_kv_tokens_offset: 0,
             name: "stage".into(),
             is_context: true,
             decoder_replay: true,

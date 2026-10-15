@@ -19,14 +19,17 @@ def main():
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--k", type=int, required=True)
     parser.add_argument("--synthetic-al", type=float)
+    parser.add_argument("--graph-policy", choices=["eager", "runtime-default"], default="runtime-default")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if args.k not in MODELS[args.model_key]["k"]:
         parser.error("K must belong to the approved matrix")
     args.output.mkdir(parents=True, exist_ok=True)
-    command, env, checkpoint = server_command(args.model_key, args.k, args.port, args.role, args.synthetic_al)
+    command, env, checkpoint = server_command(
+        args.model_key, args.k, args.port, args.role, args.synthetic_al, args.graph_policy
+    )
     (args.output / f"{args.role}-identity.json").write_text(
-        json.dumps({"command": command, "checkpoint": checkpoint}, indent=2) + "\n"
+        json.dumps({"command": command, "checkpoint": checkpoint, "graph_policy": args.graph_policy}, indent=2) + "\n"
     )
     with (args.output / f"{args.role}-gpu.csv").open("w") as output:
         subprocess.run(

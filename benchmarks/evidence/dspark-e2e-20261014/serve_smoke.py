@@ -3,9 +3,11 @@
 """Launch an aggregated DSpark smoke, acceptance pilot, or initial fixed cells."""
 
 import argparse
+import hashlib
 import json
 import math
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -18,7 +20,7 @@ from collect_fixed import fetch
 from inspect_runtime import checkpoint_path, inspect_checkpoint
 
 
-def server_command(model_key, k, port, role="agg", synthetic_al=None):
+def server_command(model_key, k, port, role="agg", synthetic_al=None, graph_policy="eager"):
     model = MODELS[model_key]
     checkpoint = inspect_checkpoint(model["model"], model["revision"])
     speculation = {
@@ -58,7 +60,6 @@ def server_command(model_key, k, port, role="agg", synthetic_al=None):
         "64",
         "--max-num-batched-tokens",
         "8192",
-        "--enforce-eager",
         "--no-enable-prefix-caching",
         "--port",
         str(port),
@@ -67,8 +68,12 @@ def server_command(model_key, k, port, role="agg", synthetic_al=None):
         "--speculative-config",
         json.dumps(speculation),
     ]
+    if graph_policy == "eager":
+        command.append("--enforce-eager")
     if model_key == "v4-pro":
         command += ["--attention-backend", "FLASHMLA_SPARSE_DSV4"]
+    if model_key == "kimi-k3":
+        command += ["--attention-config", '{"use_prefill_query_quantization":true}']
     if model_key == "v41-flash":
         command += [
             "--tokenizer-mode",
@@ -86,6 +91,9 @@ def server_command(model_key, k, port, role="agg", synthetic_al=None):
         "VLLM_USE_RUST_FRONTEND": "0",
         "VLLM_ENGINE_READY_TIMEOUT_S": "3600",
     }
+    if role == "agg":
+        command += ["--host", "127.0.0.1", "--worker-extension-cls", "runtime_receipt.DsparkReceiptWorker"]
+        env["VLLM_SERVER_DEV_MODE"] = "1"
     if role != "agg":
         command += [
             "--kv-transfer-config",
@@ -104,6 +112,9 @@ def main():
     parser.add_argument("--k", type=int, required=True)
     parser.add_argument("--port", type=int, default=8010)
     parser.add_argument("--mode", choices=["smoke", "pilot", "initial"], default="smoke")
+    parser.add_argument("--graph-policy", choices=["eager", "runtime-default"], default="eager")
+    parser.add_argument("--concurrency", type=int, choices=[1, 4], action="append")
+    parser.add_argument("--repetition", type=int, choices=[1, 2, 3], action="append")
     acceptance = parser.add_mutually_exclusive_group()
     acceptance.add_argument("--synthetic-al", type=float)
     acceptance.add_argument("--synthetic-control", type=Path)
@@ -128,13 +139,33 @@ def main():
     if args.mode == "pilot" and args.synthetic_al is not None:
         parser.error("pilots must measure real acceptance")
     args.output.mkdir(parents=True, exist_ok=False)
-    command, env, checkpoint = server_command(args.model_key, args.k, args.port, synthetic_al=args.synthetic_al)
+    source_dir = args.output / "source"
+    source_dir.mkdir()
+    source_hashes = {}
+    for name in (
+        "serve_smoke.py",
+        "campaign.py",
+        "collect_fixed.py",
+        "acceptance.py",
+        "runtime_receipt.py",
+        "inspect_runtime.py",
+        "matrix.json",
+    ):
+        source = Path(__file__).with_name(name)
+        shutil.copy2(source, source_dir / name)
+        source_hashes[name] = hashlib.sha256(source.read_bytes()).hexdigest()
+    command, env, checkpoint = server_command(
+        args.model_key, args.k, args.port, synthetic_al=args.synthetic_al, graph_policy=args.graph_policy
+    )
+    env["PYTHONPATH"] = str(source_dir.resolve()) + os.pathsep + env.get("PYTHONPATH", "")
     identity = {
         "model": model,
         "checkpoint": checkpoint,
         "image": IMAGE,
         "runtime_revision": RUNTIME_REVISION,
         "server_command": command,
+        "launcher_source_sha256": source_hashes["serve_smoke.py"],
+        "source_hashes": source_hashes,
         "runtime_environment": {
             name: env[name]
             for name in (
@@ -142,9 +173,10 @@ def main():
                 "MKL_NUM_THREADS",
                 "VLLM_USE_V2_MODEL_RUNNER",
                 "VLLM_USE_RUST_FRONTEND",
+                "VLLM_SERVER_DEV_MODE",
             )
         },
-        "graph_policy": "eager",
+        "graph_policy": args.graph_policy,
         "prefix_cache": False,
         "external_kv_offload": False,
         "engram_cpu_offload": False,
@@ -198,12 +230,29 @@ def main():
                         break
                 except (urllib.error.URLError, TimeoutError):
                     time.sleep(10)
+            with fetch(
+                f"http://127.0.0.1:{args.port}/collective_rpc",
+                {"method": "dspark_campaign_receipt", "timeout": 120},
+                timeout=150,
+            ) as response:
+                cache_receipt = json.load(response)
+            ranks = cache_receipt["results"]
+            if len(ranks) != model["gpus_per_role"] or {r["rank"] for r in ranks} != set(range(model["gpus_per_role"])):
+                raise ValueError("runtime cache receipt is missing TP ranks")
+            cache_path = args.output / "effective-cache.json"
+            cache_bytes = (json.dumps(cache_receipt, indent=2, sort_keys=True) + "\n").encode()
+            cache_path.write_bytes(cache_bytes)
+            identity["runtime_cache_sha256"] = hashlib.sha256(cache_bytes).hexdigest()
+            identity["cache_receipt_extension_sha256"] = hashlib.sha256(
+                (source_dir / "runtime_receipt.py").read_bytes()
+            ).hexdigest()
+            identity_path.write_text(json.dumps(identity, indent=2) + "\n")
             acceptance = "synthetic" if args.synthetic_al is not None else "real"
             ready = {
                 "identity_path": str(identity_path),
-                "effective_config_path": str(identity_path),
+                "effective_config_path": str(cache_path),
                 "log_paths": [str(args.output / "server.log")],
-                "cache_capacity_by_role_rank": None,
+                "cache_capacity_by_role_rank": {"agg": ranks},
                 "model_config_paths": [str(Path(checkpoint["path"]) / "config.json")],
                 "cell_id": f"{args.model_key}-agg-k{args.k}-i1024-o1024-c1-{acceptance}",
                 "endpoint": f"http://127.0.0.1:{args.port}",
@@ -213,17 +262,17 @@ def main():
                 ),
             }
             (args.output / "server-ready.json").write_text(json.dumps(ready, indent=2) + "\n")
-            concurrencies = [1, 4] if args.mode == "initial" else [1]
-            repetitions = [1, 2, 3] if args.mode == "initial" else [1]
+            concurrencies = args.concurrency or ([1, 4] if args.mode == "initial" else [1])
+            repetitions = args.repetition or ([1, 2, 3] if args.mode == "initial" else [1])
             for concurrency in concurrencies:
                 for repetition in repetitions:
                     cell_id = f"{args.model_key}-agg-k{args.k}-i1024-o1024-c{concurrency}-{acceptance}"
                     run_output = args.output / f"{args.mode}-c{concurrency}-r{repetition}"
                     client = [
                         sys.executable,
-                        str(Path(__file__).with_name("collect_fixed.py")),
+                        str(source_dir / "collect_fixed.py"),
                         "--matrix",
-                        str(Path(__file__).with_name("matrix.json")),
+                        str(source_dir / "matrix.json"),
                         "--cell-id",
                         cell_id,
                         "--identity",
@@ -245,7 +294,7 @@ def main():
                     subprocess.run(
                         [
                             sys.executable,
-                            str(Path(__file__).with_name("acceptance.py")),
+                            str(source_dir / "acceptance.py"),
                             "--run",
                             str(run_output),
                             "--k",

@@ -1,0 +1,62 @@
+{
+  "schema": "dspark-implementation-verification-v1",
+  "base_revision": "7d632e3003bf1bdfb2f60b63b25271aa6ae551d2",
+  "native_sha256": "a353b269991350a1a77185828b2e5cbb666445b5bbb7fd3c5f60d8be63b93763",
+  "compiled_schema": 31,
+  "checks": [
+    {
+      "check": "Rust workspace",
+      "log_sha256": "b778d16fe61240f676cbd07e8a6da1c22f30f1867e3ede427108804958076304",
+      "results": [
+        "test result: ok. 2000 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 84.67s",
+        "test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.11s",
+        "test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s",
+        "test result: ok. 53 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s",
+        "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+        "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s",
+        "test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s",
+        "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+        "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+        "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+        "test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s",
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s",
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+        "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s",
+        "test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s",
+        "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s"
+      ]
+    },
+    {
+      "check": "Rust public API",
+      "log_sha256": "b3740b1d600845b950198a2254e0f113f49bb5c99b5f7390a94e1f1bf686f56f",
+      "results": [
+        "test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s",
+        "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+      ]
+    },
+    {
+      "check": "Python affected contracts",
+      "log_sha256": "dbf2db1c7a75f11e63a968cc0c46ea5563c30b8a6b93bfc18a776a277e1582aa",
+      "results": [
+        "145 passed\u001b[0m, \u001b[33m\u001b[1m1 warning\u001b[0m\u001b[33m in 5.09s\u001b[0m\u001b[33m ========================\u001b[0m"
+      ]
+    },
+    {
+      "check": "Ownership policy",
+      "log_sha256": "50954a0e6ed8c31a8c1229f29f1d42c5111125f5a263123bbe67348f9b05277d",
+      "results": [
+        "107 passed in 8.43s"
+      ]
+    }
+  ],
+  "additional_checks": [
+    "Collection protocol:6 passed",
+    "Packaged legal files identical",
+    "cargo fmt --all -- --check passed",
+    "Affected Python Ruff check/format passed",
+    "git diff --check passed"
+  ],
+  "ci_snapshot_fix": "Assert warmup_policy=primer separately and remove only that new metadata before hashing. All historical timing/lifecycle hashes remain unchanged.",
+  "scope": "Functional validation only. Production serving accuracy and full collection remain incomplete."
+}

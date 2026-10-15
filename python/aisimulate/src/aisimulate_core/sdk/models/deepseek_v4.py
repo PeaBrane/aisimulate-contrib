@@ -128,7 +128,7 @@ class DeepSeekV4Model(BaseModel):
             ratio_counts[128] += ratio_counts.pop(0, 0)
             op_cls = ops.ContextDeepSeekV4AttentionModule if is_context else ops.GenerationDeepSeekV4AttentionModule
             name = "context_attention" if is_context else "generation_attention"
-            return [
+            attention_ops = [
                 op_cls(
                     name,
                     count * scale_factor,
@@ -155,6 +155,19 @@ class DeepSeekV4Model(BaseModel):
                 for ratio, count in ratio_counts.items()
                 if count > 0
             ]
+            if (
+                backend_name == "vllm"
+                and self.config.speculation is not None
+                and self.config.speculation.kind == "dspark"
+                and moe_ep_size == 1
+                and tp_size == 8
+            ):
+                # Module measurements simulate local TP shapes with collective
+                # calls stubbed. Pinned EP1 serving owns wo_b's output reduce.
+                # Source: vllm-project/vllm@ac9126e58aa7bbab1856ba6593ba4d5003fea516,
+                # vllm/models/deepseek_v4/attention.py:277 and nvidia/model.py:1180.
+                attention_ops.append(ops.CustomAllReduce(f"{name}_ar", self._num_layers * scale_factor, h, tp_size))
+            return attention_ops
 
         def _moe_ops(phase: str, num_layers: float, is_context: bool, attn_cp: int = 1):
             # attn_cp>1 (context under CP) makes MoEDispatch use the attn-CP+moe-TP

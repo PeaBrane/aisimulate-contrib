@@ -796,6 +796,8 @@ mod tests {
             sinkhorn_iters: 20,
         };
         let mut stage = Dsv41StageOp {
+            native_scope: None,
+            native_kv_tokens_offset: 0,
             name: "decoder".into(),
             is_context: true,
             decoder_replay: true,

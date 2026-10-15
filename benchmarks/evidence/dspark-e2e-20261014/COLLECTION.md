@@ -50,9 +50,18 @@ Shared model paths are mounted read-only, with no copied or downloaded checkpoin
 
 The V4.1 AgentX recipe has `engram-config.cpu_offload=true` despite its published
 KV-offload label being `off`. The fresh smoke explicitly disables Engram CPU
-residency and uses eager execution. This is a recorded configuration change, not
-a claim of historical-run equivalence. Retain the selected execution policy into
-subsequent fixed-length and AgentX runs.
+residency. Eager execution is limited to diagnostic smokes. Production selects
+`--graph-policy runtime-default`, leaving graph capture settings to the pinned
+runtime and retaining its effective settings in logs. A separate graph smoke
+exports cache capacity after graph reservation. This is a recorded configuration
+change, not a claim of historical-run equivalence; retain the selected production
+policy into subsequent fixed-length and AgentX runs.
+
+Each production job can select `DSPARK_CONCURRENCY` and `DSPARK_REPETITION`
+(or launcher `--concurrency` / `--repetition`) to collect one window. Completed
+windows retain separate summaries and raw records. Resume the campaign by
+submitting only missing windows into new result directories; never overwrite a
+completed window. Budget jobs from graph-smoke throughput before grouping windows.
 
 ## Exact-token client
 
@@ -171,3 +180,25 @@ Pass `--synthetic-control CONTROL.json` to the serving runner, or set
 The runner validates model revision and K, and records the entire frozen control
 in each serving identity. Reference-K `--synthetic-al` accepts only the verified
 historical value. No pilot or control is selected by latency error.
+
+## Exact runtime cache receipts
+
+Subsequent aggregated runs load the read-only `runtime_receipt.DsparkReceiptWorker`
+extension and enable the pinned runtime's development RPC route. The API binds
+only to `127.0.0.1`. Before warmup, the launcher exports every rank's initialized
+cache groups, per-group spec/page bytes, padded tensor strides, pool block count,
+and available cache bytes to `effective-cache.json`. Its hash and the extension
+source hash are frozen into the serving identity before requests begin. The
+extension never replaces a forward method or runs inside the measured window.
+Initial smokes launched before this addition retain their original logs and are
+unqualified. P/D still requires an equivalent per-role receipt before scoring.
+
+New aggregated runs snapshot launcher/client sources and the matrix into their
+result directory, hash each file, and execute the client and read-only cache
+extension from that snapshot. Older smokes retain their recorded source hashes
+and are explicitly distinguished from this stronger source receipt.
+
+Kimi FP8 KV requires `attention_config.use_prefill_query_quantization=true` in
+the pinned runtime. The first eager startup reached native warmup and rejected
+the missing flag; its failure is retained. Corrected launches explicitly enable
+it, preserving BF16 projection weights and the runtime's FP8 prefill query path.

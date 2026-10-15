@@ -4,7 +4,7 @@
 
 Original integration using public LLM.generate/collective_rpc APIs at
 vllm-project/vllm@ac9126e58aa7bbab1856ba6593ba4d5003fea516 (Apache-2.0).
-This produces raw observations, not an importable performance table.
+Only complete matching rank observations can produce the native-stage table.
 """
 
 import argparse
@@ -14,7 +14,13 @@ import json
 import os
 from pathlib import Path
 
-from collector.vllm.dsv41_native_contract import MODEL_CONFIG_SHA256, MODEL_REVISION, RUNTIME_REVISION
+from collector.vllm.dsv41_native_contract import (
+    MODEL_CONFIG_SHA256,
+    MODEL_REVISION,
+    RUNTIME_REVISION,
+    config_identity_digest,
+    stage_table_rows,
+)
 
 
 def run(args):
@@ -33,7 +39,7 @@ def run(args):
         "warmup_requests": 2,
         "repetitions": args.repetitions,
         "scope": "native site timing with real serving metadata; no serving accuracy claim",
-        "remaining_gate": "fused-site ownership and consumer integration",
+        "remaining_gate": "complete native observations and matching TP-rank ownership",
     }
     llm = None
     installed = False
@@ -41,6 +47,7 @@ def run(args):
         config_bytes = (args.model / "config.json").read_bytes()
         if hashlib.sha256(config_bytes).hexdigest() != MODEL_CONFIG_SHA256:
             raise ValueError("checkpoint config does not match the pinned V4.1 campaign")
+        receipt["config_identity_sha256"] = config_identity_digest(json.loads(config_bytes))
         tokens = json.loads(args.prompt_tokens.read_text())
         if not isinstance(tokens, list) or len(tokens) != 1024:
             raise ValueError("initial observer requires an explicit 1024-token prompt")
@@ -91,7 +98,8 @@ def run(args):
         )
         installed = True
         receipt["requests"] = []
-        for kind in ("layer", "attention", "mhc", "engram"):
+        site_kinds = ("layer", "attention", "mhc", "engram", "finalize", "context_preparation", "input_preparation")
+        for kind in site_kinds:
             for repetition in range(args.repetitions):
                 sample = f"{kind}-{repetition}"
                 llm.collective_rpc("dsv41_observer_begin", args=(sample, kind))
@@ -108,11 +116,27 @@ def run(args):
         if any(
             r["coverage"]["failure_count"]
             or r["coverage"]["missing_initial_shapes"]
-            or r["coverage"]["observed_site_kinds"] != ["attention", "engram", "layer", "mhc"]
+            or r["coverage"]["observed_site_kinds"] != sorted(site_kinds)
             for r in receipt["ranks"]
         ):
             raise ValueError("native observation contains missing or unsupported shapes; preserve partial records")
-        receipt["status"] = "observed_pending_ownership_audit"
+        payloads = [{**json.loads(Path(rank["path"]).read_text()), "rank": rank["rank"]} for rank in receipt["ranks"]]
+        rows = stage_table_rows(
+            payloads, config_digest=receipt["config_identity_sha256"], image_digest=args.image_digest
+        )
+        arrow = importlib.import_module("pyarrow")
+        parquet = importlib.import_module("pyarrow.parquet")
+        table = args.output / "dsv41_native_stage_perf.parquet"
+        temporary = table.with_suffix(".tmp")
+        parquet.write_table(arrow.Table.from_pylist(rows), temporary)
+        temporary.replace(table)
+        receipt["status"] = "collected_native_stages"
+        receipt["import_eligible"] = True
+        receipt["table_rows"] = len(rows)
+        receipt["table_sha256"] = hashlib.sha256(table.read_bytes()).hexdigest()
+        receipt["remaining_gate"] = (
+            "Exact observed queries only; mixed batches and wider replay KV coverage remain unqualified."
+        )
     except Exception as error:
         receipt["error"] = f"{type(error).__name__}: {error}"
         raise

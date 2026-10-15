@@ -658,6 +658,16 @@ adaptations of, the named DeepSeek model repositories:
 | `src/aisimulate_core/model_configs/deepseek-ai--DeepSeek-V4.1-Flash_config.json` | `deepseek-ai/DeepSeek-V4.1-Flash@fb2764a5cf321eaa5070ca8f9e892818f477c16d` |
 | `src/aisimulate_core/model_configs/deepseek-ai--DeepSeek-V4-Pro_config.json` | `deepseek-ai/DeepSeek-V4-Pro@b5968e9190ef611bbf34a7229255be88a0e937c1` |
 
+The unmodified evidence configuration
+`benchmarks/evidence/dspark-e2e-20261014/configs/pro0813/config.json` and its
+embedded copy in `smoke-pro-eager/replay-config.yaml` come from
+`deepseek-ai/DeepSeek-V4-Pro-0813@72e1d3230f6c080a530b0a1d46f8eb4602340597/config.json`.
+Copyright (c) 2023 DeepSeek. MIT; the adjacent evidence directory preserves the
+upstream license. The Replay YAML combines the unchanged configuration with
+original campaign settings.
+Source: https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro-0813/blob/72e1d3230f6c080a530b0a1d46f8eb4602340597/config.json
+License: https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro-0813/blob/72e1d3230f6c080a530b0a1d46f8eb4602340597/LICENSE
+
 The V4.1 descriptor and performance formulas in `src/aisimulate_core/sdk/deepseek_v41.py`,
 `src/aisimulate_core/sdk/models/deepseek_v41.py`, and repository-root
 `crates/core/src/perfmodel/operators/dsv41.rs` are AISimulate performance-model
@@ -1336,6 +1346,31 @@ Additional original paths are `vllm/models/deepseek_v41/common/engram.py`,
 `vllm/models/deepseek_v41/nvidia/flashmla.py`,
 `vllm/v1/attention/backends/mla/sparse_swa.py`,
 `vllm/v1/worker/worker_base.py`, and `vllm/entrypoints/llm.py`.
+
+The native Kimi observation adapters `collect_kimi_native.py`,
+`kimi_native_contract.py`, `kimi_native_observer.py`, and
+`kimi_native_sources.json` in `python/aisimulate/collector/vllm/`, plus the
+modified model in `python/aisimulate/src/aisimulate_core/sdk/models/kimi_k3.py`
+and native consumers `crates/core/src/perfmodel/operators/mla.rs`,
+`crates/core/src/perfmodel/perf_database/mla_native.rs`, and
+`crates/core/src/perfmodel/perf_database/dsv41_native.rs`, independently adapt
+these same pinned execution contracts. They preserve per-module ownership,
+query geometry and collective boundaries; no serving kernels are copied.
+Additional original paths are `vllm/model_executor/layers/attention/mla_attention.py`
+and `vllm/models/deepseek_v41/decoder_replay_layers.py`. These adapters and
+their derived contract documentation are modified. Copyright contributors to
+the vLLM project and NVIDIA CORPORATION & AFFILIATES. Apache-2.0.
+
+The corrected V4 DSpark draft depth, fused context projection, resident weights
+and attention collective ownership in
+`python/aisimulate/src/aisimulate_core/sdk/speculation/dspark.py` and
+`python/aisimulate/src/aisimulate_core/sdk/models/deepseek_v4.py`, with their
+regression tests, additionally follow these paths at the same pinned revision:
+`vllm/models/deepseek_v4/nvidia/dspark.py`,
+`vllm/models/deepseek_v4/nvidia/model.py`, and
+`vllm/models/deepseek_v4/attention.py`. These independent CPU models are modified
+adaptations; no serving kernels are copied. Copyright contributors to the vLLM
+project and NVIDIA CORPORATION & AFFILIATES. Apache-2.0.
 
 Source: https://github.com/vllm-project/vllm/tree/ac9126e58aa7bbab1856ba6593ba4d5003fea516
 License: https://github.com/vllm-project/vllm/blob/ac9126e58aa7bbab1856ba6593ba4d5003fea516/LICENSE

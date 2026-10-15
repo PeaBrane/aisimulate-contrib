@@ -104,6 +104,16 @@ def test_pinned_artifacts_reject_changed_loader_or_draft(tmp_path, monkeypatch):
         prediction.validate_artifacts(config, identity, receipt, tmp_path, pins)
 
 
+def test_smoke_can_be_predicted_without_changing_production_matrix():
+    config, identity, records = inputs()
+    identity["cell"]["expected_requests"] = 128
+    identity["phase"] = "smoke"
+    assert len(prediction.validate_inputs(config, identity, records)) == 1
+    identity["phase"] = "initial"
+    with pytest.raises(ValueError, match="request count"):
+        prediction.validate_inputs(config, identity, records)
+
+
 @pytest.mark.parametrize("mismatch", ["model", "hardware", "draft_width", "topology", "prefix", "tokens", "failure"])
 def test_identity_or_workload_mismatches_cannot_be_scored(mismatch):
     config, identity, records = inputs()

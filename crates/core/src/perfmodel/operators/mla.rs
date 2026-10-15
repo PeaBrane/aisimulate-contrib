@@ -25,6 +25,7 @@ use crate::perf_database::mla::{
     generation_mla_module_sol, generation_mla_module_sol_ms, generation_mla_sol,
     generation_mla_sol_ms, mla_bmm_sol, mla_bmm_sol_ms,
 };
+use crate::perf_database::mla_native::{NativeMlaKey, NativeMlaScope};
 use serde::{Deserialize, Serialize};
 
 fn prefix_correction(full_s: u32, prefix: u32) -> f64 {
@@ -200,6 +201,9 @@ pub struct MlaModuleOp {
         deserialize_with = "crate::operators::gemm::deserialize_positive_split"
     )]
     pub dcp_size: u32,
+    /// Full serving module; absent retains the legacy partial MLA boundary.
+    #[serde(default)]
+    pub native_scope: Option<NativeMlaScope>,
 }
 
 impl MlaModuleOp {
@@ -219,6 +223,7 @@ impl MlaModuleOp {
             gemm_quant_mode,
             native_num_heads: None,
             dcp_size: 1,
+            native_scope: None,
         }
     }
 
@@ -229,6 +234,9 @@ impl MlaModuleOp {
         isl: u32,
         prefix: u32,
     ) -> Result<PerformanceResult, AicError> {
+        if self.native_scope.is_some() {
+            return self.query_native(db, batch_size, isl, prefix, true);
+        }
         let mut result = query_context_mla_module_table(
             db,
             batch_size,
@@ -262,6 +270,9 @@ impl MlaModuleOp {
         batch_size: u32,
         s: u32,
     ) -> Result<PerformanceResult, AicError> {
+        if self.native_scope.is_some() {
+            return self.query_native(db, batch_size, s, 0, false);
+        }
         // No fmha arg: the generation module table has no fmha axis (decode
         // compute dtype follows the kv-cache dtype).
         let (heads, s) =
@@ -276,6 +287,98 @@ impl MlaModuleOp {
             self.native_num_heads,
         )?;
         Ok(result.clamp_non_negative().scaled(self.scale_factor))
+    }
+
+    pub fn native_weight_bytes(&self) -> f64 {
+        let Some(scope) = &self.native_scope else {
+            return 0.0;
+        };
+        let h = 7168.0;
+        let heads = f64::from(self.num_heads);
+        let elements = h * (1536.0 + 576.0)
+            + heads * (1536.0 * 192.0 + 512.0 * 256.0 + 128.0 * h)
+            + if scope.draft { 0.0 } else { h * heads * 128.0 };
+        self.scale_factor * elements * self.gemm_quant_mode.mapping().memory
+    }
+
+    fn query_native(
+        &self,
+        db: &PerfDatabase,
+        batch: u32,
+        s: u32,
+        prefix: u32,
+        context: bool,
+    ) -> Result<PerformanceResult, AicError> {
+        let scope = self.native_scope.as_ref().expect("native scope checked");
+        if scope.tensor_parallel_size == 0
+            || self.dcp_size != 1
+            || context != (scope.query_tokens == 0)
+            || (context && scope.draft)
+            || self.native_num_heads != Some(if scope.draft { 64 } else { 96 })
+            || self.num_heads.checked_mul(scope.tensor_parallel_size) != self.native_num_heads
+        {
+            return Err(AicError::ModelConfig(
+                "invalid native Kimi MLA scope/geometry".into(),
+            ));
+        }
+        let width = if context { s } else { scope.query_tokens };
+        if width == 0 || batch == 0 || self.scale_factor == 0.0 {
+            return Ok(PerformanceResult::new(0.0, Source::Sol));
+        }
+        if !context && !batch.is_multiple_of(width) {
+            return Err(AicError::ModelConfig(
+                "native MLA query rows must divide query width".into(),
+            ));
+        }
+        let sequences = if context { batch } else { batch / width };
+        let total = if context {
+            s.saturating_add(prefix)
+        } else {
+            s.saturating_add(scope.kv_tokens_offset)
+        };
+        let key = NativeMlaKey {
+            draft: scope.draft,
+            causal: !scope.draft,
+            is_context: context,
+            query_tokens: width,
+            sequence_count: sequences,
+            num_heads: self.num_heads,
+            tensor_parallel_size: scope.tensor_parallel_size,
+            kv_cache_dtype: self.kv_cache_dtype.name().into(),
+            gemm_quant_mode: self.gemm_quant_mode.name().into(),
+        };
+        // Independent analytical lower bound for SOL diagnostics; measured
+        // execution never substitutes legacy partial-module rows.
+        let flops = quant_tc_flops(&db.system_spec, self.gemm_quant_mode.mapping())?;
+        let elements =
+            self.native_weight_bytes() / self.scale_factor / self.gemm_quant_mode.mapping().memory;
+        let tokens = f64::from(sequences) * f64::from(width);
+        let sol = |kv: f64| {
+            let pairs = if context {
+                f64::from(width) * (2.0 * kv - f64::from(width) + 1.0) / 2.0
+            } else {
+                f64::from(width) * kv
+            };
+            let math = (2.0 * tokens * elements
+                + 4.0 * f64::from(sequences) * f64::from(self.num_heads) * pairs * 576.0)
+                / flops
+                * 1e3;
+            let bytes = self.native_weight_bytes() / self.scale_factor
+                + f64::from(sequences) * kv * 576.0 * self.kv_cache_dtype.mapping().memory
+                + tokens * 7168.0 * 4.0;
+            math.max(bytes / db.system_spec.gpu.mem_bw * 1e3)
+        };
+        if matches!(db.database_mode, DatabaseMode::Sol | DatabaseMode::SolFull) {
+            return Ok(PerformanceResult::new(
+                sol(f64::from(total)) * self.scale_factor,
+                Source::Sol,
+            ));
+        }
+        let result = db.mla_native.query(&key, total, &sol)?;
+        Ok(
+            PerformanceResult::with_energy(result.latency, result.energy, Source::Silicon)
+                .scaled(self.scale_factor),
+        )
     }
 }
 
@@ -931,6 +1034,37 @@ mod tests {
             .join("../..")
             .join("python/aisimulate/src/aisimulate_core/systems");
         PerfDatabase::load(&systems_root, "b200_sxm", "vllm", "0.24.0").expect("db must load")
+    }
+
+    #[test]
+    fn native_kimi_mla_keeps_width_causal_and_table_scope_distinct() {
+        let mut db = b200_vllm_db();
+        let mut op = MlaModuleOp::new(
+            "draft",
+            8,
+            KvCacheQuantMode::Fp8,
+            FmhaQuantMode::Bfloat16,
+            GemmQuantMode::Bfloat16,
+        );
+        op.native_num_heads = Some(64);
+        op.native_scope = Some(NativeMlaScope {
+            draft: true,
+            query_tokens: 2,
+            tensor_parallel_size: 8,
+            kv_tokens_offset: 4,
+        });
+        db.database_mode = DatabaseMode::Sol;
+        assert!(op.query_generation(&db, 2, 1024).unwrap().latency_ms > 0.0);
+        assert!(op.query_generation(&db, 3, 1024).is_err());
+        assert!(op.query_context(&db, 1, 1024, 0).is_err());
+        let encoded = bincode::serialize(&op).unwrap();
+        assert_eq!(bincode::deserialize::<MlaModuleOp>(&encoded).unwrap(), op);
+        db.database_mode = DatabaseMode::Silicon;
+        let error = op.query_generation(&db, 2, 1024).unwrap_err();
+        assert!(error.to_string().contains("native MLA"), "{error}");
+        // The installed old vLLM module table cannot satisfy the new scope.
+        op.native_scope = None;
+        assert!(op.query_generation(&db, 2, 1024).is_ok());
     }
 
     #[test]

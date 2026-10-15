@@ -8,8 +8,9 @@ SPDX-License-Identifier: Apache-2.0
 `deepseek-ai/DeepSeek-V4.1-Flash` uses the pinned checkpoint configuration
 `fb2764a5cf321eaa5070ca8f9e892818f477c16d`. The model covers the 40-layer text
 backbone with ordinary autoregressive decoding (`nextn=0`). The vision encoder,
-three DSpark layers, encoder replay, and host-resident Engram tables require
-separate execution contracts.
+encoder replay and host-resident Engram tables require separate execution
+contracts. Fixed-length vLLM DSpark adds three draft layers under the native
+stage contract described below.
 
 The SOL graph can be constructed for SGLang, vLLM, and TensorRT-LLM. This is an
 analytical model capability; it does not certify that a released version of
@@ -44,6 +45,32 @@ extend tails. Multiple-prefill aggregates are therefore rejected, including
 balanced batches and small total token counts. Explicit static/mixed geometry,
 single-prefill telemetry, decode-only work, and Decoder OFF retain their existing
 paths. Replay never removes resident weights or changes cache-capacity inventory.
+
+## Fixed-length vLLM DSpark native stages
+
+The fixed-length DSpark path uses the pinned vLLM `ac9126e58aa7bbab1856ba6593ba4d5003fea516`
+execution contract and the separate `dsv41_native_stage_perf.parquet` table.
+Native input preparation, layers, finalization and draft context preparation own
+inclusive runtime intervals. Their analytical children remain available for SOL
+and weight inventory, but are not added to measured stage latency. This prevents
+shifted mHC/RMSNorm and fused reductions from being counted twice. The final
+bounded decoder scatter restores full input rows before head collapse/norm;
+finalization therefore retains the full model request identity.
+
+The initial measured contract uses MXFP8 SWA records (528 bytes), checkpoint
+GEMM `fp8_block`, MoE `w4a8_mxfp4_mxfp8`, BF16 attention queries and FP8 KV.
+Other effective precision overrides require separate measurements. Every query
+keeps sequence count, per-request query width, causal mode, native owner/layer,
+absolute past-KV position, replay policy and configuration identity. Target width
+is K+1; draft width is K. Steady draft cost uses a full-acceptance KV-position
+bound; startup uses prompt+K. This is a cost assumption, not an acceptance result.
+
+The initial native table matches exact rows only. Missing rows and mixed
+prefill/decode native batches fail explicitly; old SGLang component timings are
+not a fallback. Existing non-native graphs retain their prior mixed-step path.
+See the [native collector contract](../../../python/aisimulate/collector/vllm/README.dsv41-native.md)
+for collection boundaries, rank reduction and remaining coverage requirements.
+No measured accuracy follows from the presence of this consumer.
 
 ## Operators and memory
 

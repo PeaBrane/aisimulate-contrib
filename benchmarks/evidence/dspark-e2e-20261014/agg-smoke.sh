@@ -9,7 +9,13 @@ cd "$storage_root"
 mkdir -p "$storage_root/.cache/dspark-e2e-20261014"
 export HF_HOME=/workspace/.cache/dspark-e2e-20261014/huggingface
 export XDG_CACHE_HOME=/workspace/.cache/dspark-e2e-20261014
-run_args=(--mode "${DSPARK_RUN_MODE:-smoke}")
+run_args=(--mode "${DSPARK_RUN_MODE:-smoke}" --graph-policy "${DSPARK_GRAPH_POLICY:-eager}")
+if [[ -n "${DSPARK_CONCURRENCY:-}" ]]; then
+  run_args+=(--concurrency "$DSPARK_CONCURRENCY")
+fi
+if [[ -n "${DSPARK_REPETITION:-}" ]]; then
+  run_args+=(--repetition "$DSPARK_REPETITION")
+fi
 if [[ -n "${DSPARK_SYNTHETIC_CONTROL:-}" ]]; then
   run_args+=(--synthetic-control "$DSPARK_SYNTHETIC_CONTROL")
 fi

@@ -126,7 +126,8 @@ pub const ENGINE_CONFIG_SCHEMA_VERSION: u32 = 1;
 //   The serde default covers JSON only; schema-27 bincode payloads are rejected.
 // - 29: TokenScale carries a typed draft attention sequence-length cap.
 // - 30: TokenScale distinguishes request-basis startup proposals from token scaling.
-pub const ENGINE_SPEC_SCHEMA_VERSION: u32 = 30;
+// - 31: native V4.1 stages and Kimi MLA carry exact serving-module identities.
+pub const ENGINE_SPEC_SCHEMA_VERSION: u32 = 31;
 
 /// Static engine identity and setup information carried by an
 /// [`crate::perfmodel::engine::spec::EngineSpec`].

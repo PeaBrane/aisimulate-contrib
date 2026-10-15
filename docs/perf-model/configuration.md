@@ -135,6 +135,36 @@ Replay exposes outputs at pass completion; the runtime can overlap output
 copy with proposal execution. This output-visibility approximation can affect
 TTFT and is reported separately from operation cost error.
 
+Bundled V4 DSpark defaults to three draft layers (`n_mtp_layers`), independently
+of legacy MTP's `num_nextn_predict_layers`. The pinned vLLM context preparation
+uses one replicated projection from hidden size to `draft_layers * head_dim`;
+its copied WKV weights are counted separately. For vLLM TP8/EP1, target and
+draft attention output reductions are added because existing attention module
+tables omit TP collectives. Generic collective timing and the HCA proxy for
+noncausal draft SWA remain approximations pending native measurements.
+
+For Kimi-K3 on the pinned vLLM DSpark runtime, MLA uses the complete native
+attention module, including input projections, normalization, output gate and
+output projection. Target modules include the output collective; draft modules
+leave that reduction to the following normalization. These costs are not added
+again outside the module. Native measurements preserve sequence count, query
+width, causal mode, local heads, TP and both weight/cache precision. Older
+partial MLA tables cannot satisfy this scope. SILICON requests report missing
+coverage until the dedicated native table exists; SOL remains analytical.
+The pinned checkpoint excludes attention projections from quantization, so
+native Kimi MLA always uses BF16 projections even when the global GEMM policy
+selects FP8 for other operations. Its per-operation configuration and resident
+weight inventory retain that BF16 identity; an FP8 MLA table cannot match it.
+With plain FP8 KV, the pinned native prefill path quantizes projected Q/K/V to
+FP8 and requires `use_prefill_query_quantization=true`. This fixed native scope
+uses BF16 projection weights and FP8 prefill attention inputs, separately.
+This native DSpark path currently requires EP1; expert/sequence parallel
+collective ownership needs separately qualified measurements.
+Only total KV length interpolates, within the measured interval; widths,
+causality and sequence counts never interpolate, and out-of-range KV fails.
+The standalone cost API has no just-sampled rejection count, so steady draft
+KV length uses a full-acceptance upper bound. Initial proposal KV is explicit.
+
 Bundled DeepSeek-V4.1 drafts resolve their nested `text_config`, including the
 draft's own expert count and top-k. For vLLM, the canonical system identifies
 the physical default `fp8_ds_mla` layout: 528-byte MXFP8 records on B200/B300

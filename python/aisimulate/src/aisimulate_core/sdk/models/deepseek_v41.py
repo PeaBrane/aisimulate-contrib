@@ -15,6 +15,7 @@ DSpark adds checkpoint-owned draft stages through the canonical scheme API.
 
 from __future__ import annotations
 
+import hashlib
 import json
 
 import aisimulate_core._native as core
@@ -106,6 +107,36 @@ class DeepSeekV41Model(BaseModel):
                 raise ValueError("vLLM V4.1 DSpark requires an explicit supported system for physical KV layout")
         # Validate physical dimensions before constructing any native operators.
         d.kv_entry_bytes(self.kv_cache_layout)
+        self._native_stage_contract = (
+            dspark and backend_name == "vllm" and self.kv_cache_layout == DeepSeekV41KVCacheLayout.VLLM_MXFP8
+        )
+        if self._native_stage_contract:
+            # The native table measures the pinned checkpoint's [32,32] MXFP8
+            # linear and MXFP4/MXFP8 expert path. The SDK aliases describe that
+            # artifact; explicit overrides cannot borrow its inclusive rows.
+            requested = (
+                model_config.gemm_quant_mode.name,
+                model_config.moe_quant_mode.name,
+                model_config.fmha_quant_mode.name,
+                model_config.kvcache_quant_mode.name,
+            )
+            if requested != ("fp8_block", "w4a8_mxfp4_mxfp8", "bfloat16", "fp8"):
+                raise ValueError(
+                    "V4.1 native DSpark stages require pinned gemm=fp8_block, "
+                    "moe=w4a8_mxfp4_mxfp8, fmha=bfloat16, kvcache=fp8; "
+                    f"effective overrides {requested!r} need separate native measurements"
+                )
+        self._native_config_digest = hashlib.sha256(
+            json.dumps(
+                {
+                    key: value
+                    for key, value in self.raw_config.items()
+                    if key not in ("quant_algo", "kv_cache_quant_algo", "quant_dynamic")
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
         self.engram_residency = "hbm_tp_sharded"
         h = self._hidden_size
         distribution = (
@@ -263,14 +294,23 @@ class DeepSeekV41Model(BaseModel):
                 bounded=layer >= d.decoder_start_layer,
                 window_size=d.sliding_window,
                 children=[_spec(op) for op in children],
+                native_scope=self._native_scope("layer", layer, context=context),
+                native_kv_tokens_offset=0 if context else self._native_query_width(False) - 1,
             )
 
         for context in (True, False):
             phase = "context" if context else "generation"
             target = self.context_ops if context else self.generation_ops
-            target.append(ops.Embedding(f"{phase}_embedding", 1, self._vocab_size // tp, h, 0.3))
-            target.append(ops.NCCL(f"{phase}_embedding_allreduce", 1, "all_reduce", h, tp, common.CommQuantMode.half))
+            if self._native_stage_contract:
+                target.append(self._native_input(context=context, draft=False))
+            else:
+                target.append(ops.Embedding(f"{phase}_embedding", 1, self._vocab_size // tp, h, 0.3))
+                target.append(
+                    ops.NCCL(f"{phase}_embedding_allreduce", 1, "all_reduce", h, tp, common.CommQuantMode.half)
+                )
             target.extend(stage(i, context) for i in range(d.num_hidden_layers))
+            if self._native_stage_contract:
+                target.append(self._native_finalize(context=context, draft=False))
             target.extend(
                 [
                     ops.GEMM(f"{phase}_logits_gemm", 1, self._vocab_size // tp, h, common.GEMMQuantMode.bfloat16),
@@ -301,79 +341,179 @@ class DeepSeekV41Model(BaseModel):
         if experts < 1 or not 1 <= topk <= experts or experts % ep:
             raise ValueError("V4.1 draft expert count/top-k must be valid and divisible by EP")
         local_inter = self._moe_inter_size * d.n_shared_experts // tp
-        result = []
+        result = [self._native_input(context=False, draft=True)] if self._native_stage_contract else []
         for layer in range(num_layers):
             suffix = str(layer)
-            result.extend(
-                [
+            children = [
+                _native(
+                    "Dsv41Mhc",
+                    name=f"dspark_mhc_{suffix}",
+                    hidden_size=h,
+                    hc_mult=d.hc_mult,
+                    sinkhorn_iters=d.hc_sinkhorn_iters,
+                ),
+                _native(
+                    "Dsv41Attention",
+                    name=f"dspark_attention_{suffix}",
+                    is_context=False,
+                    role="swa",
+                    compress_ratio=0,
+                    hidden_size=h,
+                    num_heads=d.num_attention_heads // tp,
+                    head_dim=d.head_dim,
+                    q_lora_rank=d.q_lora_rank,
+                    o_lora_rank=d.o_lora_rank,
+                    o_groups=d.o_groups // tp,
+                    index_n_heads=d.index_n_heads,
+                    index_head_dim=d.index_head_dim,
+                    index_topk=d.index_topk,
+                    window_size=d.sliding_window,
+                    candidate_limit=0,
+                    is_candidate_source=False,
+                    bounded_prefill=False,
+                    gemm_quant_mode=c.gemm_quant_mode.name,
+                    fmha_quant_mode=c.fmha_quant_mode.name,
+                    kv_cache_layout=self.kv_cache_layout.value,
+                ),
+                ops.CustomAllReduce(f"dspark_attention_ar_{suffix}", 1, h, tp),
+                ops.ElementWise(f"dspark_ffn_norm_{suffix}", 1, h, h, 0.8),
+                ops.GEMM(f"dspark_shared_gate_up_{suffix}", 1, 2 * local_inter, h, c.gemm_quant_mode),
+                ops.ElementWise(f"dspark_shared_act_gate_{suffix}", 1, 2 * local_inter, local_inter, 0.8),
+                ops.GEMM(f"dspark_shared_down_{suffix}", 1, h, local_inter, c.gemm_quant_mode),
+                ops.GEMM(f"dspark_router_{suffix}", 1, experts, h, common.GEMMQuantMode.bfloat16),
+                ops.MoE(
+                    f"dspark_moe_{suffix}",
+                    1,
+                    h,
+                    self._moe_inter_size,
+                    topk,
+                    experts,
+                    mtp,
+                    ep,
+                    c.moe_quant_mode,
+                    "power_law_1.01" if c.workload_distribution == "power_law" else c.workload_distribution,
+                    c.attention_dp_size,
+                    moe_kernel_source=c.moe_kernel_source,
+                ),
+                ops.MoEDispatch(
+                    f"dspark_moe_post_dispatch_{suffix}",
+                    1,
+                    h,
+                    topk,
+                    experts,
+                    mtp,
+                    ep,
+                    c.attention_dp_size,
+                    False,
+                    quant_mode=c.moe_quant_mode,
+                    backend=self._backend_name,
+                    is_context=False,
+                    attn_ar_modeled=True,
+                ),
+            ]
+            if self._native_stage_contract:
+                result.append(
                     _native(
-                        "Dsv41Mhc",
-                        name=f"dspark_mhc_{suffix}",
-                        hidden_size=h,
-                        hc_mult=d.hc_mult,
-                        sinkhorn_iters=d.hc_sinkhorn_iters,
-                    ),
-                    _native(
-                        "Dsv41Attention",
-                        name=f"dspark_attention_{suffix}",
+                        "Dsv41Stage",
+                        name=f"dspark_native_layer_{layer}",
                         is_context=False,
-                        role="swa",
-                        compress_ratio=0,
-                        hidden_size=h,
-                        num_heads=d.num_attention_heads // tp,
-                        head_dim=d.head_dim,
-                        q_lora_rank=d.q_lora_rank,
-                        o_lora_rank=d.o_lora_rank,
-                        o_groups=d.o_groups // tp,
-                        index_n_heads=d.index_n_heads,
-                        index_head_dim=d.index_head_dim,
-                        index_topk=d.index_topk,
+                        decoder_replay=False,
+                        bounded=False,
                         window_size=d.sliding_window,
-                        candidate_limit=0,
-                        is_candidate_source=False,
-                        bounded_prefill=False,
-                        gemm_quant_mode=c.gemm_quant_mode.name,
-                        fmha_quant_mode=c.fmha_quant_mode.name,
-                        kv_cache_layout=self.kv_cache_layout.value,
-                    ),
-                    ops.CustomAllReduce(f"dspark_attention_ar_{suffix}", 1, h, tp),
-                    ops.ElementWise(f"dspark_ffn_norm_{suffix}", 1, h, h, 0.8),
-                    ops.GEMM(f"dspark_shared_gate_up_{suffix}", 1, 2 * local_inter, h, c.gemm_quant_mode),
-                    ops.ElementWise(f"dspark_shared_act_gate_{suffix}", 1, 2 * local_inter, local_inter, 0.8),
-                    ops.GEMM(f"dspark_shared_down_{suffix}", 1, h, local_inter, c.gemm_quant_mode),
-                    ops.GEMM(f"dspark_router_{suffix}", 1, experts, h, common.GEMMQuantMode.bfloat16),
-                    ops.MoE(
-                        f"dspark_moe_{suffix}",
-                        1,
-                        h,
-                        self._moe_inter_size,
-                        topk,
-                        experts,
-                        mtp,
-                        ep,
-                        c.moe_quant_mode,
-                        "power_law_1.01" if c.workload_distribution == "power_law" else c.workload_distribution,
-                        c.attention_dp_size,
-                        moe_kernel_source=c.moe_kernel_source,
-                    ),
-                    ops.MoEDispatch(
-                        f"dspark_moe_post_dispatch_{suffix}",
-                        1,
-                        h,
-                        topk,
-                        experts,
-                        mtp,
-                        ep,
-                        c.attention_dp_size,
-                        False,
-                        quant_mode=c.moe_quant_mode,
-                        backend=self._backend_name,
-                        is_context=False,
-                        attn_ar_modeled=True,
-                    ),
-                ]
-            )
+                        children=[_spec(op) for op in children],
+                        native_scope=self._native_scope(
+                            "layer", d.num_hidden_layers + layer, context=False, draft=True
+                        ),
+                        native_kv_tokens_offset=2 * self._native_query_width(True),
+                    )
+                )
+            else:
+                result.extend(children)
+        if self._native_stage_contract:
+            result.append(self._native_finalize(context=False, draft=True))
+            result.append(ops.ElementWise("dspark_native_head_norm", 1, h, h, 0.8))
         return result
+
+    def _native_query_width(self, draft: bool) -> int:
+        if not self._native_stage_contract:
+            return 1
+        return self.config.speculation.params["num_draft_tokens"] + (0 if draft else 1)
+
+    def _native_scope(self, site: str, layer: int, *, context: bool, draft: bool = False):
+        if not self._native_stage_contract:
+            return None
+        return {
+            "site": site,
+            "layer_id": layer,
+            "draft": draft,
+            "tensor_parallel_size": self.config.tp_size,
+            "expert_parallel_size": self.config.resolve_moe_parallelism()[1],
+            "config_sha256": self._native_config_digest,
+            "kv_cache_layout": self.kv_cache_layout.value,
+            "decoder_replay": self.config.decoder_replay,
+            "query_tokens": 0 if context else self._native_query_width(draft),
+        }
+
+    def _native_input(self, *, context: bool, draft: bool):
+        h, tp = self._hidden_size, self.config.tp_size
+        # Draft input embeddings alias target weights. Its SOL placeholder owns
+        # activation movement only, while the measured stage owns real dispatch.
+        children = (
+            [ops.ElementWise("native_draft_input", 1, h, h, 0.8)]
+            if draft
+            else [
+                ops.Embedding("native_embedding", 1, self._vocab_size // tp, h, 0.3),
+                ops.NCCL("native_embedding_allreduce", 1, "all_reduce", h, tp, common.CommQuantMode.half),
+            ]
+        )
+        width = self._native_query_width(draft)
+        return _native(
+            "Dsv41Stage",
+            name="dspark_native_input" if draft else "target_native_input",
+            is_context=context,
+            decoder_replay=False,
+            bounded=False,
+            window_size=self.extra_params.sliding_window,
+            children=[_spec(op) for op in children],
+            native_scope=self._native_scope("input_preparation", 40 if draft else 0, context=context, draft=draft),
+            native_kv_tokens_offset=2 * width if draft else width - 1,
+        )
+
+    def _native_finalize(self, *, context: bool, draft: bool):
+        # model.py:1074 post/reduction and :1005 collapse/norm, including
+        # decoder_replay_layers.py's late-output scatter back to full rows.
+        # Draft's final norm is in compute_logits and remains outside this tail.
+        h = self._hidden_size
+        children = [ops.ElementWise("native_hc_finalize", 1, h * self.extra_params.hc_mult, h, 0.8)]
+        if not draft:
+            children.append(ops.ElementWise("native_head_norm", 1, h, h, 0.8))
+        width = self._native_query_width(draft)
+        return _native(
+            "Dsv41Stage",
+            name="dspark_native_finalize" if draft else "target_native_finalize",
+            is_context=context,
+            decoder_replay=False,
+            bounded=False,
+            window_size=self.extra_params.sliding_window,
+            children=[_spec(op) for op in children],
+            native_scope=self._native_scope("finalize", 42 if draft else 39, context=context, draft=draft),
+            native_kv_tokens_offset=2 * width if draft else width - 1,
+        )
+
+    def build_dspark_context_stage(self, children):
+        if not self._native_stage_contract:
+            return None
+        return _native(
+            "Dsv41Stage",
+            name="dspark_native_context_preparation",
+            is_context=True,
+            decoder_replay=False,
+            bounded=False,
+            window_size=self.extra_params.sliding_window,
+            children=[_spec(op) for op in children],
+            native_scope=self._native_scope("context_preparation", 40, context=True, draft=True),
+            native_kv_tokens_offset=0,
+        )
 
     def get_additional_activation_bytes(self, num_tokens: int) -> float:
         d = self.extra_params

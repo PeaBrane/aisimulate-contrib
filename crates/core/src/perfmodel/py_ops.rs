@@ -1670,7 +1670,7 @@ impl PyMLAModule {
     const _ENGINE_QUERY_SHAPE: &'static str = "module";
 
     #[new]
-    #[pyo3(signature = (name, scale_factor, is_context, num_heads, kvcache_quant_mode, fmha_quant_mode, gemm_quant_mode, native_num_heads=None, dcp_size=1))]
+    #[pyo3(signature = (name, scale_factor, is_context, num_heads, kvcache_quant_mode, fmha_quant_mode, gemm_quant_mode, native_num_heads=None, dcp_size=1, native_scope_json=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         name: String,
@@ -1682,6 +1682,7 @@ impl PyMLAModule {
         gemm_quant_mode: &Bound<'_, PyAny>,
         native_num_heads: Option<u32>,
         dcp_size: u32,
+        native_scope_json: Option<&str>,
     ) -> PyResult<(Self, PyOperation)> {
         if dcp_size == 0 {
             return Err(PyValueError::new_err("MLAModule dcp_size must be positive"));
@@ -1695,6 +1696,10 @@ impl PyMLAModule {
             gemm_quant_mode: gemm_quant(gemm_quant_mode)?,
             native_num_heads,
             dcp_size,
+            native_scope: native_scope_json
+                .map(serde_json::from_str)
+                .transpose()
+                .map_err(|e| PyValueError::new_err(format!("invalid native MLA scope: {e}")))?,
         };
         let inner = if is_context {
             Op::MlaModuleContext(module)
@@ -1723,6 +1728,14 @@ impl PyMLAModule {
         let kwargs = PyDict::new(py);
         kwargs.set_item("native_num_heads", o.native_num_heads)?;
         kwargs.set_item("dcp_size", o.dcp_size)?;
+        kwargs.set_item(
+            "native_scope_json",
+            o.native_scope
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(|e| PyValueError::new_err(e.to_string()))?,
+        )?;
         Ok((args, kwargs))
     }
 

@@ -1179,13 +1179,46 @@ impl Engine {
         mut on_op: impl FnMut(MixedPass, &Op, PerformanceResult),
     ) -> Result<[f64; 4], AicError> {
         let mut totals = [0.0; 4];
+        let native_stages = self
+            .context_ops
+            .iter()
+            .any(|op| matches!(op, Op::Dsv41Stage(stage) if stage.native_scope.is_some()))
+            && !matches!(
+                self.db.database_mode,
+                DatabaseMode::Sol | DatabaseMode::SolFull
+            );
+        if native_stages && !prefills.is_empty() {
+            if decode_batch == 0 && prefills.len() == 1 {
+                let (batch, new_tokens, prefix) = prefills[0];
+                let total = run_context_ops_with(
+                    &self.context_ops,
+                    &self.db,
+                    batch,
+                    new_tokens,
+                    prefix,
+                    context_scale,
+                    ContextOpFilter::All,
+                    |op, result| on_op(MixedPass::SharedNonAttention, op, result),
+                )?;
+                // Inclusive native intervals do not expose an attention-only
+                // split; retain their complete measured ownership here.
+                return Ok([total, total, 0.0, 0.0]);
+            }
+            // Inclusive native stages cannot be split into token-major GEMMs
+            // and attention; their shifted mHC/reductions cross that boundary.
+            return Err(AicError::PerfDatabase(
+                "V4.1 native stages require measured mixed-request identities before mixed-step replay".into(),
+            ));
+        }
         if prefills.is_empty() {
             if decode_batch > 0 {
                 // Generation can fuse or overlap children differently from
                 // prefill. Preserve that graph when no prefill is scheduled.
                 for outer in &self.generation_ops {
                     let children: &[Op] = match outer {
-                        Op::Dsv41Stage(stage) => &stage.children,
+                        Op::Dsv41Stage(stage) if stage.native_scope.is_none() || !native_stages => {
+                            &stage.children
+                        }
                         _ => std::slice::from_ref(outer),
                     };
                     for child in children {
@@ -2862,6 +2895,8 @@ mod tests {
         };
         let stage = |is_context, bounded| {
             Op::Dsv41Stage(crate::operators::Dsv41StageOp {
+                native_scope: None,
+                native_kv_tokens_offset: 0,
                 name: if bounded { "decoder" } else { "encoder" }.into(),
                 is_context,
                 bounded,
@@ -2895,6 +2930,47 @@ mod tests {
         query_context_op(&stage.children[0], &engine.db, 1, 1, 0, 1.0, None)
             .unwrap()
             .latency_ms
+    }
+
+    #[test]
+    fn native_dsv41_prefill_preserves_measured_stages_and_rejects_mixed_batches() {
+        let mut engine = dsv41_probe_engine(true);
+        engine.db = Arc::new(
+            PerfDatabase::load(&systems_root(), "b200_sxm", "vllm", "0.24.0")
+                .unwrap()
+                .with_mode(DatabaseMode::Silicon, TransferPolicy::default()),
+        );
+        let Op::Dsv41Stage(stage) = &mut engine.context_ops[0] else {
+            unreachable!()
+        };
+        stage.native_scope = Some(crate::perf_database::dsv41_native::NativeDsv41Scope {
+            site: "layer".into(),
+            layer_id: 0,
+            draft: false,
+            tensor_parallel_size: 4,
+            expert_parallel_size: 1,
+            config_sha256: "a".repeat(64),
+            kv_cache_layout: "vllm_mxfp8".into(),
+            decoder_replay: true,
+            query_tokens: 0,
+        });
+        // No native table exists in this legacy data root. A standalone
+        // prefill must query that table, never sum the analytical children.
+        let error = engine
+            .dsv41_mixed_workload(&[(1, 1024, 0)], 0, 0, 1.0, 1.0, |_, _, _| {})
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("missing exact SILICON query"), "{error}");
+        for (prefills, decode) in [
+            (vec![(1, 1024, 0)], 6),
+            (vec![(1, 1024, 0), (1, 512, 0)], 0),
+        ] {
+            let error = engine
+                .dsv41_mixed_workload(&prefills, decode, 1024, 1.0, 1.0, |_, _, _| {})
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("mixed-request identities"), "{error}");
+        }
     }
 
     #[test]

@@ -644,6 +644,43 @@ Rebuild and install the new aiconfigurator. Please make sure you have your new s
 Today, we have limited method to validate the database. You can try tools/sanity_check to validate the database a little bit. But it highly depends on your understanding
 of the GPU system and kernel optimization.
 
+# Pinned native Kimi DSpark MLA
+
+`python -m collector.vllm.collect_kimi_native --model TARGET_DIR --draft DRAFT_DIR
+--prompt-tokens TOKENS_JSON --output NEW_DIRECTORY --image-digest sha256:...`
+collects the complete Kimi `MultiHeadLatentAttention.forward` scope on vLLM
+`ac9126e58aa7bbab1856ba6593ba4d5003fea516`, TP8/EP1, fixed K2, eager,
+FP8 KV, with adaptive verification disabled. The input file must contain 1024
+explicit token IDs. Target/draft config hashes and runtime source hashes are
+checked before observation. The target's checkpoint quantization policy excludes
+attention projections; the observer confirms actual BF16 linear modules.
+Plain FP8 KV requires `attention_config.use_prefill_query_quantization=true`:
+the native prefill path casts projected Q/K/V to FP8. The collector sets and
+validates this policy and records it in the receipt and table; BF16 projection
+weights do not imply BF16 prefill attention inputs.
+The default operator probe collects sequence counts 1 and 4 with 1056 output
+tokens. Its 32 extra tokens cover speculative lookahead at the end of the
+separate 1024-token E2E scoring window. Use `--sequence-counts` and
+`--output-tokens` to narrow a diagnostic run; these probes are not E2E records.
+
+This targeted entry point observes native serving metadata and CUDA event
+intervals; it does not construct synthetic attention metadata or switch kernels.
+It requires target prefill width1024, target verify width3 and noncausal draft
+width2. Raw per-rank observations and a receipt are retained on failure. Accepted
+rows use the maximum rank duration per invocation, then the median of repeated
+physical cases. The table is `mla_native_module_perf.parquet`; it includes the
+full native target output collective and excludes the draft's external reduction.
+Query width, causal mode, sequence count, local heads, TP and precision are exact
+keys; only total KV length interpolates within the measured interval. Queries
+outside that interval fail explicitly. It is separate from historical partial
+MLA module tables. Measurements are operation coverage, not E2E accuracy results.
+
+The collector source hash manifest is derived from the immutable runtime files
+`vllm/models/kimi_k3/nvidia/{mla.py,model.py,dspark_mla.py}`. A runtime upgrade
+requires a new source/metadata audit and regeneration of these hashes, rather than
+relaxing the source check. Initial GPU execution and consumer-query validation
+remain required before treating a newly collected table as qualified evidence.
+
 # Known Issues
 
 ## NFS File Locking (Worker Deadlock)

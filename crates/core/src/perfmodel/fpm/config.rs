@@ -109,7 +109,8 @@ impl ForwardPassSpeculationConfig {
         }) {
             assumptions.extend([
                 "Kimi DSpark uses the Inferact MLA draft and shares target embedding/head; RadixArk GQA is unsupported".into(),
-                "Kimi MLA draft verification retains token-basis pricing; noncausal wide-query measurements are missing".into(),
+                "Kimi native MLA requires distinct measured causal/query-width scopes; legacy partial MLA rows are not substituted".into(),
+                "Kimi steady draft KV uses the full-acceptance upper bound because the cost-only API has no just-sampled rejection count; startup KV is explicit".into(),
                 "Kimi KDA state capacity retains the documented cache-slot approximation; exact runtime scratch and page pools require collection".into(),
             ]);
         } else if draft.is_some_and(|c| {

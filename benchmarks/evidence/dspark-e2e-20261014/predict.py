@@ -56,7 +56,8 @@ def validate_inputs(config, identity, records):
         raise ValueError("Replay target model/backend differs from the measured identity")
     if config.engine.hardware != cell["hardware"] + "_sxm":
         raise ValueError("Replay hardware differs from the measured cell")
-    if len(records) != cell["expected_requests"]:
+    expected = 1 if identity.get("phase") == "smoke" else cell["expected_requests"]
+    if len(records) != expected:
         raise ValueError("request count does not match the fixed-length matrix cell")
     if config.engine.estimation_mode != "op_level" or config.engine.fallback_policy != "deny":
         raise ValueError("campaign requires explicit op_level timing and fallback_policy=deny")
@@ -168,6 +169,8 @@ def main():
     }
     summary.update(run_id=args.output_dir.name, predictor="aisimulate.engine_replay", status="failed", metrics={})
     reasons = list(measured.get("qualification", {}).get("reasons", []))
+    if identity.get("phase") == "smoke":
+        reasons.append("smoke diagnostic; excluded from production scoring")
     if measured.get("qualification", {}).get("eligible") is not True:
         reasons.append("measurement is not qualified")
     if receipt.get("qualification", {}).get("eligible") is not True:

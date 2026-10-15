@@ -296,6 +296,7 @@ mod tests {
             gemm_quant_mode: GemmQuantMode::Fp8Block,
             native_num_heads: Some(128),
             dcp_size: 2,
+            native_scope: None,
         }
     }
 
@@ -763,6 +764,8 @@ mod tests {
                 tp_size: 4,
             }),
             OpSpec::Dsv41Stage(Dsv41StageOp {
+                native_scope: None,
+                native_kv_tokens_offset: 0,
                 name: "v41_stage".into(),
                 is_context: true,
                 decoder_replay: true,

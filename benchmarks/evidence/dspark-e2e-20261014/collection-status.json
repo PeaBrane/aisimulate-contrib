@@ -1,7 +1,7 @@
 {
   "schema": "dspark-collection-status-v1",
   "matrix": "matrix.json",
-  "measured_request_records": 0,
+  "measured_request_records": 1,
   "eligible_paired_runs": 0,
   "checkpoint_references": "checkpoint-references.json",
   "gpu_jobs": [
@@ -66,11 +66,13 @@
       "gpus": 4,
       "host_memory_gb": 768,
       "phase": "smoke",
-      "state": "pending dependency",
-      "dependency": "2257188",
+      "state": "held by campaign",
+      "dependency": "2257371",
       "results": "results/dspark-e2e-20261014/smoke-v41-flash-k5-2257181",
-      "qos": "normal",
-      "time_limit": "01:00:00"
+      "qos": "interactive",
+      "time_limit": "01:00:00",
+      "queue_note": "Active supervised qualification campaign; permitted interactive QoS, one B200 job at a time.",
+      "reason": "Await graph smoke and per-window production time budget; dependency unchanged until replacement selected."
     },
     {
       "cluster": "aws-pdx-slurm-1",
@@ -80,11 +82,15 @@
       "gpus": 8,
       "host_memory_gb": 2048,
       "phase": "smoke",
-      "state": "last observed running",
+      "state": "FAILED",
       "dependency": null,
       "results": "results/dspark-e2e-20261014/smoke-kimi-k3-k2-790490",
       "node": "pool0-0061",
-      "time_limit": "01:00:00"
+      "time_limit": "01:00:00",
+      "exit_code": "1:0",
+      "reason": "Native Kimi FP8 KV prefill requires attention_config.use_prefill_query_quantization=true; failed in startup warmup before requests.",
+      "local_artifacts": "raw/kimi-eager-failed-790490",
+      "superseded_by": "790647"
     },
     {
       "cluster": "nsc-svg-slurm-1",
@@ -94,14 +100,19 @@
       "gpus": 8,
       "host_memory_gb": 1200,
       "phase": "smoke",
-      "state": "last observed running",
+      "state": "COMPLETED",
       "dependency": null,
       "results": "results/dspark-e2e-20261014/smoke-v4-pro-k6-2257185",
       "qos": "interactive",
       "time_limit": "01:00:00",
       "memory_probe": "512GB did not improve queue estimate; restored1200GB",
       "queue_note": "Short QoS reached global node cap; current user permits interactive QoS, used for one-hour startup qualification.",
-      "node": "nsc-svg-slurm-1-gpu-4"
+      "node": "nsc-svg-slurm-1-gpu-4",
+      "exit_code": "0:0",
+      "measured_requests": 1,
+      "local_artifacts": "raw/pro-eager-smoke-2257185",
+      "graph_policy": "eager",
+      "qualification": "diagnostic smoke only; cache pool qualification pending"
     },
     {
       "cluster": "aws-pdx-slurm-1",
@@ -111,10 +122,11 @@
       "gpus": 8,
       "host_memory_gb": 2048,
       "phase": "initial",
-      "state": "submitted",
+      "state": "CANCELLED",
       "dependency": "790490",
       "results": "results/dspark-e2e-20261014/initial-kimi-k3-k2-790497",
-      "time_limit": "02:00:00"
+      "time_limit": "02:00:00",
+      "reason": "Scheduler cancelled unstarted afterok dependency on failed790490; no production windows collected."
     },
     {
       "cluster": "nsc-svg-slurm-1",
@@ -124,13 +136,52 @@
       "gpus": 8,
       "host_memory_gb": 1200,
       "phase": "initial synthetic",
-      "state": "submitted",
+      "state": "CANCELLED",
       "dependency": "2257185",
       "synthetic_acceptance_length": 3.77,
       "requests": 768,
       "results": "results/dspark-e2e-20261014/initial-v4-pro-k6-2257188",
+      "qos": "interactive",
+      "time_limit": "02:00:00",
+      "queue_note": "Active supervised qualification campaign; permitted interactive QoS, one B200 job at a time.",
+      "reason": "Old eager six-window production job exceeded time budget based on smoke throughput; cancelled during startup before measurement, replaced by graph smoke.",
+      "exit_code": "0:0",
+      "batch_exit_code": "143:0",
+      "local_artifacts": "raw/cancelled-eager-initial-2257188"
+    },
+    {
+      "cluster": "nsc-svg-slurm-1",
+      "job_id": "2257371",
+      "model": "v4-pro",
+      "k": 6,
+      "gpus": 8,
+      "host_memory_gb": 1200,
+      "phase": "graph smoke",
+      "state": "last observed running",
+      "node": "nsc-svg-slurm-1-gpu-72",
+      "dependency": "2257188",
+      "graph_policy": "runtime-default",
+      "synthetic_acceptance_length": 3.77,
+      "qos": "interactive",
+      "time_limit": "01:00:00",
+      "results": "results/dspark-e2e-20261014/smoke-v4-pro-k6-2257371"
+    },
+    {
+      "cluster": "aws-pdx-slurm-1",
+      "job_id": "790647",
+      "model": "kimi-k3",
+      "k": 2,
+      "gpus": 8,
+      "host_memory_gb": 2048,
+      "phase": "graph smoke",
+      "state": "last observed running",
+      "node": "pool0-0227",
+      "graph_policy": "runtime-default",
+      "synthetic_acceptance_length": 2.51,
+      "use_prefill_query_quantization": true,
       "qos": "normal",
-      "time_limit": "02:00:00"
+      "time_limit": "02:00:00",
+      "results": "results/dspark-e2e-20261014/smoke-kimi-k3-k2-790647"
     }
   ],
   "cpu_jobs": [
@@ -197,6 +248,33 @@
       "state": "COMPLETED",
       "exit_code": "0:0",
       "receipt": "runtime-b300.json"
+    },
+    {
+      "cluster": "nsc-svg-slurm-1",
+      "job_id": "2257277",
+      "purpose": "V4.1 native observer entrypoint help and contract import in pinned image",
+      "state": "COMPLETED",
+      "exit_code": "0:0",
+      "scope": "Does not execute GPU worker hooks",
+      "logs": "logs/dspark-e2e-20261014/native-import-2257277.{out,err}"
+    },
+    {
+      "cluster": "nsc-svg-slurm-1",
+      "job_id": "2257435",
+      "purpose": "V41 observer CPU import and installed source hashes",
+      "state": "FAILED",
+      "exit_code": "1:0",
+      "reason": "Installed V41 model.py differs from pinned manifest SHA; GPU hooks never executed.",
+      "logs": "logs/dspark-e2e-20261014/v41-native-source-check-2257435.log"
+    },
+    {
+      "cluster": "nsc-svg-slurm-1",
+      "job_id": "2257447",
+      "purpose": "Export six installed V41 sources and SHA receipts for mismatch audit",
+      "state": "COMPLETED",
+      "results": "results/dspark-e2e-20261014/v41-installed-source-audit",
+      "exit_code": "0:0",
+      "finding": "Two installed source mismatches: deepseek_v41/nvidia/model.py and decoder_replay_layers.py; other four sources match manifest. Semantic audit pending."
     }
   ],
   "storage_root": "/lustre/fsw/portfolios/coreai/projects/coreai_comparch_inferencex/users/simonec",
@@ -204,11 +282,25 @@
   "results": "results/dspark-e2e-20261014",
   "runtime": "vllm/vllm-openai:nightly-dev-x86_64-cu130-ac9126e58aa7@sha256:3d17635c5aa0340e2f2502c067ce4b587d8e7dc678195e90b71142490dc6d71c",
   "pending": [
-    "runtime/container smoke",
-    "aggregated GPU smoke",
+    "graph smoke and per-family aggregated qualification",
     "P/D GPU smoke and connector qualification",
     "fixed-length measured pilot and scoring",
     "expanded matrix",
     "AgentX pilots"
+  ],
+  "production_request_records": 0,
+  "smoke_request_records": 1,
+  "runtime_checks": [
+    {
+      "cluster": "aws-pdx-slurm-1",
+      "allocation_job_id": "790490",
+      "purpose": "Kimi native observer CPU import and source hash qualification",
+      "state": "passed",
+      "scope": "CPU help and worker import; all four pinned source hashes match. GPU hooks not executed.",
+      "logs": [
+        "logs/dspark-e2e-20261014/kimi-native-cpu-import-790490.log",
+        "logs/dspark-e2e-20261014/kimi-native-source-check-790490.log"
+      ]
+    }
   ]
 }

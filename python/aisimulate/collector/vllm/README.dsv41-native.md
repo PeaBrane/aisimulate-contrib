@@ -27,9 +27,10 @@ python -m collector.vllm.collect_dsv41_native \
 ```
 
 The executable validates the checkpoint config hash, disables external Engram
-offload and prefix caching, and warms two completed requests. It observes four
-separate passes: layer, attention, mHC, and Engram. Each pass runs five fresh
-requests by default (20 measured requests total). The synthetic acceptance
+offload and prefix caching, and warms two completed requests. It observes seven
+separate passes: input preparation, layer, finalization, draft context preparation,
+attention, mHC, and Engram. Each pass runs five fresh requests by default
+(35 measured requests total). The synthetic acceptance
 length is 3.51 committed tokens per round. Native query widths and absolute
 positions are recorded from each invocation; expected values never replace them.
 The output length allows a full K5 target verification round to occur. A runtime
@@ -56,6 +57,8 @@ All paths below are relative to the immutable vLLM source pin:
 | Layer positions and shifted mHC ownership | `vllm/models/deepseek_v41/nvidia/model.py:452` |
 | Fused prior post/current pre/RMSNorm and optional reduction | `vllm/models/deepseek_v41/nvidia/model.py:557`, `:599` |
 | Eager mHC stream behavior | `vllm/models/deepseek_v41/nvidia/model.py:475` |
+| Bounded replay gather/scatter and restored full rows | `vllm/models/deepseek_v41/decoder_replay_layers.py:46` |
+| Root input and finalization boundaries | `vllm/models/deepseek_v41/nvidia/model.py:851`, `:1005`, `:1074` |
 | Noncausal draft and native context insertion | `vllm/models/deepseek_v41/nvidia/dspark.py:1`, `:173` |
 
 ## Outputs and remaining gates
@@ -66,15 +69,47 @@ positions, query widths, sequence counts, causal identity and native dispatch.
 Each rank keeps failed or unsupported observations. No rank averages or fastest
 rank selection occur in this stage.
 
-The records are **not importable timing rows**. The current consumer's SGLang
-component geometry does not represent vLLM's fused mHC/RMSNorm/communication
-ownership. Parent/child inclusive costs must never be summed. The vLLM consumer
-needs an explicit stage/site mapping and matching sequence/query/causal keys.
-Final collapse and draft context preparation occur outside the observed layer
-sites and remain a separate coverage requirement. No numerical accuracy or
-complete performance-model coverage is claimed by a successful observation run.
+The finalizer emits `dsv41_native_stage_perf.parquet` only when all four ranks
+agree on each invocation's exact identity, all 40 target and three draft layers
+are present, and both input/finalization boundaries plus draft context preparation
+were observed. It takes the slowest rank per invocation, then the median of
+repeated identical physical queries. Auxiliary attention/mHC/Engram observations
+remain diagnostic; they are never summed with inclusive layer costs. Failed or
+partial observations remain in the raw files and cannot publish a table.
 
-The collector is experimental and is not added to default model population or
-the op registry before the consumer and native smoke are qualified. Its explicit
-entry point stages this bounded source audit; it does not emit perf Parquet or
-modify existing measurements.
+The physical key includes native site, layer/owner, config identity, TP/EP,
+decoder replay, observed 528-byte MXFP8 SWA layout, phase, sequence count,
+query width, causality and absolute past-KV position. Rows preserve actual
+attention dispatch, cache dtype/record width, fused-reduction flags, source pin,
+image digest, eager policy, sample count and rank count. Configuration identity
+is canonical sorted HF JSON excluding only SDK-inferred top-level `quant_algo`,
+`kv_cache_quant_algo` and `quant_dynamic`; original quantization declarations and
+all model geometry remain included. The consumer rejects incompatible effective
+GEMM/MoE/FMHA/cache overrides.
+
+Native layers own shifted previous-layer mHC finalization, current pre/RMSNorm,
+attention, FFN and their fused reductions. Input preparation ends at entry to the
+first layer; it replaces embedding costs and includes native Engram hash setup.
+Finalization begins immediately after the last layer returns and ends when the
+model returns. This includes the bounded replay scatter and target collapse/norm;
+its request identity uses full model input rows, not the bounded late-layer rows.
+Draft final norm runs in its logits method and remains a separate approximation.
+Draft context preparation spans native auxiliary projection through KV insertion.
+No observation changes serving dispatch or constructs attention metadata.
+
+The initial consumer requires exact queries. It neither extrapolates nor borrows
+SGLang local-compute rows. Acceptance-driven replay can request other absolute
+KV positions; these remain coverage gaps. Mixed prefill/decode native batches
+and heterogeneous prefill batches also require additional physical identities.
+A standalone homogeneous prefill retains its whole native stage graph.
+A follow-up grid may interpolate
+KV only within observed dispatch/compression boundaries, keeping site, sequence
+count, query width, causal mode, cache layout and runtime exact. No such wider
+coverage is claimed by this initial collector. The steady-state draft cost uses
+an explicit full-acceptance KV-position bound; startup uses the actual prompt+K
+query extent. Acceptance sampling remains independent from that cost assumption.
+
+The collector remains experimental and is not added to default model population
+or the op registry before a successful native GPU smoke. Its table has a separate
+consumer; it never changes existing measurements or backend labels. A successful
+collection establishes only the recorded operator coverage, not serving accuracy.
