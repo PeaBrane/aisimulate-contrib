@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import importlib.util
+import json
 from pathlib import Path
 
 import pytest
@@ -69,6 +70,38 @@ def test_measured_token_ids_are_preserved_for_closed_loop_replay():
             "output_token_ids": [10, 20, 30],
         }
     ]
+
+
+def test_pinned_artifacts_reject_changed_loader_or_draft(tmp_path, monkeypatch):
+    config, identity, _ = inputs()
+    raw = {"hidden_size": 7168, "dspark_block_size": 3}
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(raw))
+    identity["model"]["revision"] = "immutable-revision"
+    pins = {
+        config.engine.model: {
+            "revision": "immutable-revision",
+            "config_sha256": prediction.digest(path),
+        }
+    }
+    receipt = {
+        f"{role}_config_{field}": value
+        for role in ("target", "draft")
+        for field, value in (("path", path.name), ("sha256", prediction.digest(path)))
+    }
+    config.engine.speculation.draft_config = dict(raw)
+    monkeypatch.setattr(prediction, "get_model_config_from_model_path", lambda _: {"raw_config": dict(raw)})
+    prediction.validate_artifacts(config, identity, receipt, tmp_path, pins)
+    config.engine.speculation.draft_config["hidden_size"] = 4096
+    with pytest.raises(ValueError, match="exact pinned draft_config"):
+        prediction.validate_artifacts(config, identity, receipt, tmp_path, pins)
+    config.engine.speculation.draft_config = dict(raw)
+    monkeypatch.setattr(prediction, "get_model_config_from_model_path", lambda _: {"raw_config": {}})
+    with pytest.raises(ValueError, match="canonical target config"):
+        prediction.validate_artifacts(config, identity, receipt, tmp_path, pins)
+    path.write_text(json.dumps({"hidden_size": 4096}))
+    with pytest.raises(ValueError, match="immutable checkpoint pin"):
+        prediction.validate_artifacts(config, identity, receipt, tmp_path, pins)
 
 
 @pytest.mark.parametrize("mismatch", ["model", "hardware", "draft_width", "topology", "prefix", "tokens", "failure"])

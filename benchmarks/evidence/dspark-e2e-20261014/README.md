@@ -60,6 +60,15 @@ The current fixture has 255 requests and 286,917 output tokens. The earlier
 attempt in `host/failed-attempt.log` retains that mismatch; it is not a completed
 host comparison. Host wall time is separate from serving accuracy.
 
+The completed five-repetition incremental comparison is in
+[`host-regression.json`](host-regression.json), with every original CLI artifact
+in `host-matched-raw.tar.gz` and the interrupted attempt in `host-raw.tar.gz`.
+Against `e4cdd954`, median host time changed by -0.77% for the non-speculative
+control, +1.40% for AgentX, and +0.48% for AgentX with DSpark. Both builds used
+release binaries, identical dependencies, one CPU thread, and the same workload;
+one warmup per case/build was excluded. This measures the incremental schema30
+implementation, not the total DSpark feature overhead or serving accuracy.
+
 ## Matching and progression
 
 Serving identity is frozen before each measurement. Exact token IDs, runtime

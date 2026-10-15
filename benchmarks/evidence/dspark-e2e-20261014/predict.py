@@ -16,10 +16,37 @@ from aisimulate.compiler import prediction_to_replay_spec
 from aisimulate.config.cli import CorePredictionConfig
 from aisimulate.runner import EngineReplayRunnerFactory
 from aisimulate.sweeper.replay import ReplayOutputRequirements
+from aisimulate_core.sdk.utils import get_model_config_from_model_path
 
 
 def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def validate_artifacts(config, identity, receipt, receipt_dir, pins):
+    """Verify source configs before the canonical loader constructs the model."""
+    model = identity["model"]
+    target = model["model"]
+    draft = model.get("draft_model", target)
+    resolved = {}
+    for role, name, revision in (
+        ("target", target, model["revision"]),
+        ("draft", draft, model.get("draft_revision", model["revision"])),
+    ):
+        pin = pins[name]
+        path = receipt_dir / receipt[f"{role}_config_path"]
+        if (
+            revision != pin["revision"]
+            or digest(path) != pin["config_sha256"]
+            or digest(path) != receipt[f"{role}_config_sha256"]
+        ):
+            raise ValueError(f"{role} config differs from its immutable checkpoint pin")
+        resolved[role] = json.loads(path.read_text())
+    actual = get_model_config_from_model_path(config.engine.model)["raw_config"]
+    if any(key not in actual or actual[key] != value for key, value in resolved["target"].items()):
+        raise ValueError("canonical target config differs from the pinned serving config")
+    if config.engine.speculation.draft_config != resolved["draft"]:
+        raise ValueError("campaign requires the exact pinned draft_config in Replay YAML")
 
 
 def validate_inputs(config, identity, records):
@@ -159,6 +186,11 @@ def main():
         if digest(acceptance_path) != receipt["acceptance_sha256"]:
             raise ValueError("acceptance evidence digest mismatch")
         config = CorePredictionConfig.from_yaml(args.config)
+        pins = {
+            item["model"]: item
+            for item in json.loads((Path(__file__).parent / "checkpoint-references.json").read_text())
+        }
+        validate_artifacts(config, identity, receipt, args.match_receipt.parent, pins)
         acceptance = json.loads(acceptance_path.read_text())
         validate_acceptance(config.engine.speculation, acceptance, identity["cell"]["acceptance"])
         summary["acceptance"] = {

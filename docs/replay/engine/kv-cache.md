@@ -301,8 +301,12 @@ either `timing_mode`. A decode-side prefix hit skips resident token KV; the
 state still travels with the rest of the prompt. These are modeling
 assumptions: vLLM sends the raw convolution and recurrent state (about 8% less
 than the padded `bytes_per_request` for Kimi K3 at TP8), transfers it after all
-but the last prompt token and recomputes that token on the decode worker. Replay
-transfers the state for the whole prompt and does not model the recompute.
+but the last prompt token and recomputes that token on the decode worker. Set
+`engine.kv_transfer.prefill_backoff_tokens: 1` and
+`engine.kv_transfer.decode_recompute_tokens: 1` to model that boundary and
+destination recomputation. Both default to zero. The typed settings describe
+the pinned connector's contract; they do not resolve the cache-padding or
+state-transfer byte approximations above.
 
 Supported: aggregated and P/D vLLM, fixed `capacity`, `predict --stack engine`;
 inferred geometry for Kimi K3 and DeepSeek V4 at PP=1.

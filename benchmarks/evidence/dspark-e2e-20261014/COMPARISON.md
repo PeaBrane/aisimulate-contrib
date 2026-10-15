@@ -51,6 +51,10 @@ Freeze a `replay-match.json` receipt before running the predictor:
 {
   "measurement_identity_sha256": "<digest from measured summary>",
   "replay_config_sha256": "<SHA256 of canonical YAML bytes>",
+  "target_config_path": "target/config.json",
+  "target_config_sha256": "<pinned target config SHA256>",
+  "draft_config_path": "draft/config.json",
+  "draft_config_sha256": "<pinned draft config SHA256>",
   "acceptance_path": "acceptance.json",
   "acceptance_sha256": "<SHA256 of acceptance evidence bytes>",
   "qualification": {"eligible": false, "reasons": ["unresolved identity differences"]}
@@ -66,6 +70,19 @@ synthetic acceptance, use a separate frozen control containing `accepted_tokens`
 runtime's synthetic sampler must be shown to match adjacent-integer sampling
 before using the mean control. Neither receipt nor acceptance can be adjusted
 to reduce latency error.
+
+Config paths are also relative to the receipt. Their hashes and revisions must
+match `checkpoint-references.json`. The predictor checks the canonical target
+loader against the pinned source config and requires the exact pinned
+`draft_config` in Replay YAML. A public model name alone is insufficient.
+
+If runtime qualification finishes after collection, preserve the original
+`summary.json` and frozen `identity.json`. Write a separate
+`qualified-summary.json` beside them, retaining all original metrics and
+identity fields, and attach the original summary hash and qualification receipt.
+Pass that reviewed summary explicitly to prediction and scoring. Qualification
+must explain resolved runtime/cache checks and remaining model approximations;
+it must not alter measurements, workloads or acceptance to improve error.
 
 The serving identity is frozen before collection. Real acceptance evidence and
 the corresponding Replay receipt are necessarily created after that measurement
