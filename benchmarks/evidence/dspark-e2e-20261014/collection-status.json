@@ -968,10 +968,13 @@
   "paired_request_records": 1664,
   "paired_configurations": 5,
   "monitoring": {
-    "status": "submitted_and_verified",
-    "checked_utc": "2026-10-15T20:08:27.091587+00:00",
-    "active_campaign_gpu_jobs": 56,
-    "source": "queue-20261015/submission-verification.json",
+    "status": "one_pilot_failed_remaining_pending",
+    "checked_utc": "2026-10-15T23:15:24.766185+00:00",
+    "active_campaign_gpu_jobs": 55,
+    "running_jobs": 0,
+    "pending_jobs": 55,
+    "failed_jobs": 1,
+    "source": "queue-20261015/status-20261015T2314Z/",
     "unverified_jobs": []
   },
   "production_completed_runs": 13,
@@ -993,8 +996,19 @@
     "remaining_production_requests": 151936,
     "completed_production_runs_excluded": 13,
     "gpu_jobs_submitted": 56,
-    "status": "All50 fixed-length sweep/pilot jobs and6 AgentX context anchors accepted by Slurm;66 AgentX client runs remain gated",
+    "status": "All56 jobs submitted;55 pending and KimiK3 acceptance pilot797431 failed during6000s startup. No new measured requests.",
     "completion_counts_unchanged": true,
-    "verification": "queue-20261015/submission-verification.json"
+    "verification": "queue-20261015/submission-verification.json",
+    "latest_status": "queue-20261015/status-20261015T2314Z/",
+    "failed_pilot": {
+      "job_id": "797431",
+      "node": "pool0-0305",
+      "elapsed": "01:40:55",
+      "exit_code": "1:0",
+      "last_observed_stage": "NCCL distributed initialization, before reported model-weight loading",
+      "root_cause": "unresolved; startup timeout is observed, not proof of DSpark or hardware failure",
+      "measured_requests": 0,
+      "dependent_controls": "KimiK3 K3 synthetic control unavailable; independent cells remain queued"
+    }
   }
 }

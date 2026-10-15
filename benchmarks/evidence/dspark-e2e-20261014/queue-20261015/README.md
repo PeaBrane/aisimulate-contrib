@@ -1,5 +1,20 @@
 # Full fixed-length collection queue
 
+## Status at 2026-10-15 23:14 UTC
+
+- B200: all 37 jobs pending. The first job, 2267383, waits on priority;
+  the other 36 wait on dependencies.
+- B300: pilot 797431 failed after 1h40m55s when server startup exceeded
+  6,000 seconds. Its last server messages are NCCL distributed initialization,
+  before reported model-weight loading. The underlying cause is unresolved.
+  It produced no measured requests or frozen K3 acceptance control.
+- The other 18 B300 jobs remain pending, led by 797432 waiting on priority.
+  Independent real/K2 cells can proceed; K3 synthetic cells still require the
+  missing pilot control. No retries or topology substitutions are claimed.
+- Total: 55 pending, one failed, none running, and no new measured pairs.
+  The existing 13 paired runs / 1,664 requests and MAPE are unchanged.
+  Raw logs, identity and scheduler output are under `status-20261015T2314Z/`.
+
 This queue expands the approved matrix to all 196 configurations: input/output
 1024/1024 and 8192/1024, concurrency 1/4/16/64, both draft widths and acceptance
 modes, and three repetitions. Pro P/D additionally includes concurrency 8 at

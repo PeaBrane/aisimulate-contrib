@@ -1467,6 +1467,15 @@ in the immutable image above. Measured pilot values are campaign observations;
 no upstream measurements or implementation are copied. Copyright contributors
 to the vLLM project; Apache-2.0, source revision and license URLs above.
 
+The 56 submitted `.sbatch` scripts listed by `plan.json` in
+`benchmarks/evidence/dspark-e2e-20261014/queue-20261015/` and
+`benchmarks/evidence/dspark-e2e-20261014/phaseb-queue-20261015/` retain their exact
+submitted bytes. The configuration adaptations have the vLLM provenance above.
+Original orchestration and modifications: Copyright (c) 2026 NVIDIA CORPORATION
+& AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0.
+Their copyright and license are recorded here instead of changing the immutable
+scripts; the repository copyright checker pins both manifests and script hashes.
+
 The P/D collection client
 `benchmarks/evidence/dspark-fixed-20261014/collect_pd.py` adapts (modified) the
 Mooncake HTTP handshake from
