@@ -9,13 +9,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use dynamo_kv_router::config::KvRouterConfig;
-use dynamo_kv_router::protocols::{
-    ActiveSequenceEvent, WorkerConfigLike, WorkerId, WorkerWithDpRank,
-};
+use dynamo_kv_router::protocols::{WorkerConfigLike, WorkerId};
 use dynamo_kv_router::scheduling::queue::DEFAULT_MAX_BATCHED_TOKENS;
-use dynamo_kv_router::sequences::SchedulerLoadSnapshot;
-use dynamo_kv_router::sequences::multi_worker::LocalWorkerLoad;
-use dynamo_kv_router::{ActiveSequencesMultiWorker, SequencePublisher};
+use dynamo_kv_router::{ActiveSequencesMultiWorker, NoopSequencePublisher};
 
 /// The engine capacity/topology fields needed by the native Router.
 #[derive(Clone, Copy, Debug)]
@@ -24,19 +20,6 @@ pub(super) struct NativeRouterEngineArgs {
     pub(super) block_size: u32,
     pub(super) num_gpu_blocks: usize,
     pub(super) max_num_batched_tokens: Option<usize>,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-pub(super) struct ReplayNoopPublisher;
-
-impl SequencePublisher for ReplayNoopPublisher {
-    fn enqueue_event(&self, _event: ActiveSequenceEvent) -> anyhow::Result<()> {
-        Ok(())
-    }
-
-    fn publish_scheduler_load(&self, _load: SchedulerLoadSnapshot) {}
-
-    fn observe_load(&self, _: &WorkerWithDpRank, _: &str, _: LocalWorkerLoad) {}
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -90,7 +73,7 @@ pub(super) fn replay_workers_with_configs(
 pub(super) fn replay_slots(
     args: &NativeRouterEngineArgs,
     workers_with_configs: &HashMap<WorkerId, ReplayWorkerConfig>,
-) -> Arc<ActiveSequencesMultiWorker<ReplayNoopPublisher>> {
+) -> Arc<ActiveSequencesMultiWorker<NoopSequencePublisher>> {
     let dp_range = workers_with_configs
         .iter()
         .map(|(&worker_id, config)| {
@@ -106,7 +89,7 @@ pub(super) fn replay_slots(
     // expiry disabled here until replay has a liveness-aware definition of a stale request; do
     // not mask replay dead ends by expiring requests that are still live in virtual time.
     Arc::new(ActiveSequencesMultiWorker::new_without_expiry(
-        ReplayNoopPublisher,
+        NoopSequencePublisher,
         args.block_size as usize,
         dp_range,
         false,

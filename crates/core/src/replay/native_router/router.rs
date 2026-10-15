@@ -27,9 +27,10 @@ use dynamo_kv_router::scheduling::{
 use dynamo_kv_router::sequences::topology::WorkerDpRange;
 use dynamo_kv_router::services::selection::affinity::Hold;
 use dynamo_kv_router::{
-    ActiveSequencesMultiWorker, RadixTree, RoutingPartitionRef, SchedulingRequest, SequenceRequest,
-    SessionContext, TrackingHashAlgorithm, TrackingHashContext, TrackingHashScope,
-    WorkerLoadProjection, WorkerSelectionInput, WorkerSelector, scheduling::TierOverlapBlocks,
+    ActiveSequencesMultiWorker, NoopSequencePublisher, RadixTree, RoutingPartitionRef,
+    SchedulingRequest, SequenceRequest, SessionContext, TrackingHashAlgorithm, TrackingHashContext,
+    TrackingHashScope, WorkerLoadProjection, WorkerSelectionInput, WorkerSelector,
+    scheduling::TierOverlapBlocks,
 };
 use dynamo_tokens::SequenceHash;
 use rustc_hash::FxHashMap;
@@ -39,8 +40,8 @@ use uuid::Uuid;
 use super::ReplayPrefillLoadEstimator;
 use super::helpers::NativeRouterEngineArgs;
 use super::helpers::{
-    ReplayNoopPublisher, ReplayWorkerConfig, replay_router_config, replay_selector_with_seed,
-    replay_slots, replay_worker_config, replay_workers_with_configs,
+    ReplayWorkerConfig, replay_router_config, replay_selector_with_seed, replay_slots,
+    replay_worker_config, replay_workers_with_configs,
 };
 use super::observation::RouterEventBatch;
 use crate::replay::DirectRequest;
@@ -345,7 +346,7 @@ struct OfflineReplayRouter {
     profile: PolicyProfile,
     worker_config_template: ReplayWorkerConfig,
     workers_with_configs: HashMap<WorkerId, ReplayWorkerConfig>,
-    slots: Arc<ActiveSequencesMultiWorker<ReplayNoopPublisher>>,
+    slots: Arc<ActiveSequencesMultiWorker<NoopSequencePublisher>>,
     selector: DefaultWorkerSelector,
     pending: PolicyQueue<PendingRequest>,
     indexer: SyncReplayIndexer,
