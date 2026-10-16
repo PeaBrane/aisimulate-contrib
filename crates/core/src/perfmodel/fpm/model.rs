@@ -787,7 +787,7 @@ impl ForwardPassPerfModel {
             ForwardPassPerfMode::Native { corrections, .. } => {
                 let ready_buckets = corrections.ready_bucket_count();
                 ForwardPassPerfDiagnostics {
-                    source: if ready_buckets > 0 {
+                    source: if corrections.any_ready() {
                         ForwardPassPerfSource::AicWithCorrection
                     } else {
                         ForwardPassPerfSource::Aic
@@ -819,7 +819,7 @@ impl ForwardPassPerfModel {
             ForwardPassPerfMode::Learned { corrections, .. } => {
                 let ready_buckets = corrections.ready_bucket_count();
                 ForwardPassPerfDiagnostics {
-                    source: if ready_buckets > 0 {
+                    source: if corrections.any_ready() {
                         ForwardPassPerfSource::LearnedWithCorrection
                     } else {
                         ForwardPassPerfSource::Learned
@@ -1509,6 +1509,10 @@ impl<T: WithOptions> WorkloadStores<T> {
 }
 
 impl<T: StoreStats> WorkloadStores<T> {
+    fn any_ready(&self) -> bool {
+        self.prefill.is_ready() || self.decode.is_ready() || self.mixed.is_ready()
+    }
+
     fn observation_count(&self) -> usize {
         self.prefill.observation_count()
             + self.decode.observation_count()

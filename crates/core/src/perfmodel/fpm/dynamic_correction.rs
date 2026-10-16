@@ -60,13 +60,10 @@ impl DynamicCorrection {
         } else {
             shape
         };
-        // Reserve a quarter for recent evidence without making a valid
-        // workload-kind readiness threshold unreachable at small budgets.
-        let recent_capacity = (options.max_observations / 4).min(
-            options
-                .max_observations
-                .saturating_sub(options.min_observations),
-        );
+        // The global fallback must be able to become ready for every valid
+        // budget. Small budgets may leave too few primary samples for local
+        // factors, in which case all queries use the recent-global fallback.
+        let recent_capacity = (options.max_observations / 4).max(options.min_observations);
         Self {
             ndim,
             bins,

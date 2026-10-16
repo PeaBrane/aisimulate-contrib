@@ -259,9 +259,13 @@ after valid feedback is admitted. Callers control feedback cadence and should
 predict before supplying an observation's target.
 
 For a custom capacity `M`, the recent FIFO has
-`min(floor(M / 4), M - min_observations)` slots; the primary set receives the
-remaining slots. The maximum sample age is `2 * M` admissions. This preserves
-the readiness threshold even at small capacities.
+`max(floor(M / 4), min_observations)` slots; the primary set receives the
+remaining slots. The maximum sample age is `2 * M` admissions. The recent-global
+fallback can therefore become ready for every valid capacity. If the remaining
+primary capacity is below `min_observations`, local factors stay disabled and
+all valid queries use the recent-global fallback once it is ready. For example,
+`M = 10` and `min_observations = 5` allocate five slots to each set; when
+`M = min_observations`, all slots go to the recent FIFO.
 
 Each admitted observation rebuilds the bucket medians and recent-global median.
 This takes `O(M log M)` time in the worst case and allocates `O(M)` temporary
