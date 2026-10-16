@@ -277,9 +277,8 @@ forests and the existing fixed grid for native AIC estimates. Explicit
 the same selection as `estimator_config.correction.mode`. The `max_num_tokens`,
 `max_batch_size`, and `max_kv_tokens` options bound only the fixed policy.
 
-The [PR 460 calibration comparison](../../../benchmarks/evidence/fpm-dynamic-calibration/README.md)
-records measured accuracy, host cost, and regressions. To compare policies on your
-own frozen forest and held-out chronological observations, run:
+To compare policies on your own frozen forest and held-out chronological
+observations, run:
 
 ```bash
 python -m scripts.fpm_accuracy.compare_calibration --model model.json \
