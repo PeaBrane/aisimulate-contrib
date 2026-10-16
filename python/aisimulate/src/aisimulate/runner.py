@@ -367,6 +367,9 @@ class EngineReplayRunnerFactory:
 
     trace_block_size: int = 512
     determinism: Literal["random", "canonical_v1"] = field(default="random", kw_only=True)
+    # Keep each loaded trace graph for later candidates in the same worker.
+    # Only worth its retained memory when one process runs many candidates.
+    trace_graph_cache: bool = field(default=False, kw_only=True)
     runtime: EngineReplayRuntime | None = field(default=None, repr=False, compare=False)
     afd_companion_model: AFDCompanionPerformanceModel | None = field(
         default=None,
@@ -402,7 +405,7 @@ class EngineReplayRunnerFactory:
             supported_agentic_topologies=("agg", "disagg"),
             supported_agentic_backends=("vllm", "sglang"),
             supports_agentic_host_offload=True,
-            supports_agentic_speculative_decoding=False,
+            supports_agentic_speculative_decoding=True,
             agentic_qualification="functional_only",
         )
 
@@ -412,6 +415,7 @@ class EngineReplayRunnerFactory:
             capabilities=self.capabilities(),
             trace_block_size=self.trace_block_size,
             determinism=self.determinism,
+            trace_graph_cache=self.trace_graph_cache,
             runtime=self.runtime,
             afd_companion_model=self.afd_companion_model,
         )
@@ -425,6 +429,7 @@ class EngineReplayRunner:
     capabilities: RunnerCapabilities
     trace_block_size: int = 512
     determinism: Literal["random", "canonical_v1"] = field(default="random", kw_only=True)
+    trace_graph_cache: bool = field(default=False, kw_only=True)
     runtime: EngineReplayRuntime | None = None
     afd_companion_model: AFDCompanionPerformanceModel | None = None
 
@@ -572,6 +577,8 @@ class EngineReplayRunner:
             if "spec" not in execution_spec:
                 execution_spec = {"spec": execution_spec}
             execution_spec["determinism"] = self.determinism
+        if self.trace_graph_cache and "traffic" in execution_spec:
+            execution_spec["traffic"]["trace_graph_cache"] = True
         execution_spec_json = json.dumps(
             execution_spec,
             allow_nan=False,
@@ -596,6 +603,9 @@ class EngineReplayRunner:
             report = json.loads(report_json)
         except json.JSONDecodeError as exc:
             raise InvalidRunnerError("AISimulate engine replay runtime returned invalid report JSON") from exc
+        # The parsed report replaces the transport string, which can be as large as
+        # the per-request records it carries.
+        del report_json
         if not isinstance(report, Mapping):
             raise InvalidRunnerError("AISimulate engine replay runtime report must be a JSON object")
         resolved_basis = report.get("weka_nested_timestamp_basis")
@@ -1705,6 +1715,7 @@ def _materialize_engine_role(
             memory_fraction_overrides[memory_field] = float(value)
 
     aic_timing_overrides = _pop_aic_timing_overrides(rank, role)
+    prefill_context_parallel_size = aic_timing_overrides.get("cp_size", 1)
     for target in ("cp_size", "dcp"):
         if target in aic_timing_overrides:
             # Same contract as tp / attention_dp: a directly supplied deployment
@@ -1939,9 +1950,18 @@ def _materialize_engine_role(
     ):
         rank["native_host_offload"] = {**host_offload, "kv_layout_id": _kv_layout_id(rank, model, tensor_parallel_size)}
 
+    timing = rank.get("timing_model", {})
+    timing_config = timing.get("config", {}) if isinstance(timing, dict) and timing.get("provider") == "aic" else {}
+    if timing_config.get("cp_size") is not None:
+        prefill_context_parallel_size = timing_config["cp_size"]
+    prefill_context_parallel_size = _positive_int(
+        prefill_context_parallel_size,
+        f"engine provider {role} prefill context parallel size",
+    )
     return {
         "dp_size": dp_size,
         "tensor_parallel_size": tensor_parallel_size,
+        "prefill_context_parallel_size": prefill_context_parallel_size,
         "num_gpu_blocks_is_explicit": num_gpu_blocks_is_explicit,
         "rank": rank,
     }
@@ -2199,6 +2219,7 @@ def _normalize_engine_replay_report(report: Mapping[str, JSONValue], *, include_
     metadata = {
         key: payload[key]
         for key in (
+            "prediction_provenance",
             "state_cache",
             "agentic_qualification",
             "agentic_input_format",

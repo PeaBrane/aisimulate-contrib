@@ -141,6 +141,38 @@ it creates a starting configuration without replay/SLA optimization; it does
 not recreate the selected recommendation. See the
 [legacy CLI guide](../aic-backward-compatibility/cli.md).
 
+### vLLM KV precision versions
+
+Pin the generated configuration version to the serving runtime. With vLLM
+0.11.0 and newer templates (including unversioned/`current`), an explicit `kv_cache_dtype: bfloat16` renders
+`--kv-cache-dtype bfloat16`, so checkpoint FP8 KV metadata cannot replace that
+selection through `auto`. Explicit `fp8` and `auto` remain unchanged.
+The 0.10.2 template retains the BF16-to-`auto` compatibility mapping because
+that runtime does not accept literal `bfloat16`. Verify the runtime's observed
+cache precision before collecting timings.
+See the [FPM precision contract](../perf-model/fpm-self-service/implementation.md#plan-preview-and-explicitly-execute).
+
+### SGLang CUDA graph versions
+
+Pin `request.backend.generated_config_version` to the SGLang version installed
+in the serving image. For example, Dynamo 1.6.0's SGLang 0.5.21 image needs
+`generated_config_version="0.5.21"`. The image override alone does not select
+a backend template. A candidate with `backend_version: current` uses the
+unversioned template, which emits the current flag names below.
+
+| SGLang template version | `cuda_graph_batch_sizes` | `cuda_graph_max_batch_size` |
+|---|---|---|
+| Explicit supported versions before 0.5.20 | `--cuda-graph-bs` | `--cuda-graph-max-bs` |
+| 0.5.20 and newer, or unversioned/`current` | `--cuda-graph-bs-decode` | `--cuda-graph-max-bs-decode` |
+
+Both inputs retain their original **decode request-batch** meaning, including
+when benchmark rules set them on a prefill worker. SGLang's separate
+`--cuda-graph-bs-prefill` controls prefill **token** capture sizes; the generator
+leaves it at the runtime default instead of copying request batch sizes into it.
+Kubernetes, run scripts, sflow and Slurm use the same versioned CLI output.
+Expanded sflow preserves the graph capture maximum separately from the serving batch limit.
+Older runtime images should use an explicit backend version rather than `current`.
+
 ## 4. Launch on the serving host
 
 The generated scripts use Dynamo's default service discovery. On the serving

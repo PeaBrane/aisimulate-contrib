@@ -89,14 +89,82 @@ selection attempts, effective backend version, data policy, selected root,
 and complete estimator configuration. Its resolved config pins the selected
 mode with deny so saved replay input repeats that selection.
 
-Prompt-lookup verification uses the same constructor: set `speculation` to
-`{"kind": "ngram", "params": {"num_speculative_tokens": 2}}` in Python/JSON, or
-`ForwardPassSpeculationConfig::Ngram { num_speculative_tokens: 2 }` in Rust.
-It supports vLLM op-level timing with 1–5 draft tokens and `nextn: 0`; auto can
-select op-level but cannot fall back to an unsupported speculative estimator.
-The cost configuration is retained in provenance and saved recommendations.
-Acceptance rates and the scheduler seed stay in the CLI/Replay speculation
-configuration; they do not change the model's target-verification graph.
+### Speculative decoding configuration
+
+Use the same `best_available(config)` constructor and returned model for
+speculative iteration costs. The canonical `speculation` field carries the
+existing SDK scheme identity:
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `speculation` | `null` | Optional speculative scheme; omit it for the existing autoregressive or legacy `nextn` configuration. |
+| `speculation.kind` | Required | Registered scheme name: `none`, `mtp`, `ngram`, `eagle3`, `dflash`, `dspark`, or `draft_model`. A valid `none` configuration normalizes to disabled speculation. Scheme, model, and backend capability checks still apply. |
+| `speculation.params` | `{}` | Scheme-specific parameters, validated by the existing scheme implementation. Unknown parameters are rejected. |
+| `speculation.draft_model_path` | `null` | Draft checkpoint path or model ID. Required and verified for standalone `draft_model`, which builds its graph from that checkpoint. |
+| `speculation.draft_config` | `null` | Parsed draft checkpoint configuration retained as identity evidence. Learned schemes can reuse resolved geometry; this field does not replace `draft_model_path` for standalone `draft_model`. |
+
+For example, Python/JSON prompt lookup retains its existing shape:
+`{"kind": "ngram", "params": {"num_speculative_tokens": 2}}`. MTP uses
+`{"kind": "mtp", "params": {"depth": 2}}`. Legacy `nextn` input remains
+supported; do not combine a nonzero `nextn` with `speculation`. The generic cost
+API uses each scheme's parameter validation rather than a shared 1–5 draft-token
+limit. The existing n-gram contract retains vLLM and 1–5 draft tokens. Replay's
+backend, scheme, and scheduling limits remain separate.
+
+Rust callers now construct the public struct instead of the former
+`ForwardPassSpeculationConfig::Ngram` enum variant:
+
+```rust
+use aisimulate_core::{
+    BackendKind, DatabaseMode, EstimationMode, ForwardPassPerfModel,
+    ForwardPassPerfModelConfig, ForwardPassSpeculationConfig, ForwardPassWorkerType,
+};
+
+let mut config = ForwardPassPerfModelConfig::new(
+    "Qwen/Qwen3-8B", "h200_sxm", BackendKind::Vllm, ForwardPassWorkerType::Decode,
+);
+config.estimation_mode = EstimationMode::OpLevel;
+config.database_mode = DatabaseMode::Sol;
+config.speculation = Some(ForwardPassSpeculationConfig {
+    kind: "ngram".into(),
+    params: [("num_speculative_tokens".into(), 2.into())].into_iter().collect(),
+    draft_model_path: None,
+    draft_config: None,
+});
+let model = ForwardPassPerfModel::best_available(config)?;
+```
+
+This is a Rust source migration; existing n-gram JSON and legacy `nextn`
+configuration remain readable. OP timing and analytical SOL reuse the same
+speculative graph: choose `estimation_mode="op_level"` and set `database_mode`
+to the desired database policy, or `"SOL"` for analytical timing. SOL is not a
+new estimator mode, and individual operations may lack SOL support. FPM's
+`estimator_config.fpm_interpolation.method="sol"` instead controls interpolation
+of measured whole-forward data; it does not select analytical-only timing.
+
+Query conventions remain unchanged. For OP/SOL,
+`estimate_forward_pass_time_ms()` consumes already-packed `ForwardPassMetrics`
+decode counters: for `B` real requests, verification width `v`, and per-request
+KV length `s`, use `num_decode_requests = B*v` and
+`sum_decode_kv_tokens = B*v*s`. Their ratio remains `s`; the query does not apply
+the width again. `predict_decode_latency_total()` wraps the same counters.
+`static_phase_latency()` instead takes the real request batch and applies the
+configured verification width internally. This OP telemetry convention is
+distinct from the proposed speculative FPM mapping, which remains unsupported.
+
+The canonical constructor currently supports explicit speculative schemes with
+OP/SOL timing. FPM interpolation and regression are unsupported candidates for
+these schemes. An explicit FPM request with `fallback_policy="deny"` fails;
+`auto` or an explicit mode with `fallback_policy="allow"` can select a supported
+OP candidate while preserving the complete speculative identity. They do not
+drop speculation to obtain an autoregressive estimate. FPM profiles remain
+autoregressive-only. Lower-level FPM hybrid code does not imply support through
+the canonical ForwardPassMetrics query API.
+
+Acceptance assumptions and scheduler seeds belong to the prediction/Replay
+layer, not this cost configuration. The returned model continues to estimate
+iteration latency; its constructor and query signatures are unchanged. This
+configuration extension does not enable additional schemes in Replay or AgentX.
 
 ### Estimator controls
 
@@ -249,7 +317,8 @@ These additional public YAML fields are concrete controls:
 
 | Field | Meaning |
 | --- | --- |
-| `engine.gemm_quant_mode`, `moe_quant_mode`, `fmha_quant_mode`, `kvcache_quant_mode`, `comm_quant_mode` | Explicit precision overrides; omitted values follow model/profile normalization. |
+| `engine.gemm_quant_mode`, `moe_quant_mode`, `fmha_quant_mode`, `comm_quant_mode` | Explicit precision overrides; omitted values follow model/profile normalization. |
+| `engine.kvcache_quant_mode` | KV storage precision: `bfloat16`, `fp8`, or `int8`. Omission follows model/profile normalization and can select FP8 for quantized checkpoints. |
 | `engine.attention_backend`, `moe_backend`, `moe_kernel_source` | Runtime graph/backend and exact collected source selectors, subject to canonical validation. |
 | `engine.enable_eplb`, `wideep_num_slots` | Expert load balancing and redundant expert slots; require compatible MoE execution. |
 | `engine.nextn`, `nextn_accepted` | Compute-side MTP identity and separate expected acceptance assumption; both are required for explicit MTP. |
@@ -261,6 +330,49 @@ and the supported model/backend; an older external adapter can reject them at
 capability validation before Replay. Expected acceptance is workload behavior,
 not an estimator-fitting observation. See [Replay features](../replay/features.md)
 for execution and cache combinations.
+
+FP8 tensor-core compute is rejected during estimator construction on pre-SM89
+GPUs, including `a100_sxm`. Choose a BF16 checkpoint on A100, or an FP8-capable
+GPU with matching backend timing data. This checks compute precision, not weight
+storage or KV dtype: weight-only formats that compute in BF16 remain distinct.
+FPM also checks the preserved GEMM/MoE identity before selecting a timing cell,
+including profiles without an original op-level graph.
+Missing hardware metadata still follows the system-spec/data diagnostics.
+Serving runtimes may execute FP8 checkpoints through weight-only kernels such as
+Marlin on these GPUs; AISimulate does not model that path.
+
+### KV precision and token capacity
+
+An explicit `engine.kvcache_quant_mode` or worker timing override takes precedence,
+subject to model/backend and profile validation. An FPM profile supplies its
+recorded `kv_cache_dtype`. Otherwise, the first matching rule below applies:
+
+| Checkpoint metadata | Inferred KV precision |
+|---|---|
+| `kv_cache_quant_algo` is not missing/null, `fp8`, `bfloat16`, or `"none"` (for example, `int8`) | Rejected during checkpoint normalization |
+| DeepSeek V4/V4.1 architecture | FP8 |
+| `kv_cache_quant_algo: fp8` | FP8 |
+| `kv_cache_quant_algo: "none"` | BF16 |
+| KV declaration missing/null or `bfloat16`; weight `quant_algo` is `fp8`, `fp8_block`, or `nvfp4` | FP8 |
+| Other supported configurations | BF16 |
+
+These are AISimulate policies, not serving-engine defaults. `torch_dtype: bfloat16`
+does not prevent FP8 KV inference. For regular language roles using default timing,
+pass `--set engine.kvcache_quant_mode=bfloat16` or set it in YAML to require BF16.
+The explicit engine field also accepts `int8`, subject to model/backend validation;
+this does not make an `int8` checkpoint KV declaration valid.
+Fixed/polynomial timing, EPD, and AFD currently reject this engine override.
+
+Ordinary `predict` output shows each known role's effective KV dtype and source.
+JSON stdout and `prediction.json` summaries expose `kv_cache_precision.<role>`
+with `dtype` and `source`: `user_override`, `checkpoint` (a matching explicit KV
+declaration), `fpm_profile`, or `aisimulate_policy`. `--detail memory` also includes
+`kvcache_quant_mode` beside capacity. Naive fallback and roles without a capacity
+estimate omit this disclosure. Fixed/polynomial timing roles currently size capacity
+at compile time and do not report the resolved precision through this path.
+
+FP8 uses one byte per KV element; BF16 uses two. At the same byte budget, linear
+FP8 KV holds twice as many tokens. This does not imply twice the throughput.
 
 ## Migrating saved configuration
 

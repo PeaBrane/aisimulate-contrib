@@ -1024,6 +1024,15 @@ fn op_from_spec_json(py: Python<'_>, spec_json: &str) -> PyResult<Py<PyAny>> {
     crate::py_ops::op_from_spec_json(py, spec_json)
 }
 
+/// Internal payload accounting; the public construction path remains best_available.
+#[pyfunction]
+fn glm53_cache_bytes(spec_json: &str, seq_len: u32) -> PyResult<f64> {
+    let op: crate::operators::glm53flash::Glm53AttentionOp =
+        serde_json::from_str(spec_json).map_err(|e| PyValueError::new_err(e.to_string()))?;
+    op.cache_bytes(seq_len)
+        .map_err(|e| PyValueError::new_err(e.to_string()))
+}
+
 /// Internal request shared by every Rust -> Python -> Rust construction path.
 ///
 /// The public builder and the crate-internal `EngineConfig` path both normalize
@@ -1590,6 +1599,41 @@ fn compile_engine_from_request(request: EngineBuildRequest) -> Result<Engine, Ai
     Engine::from_spec_bytes(&spec_bytes, systems_root.as_path() as &Path)
 }
 
+/// Validate scheme parameters and pin draft content before selection and caching.
+/// The SDK registry supplies geometry only; Rust still owns estimator selection.
+pub(crate) fn resolve_speculation_identity(
+    config: &crate::ForwardPassSpeculationConfig,
+) -> Result<crate::ForwardPassSpeculationConfig, AicError> {
+    Python::with_gil(|py| -> PyResult<_> {
+        let json = PyModule::import(py, "json")?;
+        let encoded = serde_json::to_string(config)
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        let fields = json.call_method1("loads", (encoded,))?;
+        let module = PyModule::import(py, "aisimulate_core.sdk.speculation.base")?;
+        let spec = module
+            .getattr("SpeculationConfig")?
+            .call((), Some(fields.downcast()?))?;
+        let resolved = module.call_method1("resolve_speculation_config", (spec,))?;
+        let fields = PyModule::import(py, "dataclasses")?.call_method1("asdict", (resolved,))?;
+        let encoded: String = json.call_method1("dumps", (fields,))?.extract()?;
+        serde_json::from_str(&encoded).map_err(|error| PyValueError::new_err(error.to_string()))
+    })
+    .map_err(|error| {
+        let checkpoint_unavailable = Python::with_gil(|py| {
+            py.import("aisimulate_core.sdk.utils")
+                .and_then(|module| module.getattr("HuggingFaceDownloadError"))
+                .is_ok_and(|kind| error.is_instance(py, &kind))
+        });
+        if checkpoint_unavailable {
+            // Match native construction's checkpoint-availability category.
+            // Identity resolution still fails before estimator selection.
+            AicError::UnsupportedModel(format!("speculation checkpoint unavailable: {error}"))
+        } else {
+            AicError::InvalidEngineConfig(format!("speculation: {error}"))
+        }
+    })
+}
+
 /// Profile schema/identity facts supplied by Python without choosing an estimator.
 #[derive(serde::Deserialize)]
 pub(crate) struct ForwardPassProfileFacts {
@@ -2123,9 +2167,47 @@ impl PyForwardPassPerfModel {
             .map_err(aic_to_py)
     }
 
+    /// `RustForwardPassPerfModel.from_learned(source, options_json=None)`:
+    /// offline-trained learned model. `source` is an artifact path or the
+    /// artifact JSON text (`aic_fpm_learned_forward_perf`); the artifact binds
+    /// the worker type and feature ABI. No native engine, no Python compile.
+    #[staticmethod]
+    #[pyo3(signature = (source, options_json=None))]
+    fn from_learned(source: &str, options_json: Option<&str>) -> PyResult<Self> {
+        let options = options_json
+            .map(serde_json::from_str::<crate::ForwardPassPerfOptions>)
+            .transpose()
+            .map_err(|e| PyValueError::new_err(e.to_string()))?
+            .unwrap_or_default();
+        let inner =
+            crate::ForwardPassPerfModel::from_learned(source, options).map_err(aic_to_py)?;
+        Ok(Self { inner })
+    }
+
+    /// Ordered feature names of a learned model; `None` for other modes.
+    fn learned_feature_names(&self) -> Option<Vec<String>> {
+        self.inner
+            .learned_feature_names()
+            .map(|names| names.to_vec())
+    }
+
+    /// Trainer metadata embedded in a learned artifact as JSON; `None` for
+    /// other modes.
+    fn learned_metadata(&self) -> PyResult<Option<String>> {
+        self.inner
+            .learned_metadata()
+            .map(|value| {
+                serde_json::to_string(value)
+                    .map_err(|e| PyValueError::new_err(format!("learned metadata serialize: {e}")))
+            })
+            .transpose()
+    }
+
     /// Estimate one forward-pass iteration in ms. `fpm_json` is one iteration as
     /// a single FPM object or a per-attention-DP-rank array. Returns `None` for
-    /// regression models without enough data yet. Pure-Rust compute (GIL freed).
+    /// regression models without enough data yet and for learned models whose
+    /// artifact has no store for the iteration's workload kind. Pure-Rust
+    /// compute (GIL freed).
     fn estimate_forward_pass_time_ms(
         &self,
         py: Python<'_>,
@@ -2282,6 +2364,7 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(ops_json_from_ops, m)?)?;
     m.add_function(wrap_pyfunction!(engine_spec_schema_version, m)?)?;
     m.add_function(wrap_pyfunction!(op_from_spec_json, m)?)?;
+    m.add_function(wrap_pyfunction!(glm53_cache_bytes, m)?)?;
     m.add_class::<AicEngine>()?;
     m.add_class::<PyForwardPassPerfModel>()?;
     crate::perfmodel::py_ops::register(m)?;

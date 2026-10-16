@@ -19,6 +19,8 @@ checkable parity assertion for the port.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 pytestmark = pytest.mark.unit
@@ -31,6 +33,7 @@ pytestmark = pytest.mark.unit
 pytest.importorskip("aisimulate_core")
 
 from aisimulate.sdk import memory
+from aisimulate_core.sdk.models.helpers import _apply_model_quant_defaults
 
 _GIB = 1 << 30
 
@@ -188,6 +191,97 @@ def test_native_zero_per_token_raises():
             fraction=0.9,
             gpu_memory_capacity_bytes_override=None,
         )
+
+
+@pytest.mark.parametrize(
+    "override, resolved, token_capacity",
+    [(None, "fp8", 2097152), ("fp8", "fp8", 2097152), ("bfloat16", "bfloat16", 1048576)],
+)
+def test_native_capacity_discloses_resolved_kv_precision(monkeypatch, override, resolved, token_capacity):
+    def get_model(_path, config, backend):
+        # Exercise real default resolution for an FP8 checkpoint with no KV declaration.
+        _apply_model_quant_defaults(config, {"quant_algo": "fp8"}, "Qwen3ForCausalLM", backend)
+        # K and V, eight layers, two KV heads, head dimension 64.
+        bytes_per_token = 2 * 8 * 2 * 64 * config.kvcache_quant_mode.value.memory
+        return SimpleNamespace(
+            config=config,
+            get_kvcache_bytes_per_sequence=lambda length: length * bytes_per_token,
+            get_kvcache_batch_capacity=lambda budget, _batch: int(budget // bytes_per_token),
+        )
+
+    monkeypatch.setattr(memory, "get_model", get_model)
+    monkeypatch.setattr(
+        memory,
+        "get_backend",
+        lambda _: SimpleNamespace(_get_memory_usage=lambda *_a, **_k: dict(weights=1, activations=1, others=1, nccl=1)),
+    )
+    monkeypatch.setattr(
+        memory.perf_database,
+        "get_database",
+        lambda *_a, **_k: SimpleNamespace(version="0.19.0", system_spec={"gpu": {"mem_capacity": 8 * _GIB}}),
+    )
+    diagnostics = {}
+    blocks = memory.estimate_num_gpu_blocks(
+        "test/fp8-checkpoint",
+        "test_gpu",
+        "vllm",
+        "0.19.0",
+        max_num_tokens=128,
+        max_batch_size=1,
+        memory_fraction_kind="of_total",
+        memory_fraction_value=1.0,
+        scheduler_block_size=64,
+        kvcache_quant_mode=override,
+        diagnostics=diagnostics,
+    )
+    # Identical 4 GiB cache budgets: FP8 uses 2048 bytes/token, BF16 uses 4096.
+    assert diagnostics["total_kv_size_bytes"] == 4 * _GIB
+    assert diagnostics["total_kv_size_tokens"] == token_capacity
+    assert blocks == token_capacity // 64
+    assert diagnostics["kvcache_quant_mode"] == resolved
+
+
+@pytest.mark.parametrize("selector", ["omitted", None, "current", "literal"])
+def test_native_capacity_defaults_backend_version_to_current(monkeypatch, selector):
+    # Keep real version resolution and database lookup; isolate model weights.
+    seen_versions = []
+    monkeypatch.setattr(
+        memory,
+        "get_model",
+        lambda *_args: SimpleNamespace(
+            get_kvcache_bytes_per_sequence=lambda length: 128 * length,
+            get_kvcache_batch_capacity=lambda budget, _batch: int(budget // 128),
+        ),
+    )
+
+    def memory_usage(_model, database, **_kwargs):
+        seen_versions.append(database.version)
+        return dict(weights=1, activations=1, others=1, nccl=1)
+
+    monkeypatch.setattr(memory, "get_backend", lambda _: SimpleNamespace(_get_memory_usage=memory_usage))
+    literal = memory.perf_database.resolve_query_version("h200_sxm", "vllm", "current")
+    options = dict(max_num_tokens=8192, max_batch_size=256, memory_fraction_kind="of_total", memory_fraction_value=0.9)
+    expected = memory.estimate_kv_cache("test/model", "h200_sxm", "vllm", literal, **options)
+    version = {} if selector == "omitted" else {"backend_version": literal if selector == "literal" else selector}
+    actual = memory.estimate_kv_cache("test/model", "h200_sxm", "vllm", **version, **options)
+    assert actual == expected
+    assert actual["source"] == "native"
+    assert seen_versions == [literal, literal]
+
+
+def test_native_capacity_rejects_unavailable_backend_version():
+    with pytest.raises(ValueError, match="9.9.9") as error:
+        memory.estimate_kv_cache(
+            "test/model",
+            "h200_sxm",
+            "vllm",
+            "9.9.9",
+            max_num_tokens=8192,
+            max_batch_size=256,
+            memory_fraction_kind="of_total",
+            memory_fraction_value=0.9,
+        )
+    assert "NoneType" not in str(error.value)
 
 
 def test_breakdown_applies_nextn_to_model_config(monkeypatch):
@@ -910,6 +1004,7 @@ def test_estimate_kv_cache_falls_back_when_breakdown_raises(monkeypatch):
     )
     assert out["source"] == "naive_fallback"
     assert out["tolerance_adjusted"] is None
+    assert "kvcache_quant_mode" not in out
 
 
 @pytest.mark.parametrize("knob", ["cp_size", "dcp_size"])

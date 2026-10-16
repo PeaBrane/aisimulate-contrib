@@ -81,7 +81,7 @@ rather than hard-coding a number; the loader rejects mismatched bincode schemas
 before interpreting operation payloads. JSON defaults do not imply binary
 compatibility. Recompile saved engines when updating the paired runtime.
 
-Schema 28 adds an optional `vision` section to `EngineSpec`: the vision tower
+Schema 29 adds an optional `vision` section to `EngineSpec`: the vision tower
 compiled under `ForwardPassPerfModelConfig::encoder_parallel`, priced by
 `ForwardPassPerfModel::vision_operations` and `predict_vision_ms` over
 `EncoderImageShape` groups (`sequences`, per-sequence `patch_tokens`,
