@@ -18,7 +18,7 @@ use anyhow::{Result, ensure};
 #[cfg(feature = "python")]
 use pyo3::prelude::*;
 #[cfg(feature = "python")]
-use replay::{ReplayCaptureOptions, ReplayTelemetryObserver, run_replay_with_composition};
+use replay::{ReplayCaptureOptions, ReplayTelemetryObserver, Replayer};
 
 #[cfg(feature = "python")]
 fn execute_json(payload: &str, capture_artifacts: bool) -> Result<String> {
@@ -29,9 +29,16 @@ fn execute_json(payload: &str, capture_artifacts: bool) -> Result<String> {
     let mut result = execute_replay_with_dispatch(
         payload,
         capture_artifacts,
-        |spec, factory, input, capture_artifacts, determinism| {
+        |spec, factory, input, capture_artifacts, determinism, tokenization| {
             if spec.adapters.placement.provider != NATIVE_DYNAMO_PROVIDER {
-                return run_prepared_replay(spec, factory, input, capture_artifacts, determinism);
+                return run_prepared_replay(
+                    spec,
+                    factory,
+                    input,
+                    capture_artifacts,
+                    determinism,
+                    tokenization,
+                );
             }
             if capture_artifacts {
                 return Err(replay::ReplayError::InvalidSpec(
@@ -43,18 +50,22 @@ fn execute_json(payload: &str, capture_artifacts: bool) -> Result<String> {
             let composition = NativeDynamoReplayComposition::from_config(config, None)
                 .with_capture_decisions(spec.record_per_request);
             routing_evidence = Some(composition.routing_evidence());
-            run_replay_with_composition(
-                spec,
-                factory,
-                input,
-                composition,
-                ReplayCaptureOptions {
+            let mut replayer = Replayer::with_composition(spec, factory, composition)?
+                .with_capture_options(ReplayCaptureOptions {
                     determinism,
                     ..Default::default()
-                },
-                None,
-            )
-            .map(|report| (report, None))
+                });
+            if let Some(input) = input {
+                replayer = replayer.with_runtime_input(input);
+            }
+            if let Some(tokenization) = tokenization {
+                replayer = replayer.with_tokenization(
+                    tokenization.workers,
+                    tokenization.base_ms,
+                    tokenization.per_input_token_ms,
+                )?;
+            }
+            replayer.run().map(|report| (report, None))
         },
     )?;
     if let Some(evidence) = routing_evidence {
@@ -193,6 +204,75 @@ mod tests {
             assert!(default.get("routing_policy").is_none());
             assert_eq!(default["per_request"][0]["request_id"], "module-call");
         });
+    }
+
+    #[test]
+    fn wheel_and_shared_native_executor_preserve_tokenization() {
+        for disaggregated in [false, true] {
+            for provider in ["round_robin", "dynamo_kv_router"] {
+                let topology = if disaggregated {
+                    serde_json::json!({"kind": "disaggregated", "prefill": {"initial_workers": 1},
+                        "decode": {"initial_workers": 1}})
+                } else {
+                    serde_json::json!({"kind": "aggregated", "workers": {"initial_workers": 1}})
+                };
+                let mut payload = serde_json::json!({
+                    "spec": {
+                        "version": 1,
+                        "topology": topology,
+                        "engine": {"rank": {"block_size": 4, "num_gpu_blocks": 64,
+                            "timing_model": {"type": "fixed", "prefill_ms": 1.0, "decode_ms": 1.0}}},
+                        "adapters": {"placement": {"provider": provider, "config": {}},
+                            "scaling": {"provider": "none"}},
+                        "requests": [{"id": "tokenized", "arrival_time_ms": 0.0,
+                            "input_tokens": 4, "input_token_ids": [1, 2, 3, 4], "output_tokens": 1}]
+                    },
+                    "tokenization": {"workers": 1, "base_ms": 2.0, "per_input_token_ms": 0.5}
+                });
+                let mut reports = vec![
+                    serde_json::from_str::<serde_json::Value>(
+                        &execute_json(&payload.to_string(), false).unwrap(),
+                    )
+                    .unwrap(),
+                ];
+                if provider == "dynamo_kv_router" {
+                    reports.push(
+                        serde_json::from_str(
+                            &execute_native_router_replay(
+                                &payload.to_string(),
+                                ReplayCaptureOptions::default(),
+                                None,
+                                None,
+                                None,
+                            )
+                            .unwrap()
+                            .into_json()
+                            .unwrap(),
+                        )
+                        .unwrap(),
+                    );
+                } else if !disaggregated {
+                    let artifacts: serde_json::Value =
+                        serde_json::from_str(&execute_json(&payload.to_string(), true).unwrap())
+                            .unwrap();
+                    reports.push(artifacts["report"].clone());
+                }
+                for report in reports {
+                    assert_eq!(report["completed_requests"], 1);
+                    // One tokenizer takes 2 + 0.5 * 4 = 4 ms before engine admission.
+                    assert_eq!(report["per_request"][0]["tokenized_ms"], 4.0);
+                    assert_eq!(report["per_request"][0]["first_admit_ms"], 4.0);
+                }
+                payload["tokenization"]["workers"] = 0.into();
+                assert!(
+                    format!(
+                        "{:#}",
+                        execute_json(&payload.to_string(), false).unwrap_err()
+                    )
+                    .contains("tokenization workers must be positive")
+                );
+            }
+        }
     }
 
     #[test]

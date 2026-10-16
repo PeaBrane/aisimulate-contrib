@@ -338,15 +338,20 @@ fn dispatch_hook_runtime(
 #[case(crate::engine::Backend::Sglang)]
 fn placement_dispatch_hooks_commit_after_clock_releases_a_queued_request(
     #[case] backend: crate::engine::Backend,
+    #[values(0.0, 3.0)] tokenization_ms: f64,
 ) {
     let records = DispatchHookRecords::default();
     let report = dispatch_hook_runtime(backend, Some(7.0), records.clone())
+        .with_tokenization(TokenizationLatency::new(1, tokenization_ms, 0.0))
         .run()
         .unwrap()
         .0
         .finish();
     assert_eq!(report.per_request[0].arrival_time_ms, 0.0);
-    assert_eq!(report.per_request[0].first_admit_ms, Some(7.0));
+    assert_eq!(
+        report.per_request[0].first_admit_ms,
+        Some(7.0 + tokenization_ms)
+    );
     let terminal_ms = report.per_request[0].terminal_time_ms;
     assert!(terminal_ms > 7.0);
     let records = records.lock().unwrap();
@@ -361,11 +366,47 @@ fn placement_dispatch_hooks_commit_after_clock_releases_a_queued_request(
         vec![
             DispatchHookRecord::Selected(uuid, 0.0),
             DispatchHookRecord::Released(uuid, 7.0),
-            DispatchHookRecord::Committed(uuid, 7.0),
+            DispatchHookRecord::Committed(uuid, 7.0 + tokenization_ms),
             DispatchHookRecord::Terminal(uuid, terminal_ms)
         ]
     );
     assert!(records.contains(&DispatchHookRecord::Clock(7.0)));
+}
+
+#[rstest::rstest]
+fn canceling_tokenization_releases_policy_without_committing_dispatch(
+    #[values(crate::engine::Backend::Vllm, crate::engine::Backend::Sglang)]
+    backend: crate::engine::Backend,
+) {
+    let records = DispatchHookRecords::default();
+    let mut runtime = dispatch_hook_runtime(backend, None, records.clone())
+        .with_tokenization(TokenizationLatency::new(1, 3.0, 0.0));
+    let uuid = Uuid::from_u128(1);
+    runtime.step().unwrap();
+    assert_eq!(runtime.now_ms, 0.0);
+    assert_eq!(runtime.engine.in_flight(), 0);
+    assert_eq!(runtime.cluster_in_flight(), 1);
+    assert_eq!(
+        runtime.cancel_dynamic(uuid).unwrap(),
+        Some(ReplayTerminalStatus::Canceled)
+    );
+    assert_eq!(runtime.cluster_in_flight(), 0);
+    runtime.now_ms = 3.0;
+    assert!(!runtime.release_tokenized().unwrap());
+    let semantic = records
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|event| !matches!(event, DispatchHookRecord::Clock(_)))
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        semantic,
+        [
+            DispatchHookRecord::Selected(uuid, 0.0),
+            DispatchHookRecord::Terminal(uuid, 0.0),
+        ]
+    );
 }
 
 #[rstest::rstest]
@@ -1108,9 +1149,18 @@ fn dispatch_commit_failure_rolls_back_and_prevents_runtime_reuse(
     #[values(crate::engine::Backend::Vllm, crate::engine::Backend::Sglang)]
     backend: crate::engine::Backend,
     #[values(false, true)] fail_abort: bool,
+    #[values(0.0, 3.0)] tokenization_ms: f64,
 ) {
-    let mut runtime = failing_dispatch_runtime(backend, true, fail_abort);
-    let error = runtime.submit_dynamic(request(1, 0.0)).unwrap_err();
+    let mut runtime = failing_dispatch_runtime(backend, true, fail_abort)
+        .with_tokenization(TokenizationLatency::new(1, tokenization_ms, 0.0));
+    let error = if tokenization_ms == 0.0 {
+        runtime.submit_dynamic(request(1, 0.0)).unwrap_err()
+    } else {
+        runtime.submit_dynamic(request(1, 0.0)).unwrap();
+        assert_eq!(runtime.engine.in_flight(), 0);
+        assert!(runtime.placement.calls.lock().unwrap().is_empty());
+        runtime.step_dynamic_until(10.0).unwrap_err()
+    };
     assert_eq!(
         runtime.engine.in_flight(),
         0,

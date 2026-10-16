@@ -259,17 +259,20 @@ impl TestDisaggConfig {
             kv_eviction_policy: crate::engine::KvEvictionPolicy::Lru,
             dp_size: 1,
             tensor_parallel_size: 1,
+            prefill_context_parallel_size: 1,
             num_gpu_blocks_is_explicit: None,
             rank: MockEngineArgs::default(),
             prefill: Some(ReplayRoleConfig {
                 dp_size: self.prefill_dp_size,
                 tensor_parallel_size: 1,
+                prefill_context_parallel_size: 1,
                 num_gpu_blocks_is_explicit: None,
                 rank: self.prefill_args.clone(),
             }),
             decode: Some(ReplayRoleConfig {
                 dp_size: self.decode_dp_size,
                 tensor_parallel_size: 1,
+                prefill_context_parallel_size: 1,
                 num_gpu_blocks_is_explicit: None,
                 rank: self.decode_args.clone(),
             }),
@@ -3981,10 +3984,57 @@ fn disagg_consumes_same_now_and_future_policy_wakeups(
 }
 
 #[rstest::rstest]
+fn disagg_canceling_tokenization_releases_policy_without_committing_prefill(
+    #[values(EngineType::Vllm, EngineType::Sglang)] backend: EngineType,
+) {
+    use crate::replay::runtime_utils::dispatch_failure_test_policy::FailingDispatchPlacement;
+    let config = match backend {
+        EngineType::Vllm => disagg_config(),
+        EngineType::Sglang => sglang_disagg_config(),
+        _ => unreachable!(),
+    }
+    .runtime_config(false)
+    .unwrap();
+    let mut runtime = DisaggRuntimeImpl::<_, NoEngineEvents, NoReplayMetadata>::new_composed(
+        &config,
+        AdmissionQueue::new_requests(VecDeque::from([request(1, 64, 2, 0.0)]), ReplayMode::Trace),
+        false,
+        |_, _, _, _| {
+            Ok((
+                FailingDispatchPlacement::default(),
+                FailingDispatchPlacement::default(),
+            ))
+        },
+    )
+    .unwrap()
+    .with_tokenization(TokenizationLatency::new(1, 3.0, 0.0));
+    let uuid = Uuid::from_u128(1);
+    runtime.step().unwrap();
+    assert_eq!(runtime.now_ms, 0.0);
+    assert_eq!(runtime.prefill_engine.in_flight(), 0);
+    assert!(runtime.prefill_placement.calls.lock().unwrap().is_empty());
+    assert_eq!(runtime.tokenization.as_ref().unwrap().len(), 1);
+    let handoff_id = runtime.state(uuid).unwrap().handoff_id;
+    runtime
+        .apply_handoff_fact(uuid, HandoffFact::Canceled { handoff_id })
+        .unwrap();
+    runtime.drain_current_timestamp().unwrap();
+    assert_eq!(runtime.cluster_in_flight(), 0);
+    assert_eq!(runtime.tokenization.as_ref().unwrap().len(), 0);
+    runtime.now_ms = 3.0;
+    assert!(!runtime.release_tokenized().unwrap());
+    assert_eq!(
+        *runtime.prefill_placement.calls.lock().unwrap(),
+        ["terminal"]
+    );
+}
+
+#[rstest::rstest]
 fn disagg_dispatch_commit_failure_rolls_back_and_prevents_runtime_reuse(
     #[values(EngineType::Vllm, EngineType::Sglang)] backend: EngineType,
     #[values(false, true)] fail_prefill: bool,
     #[values(false, true)] fail_abort: bool,
+    #[values(0.0, 3.0)] tokenization_ms: f64,
 ) {
     use crate::replay::runtime_utils::dispatch_failure_test_policy::FailingDispatchPlacement;
     let config = match backend {
@@ -4013,7 +4063,8 @@ fn disagg_dispatch_commit_failure_rolls_back_and_prevents_runtime_reuse(
             ))
         },
     )
-    .unwrap();
+    .unwrap()
+    .with_tokenization(TokenizationLatency::new(1, tokenization_ms, 0.0));
     let error = loop {
         match runtime.step() {
             Err(error) => break error,

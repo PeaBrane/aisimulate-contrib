@@ -390,6 +390,7 @@ class EngineReplayRunnerFactory:
             supported_engine_model_controls=ENGINE_MODEL_CONTROL_FIELDS,
             supports_state_cache=True,
             supports_grouped_kv_cache=True,
+            supports_tokenization=True,
             supported_trace_formats=(
                 "mooncake",
                 "mooncake-delta",
@@ -559,6 +560,10 @@ class EngineReplayRunner:
             execution_spec["determinism"] = self.determinism
         if self.trace_graph_cache and "traffic" in execution_spec:
             execution_spec["traffic"]["trace_graph_cache"] = True
+        if spec.backend_deployment.tokenization is not None:
+            if "spec" not in execution_spec:
+                execution_spec = {"spec": execution_spec}
+            execution_spec["tokenization"] = dict(spec.backend_deployment.tokenization)
         execution_spec_json = json.dumps(
             execution_spec,
             allow_nan=False,
@@ -1622,6 +1627,7 @@ def _materialize_engine_role(
             memory_fraction_overrides[memory_field] = float(value)
 
     aic_timing_overrides = _pop_aic_timing_overrides(rank, role)
+    prefill_context_parallel_size = aic_timing_overrides.get("cp_size", 1)
     for target in ("cp_size", "dcp"):
         if target in aic_timing_overrides:
             # Same contract as tp / attention_dp: a directly supplied deployment
@@ -1856,9 +1862,18 @@ def _materialize_engine_role(
     ):
         rank["native_host_offload"] = {**host_offload, "kv_layout_id": _kv_layout_id(rank, model, tensor_parallel_size)}
 
+    timing = rank.get("timing_model", {})
+    timing_config = timing.get("config", {}) if isinstance(timing, dict) and timing.get("provider") == "aic" else {}
+    if timing_config.get("cp_size") is not None:
+        prefill_context_parallel_size = timing_config["cp_size"]
+    prefill_context_parallel_size = _positive_int(
+        prefill_context_parallel_size,
+        f"engine provider {role} prefill context parallel size",
+    )
     return {
         "dp_size": dp_size,
         "tensor_parallel_size": tensor_parallel_size,
+        "prefill_context_parallel_size": prefill_context_parallel_size,
         "num_gpu_blocks_is_explicit": num_gpu_blocks_is_explicit,
         "rank": rank,
     }

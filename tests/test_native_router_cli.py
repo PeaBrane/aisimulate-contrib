@@ -227,15 +227,24 @@ def test_nested_rank_model_identity_reaches_agentx_driver() -> None:
 
 
 @pytest.mark.parametrize(("backend", "mode"), [("vllm", "aggregated"), ("sglang", "disaggregated")])
-@pytest.mark.parametrize("affinity", ["session", "sibling_group"])
+@pytest.mark.parametrize(
+    ("affinity", "tokenization"),
+    [
+        ("session", None),
+        ("sibling_group", None),
+        ("session", {"workers": 1, "base_ms": 3.0, "per_input_token_us": 500.0}),
+    ],
+)
 @pytest.mark.timeout(60)
-def test_native_agentx_routing_through_supervised_cli(tmp_path, backend, mode, affinity) -> None:
+def test_native_agentx_routing_through_supervised_cli(tmp_path, backend, mode, affinity, tokenization) -> None:
     runtime = pytest.importorskip("aisimulate._runtime")
     if not getattr(runtime, "native_router_available", lambda: False)():
         pytest.skip("requires the AISimulate native routing wheel")
     fixtures = Path(__file__).parent / "e2e/configs/unified_cli/fixtures"
     engine = _prediction_engine(mode=mode)
     engine.update(backend=backend, model=str(fixtures / "tiny-model"))
+    if tokenization is not None:
+        engine["tokenization"] = tokenization
     for worker in engine["workers"].values():
         worker["kv_cache"]["block_size"] = 4
         worker["parallelism"].update(tensor=1, replicas=2)
@@ -279,6 +288,14 @@ def test_native_agentx_routing_through_supervised_cli(tmp_path, backend, mode, a
     assert plan["estimate"]["estimated_peak_bytes"] is None
     assert plan["effective_parallelism"] == 1
     report = json.loads((output / "prediction.json").read_text())
+    assert len(report["per_request"]) == 4
+    for record in report["per_request"]:
+        if tokenization is None:
+            assert "tokenized_ms" not in record
+        else:
+            service_ms = tokenization["base_ms"] + tokenization["per_input_token_us"] / 1000 * record["input_length"]
+            assert record["tokenized_ms"] - record["arrival_time_ms"] >= service_ms
+            assert record["first_admit_ms"] >= record["tokenized_ms"]
     roles = report["routing_policy"]["roles"]
     assert set(roles) == ({"aggregated"} if mode == "aggregated" else {"prefill", "decode"})
     assert roles["aggregated" if mode == "aggregated" else "prefill"]["physical_kv_events"] > 0

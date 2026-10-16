@@ -228,6 +228,7 @@ mod tests {
             dp_rank,
             data: KvEventData::Stored(StoredBlocks {
                 parent_hash,
+                session_id: None,
                 start_position: Some(start_position),
                 blocks: blocks
                     .iter()

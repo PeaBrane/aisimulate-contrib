@@ -195,6 +195,7 @@ impl ReplayComposition for NativeDynamoReplayComposition {
         let fallback = ReplayRoleConfig {
             dp_size: engine.dp_size,
             tensor_parallel_size: engine.tensor_parallel_size,
+            prefill_context_parallel_size: engine.prefill_context_parallel_size,
             num_gpu_blocks_is_explicit: engine.num_gpu_blocks_is_explicit,
             rank: engine.rank.clone(),
         };

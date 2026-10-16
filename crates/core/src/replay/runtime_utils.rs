@@ -701,6 +701,7 @@ pub(super) mod dispatch_failure_test_policy {
             false
         }
         fn request_terminal(&mut self, _: Uuid, _: f64) -> anyhow::Result<Vec<Placement>> {
+            self.calls.lock().unwrap().push("terminal");
             Ok(Vec::new())
         }
         fn prefill_completed(&mut self, _: Uuid, _: f64) -> anyhow::Result<Vec<Placement>> {

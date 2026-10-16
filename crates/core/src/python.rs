@@ -24,7 +24,6 @@ use crate::replay::{
         WekaNestedTimestampBasis, WekaResolvedTimestampBasis, WorkloadDriver,
         load_agentic_mooncake, load_weka_agentic_graph_cached,
     },
-    run_replay_with_composition,
 };
 use crate::{
     EstimationMode, EstimatorConfig, ForwardPassFallbackPolicy, ForwardPassPerfModel,
@@ -47,8 +46,26 @@ enum ExecutionPayload {
         capture_performance_diagnostics: bool,
         #[serde(default)]
         determinism: ReplayDeterminism,
+        #[serde(default)]
+        tokenization: Option<TokenizationPayload>,
     },
     Legacy(ReplaySpec),
+}
+
+/// Per-worker tokenization applied between placement and the engine.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TokenizationPayload {
+    #[serde(default = "default_tokenization_workers")]
+    pub workers: usize,
+    #[serde(default)]
+    pub base_ms: f64,
+    #[serde(default)]
+    pub per_input_token_ms: f64,
+}
+
+fn default_tokenization_workers() -> usize {
+    1
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -399,6 +416,10 @@ impl AicTimingConfig {
             return Ok(self.nextn);
         };
         ensure!(
+            speculation.kind == "ngram",
+            "generic speculation is supported by the cost-model API only; replay requires ngram or legacy nextn"
+        );
+        ensure!(
             self.nextn == 0,
             "ngram speculation cannot be combined with nextn"
         );
@@ -410,12 +431,7 @@ impl AicTimingConfig {
             self.forward_model.as_deref().unwrap_or("op_level") == "op_level",
             "ngram speculation requires op_level timing"
         );
-        let depth = speculation.num_speculative_tokens();
-        ensure!(
-            (1..=5).contains(&depth),
-            "ngram num_speculative_tokens must be in 1..=5"
-        );
-        Ok(depth)
+        Ok(speculation.ngram_depth()?)
     }
 
     fn resolved_backend_version(&self) -> &str {
@@ -618,7 +634,10 @@ impl AicTimingModel {
                     Ok(operation)
                 })
                 .collect::<Result<Vec<_>>>()?;
-            let phase = Arc::new(ValidatedTimingPhase::from_operations(operations)?);
+            // Diagnostics are name-folded in first-encounter order.
+            let phase = Arc::new(ValidatedTimingPhase::from_name_folded_operations(
+                operations,
+            )?);
             self.phase_cache.insert(key, Arc::clone(&phase));
             return Ok(phase);
         }
@@ -1096,6 +1115,11 @@ fn materialize_aic_capacity(
         role.tensor_parallel_size
     );
     ensure!(
+        config.cp_size.unwrap_or(1) == role.prefill_context_parallel_size,
+        "AIC cp_size does not match engine prefill_context_parallel_size={}",
+        role.prefill_context_parallel_size
+    );
+    ensure!(
         config.attention_dp == role.dp_size,
         "AIC attention_dp={} does not match engine dp_size={}",
         config.attention_dp,
@@ -1201,6 +1225,7 @@ fn aggregated_role(engine: &ReplayEngineConfig) -> ReplayRoleConfig {
     ReplayRoleConfig {
         dp_size: engine.dp_size,
         tensor_parallel_size: engine.tensor_parallel_size,
+        prefill_context_parallel_size: engine.prefill_context_parallel_size,
         num_gpu_blocks_is_explicit: engine.num_gpu_blocks_is_explicit,
         rank: engine.rank.clone(),
     }
@@ -1772,30 +1797,30 @@ pub fn run_prepared_replay(
     input: Option<ReplayRuntimeInput>,
     capture_artifacts: bool,
     determinism: ReplayDeterminism,
+    tokenization: Option<TokenizationPayload>,
 ) -> crate::replay::ReplayResult<(crate::replay::ReplayReport, Option<ReplayArtifacts>)> {
-    let capture = ReplayCaptureOptions {
-        determinism,
-        ..ReplayCaptureOptions::default()
-    };
-    if !capture_artifacts {
-        return run_replay_with_composition(
-            spec,
-            factory,
-            input,
-            crate::replay::RoundRobinComposition,
-            capture,
-            None,
-        )
-        .map(|report| (report, None));
-    }
-    let replayer = match input {
+    let mut replayer = match input {
         Some(input) => Replayer::new(spec, factory)?.with_runtime_input(input),
         None => Replayer::new(spec, factory)?,
     }
-    .with_capture_options(capture);
-    let (report, artifacts) =
-        replayer.run_with_artifacts(ReplayArtifactKvEventVisibility::Native)?;
-    Ok((report, Some(artifacts)))
+    .with_capture_options(ReplayCaptureOptions {
+        determinism,
+        ..ReplayCaptureOptions::default()
+    });
+    if let Some(tokenization) = tokenization {
+        replayer = replayer.with_tokenization(
+            tokenization.workers,
+            tokenization.base_ms,
+            tokenization.per_input_token_ms,
+        )?;
+    }
+    if capture_artifacts {
+        let (report, artifacts) =
+            replayer.run_with_artifacts(ReplayArtifactKvEventVisibility::Native)?;
+        Ok((report, Some(artifacts)))
+    } else {
+        Ok((replayer.run()?, None))
+    }
 }
 
 struct TimingPowerSource {
@@ -2158,8 +2183,13 @@ fn infer_aic_timing_topology(engine: &mut serde_json::Value) -> Result<()> {
         for (target, fields) in [
             ("tensor_parallel_size", ["tp", "tp_size"]),
             ("dp_size", ["attention_dp", "attention_dp_size"]),
+            ("prefill_context_parallel_size", ["cp_size", "cp_size"]),
         ] {
-            if let Some(value) = config.get(fields[0]).or_else(|| config.get(fields[1])) {
+            if let Some(value) = config
+                .get(fields[0])
+                .or_else(|| config.get(fields[1]))
+                .filter(|value| !value.is_null())
+            {
                 if let Some(explicit) = engine.get(target) {
                     ensure!(
                         explicit == value,
@@ -2320,15 +2350,30 @@ pub fn execute_replay_with_composition<C: ReplayComposition>(
     let mut result = execute_replay_with_dispatch(
         payload,
         false,
-        move |spec, factory, input, _, determinism| {
+        move |mut spec, factory, input, _, determinism, tokenization| {
             let mut capture = capture;
             // Canonical replay may be selected at either public input boundary.
             // Keep an explicit native capture choice when the payload uses defaults.
             if determinism == ReplayDeterminism::CanonicalV1 {
                 capture.determinism = determinism;
             }
-            run_replay_with_composition(spec, factory, input, composition, capture, telemetry)
-                .map(|report| (report, None))
+            spec.record_per_request |= capture.effective_per_request();
+            let mut replayer = Replayer::with_composition(spec, factory, composition)?
+                .with_capture_options(capture);
+            if let Some(input) = input {
+                replayer = replayer.with_runtime_input(input);
+            }
+            if let Some(tokenization) = tokenization {
+                replayer = replayer.with_tokenization(
+                    tokenization.workers,
+                    tokenization.base_ms,
+                    tokenization.per_input_token_ms,
+                )?;
+            }
+            if let Some((interval_ms, observer)) = telemetry {
+                replayer = replayer.with_telemetry_observer(interval_ms, observer)?;
+            }
+            replayer.run().map(|report| (report, None))
         },
     )?;
     result.include_per_request |= capture.effective_per_request();
@@ -2371,25 +2416,30 @@ where
         Option<ReplayRuntimeInput>,
         bool,
         ReplayDeterminism,
+        Option<TokenizationPayload>,
     ) -> crate::replay::ReplayResult<(
         crate::replay::ReplayReport,
         Option<ReplayArtifacts>,
     )>,
 {
-    let (mut spec, mut traffic, capture_performance_diagnostics, determinism) =
+    let (mut spec, mut traffic, capture_performance_diagnostics, determinism, tokenization) =
         match serde_json::from_str(payload).context("invalid AISimulate execution ReplaySpec")? {
             ExecutionPayload::Configured {
                 spec,
                 traffic,
                 capture_performance_diagnostics,
                 determinism,
+                tokenization,
             } => (
                 spec,
                 traffic.map(|t| *t),
                 capture_performance_diagnostics,
                 determinism,
+                tokenization,
             ),
-            ExecutionPayload::Legacy(spec) => (spec, None, false, ReplayDeterminism::default()),
+            ExecutionPayload::Legacy(spec) => {
+                (spec, None, false, ReplayDeterminism::default(), None)
+            }
         };
     ensure!(
         spec.max_sim_time_ms.is_none()
@@ -2454,6 +2504,7 @@ where
             prediction_provenance.insert("aggregated".into(), timing_provenance(&role.rank.timing_model));
             engine_config.dp_size = role.dp_size;
             engine_config.tensor_parallel_size = role.tensor_parallel_size;
+            engine_config.prefill_context_parallel_size = role.prefill_context_parallel_size;
             engine_config.num_gpu_blocks_is_explicit = role.num_gpu_blocks_is_explicit;
             engine_config.rank = role.rank;
             if let Some(traffic) = traffic.as_mut()
@@ -2463,6 +2514,7 @@ where
                     &ReplayRoleConfig {
                         dp_size: engine_config.dp_size,
                         tensor_parallel_size: engine_config.tensor_parallel_size,
+                        prefill_context_parallel_size: engine_config.prefill_context_parallel_size,
                         num_gpu_blocks_is_explicit: engine_config.num_gpu_blocks_is_explicit,
                         rank: engine_config.rank.clone(),
                     },
@@ -2487,7 +2539,7 @@ where
                 ReplayEngineFactory::new,
                 ReplayEngineFactory::with_timing_model,
             );
-            run(spec, factory, input, capture_artifacts, determinism)
+            run(spec, factory, input, capture_artifacts, determinism, tokenization)
                 .map(|(report, artifacts)| (report, artifacts, resolved_basis))
         }
         ReplayTopology::Disaggregated { .. } => {
@@ -2611,6 +2663,7 @@ where
                 input,
                 capture_artifacts,
                 determinism,
+                tokenization,
             )
             .map(|(report, artifacts)| (report, artifacts, resolved_basis))
         }
@@ -3845,10 +3898,14 @@ mod tests {
 
     #[test]
     fn canonical_timing_infers_topology_and_rejects_explicit_conflicts() {
-        let mut engine = serde_json::json!({"rank": {"timing_model": {"type":"external", "provider":"aic", "config":{"tp":2, "attention_dp":4}}}});
+        let mut engine = serde_json::json!({"rank": {"timing_model": {"type":"external", "provider":"aic", "config":{"tp":2, "attention_dp":4, "cp_size":8, "dcp":2}}}});
         infer_aic_timing_topology(&mut engine).unwrap();
         assert_eq!(engine["tensor_parallel_size"], 2);
         assert_eq!(engine["dp_size"], 4);
+        assert_eq!(engine["prefill_context_parallel_size"], 8);
+        let mut conflicting_cp = engine.clone();
+        conflicting_cp["prefill_context_parallel_size"] = serde_json::json!(1);
+        assert!(infer_aic_timing_topology(&mut conflicting_cp).is_err());
         engine["tensor_parallel_size"] = serde_json::json!(1);
         assert!(infer_aic_timing_topology(&mut engine).is_err());
     }
@@ -4057,9 +4114,12 @@ mod tests {
     #[test]
     fn ngram_timing_requires_matching_scheduler_depth_and_no_mtp() {
         let mut config = aic_config();
-        config.speculation = Some(crate::ForwardPassSpeculationConfig::Ngram {
-            num_speculative_tokens: 2,
-        });
+        config.speculation = Some(
+            serde_json::from_value(serde_json::json!({
+                "kind": "ngram", "params": {"num_speculative_tokens": 2}
+            }))
+            .unwrap(),
+        );
         let mut role = aggregated_role(&ReplayEngineConfig::default());
         assert!(materialize_aic_capacity(&config, &mut role, true, |_, _| unreachable!()).is_err());
         role.rank.aic_nextn = Some(2);
@@ -4067,21 +4127,24 @@ mod tests {
         config.nextn = 2;
         assert!(config.validate_parallel_shape().is_err());
         config.nextn = 0;
-        config.speculation = Some(crate::ForwardPassSpeculationConfig::Ngram {
-            num_speculative_tokens: 6,
-        });
+        config.speculation = Some(
+            serde_json::from_value(serde_json::json!({
+                "kind": "ngram", "params": {"num_speculative_tokens": 6}
+            }))
+            .unwrap(),
+        );
         assert!(config.validate_parallel_shape().is_err());
     }
 
     #[test]
-    fn ngram_timing_rejects_unmodeled_trigger_rate_and_unknown_schemes() {
+    fn replay_rejects_generic_schemes_and_unmodeled_ngram_parameters() {
         for payload in [
-            serde_json::json!({"kind": "mtp", "params": {"num_speculative_tokens": 2}}),
+            serde_json::json!({"kind": "mtp", "params": {"depth": 2}}),
             serde_json::json!({"kind": "ngram", "params": {"num_speculative_tokens": 2, "trigger_rate": 0.5}}),
         ] {
-            assert!(
-                serde_json::from_value::<crate::ForwardPassSpeculationConfig>(payload).is_err()
-            );
+            let mut config = aic_config();
+            config.speculation = Some(serde_json::from_value(payload).unwrap());
+            assert!(config.validate_parallel_shape().is_err());
         }
     }
 
