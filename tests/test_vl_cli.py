@@ -469,6 +469,29 @@ def test_materialized_request_lists_reject_image_workloads():
         EngineReplayRunnerFactory().create(0).run(legacy)
 
 
+@pytest.mark.parametrize("mode", ["aggregated", "disaggregated"])
+def test_nested_rank_vision_replays_like_the_flat_worker(mode):
+    from aisimulate.runner import _materialize_engine_role
+
+    raw = _prediction() if mode == "aggregated" else _disaggregated_prediction()
+    spec = prediction_to_replay_spec(CorePredictionConfig.model_validate(raw))
+    deployment = spec.backend_deployment
+    field, role = ("agg_engine_args", "aggregated") if mode == "aggregated" else ("prefill_engine_args", "prefill")
+    # The materialized form nests the rank, as lower-level Runner specifications write it.
+    nested = _materialize_engine_role(
+        deployment.backend, deployment.backend_version, deployment.parallel_config, getattr(deployment, field), role
+    )
+    # Hand-written nested specifications carry the rank and its parallel widths only.
+    for key in ("num_gpu_blocks_is_explicit", "prefill_context_parallel_size"):
+        nested.pop(key)
+    assert nested["rank"]["vision"] is True
+    nested_spec = dataclasses.replace(spec, backend_deployment=dataclasses.replace(deployment, **{field: nested}))
+    runner = EngineReplayRunnerFactory().create(0)
+    flat, nested_report = runner.run(spec), runner.run(nested_spec)
+    for key in ("mean_ttft_ms", "mean_frontend_ms", "mean_e2e_latency_ms"):
+        assert nested_report.metrics[key] == pytest.approx(flat.metrics[key])
+
+
 def _disaggregated_prediction():
     raw = _prediction()
     prefill = raw["engine"]["workers"].pop("aggregated")

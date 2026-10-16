@@ -1194,12 +1194,22 @@ def _materialize_engine_execution_spec(
 
 
 def _vision_role_args(deployment: BackendDeploymentSpec) -> Mapping[str, JSONValue] | None:
-    """Engine args of the language role hosting the vision encoder: the aggregated or the prefill worker."""
-    if (deployment.decode_engine_args or {}).get("vision"):
+    """Rank args of the language role hosting the vision encoder: the aggregated or the prefill worker.
+
+    Lower-level specifications nest the rank under `rank`, as the materializer
+    accepts them; the flat form is the rank itself.
+    """
+
+    def rank(args: Mapping[str, JSONValue] | None) -> Mapping[str, JSONValue] | None:
+        nested = args.get("rank") if args else None
+        return nested if isinstance(nested, Mapping) else args
+
+    if (rank(deployment.decode_engine_args) or {}).get("vision"):
         raise InvalidRunnerError("the decode worker never runs the vision encoder")
     for args in (deployment.agg_engine_args, deployment.prefill_engine_args):
-        if args and args.get("vision"):
-            return args
+        role = rank(args)
+        if role and role.get("vision"):
+            return role
     return None
 
 

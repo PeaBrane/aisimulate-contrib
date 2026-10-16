@@ -917,6 +917,8 @@ def test_runtime_grouped_memory_keeps_layout_and_transient_pages(grouped_profile
         ({"memory_fraction_value": 0.9}, "gpu_memory_utilization"),
         ({"context_length": 2049}, "max_model_len"),
         ({"cuda_graph_reserved_bytes": 1}, "graph reservations"),
+        ({"reserved_bytes": 100}, "model build path only"),
+        ({"colocated_encoder": True, "encoder_parallel": "tp"}, "model build path only"),
         ({"gpu_memory_capacity_bytes_override": 599}, "smaller than"),
         ({"gpu_memory_capacity_bytes_override": 749}, "smaller than"),
     ],

@@ -1163,6 +1163,10 @@ def estimate_kv_cache(
         request_occupancy_tokens: optional logical request length for a separate
             native one-token decode occupancy estimate. Requires an FPM profile;
             context and scheduler admission still use their original settings.
+        colocated_encoder, encoder_parallel, reserved_bytes: the resident vision
+            tower, its layout over the tensor-parallel group, and a fixed rank-local
+            reservation, charged by the model build path only; an FPM profile
+            records the rank's memory as measured and rejects them.
 
     Returns:
         A flat dict with ``total_gpu_capacity_bytes``, ``total_kv_size_bytes``,
@@ -1197,6 +1201,13 @@ def estimate_kv_cache(
     if fpm_profile is not None:
         if nextn:
             raise ValueError("FPM profile resources support plain autoregressive execution; nextn must be 0")
+        if colocated_encoder or reserved_bytes or encoder_parallel is not None:
+            # The profile records the rank's memory as measured; it cannot be reshaped by
+            # a reservation or an encoder layout the recording did not carry.
+            raise ValueError(
+                "FPM profile resources carry the measured rank memory; colocated_encoder, "
+                "reserved_bytes and encoder_parallel apply to the model build path only"
+            )
         profile = load_fpm_profile(fpm_profile)
         if backend_version is None:
             raise ValueError("FPM profile memory estimation requires the profile's literal backend_version")

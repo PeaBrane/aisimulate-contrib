@@ -1210,13 +1210,15 @@ impl SglangCore {
         };
 
         // Capture scheduled decode data before the decode step modifies running. A prefill-first
-        // pass is a pure prefill forward: nothing is scheduled for decode.
+        // pass is a pure prefill forward: nothing is scheduled for decode. Under the host loop
+        // a finished request is still a row of this batch until the next iteration observes
+        // it, so the metrics carry the same rows the timing provider is charged for.
         let scheduled_decode_lens: Vec<u64> = if prefill_pass {
             Vec::new()
         } else {
             self.running
                 .iter()
-                .filter(|req| req.remaining_output_tokens() > 0)
+                .filter(|req| req.pending_terminal || req.remaining_output_tokens() > 0)
                 .map(|req| req.current_sequence_len() as u64)
                 .collect()
         };

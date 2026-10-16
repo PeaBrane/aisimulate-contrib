@@ -3625,6 +3625,62 @@ mod host_loop_passes {
         SglangCore::new(args)
     }
 
+    /// A decode forward costs its batch size in milliseconds, so the charged
+    /// duration names the rows the provider was asked to run.
+    struct BatchTiming;
+
+    impl crate::engine::TimingModel for BatchTiming {
+        fn prefill_batch_validation_can_fail(&self) -> bool {
+            false
+        }
+        fn predict_prefill_ms(&self, _: usize, _: usize, _: usize) -> anyhow::Result<f64> {
+            Ok(7.0)
+        }
+        fn predict_decode_ms(
+            &self,
+            batch_size: usize,
+            _: usize,
+            _: usize,
+            _: usize,
+        ) -> anyhow::Result<f64> {
+            Ok(batch_size as f64)
+        }
+    }
+
+    #[test]
+    fn decode_metrics_count_the_ghost_rows_the_forward_runs() {
+        // Two four-token prompts prefill together; a request that finishes on its
+        // first token stays a batch member of the next decode under the host loop.
+        for (host_loop, outputs, rows, kv_tokens) in [
+            (false, [1, 3], 1, 5),
+            (true, [1, 3], 2, 10),
+            (true, [1, 1], 2, 10),
+        ] {
+            let mut args = test_args(128, 1, 128);
+            args.sglang.as_mut().unwrap().host_loop = host_loop;
+            args.perf_model = crate::engine::common::perf_model::PerfModel::External {
+                timing: Arc::new(BatchTiming),
+            }
+            .into();
+            let mut core = SglangCore::new(args);
+            core.receive(direct_request((0..4).collect(), outputs[0]));
+            core.receive(direct_request((100..104).collect(), outputs[1]));
+            let prefill = core.execute_hidden_pass(0.0);
+            assert_eq!(prefill.fpm.as_ref().unwrap().num_prefill_requests, 2);
+            let fpm = core.execute_hidden_pass(prefill.end_ms).fpm.unwrap();
+            assert_eq!(
+                (fpm.num_decode_requests, fpm.sum_decode_kv_tokens),
+                (rows, kv_tokens),
+                "host_loop={host_loop} outputs={outputs:?}"
+            );
+            assert_eq!(
+                fpm.wall_time_secs * 1000.0,
+                f64::from(rows),
+                "the charged forward ran {rows} rows (host_loop={host_loop})"
+            );
+        }
+    }
+
     fn stage(pass: &EnginePassResult, wanted: TtftMilestone) -> Vec<(Uuid, f64)> {
         pass.lifecycle_events
             .iter()
