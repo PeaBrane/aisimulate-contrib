@@ -37,6 +37,10 @@ from pathlib import Path
 
 METHODS = ("raw", "fixed", "dynamic")
 COHORTS = ("all", "inside_fixed_grid", "outside_fixed_grid", "invalid_coordinates")
+# Pin the experiment's fixed grid in model options, cohort labels, and metadata.
+FIXED_MAX_NUM_TOKENS = 8192
+FIXED_MAX_BATCH_SIZE = 512
+FIXED_MAX_KV_TOKENS = 2_000_000
 
 
 def finite_positive(value):
@@ -55,9 +59,13 @@ def fixed_cohort(metrics):
             return "invalid_coordinates"
         prefill, decode, kv = values
         if prefill > 0:
-            axes, limits = ((prefill, kv), (8192, 2_000_000)) if decode > 0 or kv > 0 else ((prefill,), (8192,))
+            axes, limits = (
+                ((prefill, kv), (FIXED_MAX_NUM_TOKENS, FIXED_MAX_KV_TOKENS))
+                if decode > 0 or kv > 0
+                else ((prefill,), (FIXED_MAX_NUM_TOKENS,))
+            )
         elif decode > 0 or kv > 0:
-            axes, limits = (decode, kv), (512, 2_000_000)
+            axes, limits = (decode, kv), (FIXED_MAX_BATCH_SIZE, FIXED_MAX_KV_TOKENS)
         else:
             continue
         if sum(axes) >= largest:
@@ -177,7 +185,11 @@ def compare_events(events, factory, interval_ms=5000.0):
         feedback="valid target and all three finite positive predictions; predict before update; raw never tuned",
         state="one independent model per worker and method; shared frozen artifact; no bootstrap",
         metric="iteration-weighted MAPE/WAPE on common coverage; invalid targets excluded",
-        fixed_grid="inclusive prefill<=8192; decode batch<=512 and KV<=2000000; mixed prefill<=8192 and KV<=2000000",
+        fixed_grid=(
+            f"inclusive prefill<={FIXED_MAX_NUM_TOKENS}; "
+            f"decode batch<={FIXED_MAX_BATCH_SIZE} and KV<={FIXED_MAX_KV_TOKENS}; "
+            f"mixed prefill<={FIXED_MAX_NUM_TOKENS} and KV<={FIXED_MAX_KV_TOKENS}"
+        ),
     )
     return result
 
@@ -215,7 +227,13 @@ def main():
 
     def factory(method):
         return RustForwardPassPerfModel.from_learned(
-            artifact, {"correction_mode": "dynamic_local" if method == "dynamic" else "fixed"}
+            artifact,
+            {
+                "correction_mode": "dynamic_local" if method == "dynamic" else "fixed",
+                "max_num_tokens": FIXED_MAX_NUM_TOKENS,
+                "max_batch_size": FIXED_MAX_BATCH_SIZE,
+                "max_kv_tokens": FIXED_MAX_KV_TOKENS,
+            },
         )
 
     result = compare_events(read_events(args.input), factory, args.interval_ms)

@@ -263,6 +263,14 @@ For a custom capacity `M`, the recent FIFO has
 remaining slots. The maximum sample age is `2 * M` admissions. This preserves
 the readiness threshold even at small capacities.
 
+Each admitted observation rebuilds the bucket medians and recent-global median.
+This takes `O(M log M)` time in the worst case and allocates `O(M)` temporary
+storage per update; retained calibration state is also `O(M)` per workload kind.
+Prediction reads cached factors in `O(log B)` time for `B` populated buckets,
+without scanning samples or allocating calibration storage. Keep the default
+capacity of 64 unless a larger sample history is needed, and measure update
+cost at the intended capacity and feedback cadence before increasing it.
+
 To reproduce the previous fixed-grid behavior, select it explicitly:
 
 ```python

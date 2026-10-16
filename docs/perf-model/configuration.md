@@ -272,6 +272,7 @@ sample from the most populated cell when the store exceeds its budget.
 | Correction field | Default | Behavior |
 | --- | --- | --- |
 | `estimator_config.correction.mode` | `auto` | `auto` keeps fixed correction for native AIC estimates and selects dynamic local correction for learned forests. `fixed` and `dynamic_local` explicitly select either policy. |
+| `estimator_config.correction.sampling.max_observations` | `64` | Maximum retained sample slots per workload kind. Dynamic local updates take `O(M log M)` time and `O(M)` temporary storage in this capacity `M`; measure update cost before increasing it. |
 
 The fixed policy uses raw workload coordinates and the configured fixed limits.
 The dynamic local policy expands `log1p` bounds as valid feedback arrives, balances
