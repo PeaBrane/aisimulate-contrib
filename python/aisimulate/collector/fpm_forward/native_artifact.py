@@ -105,7 +105,8 @@ def _validate_kvwarm_contract(cell: FPMCell, kvwarm: object, path: Path) -> dict
             f"native KV warm-up protocol mismatch for strategy {cell.parallel_strategy!r}: "
             f"enabled={enabled!r}, skip_reason={skip_reason!r}: {path}. "
             "Use a Dynamo runtime that performs real-KV warm-up for this topology, "
-            "with DYN_BENCH_KV_WARMUP=on and its required prefix caching and seeding inputs. "
+            "with DYN_BENCH_KV_WARMUP=on and the required seeding inputs. "
+            "Shared-chain warm-up also requires prefix caching; native exact-context warm-up does not. "
             "Synthetic fallback measurements cannot qualify this collection."
         )
     return kvwarm

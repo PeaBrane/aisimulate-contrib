@@ -1200,8 +1200,9 @@ MiniMax-M2.7 TP4 uses the `pure_tp` protocol. A runtime that reports
 `moe_tp_balanced_by_construction` is incompatible with this collection even if
 its benchmark reports `complete` or `usable: true`. Tensor parallelism balances
 each expert across ranks, but expert activation still depends on input content.
-Use a Dynamo build that performs real-KV warm-up for pure-TP MoE, retain prefix
-caching and the required seeding inputs, and repeat the smoke in a fresh campaign.
+Use a Dynamo build that performs real-KV warm-up for pure-TP MoE and provide the
+required seeding inputs. Shared-chain warm-up requires prefix caching; native
+exact-context warm-up does not. Repeat the smoke in a fresh campaign.
 The tested Dynamo 1.6.0-rc.6 / vLLM 0.31.0 combination skips this warm-up and does
 not qualify. Do not change the requested topology, disable validation, or relabel
 `fake_fallback` rows to make the example pass. Verify `warm_eligible: true`, real-KV
