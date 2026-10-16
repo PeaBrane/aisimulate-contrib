@@ -47,8 +47,8 @@ engine:
 | `workers.<role>.scheduler.prefill_schedule_interval` | `1` | predict only | vLLM only. See [vLLM prefill schedule interval](#vllm-prefill-schedule-interval). |
 | `workers.<role>.scheduler.prefill_decode_interval` | `0` | predict only | SGLang only. See [SGLang prefill/decode interval](#sglang-prefilldecode-interval). |
 | `workers.{aggregated,prefill}.host_loop` | `false` | fixed | SGLang only; `aggregated` in aggregated mode, `prefill` in disaggregated mode. Each pass is one overlap-scheduler iteration. Implied by `frontend` and `host_profile`. See [SGLang host loop, frontend and vision](#sglang-host-loop-frontend-and-vision). |
-| `workers.{aggregated,prefill}.frontend` | Unset | fixed | Ordered `stages`, each `{workers, service_ms, concurrency_scale}`, plus optional `measured_for` (model, frontend and image shape the stages were measured on). Exclusive with `host_profile`. Unset together with `host_profile`, a worker with images encodes them on the GPU and prices no frontend stage, so its TTFT starts at the scheduler. |
-| `workers.{aggregated,prefill}.host_profile` | Unset | fixed | `{path, frontend}` with `frontend` `python` (SGLang's default HTTP server with its `TokenizerManager`) or `rust` (the embedded Rust server, `SGLANG_RUST_SERVER=1`, measured at tensor-parallel width one). Frontend stages from a host cost table written by `python -m aisimulate.vl.collect`. The table describes SGLang's CPU image-processor path (`--image-processor-backend pil`); SGLang 0.5.19's default `auto` on a GPU host runs the fast torchvision processor on the serving GPU, which is not priced, so a deployment matches its table only when launched with that flag. No table is read or measured unless this field is set. |
+| `workers.{aggregated,prefill}.frontend` | Unset | fixed | Ordered `stages`, each `{workers, service_ms, concurrency_scale}`, plus optional `measured_for` (model, frontend, feature transport and image shape the stages were measured on). Exclusive with `host_profile`. Unset together with `host_profile`, a worker with images encodes them on the GPU and prices no frontend stage, so its TTFT starts at the scheduler. |
+| `workers.{aggregated,prefill}.host_profile` | Unset | fixed | `{path, frontend}` with `frontend` `python` (SGLang's default HTTP server with its `TokenizerManager`) or `rust` (the embedded Rust server, `SGLANG_RUST_SERVER=1`). Frontend stages from a host cost table written by `python -m aisimulate.vl.collect`. The table describes SGLang's CPU image-processor path (`--image-processor-backend pil`); SGLang 0.5.19's default `auto` on a GPU host runs the fast torchvision processor on the serving GPU, which is not priced, so a deployment matches its table only when launched with that flag. No table is read or measured unless this field is set. |
 | `workers.{aggregated,prefill}.vision.cache_mib` | `100` | fixed | Non-negative MiB; `0` disables the embedding cache. SGLang multimodal embedding cache (`SGLANG_VLM_CACHE_SIZE_MB`) for images encoded on the worker. |
 | `workers.{aggregated,prefill}.vision.encoder_parallel` | `tp` | fixed | `tp` shards the vision tower over the tensor-parallel group; `dp` (`--mm-enable-dp-encoder`) replicates it and splits the images. Sets encoder timing, collectives and per-rank tower weights. Adds no ranks; see the four parallelism knobs under [Compatibility and scope](sglang-vl-host-loop.md#compatibility-and-scope). |
 | `engine.enable_chunked_prefill` | Backend default (on) | fixed | Boolean. Applies to aggregated and prefill roles; `false` is rejected for SGLang and for AFD. |
@@ -248,9 +248,10 @@ aisimulate predict --stack engine --config prediction.yaml
 ```
 
 `collect` times the real SGLang frontend objects on the serving host (no GPU
-needed) and adds one row, keyed by model, frontend and image shape, to the
-table at `host_profile.path`; a prediction whose workload has no
-row fails and prints the `collect` command that adds it. Requires
+needed) and adds one row per feature transport the frontend serves, keyed by
+model, frontend, feature transport and image shape, to the table at
+`host_profile.path`; a prediction whose workload has no row fails and prints
+the `collect` command that adds it. Requires
 `backend: sglang`, `pipeline: 1`, `attention_data: 1` and context parallelism
 (`prefill_context`, `decode_context`) at `1`; images encoded on the
 worker also require default timing. Image traffic takes either this path or an
@@ -264,7 +265,7 @@ approximations are on [SGLang VL host loop](sglang-vl-host-loop.md).
 `--sglang-python`; the two are separate environments whenever the serving
 venv's Python is older than aisimulate supports. `engine.backend_version`
 selects the packaged GPU performance data, while the table is measured with the
-serving host's sglang 0.5.19, on which the frontend stage is defined; the two
+serving host's sglang 0.5.19, on which the frontend stages are defined; the two
 pins are independent.
 
 ### Backend scheduling differences

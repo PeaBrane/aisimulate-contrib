@@ -22,7 +22,7 @@ import time
 from pathlib import Path
 
 from ...config.common import _absolute_path, load_yaml
-from ...config.engine import FrontendMeasurementConfig, FrontendStageConfig
+from ...config.engine import FrontendMeasurementConfig, FrontendStageConfig, feature_transport
 from ..table import SGLANG_VERSION, load_table, update_table
 from .lower import STAGE_LABELS, environment, frontend_row
 
@@ -43,9 +43,11 @@ PROVENANCE_SHOWN = ("host", "threads", "image_processor_backend", "processor_wor
 LIBRARY_VERSIONS_SHOWN = ("transformers", "torch")
 
 
-def _stages(stages: list[FrontendStageConfig]) -> str:
+def _stages(frontend: str, stages: list[FrontendStageConfig]) -> str:
     """Stages labeled by `STAGE_LABELS`, or by position when a row holds another number of them."""
-    labels = STAGE_LABELS if len(stages) == len(STAGE_LABELS) else [f"stage{i}" for i in range(1, len(stages) + 1)]
+    labels = STAGE_LABELS[frontend]
+    if len(stages) != len(labels):
+        labels = [f"stage{i}" for i in range(1, len(stages) + 1)]
     return ", ".join(
         f"{label}({stage.workers}) {stage.service_ms:.2f} ms" for label, stage in zip(labels, stages, strict=True)
     )
@@ -59,7 +61,8 @@ def _show(path: Path) -> int:
     env = table.environment
     print(f"{path}: {env.cpu}, sglang {env.sglang_version}, python {env.python}")
     for row in table.rows:
-        print(f"  {row.measured_for.describe():70s} | {_stages(row.stages)} | {table.digest(row)}")
+        stages = _stages(row.measured_for.frontend, row.stages)
+        print(f"  {row.measured_for.describe():70s} | {stages} | {table.digest(row)}")
         for keys in (PROVENANCE_SHOWN, LIBRARY_VERSIONS_SHOWN):
             shown = ", ".join(f"{key} {row.provenance[key]}" for key in keys if key in row.provenance)
             if shown:
@@ -121,7 +124,7 @@ def main(argv=None) -> int:
     parser.add_argument(
         "--frontend",
         choices=("python", "rust"),
-        help="python: SGLang's HTTP server with its TokenizerManager; rust: the embedded Rust server (single-rank)",
+        help="python: SGLang's HTTP server with its TokenizerManager; rust: the embedded Rust server",
     )
     parser.add_argument("--images", type=_images, metavar="HxW[xN]")
     parser.add_argument("--encoding", choices=("png", "jpeg"))
@@ -140,45 +143,61 @@ def main(argv=None) -> int:
     for name in ("model", "frontend", "images"):
         if getattr(args, name) is None:
             parser.error(f"--{name} is required")
-    encoding = args.encoding or "png"
-    height, width, count = args.images
-    measurement = FrontendMeasurementConfig(
-        model=args.model,
-        frontend=args.frontend,
-        height=height,
-        width=width,
-        count=count,
-        encoding=encoding,
-        min_pixels=args.min_pixels,
-        max_pixels=args.max_pixels,
-    )
     if args.recording is not None:
         recording = json.loads(Path(args.recording).read_text())
         # A kept recording is lowered under the measurement it was taken for, never relabeled.
         measured_for = recording.get("measured_for")
         if measured_for is None:
             raise SystemExit(f"{args.recording} carries no measurement identity; measure again instead of lowering it")
-        if measured_for != measurement.model_dump(mode="json"):
-            taken_for = FrontendMeasurementConfig.model_validate(measured_for).describe()
-            raise SystemExit(f"{args.recording} was measured for {taken_for}; this run names {measurement.describe()}")
+        taken_for = FrontendMeasurementConfig.model_validate(measured_for)
+        named = _measurement(args, taken_for.feature_transport)
+        if taken_for != named:
+            raise SystemExit(
+                f"{args.recording} was measured for {taken_for.describe()}; this run names {named.describe()}"
+            )
+        recordings = [(taken_for, recording)]
     else:
-        recording = _measure(args, measurement)
-        recording["measured_for"] = measurement.model_dump(mode="json")
-    try:
-        row = frontend_row(recording, measurement)
-        table = update_table(path, environment(recording), row)
-    except ValueError as exc:
-        # A lowering failure or a table from another serving environment keeps the measurement.
-        failed = path.with_name(f"{path.name}.failed-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}.json")
-        failed.parent.mkdir(parents=True, exist_ok=True)
-        failed.write_text(json.dumps(recording, indent=1))
-        raise SystemExit(f"{exc}\nThe raw recording was kept at {failed}; lower it again with --recording") from exc
-    print(f"{path}: {measurement.describe()} -> {_stages(row.stages)} [{table.digest(row)}]")
+        # One collection measures every transport the frontend serves: the Python
+        # tokenizer manager always publishes through shared memory, the Rust workers
+        # keep features inline on one rank and use shared memory above it.
+        recordings = []
+        for tensor in (1, 2) if args.frontend == "rust" else (1,):
+            measurement = _measurement(args, feature_transport(args.frontend, tensor))
+            recording = _measure(args, measurement, tensor)
+            recording["measured_for"] = measurement.model_dump(mode="json")
+            recordings.append((measurement, recording))
+    for measurement, recording in recordings:
+        try:
+            row = frontend_row(recording, measurement)
+            table = update_table(path, environment(recording), row)
+        except ValueError as exc:
+            # A lowering failure or a table from another serving environment keeps the measurement.
+            failed = path.with_name(f"{path.name}.failed-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}.json")
+            failed.parent.mkdir(parents=True, exist_ok=True)
+            failed.write_text(json.dumps(recording, indent=1))
+            raise SystemExit(f"{exc}\nThe raw recording was kept at {failed}; lower it again with --recording") from exc
+        print(f"{path}: {measurement.describe()} -> {_stages(measurement.frontend, row.stages)} [{table.digest(row)}]")
     return 0
 
 
-def _measure(args: argparse.Namespace, measurement: FrontendMeasurementConfig) -> dict:
-    """Run the worker in the serving interpreter and return its recording."""
+def _measurement(args: argparse.Namespace, transport: str) -> FrontendMeasurementConfig:
+    """The row identity this run names for one feature transport."""
+    height, width, count = args.images
+    return FrontendMeasurementConfig(
+        model=args.model,
+        frontend=args.frontend,
+        feature_transport=transport,
+        height=height,
+        width=width,
+        count=count,
+        encoding=args.encoding or "png",
+        min_pixels=args.min_pixels,
+        max_pixels=args.max_pixels,
+    )
+
+
+def _measure(args: argparse.Namespace, measurement: FrontendMeasurementConfig, tensor: int) -> dict:
+    """Run the worker in the serving interpreter under `tensor` ranks and return its recording."""
     _check_sglang(args.sglang_python)
     command = [
         args.sglang_python,
@@ -197,6 +216,8 @@ def _measure(args: argparse.Namespace, measurement: FrontendMeasurementConfig) -
         measurement.encoding,
         "--text-tokens",
         str(args.text_tokens),
+        "--tp",
+        str(tensor),
     ]
     for name, value in (("--min-pixels", measurement.min_pixels), ("--max-pixels", measurement.max_pixels)):
         if value is not None:

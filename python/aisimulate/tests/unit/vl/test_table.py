@@ -27,7 +27,7 @@ def _environment(cpu: str = "test-cpu", sglang: str = "0.5.19", python: str = "3
 
 
 def _measurement(**overrides) -> FrontendMeasurementConfig:
-    base = {"model": "m", "frontend": "python", "height": 480, "width": 480, "count": 2}
+    base = {"model": "m", "frontend": "python", "feature_transport": "shm", "height": 480, "width": 480, "count": 2}
     return FrontendMeasurementConfig(**{**base, **overrides})
 
 
@@ -48,6 +48,7 @@ def test_a_remeasured_row_replaces_the_old_one_and_lookup_returns_it(tmp_path):
         HostProfileConfig(path=str(path), frontend="python"),
         model="m",
         images={"height": 480, "width": 480, "count": 2},
+        tensor=1,
     )
     assert frontend.stages[0].service_ms == 5.0
     assert frontend.measured_for == _measurement()
@@ -60,7 +61,7 @@ def test_a_table_belongs_to_one_serving_environment(tmp_path):
     path = tmp_path / "table.json"
     update_table(path, _environment(), _row())
     with pytest.raises(ValueError, match="one table per serving environment"):
-        update_table(path, _environment(cpu="other-cpu"), _row(frontend="rust"))
+        update_table(path, _environment(cpu="other-cpu"), _row(frontend="rust", feature_transport="inline"))
     with pytest.raises(ValueError, match="one table per serving environment"):
         update_table(path, _environment(python="3.12.1"), _row(model="other"))
 
@@ -71,6 +72,7 @@ def test_a_missing_table_names_the_command_that_creates_it(tmp_path):
             HostProfileConfig(path=str(tmp_path / "new.json"), frontend="rust"),
             model="m",
             images={"height": 480, "width": 480},
+            tensor=2,
         )
     assert "--frontend rust --images 480x480x1 --encoding png" in str(error.value)
 
@@ -80,6 +82,7 @@ def test_a_miss_names_the_command_that_measures_the_row(tmp_path):
     measurement = FrontendMeasurementConfig(
         model="m",
         frontend="rust",
+        feature_transport="inline",
         height=1024,
         width=1024,
         encoding="jpeg",
@@ -88,7 +91,7 @@ def test_a_miss_names_the_command_that_measures_the_row(tmp_path):
     with pytest.raises(MissingRow) as error:
         lookup(table, tmp_path / "t.json", measurement)
     message = str(error.value)
-    assert "no row for m rust 1024x1024x1 jpeg max_pixels=1000000" in message
+    assert f"no row for {measurement.describe()}" in message
     for flag in (
         "--model m",
         "--frontend rust",
@@ -108,6 +111,6 @@ def test_a_miss_names_the_command_that_measures_the_row(tmp_path):
 
 def test_a_table_from_an_earlier_schema_is_refused(tmp_path):
     path = tmp_path / "table.json"
-    path.write_text(json.dumps({"schema_version": 1, "environment": _environment().model_dump(), "rows": []}))
-    with pytest.raises(ValueError, match="schema-2"):
+    path.write_text(json.dumps({"schema_version": 2, "environment": _environment().model_dump(), "rows": []}))
+    with pytest.raises(ValueError, match="schema-3"):
         load_table(path)

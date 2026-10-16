@@ -207,13 +207,13 @@ def _native_encoder_rows(encoder, *, model_name, system, backend, version, datab
     if encoder.frontend is not None:
         # A saved recommendation carries the resolved stage; it prices only the workload it was measured for.
         frontend = FrontendPredictionConfig.model_validate(encoder.frontend)
-        needed = FrontendMeasurementConfig.for_workload(model_name, "python", images.model_dump(mode="json"))
+        needed = FrontendMeasurementConfig.for_workload(model_name, "python", images.model_dump(mode="json"), 1)
         if frontend.measured_for != needed:
             raise ValueError("saved encoder frontend stages were measured for another workload")
         digest = None
     else:
         profile = HostProfileConfig.model_validate(encoder.host_profile)
-        frontend, digest = resolve_frontend(profile, model=model_name, images=images.model_dump(mode="json"))
+        frontend, digest = resolve_frontend(profile, model=model_name, images=images.model_dump(mode="json"), tensor=1)
     rows = []
     rejected = []
     for tp, workers in product(encoder.tp, encoder.workers):

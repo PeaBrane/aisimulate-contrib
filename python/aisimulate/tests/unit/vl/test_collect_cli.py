@@ -16,7 +16,7 @@ from .test_lower import ENVIRONMENT, _level
 pytestmark = pytest.mark.unit
 
 
-MEASUREMENT = FrontendMeasurementConfig(model="m", frontend="python", height=480, width=480)
+MEASUREMENT = FrontendMeasurementConfig(model="m", frontend="python", feature_transport="shm", height=480, width=480)
 
 
 def _recording() -> dict:
@@ -24,6 +24,8 @@ def _recording() -> dict:
         "frontend": "python",
         "workers": 2,
         "levels": {"1": _level(1, 20.0), "2": _level(2, 24.0)},
+        "send_ms": 3.5,
+        "receive_ms": 7.25,
         "environment": ENVIRONMENT,
         "provenance": {
             "host": "serving-host",

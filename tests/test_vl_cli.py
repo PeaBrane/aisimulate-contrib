@@ -178,11 +178,12 @@ def test_native_vl_schema_rejects_unsupported(kind):
         CorePredictionConfig.model_validate(deepcopy(raw))
 
 
-def _host_row(frontend="python", service_ms=3.0):
+def _host_row(frontend="python", feature_transport="shm", service_ms=3.0):
     return {
         "measured_for": {
             "model": "Qwen/Qwen3-VL-8B-Instruct",
             "frontend": frontend,
+            "feature_transport": feature_transport,
             "height": 448,
             "width": 448,
             "count": 1,
@@ -195,7 +196,7 @@ def _host_row(frontend="python", service_ms=3.0):
 
 def _host_table(sglang_version="0.5.19", rows=None):
     environment = {"cpu": "example-cpu", "sglang_version": sglang_version, "python": "3.10.12"}
-    return {"schema_version": 2, "environment": environment, "rows": rows or [_host_row()]}
+    return {"schema_version": 3, "environment": environment, "rows": rows or [_host_row()]}
 
 
 def test_host_profile_lowers_to_the_explicit_stages(tmp_path):
@@ -346,12 +347,14 @@ def test_profile_backed_recommendation_pins_the_resolved_stages(tmp_path, capsys
     worker["parallelism"]["tensor"] = 2
     lowered = recommendation_to_sweeper(CoreRecommendationConfig.model_validate(raw))
     space = lowered.search_space
-    # Candidates score the one row resolved for the role's workload, identified by
-    # content; the mutable file path is not part of what a candidate carries or exports.
+    # Candidates score the row resolved for their feature transport (the Python
+    # frontend always uses shared memory), identified by content; the mutable file
+    # path is not part of what a candidate carries or exports.
     assert space.agg_host_loop is True
-    assert space.agg_frontend["stages"][0]["service_ms"] == explicit_frontend["stages"][0]["service_ms"]
-    assert isinstance(space.agg_host_profile_digest, str) and space.agg_host_profile_digest
-    assert not hasattr(space, "agg_frontend_by_transport")
+    row = space.agg_frontend_by_transport["shm"]
+    assert row["frontend"]["stages"][0]["service_ms"] == explicit_frontend["stages"][0]["service_ms"]
+    assert row["frontend"]["measured_for"]["feature_transport"] == "shm"
+    assert len(row["digest"]) == 16
     assert not hasattr(space, "agg_host_profile")
 
     search = tmp_path / "search.yaml"
@@ -380,6 +383,7 @@ def test_profile_backed_recommendation_pins_the_resolved_stages(tmp_path, capsys
     saved_path = root / "recommendations" / "0001.yaml"
     saved = CorePredictionConfig.from_yaml(saved_path)
     assert saved.engine.workers.aggregated.frontend.stages[0].service_ms == 3.0
+    assert saved.engine.workers.aggregated.frontend.measured_for.feature_transport == "shm"
     assert saved.engine.workers.aggregated.host_profile is None
     # The saved stages carry the workload they were measured for: changing the
     # images makes the candidate refuse to price them with the old constants.
@@ -391,6 +395,26 @@ def test_profile_backed_recommendation_pins_the_resolved_stages(tmp_path, capsys
     edited["engine"]["model"] = "Qwen/Qwen3-VL-2B-Instruct"
     with pytest.raises(ValueError, match="measured for"):
         prediction_to_replay_spec(CorePredictionConfig.model_validate(edited))
+
+
+def test_rust_profiles_resolve_only_the_transports_the_tp_domain_uses(tmp_path):
+    path = tmp_path / "table.json"
+    rows = [_host_row("rust", "inline", 2.0), _host_row("rust", "shm", 5.0)]
+    path.write_text(json.dumps(_host_table(rows=rows)))
+    raw = _recommendation()
+    worker = raw["engine"]["workers"]["aggregated"]
+    del worker["frontend"]
+    worker["host_profile"] = {"path": str(path), "frontend": "rust"}
+
+    def transports(tensor):
+        worker["parallelism"]["tensor"] = tensor
+        space = recommendation_to_sweeper(CoreRecommendationConfig.model_validate(deepcopy(raw))).search_space
+        return {key: row["frontend"]["stages"][0]["service_ms"] for key, row in space.agg_frontend_by_transport.items()}
+
+    # One rank keeps features inline; every wider candidate shares the shm row.
+    assert transports({"choices": [1, 2]}) == {"inline": 2.0, "shm": 5.0}
+    assert transports({"range": {"min": 2, "max": 4, "scale": "log"}}) == {"shm": 5.0}
+    assert transports(4) == {"shm": 5.0}
 
 
 def test_text_only_host_tables_reach_predict_and_recommend_alike(tmp_path, capsys):
