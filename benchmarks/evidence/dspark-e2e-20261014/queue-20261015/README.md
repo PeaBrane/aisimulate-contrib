@@ -14,6 +14,8 @@
 - Total: 55 pending, one failed, none running, and no new measured pairs.
   The existing 13 paired runs / 1,664 requests and MAPE are unchanged.
   Raw logs, identity and scheduler output are under `status-20261015T2314Z/`.
+  `server.log.gz` preserves the original log bytes, including terminal whitespace;
+  compression avoids treating raw log formatting as a source whitespace error.
 
 This queue expands the approved matrix to all 196 configurations: input/output
 1024/1024 and 8192/1024, concurrency 1/4/16/64, both draft widths and acceptance
