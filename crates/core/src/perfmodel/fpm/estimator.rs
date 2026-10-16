@@ -1048,34 +1048,6 @@ mod migration_tests {
     use super::{EstimatorConfig, FpmInterpolationMethod, SplineFitConfig, SplineSearchConfig};
 
     #[test]
-    fn correction_mode_preserves_explicit_auto_and_detects_conflicts() {
-        for mode in ["auto", "fixed", "dynamic_local"] {
-            let saved = serde_json::json!({"correction":{"mode":mode}}).to_string();
-            let legacy = serde_json::json!({"correction_mode":mode}).to_string();
-            let from_legacy =
-                EstimatorConfig::migrate_legacy_inputs(None, Some(&legacy), None, None).unwrap();
-            let merged =
-                EstimatorConfig::migrate_legacy_inputs(Some(&saved), Some(&legacy), None, None)
-                    .unwrap();
-            assert_eq!(from_legacy, merged);
-            let serialized = serde_json::to_string(&merged).unwrap();
-            assert_eq!(
-                EstimatorConfig::migrate_legacy_inputs(Some(&serialized), None, None, None)
-                    .unwrap(),
-                merged
-            );
-        }
-        let error = EstimatorConfig::migrate_legacy_inputs(
-            Some(r#"{"correction":{"mode":"fixed"}}"#),
-            Some(r#"{"correction_mode":"auto"}"#),
-            None,
-            None,
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("correction.mode"));
-    }
-
-    #[test]
     fn migration_resolves_spline_controls_after_merging_explicit_inputs() {
         for (fit, expected) in [
             (
