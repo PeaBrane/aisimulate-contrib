@@ -329,3 +329,12 @@ def test_explicit_skipped_defaults_migrate_without_becoming_null(options):
     )
     normalized = RustForwardPassPerfModel.normalize_config(_reload(config))
     assert normalized["estimator_config"]["fpm_interpolation"]["method"] == "sol"
+
+
+@pytest.mark.parametrize("mode", ["auto", "fixed", "dynamic_local"])
+def test_correction_mode_survives_explicit_options_and_reload(mode):
+    options = ForwardPassPerfOptions(correction_mode=mode)
+    assert options.to_dict() == {"correction_mode": mode}
+    canonical = ForwardPassPerfModelConfig.from_legacy_engine_config(_legacy_config(), "decode", options)
+    controls = RustForwardPassPerfModel.normalize_config(_reload(canonical))["estimator_config"]
+    assert controls["correction"].get("mode", "auto") == mode

@@ -510,3 +510,28 @@ def test_train_hisim_slot_features_roundtrip() -> None:
     )
     # 30 shallow trees on 96 slot columns: a loose fit is enough to prove the slot path is wired end to end
     assert report["pure_decode"]["mape_pct"] < 12.0
+
+
+def test_dynamic_correction_accepts_outside_grid_feedback_and_fixed_remains_available() -> None:
+    from aisimulate_core.sdk import RustForwardPassPerfModel
+
+    artifact = {
+        "schema": "aic_fpm_learned_forward_perf",
+        "schema_version": 1,
+        "worker_type": "decode",
+        "target": "log_ms",
+        "features": ["num_decode_requests"],
+        "stores": {"pure_decode": {"baseline": math.log(10.0), "trees": []}},
+        "metadata": {},
+    }
+    dynamic = RustForwardPassPerfModel.from_learned(artifact)
+    fixed = RustForwardPassPerfModel.from_learned(artifact, options={"correction_mode": "fixed"})
+    feedback = [[_decode_fpm(600 + i, 3_000_000 + i, 0.015)] for i in range(5)]
+    query = [_decode_fpm(1024, 8_000_000, 0.0)]
+    for model in (dynamic, fixed):
+        assert model.estimate_forward_pass_time_ms(query) == pytest.approx(10.0)
+        model.tune_with_fpms(feedback)
+    assert dynamic.estimate_forward_pass_time_ms(query) == pytest.approx(15.0)
+    assert fixed.estimate_forward_pass_time_ms(query) == pytest.approx(10.0)
+    assert dynamic.diagnostics()["retained_observations"] == 5
+    assert fixed.diagnostics()["retained_observations"] == 0

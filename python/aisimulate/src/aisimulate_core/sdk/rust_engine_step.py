@@ -228,6 +228,7 @@ class ForwardPassPerfOptions:
     regression_ffn_token_weight: float = 1.0
     bucket_shape: tuple[int, int] | None = None
     regression_ridge_scale: float = 1e-9
+    correction_mode: str = "auto"
 
     def __new__(cls, *args: Any, **kwargs: Any) -> ForwardPassPerfOptions:
         instance = super().__new__(cls)
@@ -414,8 +415,11 @@ class RustForwardPassPerfModel:
         ``aisimulate_core.sdk.fpm_learned``). ``source`` is an artifact path,
         the artifact JSON text, or the already-parsed artifact mapping. The
         artifact binds the worker type and the ordered feature ABI; estimation is
-        the learned prediction times the native-style online correction factor
-        accumulated through ``tune_with_fpms()``. Iterations whose workload kind
+        the learned prediction times a dynamic local correction factor
+        accumulated through ``tune_with_fpms()``. Bounds expand from admitted
+        observations; out-of-domain queries use recent global feedback. Pass
+        ``options={"correction_mode": "fixed"}`` to retain the legacy fixed grid.
+        Iterations whose workload kind
         has no trained store return ``None``.
         """
         _configure_default_data_roots()
