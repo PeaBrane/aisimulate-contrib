@@ -27,10 +27,13 @@ worker readiness, transfers and admission, then telemetry and scaling. A
 logical worker can contain multiple attention-DP rank schedulers; the grouped
 pass completes at the slowest rank's latency.
 
-The built-in `engine` stack provides offline execution with round-robin
-placement and fixed worker pools. Dynamo supplies its own Router and Planner
-composition through neutral contracts. Importing a Dynamo trace is a workload
-operation and does not require the Dynamo execution stack.
+The built-in `engine` stack provides offline execution with fixed worker pools,
+round-robin placement, and native Dynamo routing through `engine.router`.
+Conversation-aware routing runs within AISimulate using Dynamo's routing
+crates; it requires no Dynamo Python package or service. The optional Dynamo
+stack supplies Planner and downstream integration through neutral contracts.
+Importing a Dynamo trace is a workload operation and does not require the
+Dynamo execution stack.
 
 Native token replay and the analytical AFD/EPD paths have different support and
 reporting boundaries. A successful run does not establish silicon accuracy.

@@ -2486,8 +2486,7 @@ fn test_source_first_handoff_waits_for_decode_scale_up() {
     assert_eq!(stats.request_snapshots[&uuid].phase, DisaggPhase::Done);
 }
 
-#[test]
-fn shared_g2_outlives_a_prefill_role_scaled_to_zero_and_back() {
+fn shared_g2_disagg_config() -> TestDisaggConfig {
     use crate::engine::{NativeHostOffloadConfig, TimingModelConfig};
     let args = |worker_type| MockEngineArgs {
         block_size: 4,
@@ -2510,14 +2509,19 @@ fn shared_g2_outlives_a_prefill_role_scaled_to_zero_and_back() {
             .with_bandwidths(1.0, 1.0)
             .cluster_shared("tp1"),
     );
-    let config = TestDisaggConfig {
+    TestDisaggConfig {
         prefill_args,
         decode_args: args(WorkerType::Decode),
         prefill_dp_size: 1,
         decode_dp_size: 1,
         num_prefill_workers: 1,
         num_decode_workers: 1,
-    };
+    }
+}
+
+#[test]
+fn shared_g2_outlives_a_prefill_role_scaled_to_zero_and_back() {
+    let config = shared_g2_disagg_config();
     let prompt = |id, arrival_ms| DirectRequest {
         tokens: (1..=9).collect(),
         max_output_tokens: 1,
@@ -3895,6 +3899,55 @@ fn disagg_rejects_invalid_policy_wakeup_before_advancing_clock(
     assert!(
         runtime.now_ms.is_finite() && runtime.now_ms >= previous_ms,
         "invalid policy must not corrupt replay time"
+    );
+}
+
+#[rstest::rstest]
+#[case::coincident(0.5)]
+#[case::later(0.75)]
+fn disagg_internal_deadline_settles_before_policy_wakeup(#[case] delay_ms: f64) {
+    use crate::replay::runtime_utils::wakeup_test_policy::WakeupPlacement;
+    let config = shared_g2_disagg_config().runtime_config(false).unwrap();
+    let mut runtime = DisaggRuntimeImpl::<_, NoEngineEvents, NoReplayMetadata>::new_composed(
+        &config,
+        AdmissionQueue::new_requests(
+            VecDeque::from([request(1, 9, 1, 0.0), request(2, 9, 1, 2.5)]),
+            ReplayMode::Trace,
+        ),
+        false,
+        |_, _, _, _| {
+            Ok((
+                WakeupPlacement::new(None, true),
+                WakeupPlacement::new(None, true),
+            ))
+        },
+    )
+    .unwrap()
+    .with_per_request_records(true);
+    // Seed two host blocks: the 1 ms prefill starts a 2 ms D2H transfer.
+    // Request 1 finishes at 2 ms, while the prefill worker is busy until 3 ms.
+    for expected_ms in [0.0, 1.0, 2.0] {
+        assert_eq!(
+            runtime.step().unwrap(),
+            ReplayStepOutcome::Settled {
+                now_ms: expected_ms
+            }
+        );
+    }
+    runtime.prefill_placement = WakeupPlacement::new(Some(delay_ms), true);
+    let report = runtime.run().unwrap().0.finish();
+    assert_eq!(report.request_counts.completed_requests, 2);
+    let released = report
+        .per_request
+        .iter()
+        .find(|request| request.uuid == Uuid::from_u128(2).to_string())
+        .unwrap();
+    assert_eq!(released.prefill_admit_ms, Some(2.5 + delay_ms));
+    assert!(
+        report
+            .per_request
+            .iter()
+            .all(|request| { request.terminal_status == ReplayTerminalStatus::Completed })
     );
 }
 

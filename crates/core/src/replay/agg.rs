@@ -896,12 +896,12 @@ where
                 "aggregated",
                 false,
             )?;
+            // Settle idle deadlines before policy wakeups or completions can
+            // release a queued placement to that same idle worker.
+            changed |= self.settle_internal_work(&mut consecutive_internal_steps)?;
             let placements = self.placement.advance_clock(self.now_ms)?;
             changed |= !placements.is_empty();
             self.dispatch_placements(placements)?;
-            // Settle idle deadlines first: a completion below may release a
-            // queued placement and submit it to that same idle worker.
-            changed |= self.settle_internal_work(&mut consecutive_internal_steps)?;
             let completed = self.apply_worker_completions()?;
             changed |= completed;
             if completed {
@@ -2497,6 +2497,7 @@ mod host_offload_tests {
 
     struct ReleaseToIdleWorker {
         pending: Option<Uuid>,
+        release_at_ms: Option<f64>,
     }
 
     impl PlacementPolicy<ReplayRequestPayload> for ReleaseToIdleWorker {
@@ -2552,12 +2553,24 @@ mod host_offload_tests {
             }
         }
 
+        fn next_wakeup_ms(&self) -> Option<f64> {
+            self.pending.and(self.release_at_ms)
+        }
+
+        fn advance_clock(&mut self, now_ms: f64) -> anyhow::Result<Vec<Placement>> {
+            if self.release_at_ms.is_some_and(|at_ms| at_ms <= now_ms) {
+                self.release_at_ms = None;
+                return self.request_terminal(COMPLETING_A, now_ms);
+            }
+            Ok(Vec::new())
+        }
+
         fn request_terminal(
             &mut self,
             request_id: Uuid,
             _now_ms: f64,
         ) -> anyhow::Result<Vec<Placement>> {
-            if request_id != COMPLETING_A {
+            if request_id != COMPLETING_A || self.release_at_ms.is_some() {
                 return Ok(Vec::new());
             }
             Ok(self
@@ -2625,8 +2638,13 @@ mod host_offload_tests {
         }
     }
 
-    #[test]
-    fn idle_internal_deadline_settles_before_completion_releases_placement() {
+    #[rstest::rstest]
+    #[case::completion(None)]
+    #[case::coincident_wakeup(Some(5.0))]
+    #[case::later_wakeup(Some(5.25))]
+    fn idle_internal_deadline_settles_before_releasing_placement(
+        #[case] release_at_ms: Option<f64>,
+    ) {
         let config = ReplayEngineConfig {
             rank: EngineConfig {
                 num_gpu_blocks: 1,
@@ -2672,7 +2690,10 @@ mod host_offload_tests {
                         .collect::<Vec<_>>(),
                     vec![&[0][..], &[1][..]]
                 );
-                Ok(ReleaseToIdleWorker { pending: None })
+                Ok(ReleaseToIdleWorker {
+                    pending: None,
+                    release_at_ms,
+                })
             },
         )
         .unwrap()
@@ -2696,7 +2717,7 @@ mod host_offload_tests {
             .find(|request| request.uuid == QUEUED_FOR_B.to_string())
             .expect("released request record");
         assert_eq!(released.decode_worker_idx, Some(1));
-        assert_eq!(released.first_admit_ms, Some(5.0));
+        assert_eq!(released.first_admit_ms, Some(release_at_ms.unwrap_or(5.0)));
         assert_eq!(released.terminal_status, ReplayTerminalStatus::Completed);
     }
 }

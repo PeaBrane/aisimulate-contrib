@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
 import subprocess
 import sys
 from dataclasses import replace
@@ -16,6 +17,7 @@ import pytest
 import yaml
 from pydantic import ValidationError
 from test_host_offload_cli import _prediction_engine, _RecordingRuntime
+from test_host_resources import _supervised
 
 from aisimulate import main as cli
 from aisimulate.compiler import prediction_to_replay_spec
@@ -41,6 +43,12 @@ def _routed_spec(*, affinity="session", mode="aggregated"):
 def test_agentx_cli_uses_aisimulate_native_runtime_without_dynamo_plugin(
     tmp_path, monkeypatch, capsys, mode, affinity, backend
 ) -> None:
+    # This unit test invokes the child CLI directly to record its runtime calls.
+    # Model its supervisor budget; the subprocess tests below use real supervision.
+    _supervised(monkeypatch)
+    budget = json.loads(os.environ["_AISIMULATE_SUPERVISED_BUDGET"])
+    budget.update(events_path=str(tmp_path / "events.jsonl"), ready_path=str(tmp_path / "ready"))
+    monkeypatch.setenv("_AISIMULATE_SUPERVISED_BUDGET", json.dumps(budget))
     runtime = _RecordingRuntime()
     imported = []
     original_import = importlib.import_module
@@ -265,6 +273,11 @@ def test_native_agentx_routing_through_supervised_cli(tmp_path, backend, mode, a
     assert completed.returncode == 0, completed.stderr
     assert json.loads(completed.stdout)["completed_requests"] == 4
     assert json.loads((output / "resource-runtime.json").read_text())["status"] == "completed"
+    events = [json.loads(line) for line in (output / "execution-events.jsonl").read_text().splitlines()]
+    plan = next(event["value"] for event in events if event["event"] == "resource_plan")
+    assert plan["estimate"]["allocation_model"] == "dynamo-unqualified-v1"
+    assert plan["estimate"]["estimated_peak_bytes"] is None
+    assert plan["effective_parallelism"] == 1
     report = json.loads((output / "prediction.json").read_text())
     roles = report["routing_policy"]["roles"]
     assert set(roles) == ({"aggregated"} if mode == "aggregated" else {"prefill", "decode"})

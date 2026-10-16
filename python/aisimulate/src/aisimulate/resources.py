@@ -21,7 +21,7 @@ from collections import OrderedDict
 from collections.abc import Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -1000,6 +1000,7 @@ def build_plan(
     host: HostResources | None = None,
     factory: Any = None,
     concurrency: int | None = None,
+    native_router: bool = False,
 ) -> dict[str, Any]:
     policy = policy or _POLICY.get() or ResourceConfig()
     host = host or discover_host()
@@ -1026,6 +1027,17 @@ def build_plan(
         raise ResourceLimitError("runner returned an invalid host resource estimate")
     if peak is not None and (type(peak) is not int or peak <= 0 or peak < estimate.lower_bound_bytes):
         raise ResourceLimitError("runner returned an invalid host resource estimate")
+    if native_router and ((peak is not None and peak <= free) or estimate.allocation_model == OBSERVED_TRACE_MODEL):
+        # Preserve initial-materialization refusals and lower bounds, but neither
+        # an engine-only estimate nor an observed trace peak qualifies router state.
+        estimate = replace(
+            estimate,
+            allocation_model="dynamo-unqualified-v1",
+            estimated_peak_bytes=None,
+            reason="Dynamo policy retains native router state beyond the engine estimate; "
+            "total memory requires supervised serial execution",
+        )
+        peak = None
     workers = min(requested_parallelism, budget["cpu_limit"], free // peak) if peak else 0
     reason = "" if workers else "candidate exceeds the host memory budget"
     if peak is None:
@@ -1077,8 +1089,23 @@ def resource_policy(policy: ResourceConfig):
         _POLICY.reset(token)
 
 
+def _uses_native_router(spec: Any) -> bool:
+    return any(
+        hook.provider == "engine.router"
+        and hook.kind == "placement_policy"
+        and hook.config.get("provider") == "dynamo_kv_router"
+        for hook in getattr(spec, "runtime_hooks", ())
+    )
+
+
 def guard_replay(spec: Any, *, stack: str, factory: Any = None) -> dict[str, Any]:
-    plan = build_plan(spec.workload, stack=stack, concurrency=spec.concurrency, factory=factory)
+    plan = build_plan(
+        spec.workload,
+        stack=stack,
+        concurrency=spec.concurrency,
+        factory=factory,
+        native_router=_uses_native_router(spec),
+    )
     require_plan(plan)
     return plan
 
@@ -1176,6 +1203,7 @@ class GuardedRunnerFactory:
                 host=host,
                 factory=self.factory,
                 concurrency=spec.concurrency,
+                native_router=_uses_native_router(spec),
             )
             plans.append(plan)
             estimate = plan["estimate"]

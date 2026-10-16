@@ -2624,19 +2624,20 @@ where
                 "decode",
                 false,
             )?;
-            let prefill = self.prefill_placement.advance_clock(self.now_ms)?;
-            let decode = self.decode_placement.advance_clock(self.now_ms)?;
-            changed |= !prefill.is_empty() || !decode.is_empty();
-            self.dispatch_prefill_placements(prefill)?;
-            self.dispatch_decode_placements(decode)?;
             let now_ms = self.now_ms;
             let mut settle = |runtime: &mut Self| {
                 settle_internal_work(now_ms, &mut consecutive_internal_steps, || {
                     runtime.apply_internal_work()
                 })
             };
-            // Settle idle deadlines first, then any exposed by pass completion.
+            // Settle idle deadlines before policy wakeups or pass completions
+            // can release placements, then settle any exposed by completion.
             changed |= settle(self)?;
+            let prefill = self.prefill_placement.advance_clock(self.now_ms)?;
+            let decode = self.decode_placement.advance_clock(self.now_ms)?;
+            changed |= !prefill.is_empty() || !decode.is_empty();
+            self.dispatch_prefill_placements(prefill)?;
+            self.dispatch_decode_placements(decode)?;
             let completed = self.apply_worker_completions()?;
             changed |= completed;
             if completed {

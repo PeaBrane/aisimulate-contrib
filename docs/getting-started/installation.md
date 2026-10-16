@@ -133,9 +133,9 @@ for the standalone development wheel and native policy dependency requirements.
 The optional packages below provide Dynamo-specific integration, including Planner;
 they are not required for AISimulate-owned conversation routing.
 
-The engine stack does not require Dynamo. For `--stack dynamo`, install a
-Dynamo distribution that supplies the required runner and adapters into the
-same environment. The root [README](../../README.md#with-dynamo) records a validated pair: `ai-dynamo==1.6.0.dev20260930` and
+The engine stack does not require a Dynamo Python package or service. For
+`--stack dynamo`, install a Dynamo distribution that supplies the required runner
+and adapters into the same environment. The root [README](../../README.md#with-dynamo) records a validated pair: `ai-dynamo==1.6.0.dev20260930` and
 `aisimulate==0.13.0.dev202609270000000058`, from the NVIDIA prerelease index.
 Installation, `pip check`, CPU prediction, an eight-trial recommendation, and
 prediction of the best candidate pass with Python 3.12 on Linux.

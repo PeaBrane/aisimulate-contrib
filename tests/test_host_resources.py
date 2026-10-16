@@ -1245,16 +1245,21 @@ def test_profile_keeps_initial_trace_materialization_guards(tmp_path, host, monk
 
 
 @pytest.mark.parametrize(
-    "profile,snapshot,expected_model",
+    "profile,snapshot,trace_format,expected_model",
     [
-        (None, False, resources.OBSERVED_TRACE_MODEL),
-        (None, True, "dynamo-unqualified-v1"),
-        ({}, False, "agentic-profile-unqualified-v1"),
+        (None, False, "weka", resources.OBSERVED_TRACE_MODEL),
+        (None, False, "mooncake", resources.OBSERVED_TRACE_MODEL),
+        (None, True, "weka", "dynamo-unqualified-v1"),
+        ({}, False, "weka", "agentic-profile-unqualified-v1"),
     ],
 )
+@pytest.mark.parametrize("stack", ["dynamo", "engine"])
 def test_dynamo_policy_finite_and_profile_memory_remains_unqualified(
-    tmp_path, host, monkeypatch, profile, snapshot, expected_model
+    tmp_path, host, monkeypatch, profile, snapshot, trace_format, expected_model, stack
 ):
+    from aisimulate.config_adapter import PredictionAdapterContext
+    from aisimulate.router import EngineRouterConfigAdapter
+
     trace = tmp_path / "play.json"
     trace.write_text(
         json.dumps(
@@ -1268,13 +1273,18 @@ def test_dynamo_policy_finite_and_profile_memory_remains_unqualified(
         )
         + "\n"
     )
-    workload = {"trace_path": str(trace), "trace_format": "weka"}
+    if trace_format == "mooncake":
+        trace.write_text(json.dumps({"timestamp": 0, "input_length": 8, "output_length": 1}) + "\n")
+    workload = {"trace_path": str(trace), "trace_format": trace_format}
     if profile is not None:
         workload["agentic_profile"] = profile
     if snapshot:
         workload["agentic_snapshot"] = {"seed": 42}
+    native_router = stack == "engine"
+    if native_router and profile is None:
+        expected_model = "dynamo-unqualified-v1"
     monkeypatch.delenv("_AISIMULATE_SUPERVISED_BUDGET", raising=False)
-    assert build_plan(workload, stack="dynamo", host=host)["status"] == "resource_limited"
+    assert build_plan(workload, stack=stack, host=host, native_router=native_router)["status"] == "resource_limited"
     monkeypatch.setenv(
         "_AISIMULATE_SUPERVISED_BUDGET",
         json.dumps(
@@ -1286,15 +1296,81 @@ def test_dynamo_policy_finite_and_profile_memory_remains_unqualified(
             }
         ),
     )
-    plan = build_plan(workload, stack="dynamo", host=host, requested_parallelism=4)
+    plan = build_plan(workload, stack=stack, host=host, requested_parallelism=4, native_router=native_router)
     assert plan["status"] == "admitted"
     assert plan["effective_parallelism"] == 1
     assert plan["estimate"]["estimated_peak_bytes"] is None
     assert plan["estimate"]["allocation_model"] == expected_model
     monkeypatch.setattr(resources, "discover_host", lambda: host)
-    spec = SimpleNamespace(workload=workload, concurrency=None)
-    assert guard_replay(spec, stack="dynamo")["status"] == "admitted"
-    factory = GuardedRunnerFactory(object(), "dynamo", ResourceConfig())
+    adapter = EngineRouterConfigAdapter().compile_prediction(
+        {"policy": "kv_router"}, PredictionAdapterContext(engine={}, traffic={}, evaluation={})
+    )
+    spec = SimpleNamespace(
+        workload=workload, concurrency=None, runtime_hooks=adapter.runtime_hooks if native_router else ()
+    )
+    assert guard_replay(spec, stack=stack)["estimate"] == plan["estimate"]
+    factory = GuardedRunnerFactory(object(), stack, ResourceConfig())
     assert factory.admit_wave([spec])["status"] == "admitted"
+    if native_router:
+        # A completed run must not qualify a later native-router parallel wave.
+        factory.record_peak(spec, resources.WORKER_BASELINE_BYTES)
     with pytest.raises(ResourceLimitError, match="wave"):
         factory.admit_wave([spec, spec])
+
+
+@pytest.mark.parametrize("router", [None, {}, {"policy": "round_robin"}, {"policy": "kv_router"}])
+def test_compiled_router_policy_controls_synthetic_resource_admission(monkeypatch, host, router):
+    from aisimulate.config_adapter import PredictionAdapterContext
+    from aisimulate.router import EngineRouterConfigAdapter
+
+    hooks = ()
+    if router is not None:
+        hooks = (
+            EngineRouterConfigAdapter()
+            .compile_prediction(router, PredictionAdapterContext(engine={}, traffic={}, evaluation={}))
+            .runtime_hooks
+        )
+    spec = SimpleNamespace(workload={"request_count": 4, "isl": 8, "osl": 1}, concurrency=None, runtime_hooks=hooks)
+    monkeypatch.setattr(resources, "discover_host", lambda: host)
+    monkeypatch.delenv("_AISIMULATE_SUPERVISED_BUDGET", raising=False)
+    if hooks:
+        with pytest.raises(ResourceLimitError, match="Dynamo policy"):
+            guard_replay(spec, stack="engine")
+    else:
+        assert guard_replay(spec, stack="engine")["estimate"]["estimated_peak_bytes"] is not None
+    _supervised(monkeypatch)
+    factory = GuardedRunnerFactory(object(), "engine", ResourceConfig())
+    if hooks:
+        with pytest.raises(ResourceLimitError, match="wave"):
+            factory.admit_wave([spec, spec])
+    else:
+        assert factory.admit_wave([spec, spec])["status"] == "admitted"
+
+
+def test_cli_native_router_override_requires_supervision_before_execution(tmp_path, monkeypatch, host):
+    raw = _config()
+    raw.pop("optimizer")
+    raw.pop("optimization")
+    raw["traffic"]["load"]["concurrency"] = 4
+    raw["router"] = {"policy": "round_robin"}
+    config = tmp_path / "case.yaml"
+    config.write_text(yaml.safe_dump(raw))
+    output = tmp_path / "output"
+    monkeypatch.setattr(cli, "resolve_runner_factory", lambda _: object())
+    monkeypatch.setattr(resources, "discover_host", lambda: host)
+    monkeypatch.delenv("_AISIMULATE_SUPERVISED_BUDGET", raising=False)
+    assert (
+        cli.main(["predict", "--config", str(config), "--output-dir", str(output), "--set", "router.policy=kv_router"])
+        == 3
+    )
+    plan = json.loads((output / "resource-plan.json").read_text())
+    assert plan["stack"] == "engine"
+    assert plan["estimate"]["allocation_model"] == "dynamo-unqualified-v1"
+    assert plan["estimate"]["estimated_peak_bytes"] is None
+
+
+def test_native_router_keeps_initial_materialization_refusal(host, monkeypatch):
+    _supervised(monkeypatch)
+    plan = build_plan({"request_count": 1, "isl": 10**12}, stack="engine", host=host, native_router=True)
+    assert plan["status"] == "resource_limited"
+    assert plan["estimate"]["estimated_peak_bytes"] > plan["budget"]["memory_limit_bytes"]
