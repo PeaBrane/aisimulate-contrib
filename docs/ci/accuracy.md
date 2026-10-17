@@ -530,7 +530,8 @@ renamed repository. Old pinned revisions retain their original paths and identit
 Other repository identities remain strict. FPM manifests under `data/fpm/` retain
 the existing measurement contracts; E2E artifacts do not enter FPM evaluation.
 
-The weekly/manual InferenceX worker runs in internal GitLab. Public GitHub CI
+The weekly/manual InferenceX worker runs in internal GitLab and installs the
+hashed `scripts/e2e_hf_cache/requirements.txt` dependency lock. Public GitHub CI
 receives no private cache credentials and does not consume this source. API data
 retains InferenceX attribution and the upstream request for data terms; the data
 license remains unconfirmed. The publisher rejects public target repositories.

@@ -73,17 +73,9 @@ def test_conflicting_duplicate_fails():
 def test_delta_reuses_unchanged_partitions_and_snapshot(tmp_path):
     inputs = [row(), row("2", "b200")]
     first = prepare(tmp_path, inputs)
-    before = {
-        str(p.relative_to(tmp_path)): p.read_bytes()
-        for p in tmp_path.rglob("*")
-        if p.is_file()
-    }
+    before = {str(p.relative_to(tmp_path)): p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()}
     assert prepare(tmp_path, inputs) == first
-    assert {
-        str(p.relative_to(tmp_path)): p.read_bytes()
-        for p in tmp_path.rglob("*")
-        if p.is_file()
-    } == before
+    assert {str(p.relative_to(tmp_path)): p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()} == before
     changed = copy.deepcopy(inputs)
     changed[0]["metrics"]["mean_ttft"] = 0.5
     second = prepare(tmp_path, changed)
@@ -170,9 +162,7 @@ def test_conditional_cache_and_corruption(tmp_path):
 def test_bounded_retry_and_invalid_run_id(tmp_path, monkeypatch):
     sleeps = []
     monkeypatch.setattr(cache.time, "sleep", sleeps.append)
-    session = Session(
-        [response(429, **{"Retry-After": "2"}), response(500), response(200)]
-    )
+    session = Session([response(429, **{"Retry-After": "2"}), response(500), response(200)])
     client = cache.InferenceXClient(tmp_path, session)
     client.get("benchmarks", model="Example")
     assert len(session.calls) == 3 and sleeps == [2, 2]
