@@ -21,7 +21,7 @@ pub use dynamo_kv_router::PrefillLoadEstimator;
 pub use dynamo_kv_router::config::KvRouterConfig;
 use serde::{Deserialize, Serialize};
 
-pub const NATIVE_DYNAMO_REVISION: &str = "85ce615a409d61144c5b94ce74dae3f7291573dd";
+pub const NATIVE_DYNAMO_REVISION: &str = "f24c59b936ba23c933cc35d2f8c7f9ff71f54c3d";
 pub const NATIVE_DYNAMO_PROVIDER: &str = "dynamo_kv_router";
 
 pub type ReplayPrefillLoadEstimator = std::sync::Arc<dyn PrefillLoadEstimator>;

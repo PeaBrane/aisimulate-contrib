@@ -579,7 +579,7 @@ dependencies = [
 [[package]]
 name = "dynamo-custom-policy-builtin"
 version = "1.6.0"
-source = "git+https://github.com/ai-dynamo/dynamo.git?rev=85ce615a409d61144c5b94ce74dae3f7291573dd#85ce615a409d61144c5b94ce74dae3f7291573dd"
+source = "git+https://github.com/ai-dynamo/dynamo.git?rev=f24c59b936ba23c933cc35d2f8c7f9ff71f54c3d#f24c59b936ba23c933cc35d2f8c7f9ff71f54c3d"
 dependencies = [
  "async-trait",
  "dynamo-kv-router",
@@ -594,7 +594,7 @@ dependencies = [
 [[package]]
 name = "dynamo-kv-hashing"
 version = "1.6.0"
-source = "git+https://github.com/ai-dynamo/dynamo.git?rev=85ce615a409d61144c5b94ce74dae3f7291573dd#85ce615a409d61144c5b94ce74dae3f7291573dd"
+source = "git+https://github.com/ai-dynamo/dynamo.git?rev=f24c59b936ba23c933cc35d2f8c7f9ff71f54c3d#f24c59b936ba23c933cc35d2f8c7f9ff71f54c3d"
 dependencies = [
  "derive_builder",
  "dynamo-tokens",
@@ -606,7 +606,7 @@ dependencies = [
 [[package]]
 name = "dynamo-kv-router"
 version = "1.6.0"
-source = "git+https://github.com/ai-dynamo/dynamo.git?rev=85ce615a409d61144c5b94ce74dae3f7291573dd#85ce615a409d61144c5b94ce74dae3f7291573dd"
+source = "git+https://github.com/ai-dynamo/dynamo.git?rev=f24c59b936ba23c933cc35d2f8c7f9ff71f54c3d#f24c59b936ba23c933cc35d2f8c7f9ff71f54c3d"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -650,7 +650,7 @@ dependencies = [
 [[package]]
 name = "dynamo-tokens"
 version = "1.6.0"
-source = "git+https://github.com/ai-dynamo/dynamo.git?rev=85ce615a409d61144c5b94ce74dae3f7291573dd#85ce615a409d61144c5b94ce74dae3f7291573dd"
+source = "git+https://github.com/ai-dynamo/dynamo.git?rev=f24c59b936ba23c933cc35d2f8c7f9ff71f54c3d#f24c59b936ba23c933cc35d2f8c7f9ff71f54c3d"
 dependencies = [
  "bs58",
  "bytemuck",
@@ -666,7 +666,7 @@ dependencies = [
 [[package]]
 name = "dynamo-truthy"
 version = "1.6.0"
-source = "git+https://github.com/ai-dynamo/dynamo.git?rev=85ce615a409d61144c5b94ce74dae3f7291573dd#85ce615a409d61144c5b94ce74dae3f7291573dd"
+source = "git+https://github.com/ai-dynamo/dynamo.git?rev=f24c59b936ba23c933cc35d2f8c7f9ff71f54c3d#f24c59b936ba23c933cc35d2f8c7f9ff71f54c3d"
 dependencies = [
  "anyhow",
 ]

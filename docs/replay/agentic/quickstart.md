@@ -28,14 +28,12 @@ Functional simulation does not establish hardware performance accuracy.
 
 [Dynamo #15631](https://github.com/ai-dynamo/dynamo/pull/15631) is merged at
 `094aaca91941421bb0dcb645b0f700a42d6de3ef`. The native policy dependency is
-pinned to `85ce615a409d61144c5b94ce74dae3f7291573dd`, which also exposes an
-admission barrier so AISimulate can drive the production scheduler at each
-simulation timestamp. This pin is the unmerged head of
-[Dynamo #16490](https://github.com/ai-dynamo/dynamo/pull/16490): merge that PR
-first, then update all three Dynamo dependency pins and the lockfile to its
-merged revision and rerun native-router validation before merging
-[AISimulate #306](https://github.com/ai-dynamo/aisimulate/pull/306), which
-provides simulation, CLI configuration, and reports.
+pinned to `f24c59b936ba23c933cc35d2f8c7f9ff71f54c3d`, the merged revision of
+[Dynamo #16490](https://github.com/ai-dynamo/dynamo/pull/16490) on Dynamo main.
+It exposes an admission barrier so AISimulate can drive the production
+scheduler at each simulation timestamp.
+[AISimulate #306](https://github.com/ai-dynamo/aisimulate/pull/306) provides
+simulation, CLI configuration, and reports.
 [Dynamo #15240](https://github.com/ai-dynamo/dynamo/pull/15240) updates the
 optional Dynamo integration to consume AISimulate's interfaces; it is not a
 prerequisite for this example.

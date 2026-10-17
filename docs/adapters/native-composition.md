@@ -10,7 +10,7 @@ SPDX-License-Identifier: Apache-2.0
 The built-in `RoundRobinComposition` has fixed workers. The unpublished
 `aisimulate-python` wheel host adds `NativeDynamoReplayComposition`, calling
 Dynamo's native policy crates pinned to revision
-`85ce615a409d61144c5b94ce74dae3f7291573dd`. The published core has no Dynamo
+`f24c59b936ba23c933cc35d2f8c7f9ff71f54c3d`. The published core has no Dynamo
 dependency.
 Dynamo integrations may supply Planner callbacks through the same contracts.
 These are Rust crate interfaces, not a stable dynamically loaded binary ABI.
