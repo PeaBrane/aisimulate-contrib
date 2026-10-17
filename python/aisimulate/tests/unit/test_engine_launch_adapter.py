@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import json
+
 import pytest
 
 from aisimulate.runner import canonical_performance_config, materialize_engine_launch_config
@@ -56,7 +58,26 @@ def test_canonical_timing_metadata_preserves_controls_and_role():
 @pytest.mark.parametrize("backend", ["vllm", "sglang"])
 @pytest.mark.parametrize("role", ["aggregated", "prefill", "decode"])
 @pytest.mark.parametrize("kind", ["mtp", "eagle3"])
-def test_generic_speculation_survives_canonical_launch(backend, role, kind):
+def test_generic_speculation_survives_canonical_launch(tmp_path, backend, role, kind):
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["LlamaForCausalLM"],
+                "model_type": "llama",
+                "num_hidden_layers": 4,
+                "hidden_size": 2048,
+                "intermediate_size": 5632,
+                "num_attention_heads": 16,
+                "num_key_value_heads": 4,
+                "head_dim": 128,
+                "vocab_size": 32000,
+                "max_position_embeddings": 2048,
+            }
+        )
+    )
+    version = "0.24.0" if backend == "vllm" else "0.5.14"
     selection = {
         "kind": kind,
         "params": {"depth": 3} if kind == "mtp" else {"num_speculative_tokens": 3},
@@ -75,7 +96,7 @@ def test_generic_speculation_survives_canonical_launch(backend, role, kind):
         }
     config = materialize_engine_launch_config(
         backend,
-        "",
+        version,
         {},
         {
             "block_size": 16,
@@ -83,9 +104,10 @@ def test_generic_speculation_survives_canonical_launch(backend, role, kind):
             "speculation": selection,
             "timing_model": {
                 "type": "external",
-                "provider": "ais",
+                "provider": "aic",
                 "config": {
-                    "model": "geometry-only",
+                    "model": str(target),
+                    "backend_version": version,
                     "system": "h200_sxm",
                     "backend": backend,
                     "worker_type": role,
