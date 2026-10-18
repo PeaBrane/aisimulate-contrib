@@ -78,6 +78,8 @@ pub(crate) struct DirectRequest {
     pub output_token_ids: Option<Vec<Token>>,
     pub uuid: Option<Uuid>,
     pub arrival_timestamp_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
 }
 
 impl DirectRequest {
@@ -209,6 +211,10 @@ pub(crate) struct MockEngineArgs {
     pub kv_transfer_bytes_per_token: Option<usize>,
     #[builder(default = "None")]
     pub kv_cache_bytes_per_token: Option<usize>,
+    #[builder(default)]
+    pub kv_cache_groups: Vec<crate::perfmodel::FpmCacheGroup>,
+    #[builder(default = "None")]
+    pub kv_cache_capacity_bytes: Option<u64>,
     #[builder(default = "None")]
     pub native_host_offload: Option<NativeHostOffloadConfig>,
     #[builder(default = "None")]

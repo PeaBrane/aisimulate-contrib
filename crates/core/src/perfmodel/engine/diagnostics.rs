@@ -11,6 +11,24 @@ pub struct SolDiagnostics {
     pub memory_ms: f64,
 }
 
+impl SolDiagnostics {
+    /// Component-wise `self + other`.
+    pub(crate) fn plus(&self, other: &Self) -> Self {
+        Self {
+            latency_ms: self.latency_ms + other.latency_ms,
+            math_ms: self.math_ms + other.math_ms,
+            memory_ms: self.memory_ms + other.memory_ms,
+        }
+    }
+
+    /// Every component is finite and nonnegative.
+    pub(crate) fn is_valid(&self) -> bool {
+        [self.latency_ms, self.math_ms, self.memory_ms]
+            .iter()
+            .all(|v| v.is_finite() && *v >= 0.0)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutedFallback {
     pub inference_phase: String,
@@ -27,6 +45,9 @@ pub struct OperationDetails {
     pub sol_unavailable_reason: Option<String>,
     /// Executed measurement substitutions; empty means no recorded substitution.
     pub fallbacks: Vec<ExecutedFallback>,
+    /// Whole-forward estimates, counted by identical result and replay scale.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fpm_estimates: Vec<crate::FpmEstimateEvidence>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

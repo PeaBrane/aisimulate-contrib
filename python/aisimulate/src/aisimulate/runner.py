@@ -14,7 +14,7 @@ import random
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from numbers import Real
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Literal, Protocol, runtime_checkable
 
 import numpy as np
 
@@ -83,6 +83,7 @@ _RUNTIME_TRAFFIC_FIELDS = frozenset(
         "agentic_lanes",
         "agentic_snapshot",
         "agentic_warmup",
+        "agentic_profile",
     }
 )
 
@@ -91,6 +92,8 @@ _AIC_TIMING_FIELD_ALIASES = {
     "pp": ("aic_pp_size",),
     "moe_tp_size": ("moe_tp_size", "aic_moe_tp_size"),
     "moe_ep_size": ("moe_ep_size", "aic_moe_ep_size"),
+    "cp_size": ("cp_size", "aic_cp_size"),
+    "dcp": ("dcp", "dcp_size", "aic_dcp_size"),
     "gemm_dtype": ("gemm_dtype", "aic_gemm_dtype"),
     "moe_dtype": ("moe_dtype", "aic_moe_dtype"),
     "fmha_dtype": ("fmha_dtype", "aic_fmha_dtype"),
@@ -99,6 +102,7 @@ _AIC_TIMING_FIELD_ALIASES = {
     "comm_dtype": ("comm_dtype", "aic_comm_dtype"),
     "systems_path": ("systems_path",),
     "forward_model": ("forward_model", "aic_forward_model"),
+    "fpm_profile": ("fpm_profile", "aic_fpm_profile"),
     "fpm_parquet_path": ("fpm_parquet_path", "aic_fpm_parquet_path"),
     "moe_backend": ("aic_moe_backend",),
     "moe_kernel_source": ("moe_kernel_source", "aic_moe_kernel_source"),
@@ -273,6 +277,11 @@ class AICAFDCompanionPerformanceModel:
                     if field in timing_overrides:
                         quantization[parameter] = timing_overrides[field]
                 sharded_moe = kwargs.get("moe_tp_size", 1) * kwargs.get("moe_ep_size", 1) > 1
+                estimator_config = (
+                    {"fpm_interpolation": {"fpm_parquet_path": fpm_parquet_path}}
+                    if fpm_parquet_path is not None
+                    else {}
+                )
                 config = ForwardPassPerfModelConfig(
                     model=model_name,
                     system=hardware,
@@ -287,11 +296,7 @@ class AICAFDCompanionPerformanceModel:
                     nextn=kwargs.get("nextn", 0),
                     kv_block_size=args.get("block_size"),
                     estimation_mode="fpm_interpolation",
-                    estimator_config=(
-                        {"fpm_interpolation": {"fpm_parquet_path": fpm_parquet_path}}
-                        if fpm_parquet_path is not None
-                        else {}
-                    ),
+                    estimator_config=estimator_config,
                     systems_paths=(timing_overrides["systems_path"],) if "systems_path" in timing_overrides else (),
                     **quantization,
                     **{
@@ -360,6 +365,10 @@ class EngineReplayRunnerFactory:
     """
 
     trace_block_size: int = 512
+    determinism: Literal["random", "canonical_v1"] = field(default="random", kw_only=True)
+    # Keep each loaded trace graph for later candidates in the same worker.
+    # Only worth its retained memory when one process runs many candidates.
+    trace_graph_cache: bool = field(default=False, kw_only=True)
     runtime: EngineReplayRuntime | None = field(default=None, repr=False, compare=False)
     afd_companion_model: AFDCompanionPerformanceModel | None = field(
         default=None,
@@ -375,8 +384,11 @@ class EngineReplayRunnerFactory:
             supports_analytical_epd=True,
             supports_cached_prefix_tokens=True,
             supports_mtp_expected_acceptance=True,
+            supports_generic_speculation=True,
             supported_engine_model_controls=ENGINE_MODEL_CONTROL_FIELDS,
             supports_state_cache=True,
+            supports_grouped_kv_cache=True,
+            supports_tokenization=True,
             supported_trace_formats=(
                 "mooncake",
                 "mooncake-delta",
@@ -388,10 +400,11 @@ class EngineReplayRunnerFactory:
             supports_agentic_lanes=True,
             supports_agentic_snapshots=True,
             supports_agentic_warmup=True,
+            supports_agentic_profile=True,
             supported_agentic_topologies=("agg", "disagg"),
             supported_agentic_backends=("vllm", "sglang"),
-            supports_agentic_host_offload=False,
-            supports_agentic_speculative_decoding=False,
+            supports_agentic_host_offload=True,
+            supports_agentic_speculative_decoding=True,
             agentic_qualification="functional_only",
         )
 
@@ -400,6 +413,8 @@ class EngineReplayRunnerFactory:
             worker_id=worker_id,
             capabilities=self.capabilities(),
             trace_block_size=self.trace_block_size,
+            determinism=self.determinism,
+            trace_graph_cache=self.trace_graph_cache,
             runtime=self.runtime,
             afd_companion_model=self.afd_companion_model,
         )
@@ -412,6 +427,8 @@ class EngineReplayRunner:
     worker_id: int
     capabilities: RunnerCapabilities
     trace_block_size: int = 512
+    determinism: Literal["random", "canonical_v1"] = field(default="random", kw_only=True)
+    trace_graph_cache: bool = field(default=False, kw_only=True)
     runtime: EngineReplayRuntime | None = None
     afd_companion_model: AFDCompanionPerformanceModel | None = None
 
@@ -446,6 +463,12 @@ class EngineReplayRunner:
         output_requirements: ReplayOutputRequirements | None = None,
     ) -> ReplayReport:
         output_requirements = output_requirements or ReplayOutputRequirements()
+        if self.determinism not in {"random", "canonical_v1"}:
+            raise ValueError(f"unsupported replay determinism: {self.determinism!r}")
+        if self.determinism != "random" and (
+            spec.backend_deployment.deployment_mode in {"afd", "afd+pd"} or spec.backend_deployment.encoder is not None
+        ):
+            raise InvalidRunnerError("canonical determinism requires native text replay")
         if output_requirements.capture_telemetry:
             raise InvalidRunnerError("EngineReplayRunner's JSON runtime does not yet expose replay telemetry")
         if spec.workload.get("source_type") is not None and "length_sampler" in spec.workload:
@@ -526,6 +549,16 @@ class EngineReplayRunner:
             if "spec" not in execution_spec:
                 execution_spec = {"spec": execution_spec}
             execution_spec["capture_performance_diagnostics"] = True
+        if self.determinism != "random":
+            if "spec" not in execution_spec:
+                execution_spec = {"spec": execution_spec}
+            execution_spec["determinism"] = self.determinism
+        if self.trace_graph_cache and "traffic" in execution_spec:
+            execution_spec["traffic"]["trace_graph_cache"] = True
+        if spec.backend_deployment.tokenization is not None:
+            if "spec" not in execution_spec:
+                execution_spec = {"spec": execution_spec}
+            execution_spec["tokenization"] = dict(spec.backend_deployment.tokenization)
         execution_spec_json = json.dumps(
             execution_spec,
             allow_nan=False,
@@ -540,13 +573,19 @@ class EngineReplayRunner:
                 from .resources import ResourceLimitError
             except ImportError:
                 raise error from None
-            raise ResourceLimitError(str(error)) from error
+            failure = ResourceLimitError(str(error))
+            if hasattr(error, "fpm_query_coverage"):
+                failure.fpm_query_coverage = error.fpm_query_coverage
+            raise failure from error
         if not isinstance(report_json, str):
             raise InvalidRunnerError("AISimulate engine replay runtime report must be a JSON string")
         try:
             report = json.loads(report_json)
         except json.JSONDecodeError as exc:
             raise InvalidRunnerError("AISimulate engine replay runtime returned invalid report JSON") from exc
+        # The parsed report replaces the transport string, which can be as large as
+        # the per-request records it carries.
+        del report_json
         if not isinstance(report, Mapping):
             raise InvalidRunnerError("AISimulate engine replay runtime report must be a JSON object")
         resolved_basis = report.get("weka_nested_timestamp_basis")
@@ -558,6 +597,13 @@ class EngineReplayRunner:
             )
         if memory_diagnostics is not None:
             report = {**report, "memory_diagnostics": memory_diagnostics}
+        state_sizes = {
+            role: metadata["state_cache"]
+            for role, metadata in spec.backend_deployment.performance_model_metadata.items()
+            if isinstance(metadata, dict) and "state_cache" in metadata
+        }
+        if state_sizes:
+            report = {**report, "state_cache": state_sizes}
         normalized = _normalize_engine_replay_report(
             report,
             include_native_report=(
@@ -1154,6 +1200,10 @@ def _configured_in_flight_cap(spec: ReplaySpec) -> int | None:
 def _pop_aic_timing_overrides(rank: dict[str, JSONValue], role: str) -> dict[str, JSONValue]:
     aic_timing_overrides: dict[str, JSONValue] = {}
     for target, aliases in _AIC_TIMING_FIELD_ALIASES.items():
+        if target == "moe_kernel_source":
+            for alias in aliases:
+                if rank.get(alias) is None:
+                    rank.pop(alias, None)
         configured = [alias for alias in aliases if alias in rank]
         if len(configured) > 1:
             names = ", ".join(configured)
@@ -1161,8 +1211,12 @@ def _pop_aic_timing_overrides(rank: dict[str, JSONValue], role: str) -> dict[str
         if not configured:
             continue
         value = rank.pop(configured[0])
-        if target in {"pp", "moe_tp_size", "moe_ep_size", "wideep_num_slots"}:
+        if target in {"pp", "moe_tp_size", "moe_ep_size", "wideep_num_slots", "cp_size", "dcp"}:
             value = _positive_int(value, f"engine provider {role} {target}")
+        elif target == "fpm_profile":
+            from aisimulate_core.sdk.fpm_profile import load_fpm_profile
+
+            value = load_fpm_profile(value).model_dump(mode="json")
         elif target in {"enable_eplb", "decoder_replay", "enable_shared_layer", "strict_provenance"}:
             if not isinstance(value, bool):
                 raise ValueError(f"engine provider {role} {target} must be a boolean")
@@ -1313,6 +1367,35 @@ def _materialize_sla(spec: ReplaySpec) -> dict[str, JSONValue]:
     }
 
 
+def canonical_performance_config(config: Mapping[str, Any], *, worker_type: str) -> dict[str, Any]:
+    """Normalize Runner timing metadata through the native estimator contract."""
+    from . import _runtime
+
+    return json.loads(_runtime.canonical_timing_config_json(json.dumps(dict(config), allow_nan=False), worker_type))
+
+
+def materialize_engine_launch_config(
+    deployment_backend: str,
+    deployment_backend_version: str,
+    parallel_config: Mapping[str, JSONValue],
+    raw_config: Mapping[str, JSONValue],
+    role: str,
+) -> dict[str, JSONValue]:
+    """Resolve Runner inputs into the canonical engine launch contract for adapters."""
+    from . import _runtime
+
+    descriptor = _materialize_engine_role(
+        deployment_backend, deployment_backend_version, parallel_config, raw_config, role
+    )
+    descriptor["rank"]["worker_type"] = role
+    return json.loads(
+        _runtime.engine_launch_from_replay_role_json(
+            json.dumps(descriptor, allow_nan=False),
+            _startup_delay_ms(raw_config) / 1000.0,
+        )
+    )
+
+
 def _materialize_engine_role(
     deployment_backend: str,
     deployment_backend_version: str,
@@ -1325,6 +1408,23 @@ def _materialize_engine_role(
     """Materialize one single-rank or attention-DP generalized engine."""
 
     role_config = dict(raw_config)
+    # New generic schemes use caller-authored capacity; leave the existing
+    # Ngram/NextN capacity paths unchanged.
+    requested_rank = role_config.get("rank", role_config)
+    if isinstance(requested_rank, Mapping):
+        timing = requested_rank.get("timing_model")
+        timing_config = timing.get("config", {}) if isinstance(timing, Mapping) else {}
+        canonical = timing_config.get("speculation") if isinstance(timing_config, Mapping) else None
+        selections = (requested_rank.get("speculation"), canonical)
+        for spec in selections:
+            if spec is not None and not isinstance(spec, Mapping):
+                raise ValueError("speculation must be a mapping")
+            if isinstance(spec, Mapping) and not isinstance(spec.get("params", {}), Mapping):
+                raise ValueError("speculation params must be a mapping")
+        if requested_rank.get("num_gpu_blocks") is None:
+            for spec in selections:
+                if isinstance(spec, Mapping) and spec.get("kind") not in ("none", "ngram"):
+                    raise ValueError(f"{spec.get('kind')} speculation requires explicit fixed KV capacity on {role}")
     # The shared CLI/Sweeper form is flat. Nested rank descriptors are already
     # execution-level input and retain the native runtime's compatibility
     # fallback after their structure has been validated below.
@@ -1342,6 +1442,11 @@ def _materialize_engine_role(
         memory_diagnostics[role] = role_memory
     capacity_materialized = False
     num_gpu_blocks_is_explicit = False
+    # A nested canonical timing config carries the CP knobs too; check them
+    # against parallel_config BEFORE capacity materialization resolves them
+    # into AIC inputs, so a mismatch cannot size the KV cache for one topology
+    # while the deployment reports another.
+    _require_nested_context_parallel_match(role_config, parallel_config, role)
     if "rank" not in role_config:
         state_cache = _manual_state_cache(role_config, deployment_backend, role)
         num_gpu_blocks_is_explicit = role_config.get("num_gpu_blocks") is not None
@@ -1390,9 +1495,12 @@ def _materialize_engine_role(
             )
             if role_memory is not None and "total_gpu_capacity_bytes" in role_memory:
                 role_memory["status"] = "available"
-                role_memory["estimated_num_gpu_blocks"] = role_memory.pop("num_gpu_blocks")
+                if "num_gpu_blocks" in role_memory:
+                    role_memory["estimated_num_gpu_blocks"] = role_memory.pop("num_gpu_blocks")
                 role_memory.pop("unavailable_reason", None)
-            capacity_materialized = role_config.get("num_gpu_blocks") is not None
+            capacity_materialized = (
+                role_config.get("num_gpu_blocks") is not None or role_config.get("kv_cache_capacity_bytes") is not None
+            )
     for name in ("engine_type", "aic_backend"):
         configured = role_config.pop(name, None)
         if configured is not None and configured != deployment_backend:
@@ -1526,6 +1634,17 @@ def _materialize_engine_role(
             memory_fraction_overrides[memory_field] = float(value)
 
     aic_timing_overrides = _pop_aic_timing_overrides(rank, role)
+    prefill_context_parallel_size = aic_timing_overrides.get("cp_size", 1)
+    for target in ("cp_size", "dcp"):
+        if target in aic_timing_overrides:
+            # Same contract as tp / attention_dp: a directly supplied deployment
+            # must not price one CP topology while parallel_config reports another.
+            _require_parallel_match(
+                parallel_config,
+                f"{parallel_prefix}{'cp' if target == 'cp_size' else 'dcp'}",
+                aic_timing_overrides[target],
+                f"engine provider {role} {target}",
+            )
 
     timing_model = rank.get("timing_model")
     uses_aic_timing = timing_model is None or (
@@ -1603,18 +1722,23 @@ def _materialize_engine_role(
             memory_fraction_overrides.clear()
 
     speculation_raw = rank.pop("speculation", None)
+    timing_config = timing_model.get("config", {}) if uses_aic_timing and isinstance(timing_model, dict) else {}
+    canonical_speculation = timing_config.get("speculation")
+    canonical_kind = canonical_speculation.get("kind") if isinstance(canonical_speculation, Mapping) else None
     speculation = None
     if speculation_raw is not None:
-        from .config.engine import NgramSpeculationConfig
+        from pydantic import TypeAdapter
 
-        speculation = NgramSpeculationConfig.model_validate(speculation_raw)
-        if backend != "vllm" or rank.get("native_host_offload") is not None:
-            raise ValueError("ngram speculation requires vllm without host_offload")
+        from .config.engine import NgramSpeculationConfig, SpeculationConfig
+
+        speculation = TypeAdapter(SpeculationConfig).validate_python(speculation_raw)
         if any(
             rank.get(key) is not None
             for key in (
                 "aic_nextn",
                 "nextn",
+                "aic_nextn_accepted",
+                "nextn_accepted",
                 "aic_nextn_accept_rates",
                 "nextn_accept_rates",
                 "aic_mtp_seed",
@@ -1623,8 +1747,17 @@ def _materialize_engine_role(
         ):
             raise ValueError("speculation cannot be combined with legacy speculative decoding fields")
         rank["aic_nextn"] = speculation.num_speculative_tokens
-        rank["aic_nextn_accept_rates"] = ",".join(str(rate) for rate in speculation.acceptance_rates)
+        if isinstance(speculation, NgramSpeculationConfig):
+            rank["aic_nextn_accept_rates"] = ",".join(str(rate) for rate in speculation.acceptance_rates)
+        else:
+            rank["aic_nextn_accepted"] = speculation.expected_accepted_tokens
         rank["aic_mtp_seed"] = speculation.seed
+
+    kind = speculation.kind if speculation is not None else canonical_kind
+    if kind not in (None, "none"):
+        supported = {"vllm"} if kind == "ngram" else {"vllm", "sglang"}
+        if backend not in supported or rank.get("native_host_offload") is not None:
+            raise ValueError(f"{kind} speculation requires a supported backend without host_offload")
 
     nextn = _pop_alias(rank, "aic_nextn", ("aic_nextn", "nextn"))
     if nextn is not None:
@@ -1639,7 +1772,9 @@ def _materialize_engine_role(
         ("aic_nextn_accept_rates", "nextn_accept_rates"),
     )
     if accept_rates is not None:
-        if nextn is None:
+        # Canonical timing resolves depth in native replay. Keep the authored
+        # rates intact instead of requiring the same depth on the rank too.
+        if nextn is None and canonical_kind in (None, "none"):
             raise ValueError(f"engine provider {role} aic_nextn_accept_rates requires aic_nextn")
         if not isinstance(accept_rates, str):
             raise ValueError(f"engine provider {role} aic_nextn_accept_rates must be a string")
@@ -1724,29 +1859,72 @@ def _materialize_engine_role(
             if speculation is not None:
                 cost_config = speculation.cost_config()
                 if timing_config.get("nextn") not in (None, 0):
-                    raise ValueError("ngram speculation conflicts with timing_model.config.nextn")
+                    raise ValueError("speculation conflicts with timing_model.config.nextn")
                 if timing_config.get("speculation") not in (None, cost_config):
-                    raise ValueError("ngram speculation conflicts with timing_model.config.speculation")
-                if timing_config.get("forward_model", "op_level") != "op_level":
-                    raise ValueError("ngram speculation requires op_level timing")
+                    raise ValueError("speculation conflicts with timing_model.config.speculation")
+                if speculation.kind == "ngram" and timing_config.get("forward_model", "op_level") != "op_level":
+                    raise ValueError("speculation requires op_level timing")
                 timing_config["speculation"] = cost_config
             configured_nextn = timing_config.get("nextn")
-            if speculation is None and configured_nextn is not None and configured_nextn != nextn:
+            canonical = timing_config.get("speculation")
+            if speculation is None and canonical is None and configured_nextn is not None and configured_nextn != nextn:
                 raise ValueError(
                     f"engine provider {role} aic_nextn={nextn} conflicts with "
                     f"timing_model.config.nextn={configured_nextn!r}"
                 )
-            if speculation is None:
+            if speculation is None and canonical is None:
                 timing_config["nextn"] = nextn
             timing_model["config"] = timing_config
             rank["timing_model"] = timing_model
+        elif speculation is not None and speculation.kind != "ngram":
+            raise ValueError(f"{speculation.kind} speculation requires external AIC timing")
 
+    host_offload = rank.get("native_host_offload")
+    if (
+        nested_rank is None
+        and isinstance(host_offload, dict)
+        and host_offload.get("scope") == "cluster_shared"
+        and host_offload.get("kv_layout_id") is None
+    ):
+        rank["native_host_offload"] = {**host_offload, "kv_layout_id": _kv_layout_id(rank, model, tensor_parallel_size)}
+
+    timing = rank.get("timing_model", {})
+    timing_config = timing.get("config", {}) if isinstance(timing, dict) and timing.get("provider") == "aic" else {}
+    if timing_config.get("cp_size") is not None:
+        prefill_context_parallel_size = timing_config["cp_size"]
+    prefill_context_parallel_size = _positive_int(
+        prefill_context_parallel_size,
+        f"engine provider {role} prefill context parallel size",
+    )
     return {
         "dp_size": dp_size,
         "tensor_parallel_size": tensor_parallel_size,
+        "prefill_context_parallel_size": prefill_context_parallel_size,
         "num_gpu_blocks_is_explicit": num_gpu_blocks_is_explicit,
         "rank": rank,
     }
+
+
+def _kv_layout_id(rank: Mapping[str, JSONValue], model: JSONValue, tensor_parallel_size: int) -> str:
+    """Identity of stored KV bytes: ranks may share a G2 pool only when equal.
+
+    Uses the resolved timing identity, so per-worker quantization and attention
+    backend overrides, DCP and the canonical backend version all participate.
+    """
+    timing = rank.get("timing_model")
+    config = timing.get("config", {}) if isinstance(timing, dict) else {}
+    identity = {
+        "model": config.get("model", model),
+        "backend": rank["backend"],
+        "tp": config.get("tp", tensor_parallel_size),
+        "block_size": rank.get("block_size"),
+        "bytes_per_token": rank.get("kv_cache_bytes_per_token"),
+        **{
+            name: config.get(name)
+            for name in ("backend_version", "pp", "dcp", "kvcache_quant_mode", "attention_backend")
+        },
+    }
+    return json.dumps({k: v for k, v in identity.items() if v is not None}, sort_keys=True, separators=(",", ":"))
 
 
 def _manual_state_cache(rank: Mapping[str, JSONValue], backend: str, role: str) -> StateCacheConfig | None:
@@ -1758,27 +1936,23 @@ def _manual_state_cache(rank: Mapping[str, JSONValue], backend: str, role: str) 
     state_cache = StateCacheConfig.model_validate(raw)
     if rank.get("prefix_match_unit") is not None and rank.get("aic_nextn") is not None:
         raise ValueError("prefix_match_unit does not support speculative decoding")
-    if backend != "vllm" or role != "aggregated":
-        raise ValueError("state_cache requires backend=vllm and an aggregated G1 worker")
+    if backend != "vllm" or role not in ("aggregated", "prefill", "decode"):
+        raise ValueError("state_cache requires backend=vllm and an aggregated, prefill or decode G1 worker")
     if rank.get("native_host_offload") is not None:
         raise ValueError("state_cache supports G1 only; native_host_offload is not supported")
     if rank.get("g3_offload") is not None:
         raise ValueError("state_cache supports G1 only; g3_offload is not supported")
+    # Only prefill and decode roles transfer KV.
+    transfer = ("kv_transfer_bytes_per_token", "kv_transfer_bandwidth") if role == "aggregated" else ()
     conflicts = [
         name
-        for name in (
-            "gpu_memory_utilization",
-            "mem_fraction_static",
-            "free_gpu_memory_fraction",
-            "kv_transfer_bytes_per_token",
-            "kv_transfer_bandwidth",
-        )
+        for name in ("gpu_memory_utilization", "mem_fraction_static", "free_gpu_memory_fraction", *transfer)
         if rank.get(name) is not None
     ]
     if rank.get("cuda_graph_reserved_bytes") not in (None, 0):
         conflicts.append("cuda_graph_reserved_bytes")
     # Rust serializes this default explicitly; it does not enable PD transfer.
-    if rank.get("kv_transfer_timing_mode") not in (None, "full_prompt"):
+    if role == "aggregated" and rank.get("kv_transfer_timing_mode") not in (None, "full_prompt"):
         conflicts.append("kv_transfer_timing_mode")
     if conflicts:
         raise ValueError(f"state_cache rejects capacity/transfer overrides: {', '.join(conflicts)}")
@@ -1849,6 +2023,37 @@ def _sample_synthetic_lengths(
     if isinstance(rng, np.random.RandomState):
         return rng.randint(lower, upper + 1, size=count).tolist()
     return [rng.randint(lower, upper) for _ in range(count)]
+
+
+def _require_nested_context_parallel_match(
+    role_config: Mapping[str, JSONValue],
+    parallel_config: Mapping[str, JSONValue],
+    role: str,
+) -> None:
+    """Reject ``timing_model.config.cp_size/dcp`` that disagree with ``parallel_config``.
+
+    The timing model may sit at the top level (flat CLI/Sweeper form) or under
+    the nested ``rank`` descriptor (execution-level input); both are checked.
+    """
+    rank_config = role_config.get("rank")
+    timing_source: Mapping[str, JSONValue] = rank_config if isinstance(rank_config, Mapping) else role_config
+    timing = timing_source.get("timing_model")
+    if not isinstance(timing, dict) or timing.get("type") != "external" or timing.get("provider") != "aic":
+        return
+    nested = timing.get("config")
+    if not isinstance(nested, dict):
+        return
+    prefix = "" if role == "aggregated" else f"{role}_"
+    for target, parallel_field in (("cp_size", "cp"), ("dcp", "dcp")):
+        value = nested.get(target)
+        if value is None:
+            continue
+        _require_parallel_match(
+            parallel_config,
+            f"{prefix}{parallel_field}",
+            _positive_int(value, f"engine provider {role} timing_model.config.{target}"),
+            f"engine provider {role} timing_model.config.{target}",
+        )
 
 
 def _require_parallel_match(
@@ -1952,13 +2157,17 @@ def _normalize_engine_replay_report(report: Mapping[str, JSONValue], *, include_
     metadata = {
         key: payload[key]
         for key in (
+            "prediction_provenance",
+            "state_cache",
             "agentic_qualification",
             "agentic_input_format",
             "agentic_lanes",
             "agentic_snapshots",
             "agentic_phases",
+            "agentic_profile",
             "agentic_model_projection",
             "weka_nested_timestamp_basis",
+            "fpm_query_evidence",
         )
         if key in payload
     }

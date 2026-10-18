@@ -18,8 +18,13 @@ pub struct Request {
     /// Requested output length.
     pub max_output_tokens: usize,
     /// Optional exact output IDs. Its length overrides `max_output_tokens`.
+    /// When absent, each output token is derived from `request_id` and its
+    /// output position, so reusing a request ID reproduces the same stream.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_token_ids: Option<Vec<u32>>,
+    /// Optional session attribution; does not affect scheduling or cache identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
 }
 
 /// Commands supported by the standalone scheduler.
@@ -107,13 +112,18 @@ pub struct StoredBlocks {
     pub parent_hash: Option<u64>,
     /// Optional absolute zero-based position of the first block.
     ///
-    /// `None` preserves the parent-linked stream emitted by the native
+    /// `None` preserves the parent-linked device stream emitted by the native
     /// schedulers; adapters must not invent an absolute position because that
     /// changes how downstream radix indexes reconcile stores and removals.
+    /// `HostPinned` events carry the prompt block index, because shared-pool
+    /// residency can land a child before its parent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub start_position: Option<usize>,
     /// Blocks in sequence order.
     pub blocks: Vec<KvBlock>,
+    /// Session of the request making these blocks visible, not exclusive ownership.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
 }
 
 /// Runtime-neutral KV event payload.
@@ -126,6 +136,24 @@ pub enum KvEventData {
     Removed { block_hashes: Vec<u64> },
 }
 
+/// Cache tier whose residency a [`KvEvent`] describes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KvEventTier {
+    /// Device (G1) KV cache. Omitted from serialized events.
+    #[default]
+    Device,
+    /// The native G2 host cache reachable by the publishing rank: its private
+    /// `dp_rank_local` cache or a `cluster_shared` pool.
+    HostPinned,
+}
+
+impl KvEventTier {
+    fn is_device(&self) -> bool {
+        *self == Self::Device
+    }
+}
+
 /// Ordered runtime-neutral KV event emitted by one rank.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KvEvent {
@@ -135,6 +163,9 @@ pub struct KvEvent {
     pub dp_rank: u32,
     /// Event payload.
     pub data: KvEventData,
+    /// Residency tier; absent means [`KvEventTier::Device`].
+    #[serde(default, skip_serializing_if = "KvEventTier::is_device")]
+    pub tier: KvEventTier,
 }
 
 /// First-admission provenance for prompt tokens reused across cache tiers.
@@ -232,8 +263,14 @@ pub struct Metrics {
     /// currently populated by vLLM; SGLang reports zero because its legacy
     /// occupied count already includes radix-resident pages.
     pub inactive_blocks: u64,
+    /// Zero for grouped caches: heterogeneous page sizes have no single
+    /// block capacity. Use `kv_cache_capacity_bytes` in that case.
     pub total_blocks: u64,
-    /// `active_blocks / total_blocks`, with backend-native semantics above.
+    /// Physical grouped-cache occupancy, including scheduled chunk storage.
+    pub kv_cache_used_bytes: Option<u64>,
+    /// Physical grouped-cache capacity; absent for the legacy linear pool.
+    pub kv_cache_capacity_bytes: Option<u64>,
+    /// Byte occupancy for grouped caches; otherwise `active_blocks / total_blocks`.
     pub cache_usage: f64,
     /// Physical resident fraction. This includes inactive reusable vLLM blocks
     /// and equals `cache_usage` for SGLang's legacy occupied-page metric.
@@ -292,6 +329,9 @@ pub struct CommandEffects {
 /// Effects visible as soon as an engine pass starts.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PassStartEffects {
+    /// Requests selected for this committed pass, including chunked prefill.
+    /// Queue ownership alone does not imply unfinished model work.
+    pub committed_requests: Vec<Uuid>,
     pub admissions: Vec<Admission>,
     pub pressure_events: Vec<PressureEvent>,
     pub kv_events: Vec<KvEvent>,
@@ -331,4 +371,38 @@ pub struct PassCompletionEffects {
 pub struct PendingPass {
     pub(crate) started_at_ms: f64,
     pub(crate) effects: PassCompletionEffects,
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+
+    #[test]
+    fn optional_session_metadata_is_json_compatible() {
+        let request_json = serde_json::json!({"request_id": Uuid::nil(), "tokens": [1, 2], "max_output_tokens": 1});
+        let mut request: Request = serde_json::from_value(request_json).unwrap();
+        assert!(request.session_id.is_none());
+        assert!(
+            serde_json::to_value(&request)
+                .unwrap()
+                .get("session_id")
+                .is_none()
+        );
+        request.session_id = Some("session".into());
+        assert_eq!(
+            serde_json::from_value::<Request>(serde_json::to_value(&request).unwrap()).unwrap(),
+            request
+        );
+        let legacy = serde_json::json!({"event_id": 1, "dp_rank": 0, "data": {"stored": {"parent_hash": null, "blocks": []}}});
+        let mut event: KvEvent = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&event).unwrap(), legacy);
+        let KvEventData::Stored(stored) = &mut event.data else {
+            panic!("expected store");
+        };
+        stored.session_id = Some("session".into());
+        assert_eq!(
+            serde_json::from_value::<KvEvent>(serde_json::to_value(&event).unwrap()).unwrap(),
+            event
+        );
+    }
 }

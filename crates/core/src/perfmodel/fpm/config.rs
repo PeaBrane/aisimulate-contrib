@@ -52,25 +52,41 @@ pub enum ForwardPassFallbackPolicy {
     LegacyRegression,
 }
 
-/// Target-verification cost; acceptance and scheduler progress belong to replay.
+/// Speculative cost identity shared with the SDK scheme registry.
+/// Acceptance and scheduler progress belong to replay, not this configuration.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(
-    tag = "kind",
-    content = "params",
-    rename_all = "snake_case",
-    deny_unknown_fields
-)]
-pub enum ForwardPassSpeculationConfig {
-    Ngram { num_speculative_tokens: u32 },
+#[serde(deny_unknown_fields)]
+pub struct ForwardPassSpeculationConfig {
+    pub kind: String,
+    #[serde(default)]
+    pub params: serde_json::Map<String, serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draft_model_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draft_config: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 impl ForwardPassSpeculationConfig {
-    pub fn num_speculative_tokens(&self) -> u32 {
-        match self {
-            Self::Ngram {
-                num_speculative_tokens,
-            } => *num_speculative_tokens,
+    /// Preserve the existing prompt-lookup contract for canonical and replay callers.
+    pub(crate) fn ngram_depth(&self) -> Result<u32, AicError> {
+        if self.kind != "ngram" {
+            return Err(invalid_config("expected ngram speculation"));
         }
+        if self.params.len() != 1 || !self.params.contains_key("num_speculative_tokens") {
+            return Err(invalid_config(
+                "ngram params must contain only num_speculative_tokens",
+            ));
+        }
+        if self.draft_model_path.is_some() || self.draft_config.is_some() {
+            return Err(invalid_config("ngram does not accept a draft checkpoint"));
+        }
+        self.params["num_speculative_tokens"]
+            .as_u64()
+            .filter(|depth| (1..=5).contains(depth))
+            .map(|depth| depth as u32)
+            .ok_or_else(|| {
+                invalid_config("ngram num_speculative_tokens must be an integer in 1..=5")
+            })
     }
 }
 
@@ -87,6 +103,9 @@ pub struct ForwardPassPerfModelConfig {
     pub worker_type: ForwardPassWorkerType,
     #[serde(default)]
     pub backend_version: Option<String>,
+    /// Full independent model identity, precision and resource profile.
+    #[serde(default)]
+    pub fpm_profile: Option<serde_json::Map<String, serde_json::Value>>,
 
     #[serde(default = "one", alias = "tp_size")]
     pub tp: u32,
@@ -94,10 +113,18 @@ pub struct ForwardPassPerfModelConfig {
     pub pp: u32,
     #[serde(default = "one", alias = "attention_dp_size")]
     pub attention_dp: u32,
+    /// Recorded decode context parallelism within the TP group.
+    #[serde(default)]
+    pub dcp: Option<u32>,
     #[serde(default)]
     pub moe_tp_size: Option<u32>,
     #[serde(default)]
     pub moe_ep_size: Option<u32>,
+    /// Prefill context parallelism (SGLang `--attn-cp-size`, vLLM `-pcp`): extra
+    /// attention ranks that split prefill tokens, so it widens the attention side
+    /// (`tp * attention_dp * cp_size == moe_tp_size * moe_ep_size`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cp_size: Option<u32>,
 
     #[serde(default, alias = "gemm_dtype")]
     pub gemm_quant_mode: Option<String>,
@@ -168,11 +195,14 @@ impl ForwardPassPerfModelConfig {
             backend,
             worker_type,
             backend_version: None,
+            fpm_profile: None,
             tp: 1,
             pp: 1,
             attention_dp: 1,
+            dcp: None,
             moe_tp_size: None,
             moe_ep_size: None,
+            cp_size: None,
             gemm_quant_mode: None,
             moe_quant_mode: None,
             fmha_quant_mode: None,
@@ -222,7 +252,103 @@ impl ForwardPassPerfModelConfig {
         candidates
     }
 
+    /// Validate profile metadata and pin interpolation without constructing a
+    /// graph or opening performance data. This also serves configuration-only
+    /// consumers such as memory planning.
+    pub(crate) fn resolve(self) -> Result<Self, AicError> {
+        self.resolve_with_registration().map(|(config, _)| config)
+    }
+
+    /// Retain registry availability for native candidate selection without
+    /// adding transient registry facts to the serialized request.
+    pub(crate) fn resolve_with_registration(mut self) -> Result<(Self, Option<bool>), AicError> {
+        self.estimator_config.resolve_defaults();
+        self.validate()?;
+        if let Some(speculation) = &self.speculation {
+            #[cfg(feature = "python")]
+            {
+                self.speculation = Some(crate::py::resolve_speculation_identity(speculation)?);
+            }
+            #[cfg(not(feature = "python"))]
+            if !matches!(speculation.kind.as_str(), "ngram" | "none") {
+                return Err(invalid_config(
+                    "generic speculation validation requires the python feature",
+                ));
+            }
+        }
+        if self
+            .speculation
+            .as_ref()
+            .is_some_and(|spec| spec.kind == "none")
+        {
+            self.speculation = None;
+        }
+        let registered = if self.fpm_profile.is_some() {
+            self.estimator_config
+                .fpm_interpolation
+                .validate_profile_options()?;
+            if self.dcp.is_some() {
+                return Err(invalid_config(
+                    "fpm_profile does not describe recorded DCP identity",
+                ));
+            }
+            if self.backend_version.is_none() {
+                return Err(invalid_config(
+                    "fpm_profile requires a literal backend_version",
+                ));
+            }
+            if self.nextn != 0 || self.speculation.is_some() {
+                return Err(invalid_config(
+                    "FPM profiles support plain autoregressive decoder-only execution",
+                ));
+            }
+            #[cfg(feature = "python")]
+            {
+                let facts = crate::py::validate_forward_pass_profile(&self)?;
+                self.fpm_profile = Some(facts.profile);
+                self.gemm_quant_mode = Some(facts.gemm_quant_mode);
+                self.moe_quant_mode = Some(facts.moe_quant_mode);
+                self.fmha_quant_mode = Some(facts.fmha_quant_mode);
+                self.kvcache_quant_mode = Some(facts.kvcache_quant_mode);
+                self.comm_quant_mode = Some(facts.comm_quant_mode);
+                self.attention_backend = Some(facts.attention_backend);
+                self.fpm_resources()?;
+                Some(facts.registered)
+            }
+            #[cfg(not(feature = "python"))]
+            return Err(invalid_config(
+                "FPM profile validation requires the python feature",
+            ));
+        } else {
+            None
+        };
+        self.estimator_config.fpm_interpolation.method = self
+            .estimator_config
+            .fpm_interpolation
+            .method
+            .resolve(registered)?;
+        if self.estimator_config.fpm_interpolation.method == super::FpmInterpolationMethod::Direct
+            && self.database_mode != DatabaseMode::Silicon
+        {
+            return Err(invalid_config(
+                "direct FPM interpolation requires database_mode='SILICON'; it has no analytical SOL model",
+            ));
+        }
+        self.validate()?;
+        Ok((self, registered))
+    }
+
     pub(crate) fn validate(&self) -> Result<(), AicError> {
+        if self.estimator_config.fpm_interpolation.collect_coverage
+            && (self.estimation_mode != EstimationMode::FpmInterpolation
+                || self.fallback_policy != ForwardPassFallbackPolicy::Deny
+                || self.estimator_config.fpm_interpolation.method
+                    != super::FpmInterpolationMethod::Direct)
+        {
+            return Err(invalid_config(
+                "collect_coverage requires estimation_mode='fpm_interpolation', method='direct', and fallback_policy='deny'",
+            ));
+        }
         if self.model.trim().is_empty() {
             return Err(invalid_config("model cannot be empty"));
         }
@@ -246,6 +372,22 @@ impl ForwardPassPerfModelConfig {
         if self.tp == 0 || self.pp == 0 || self.attention_dp == 0 {
             return Err(invalid_config("tp, pp, and attention_dp must be positive"));
         }
+        if self.cp_size == Some(0) {
+            return Err(invalid_config("cp_size must be positive"));
+        }
+        // Decode CP stripes the KV inside the TP group: it must divide tp and
+        // never enters the width identity below.
+        if self.dcp.is_some_and(|dcp| dcp == 0 || self.tp % dcp != 0) {
+            return Err(invalid_config("dcp must be positive and divide tp"));
+        }
+        self.estimator_config
+            .fpm_interpolation
+            .validate_quant_modes(
+                self.fmha_quant_mode
+                    .as_deref()
+                    .or(self.fpm_fmha_quant_mode.as_deref()),
+                self.comm_quant_mode.as_deref(),
+            )?;
         if self.moe_tp_size.is_some() != self.moe_ep_size.is_some() {
             return Err(invalid_config(
                 "moe_tp_size and moe_ep_size must be configured together",
@@ -257,11 +399,18 @@ impl ForwardPassPerfModelConfig {
                     "moe_tp_size and moe_ep_size must be positive",
                 ));
             }
-            if u64::from(self.tp) * u64::from(self.attention_dp)
-                != u64::from(moe_tp) * u64::from(moe_ep)
+            // Prefill CP adds attention ranks; decode CP reuses them, so only
+            // `cp_size` folds into the attention width (same identity as the
+            // replay-side `AicTimingConfig::validate_parallel_shape`). Profile
+            // schema also admits dense TP with unused MoE dimensions equal to
+            // one, and checks the exact requested deployment below.
+            let cp = u64::from(self.cp_size.unwrap_or(1));
+            if self.fpm_profile.is_none()
+                && u64::from(self.tp) * u64::from(self.attention_dp) * cp
+                    != u64::from(moe_tp) * u64::from(moe_ep)
             {
                 return Err(invalid_config(
-                    "topology requires tp * attention_dp == moe_tp_size * moe_ep_size",
+                    "topology requires tp * attention_dp * cp_size == moe_tp_size * moe_ep_size",
                 ));
             }
         }
@@ -278,7 +427,7 @@ impl ForwardPassPerfModelConfig {
                 ));
             }
         }
-        if self.estimation_mode == EstimationMode::FpmInterpolation
+        if (self.estimation_mode == EstimationMode::FpmInterpolation || self.fpm_profile.is_some())
             && (self.enable_eplb
                 || self.moe_kernel_source.is_some()
                 || self.wideep_num_slots.is_some()
@@ -296,23 +445,25 @@ impl ForwardPassPerfModelConfig {
         }
         if let Some(speculation) = &self.speculation {
             if self.nextn != 0 {
+                return Err(invalid_config("speculation cannot be combined with nextn"));
+            }
+            if speculation.kind.trim().is_empty() {
+                return Err(invalid_config("speculation kind cannot be empty"));
+            }
+            if speculation.kind == "ngram" {
+                speculation.ngram_depth()?;
+                if self.backend != BackendKind::Vllm {
+                    return Err(invalid_config("ngram speculation requires backend=vllm"));
+                }
+            }
+            if speculation.kind == "none"
+                && (!speculation.params.is_empty()
+                    || speculation.draft_model_path.is_some()
+                    || speculation.draft_config.is_some())
+            {
                 return Err(invalid_config(
-                    "ngram speculation cannot be combined with nextn",
+                    "none speculation does not accept parameters or a draft checkpoint",
                 ));
-            }
-            if self.backend != BackendKind::Vllm {
-                return Err(invalid_config("ngram speculation requires backend=vllm"));
-            }
-            if !(1..=5).contains(&speculation.num_speculative_tokens()) {
-                return Err(invalid_config(
-                    "ngram num_speculative_tokens must be in 1..=5",
-                ));
-            }
-            if !matches!(
-                self.estimation_mode,
-                EstimationMode::Auto | EstimationMode::OpLevel
-            ) {
-                return Err(invalid_config("ngram speculation requires op_level timing"));
             }
         }
         if self.estimation_mode == EstimationMode::FpmInterpolation && self.nextn != 0 {
@@ -348,7 +499,7 @@ impl ForwardPassPerfModelConfig {
     }
 }
 
-fn invalid_config(message: impl Into<String>) -> AicError {
+pub(super) fn invalid_config(message: impl Into<String>) -> AicError {
     AicError::InvalidEngineConfig(format!(
         "invalid forward pass perf model config: {}",
         message.into()
@@ -368,6 +519,136 @@ mod tests {
             .unwrap()
             .extend(value.as_object().unwrap().clone());
         serde_json::from_value(base).unwrap()
+    }
+
+    #[test]
+    fn config_resolution_preserves_spline_defaults_and_registration_contract() {
+        use super::super::estimator::{SplineFitConfig, SplineSearchConfig};
+
+        for (fit, expected) in [
+            (
+                serde_json::json!({"kind": "spline"}),
+                SplineFitConfig::default(),
+            ),
+            (
+                serde_json::json!({"kind": "spline", "spline": {
+                    "search": {"kind": "periodic", "step": 17}
+                }}),
+                SplineFitConfig {
+                    knots_per_axis: 2,
+                    search: SplineSearchConfig::periodic(17),
+                },
+            ),
+        ] {
+            let cfg = config(serde_json::json!({
+                "estimation_mode": "fpm_regression", "estimator_config": {"fpm_regression": {"fit": fit}}
+            }));
+            let normalized = cfg.clone().resolve().unwrap();
+            let (with_registration, registered) = cfg.resolve_with_registration().unwrap();
+            assert_eq!(normalized, with_registration);
+            assert_eq!(registered, None);
+            assert_eq!(
+                normalized.estimator_config.fpm_regression.fit.spline,
+                Some(expected)
+            );
+            let reloaded: ForwardPassPerfModelConfig =
+                serde_json::from_str(&serde_json::to_string(&normalized).unwrap()).unwrap();
+            assert_eq!(reloaded.resolve().unwrap(), normalized);
+        }
+        let linear = config(serde_json::json!({})).resolve().unwrap();
+        assert!(linear.estimator_config.fpm_regression.fit.spline.is_none());
+    }
+
+    #[test]
+    fn interpolation_controls_are_typed_and_resolved_before_candidates() {
+        use super::super::FpmInterpolationMethod::{Auto, Direct, Sol};
+        for (requested, registered, expected) in [
+            (Auto, None, Sol),
+            (Auto, Some(true), Sol),
+            (Auto, Some(false), Direct),
+            (Sol, None, Sol),
+            (Sol, Some(true), Sol),
+            (Direct, Some(true), Direct),
+            (Direct, Some(false), Direct),
+        ] {
+            assert_eq!(requested.resolve(registered).unwrap(), expected);
+        }
+        assert!(Direct.resolve(None).is_err());
+        assert!(Sol.resolve(Some(false)).is_err());
+        let cfg = config(serde_json::json!({})).resolve().unwrap();
+        assert_eq!(cfg.estimator_config.fpm_interpolation.method, Sol);
+        assert_eq!(cfg.estimation_mode, EstimationMode::Auto);
+        let cfg = config(serde_json::json!({
+            "estimation_mode": "fpm_regression", "fallback_policy": "allow",
+            "estimator_config": {"fpm_interpolation": {"method": "direct"}}
+        }));
+        assert!(cfg.resolve().is_err());
+        assert!(
+            serde_json::from_value::<EstimatorConfig>(serde_json::json!({
+                "fpm_interpolation": {"method": "dierct"}
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn coverage_controls_preserve_default_serialization_and_require_strict_direct() {
+        let default = serde_json::to_value(EstimatorConfig::default()).unwrap();
+        assert_eq!(
+            default["fpm_interpolation"],
+            serde_json::json!({"method": "auto"})
+        );
+        let cfg = config(serde_json::json!({
+            "estimation_mode": "fpm_interpolation",
+            "estimator_config": {"fpm_interpolation": {"method": "direct", "collect_coverage": true}}
+        }));
+        cfg.validate().unwrap();
+        let reloaded: ForwardPassPerfModelConfig =
+            serde_json::from_value(serde_json::to_value(&cfg).unwrap()).unwrap();
+        assert_eq!(cfg, reloaded);
+        for mode in [
+            EstimationMode::Auto,
+            EstimationMode::OpLevel,
+            EstimationMode::FpmRegression,
+        ] {
+            let mut invalid = cfg.clone();
+            invalid.estimation_mode = mode;
+            assert!(
+                invalid
+                    .validate()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("collect_coverage")
+            );
+        }
+        for method in [
+            super::super::FpmInterpolationMethod::Auto,
+            super::super::FpmInterpolationMethod::Sol,
+        ] {
+            let mut invalid = cfg.clone();
+            invalid.estimator_config.fpm_interpolation.method = method;
+            assert!(
+                invalid
+                    .validate()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("collect_coverage")
+            );
+        }
+        for fallback in [
+            ForwardPassFallbackPolicy::Allow,
+            ForwardPassFallbackPolicy::LegacyRegression,
+        ] {
+            let mut invalid = cfg.clone();
+            invalid.fallback_policy = fallback;
+            assert!(
+                invalid
+                    .validate()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("collect_coverage")
+            );
+        }
     }
 
     #[test]
@@ -412,6 +693,24 @@ mod tests {
         assert_eq!(decoded.wideep_num_slots, Some(256));
         assert_eq!(decoded.moe_backend.as_deref(), Some("deepep_moe"));
         assert_eq!(decoded.fallback_policy, ForwardPassFallbackPolicy::Deny);
+    }
+
+    #[test]
+    fn profile_auto_selection_does_not_drop_unsupported_engine_controls() {
+        for controls in [
+            serde_json::json!({"enable_eplb": true}),
+            serde_json::json!({"wideep_num_slots": 256}),
+            serde_json::json!({"moe_backend": "deepep_moe", "backend": "sglang"}),
+        ] {
+            let mut cfg = config(controls);
+            cfg.fpm_profile = Some(Default::default());
+            assert!(
+                cfg.validate()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("does not support EPLB")
+            );
+        }
     }
 
     #[test]
@@ -506,7 +805,9 @@ mod tests {
             EstimationMode::FpmRegression,
         ] {
             cfg.estimation_mode = mode;
-            assert!(cfg.validate().is_err());
+            // Estimator capability is checked during candidate selection, not
+            // syntax validation, so explicit fallback can retain this identity.
+            cfg.validate().unwrap();
         }
         cfg.estimation_mode = EstimationMode::Auto;
         cfg.nextn = 2;
@@ -516,9 +817,12 @@ mod tests {
         assert!(cfg.validate().is_err());
         cfg.backend = BackendKind::Vllm;
         for depth in [0, 6] {
-            cfg.speculation = Some(ForwardPassSpeculationConfig::Ngram {
-                num_speculative_tokens: depth,
-            });
+            cfg.speculation = Some(
+                serde_json::from_value(serde_json::json!({
+                    "kind": "ngram", "params": {"num_speculative_tokens": depth}
+                }))
+                .unwrap(),
+            );
             assert!(cfg.validate().is_err());
         }
     }
@@ -551,6 +855,38 @@ mod tests {
     }
 
     #[test]
+    fn context_parallel_knobs_fold_prefill_cp_only_and_round_trip() {
+        // Unset knobs stay out of the serialized identity (pre-CP configs are
+        // byte-identical) and deserialize back to None.
+        let plain = config(serde_json::json!({}));
+        let json = serde_json::to_string(&plain).unwrap();
+        assert!(!json.contains("cp_size"), "{json}");
+        assert_eq!(
+            serde_json::from_str::<ForwardPassPerfModelConfig>(&json).unwrap(),
+            plain
+        );
+
+        // Prefill CP widens the attention side to match the MoE width ...
+        let mut cfg = config(serde_json::json!({
+            "moe_tp_size": 1, "moe_ep_size": 8, "cp_size": 8, "dcp": 1
+        }));
+        cfg.validate().unwrap();
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(json.contains("\"cp_size\":8") && json.contains("\"dcp\":1"));
+        assert_eq!(
+            serde_json::from_str::<ForwardPassPerfModelConfig>(&json).unwrap(),
+            cfg
+        );
+        // ... decode CP does not: without prefill CP the widths no longer match.
+        cfg.cp_size = None;
+        assert!(cfg.validate().is_err());
+        // Zero is rejected like every other parallel size.
+        cfg.cp_size = Some(8);
+        cfg.dcp = Some(0);
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
     fn role_and_typed_estimator_controls_are_validated() {
         assert!(
             serde_json::from_value::<ForwardPassPerfModelConfig>(
@@ -578,5 +914,31 @@ mod tests {
             )
             .is_err()
         );
+    }
+    #[test]
+    fn recorded_dcp_is_validated_and_survives_round_trip() {
+        let cfg =
+            config(serde_json::json!({"tp": 8, "dcp": 8, "moe_tp_size": 8, "moe_ep_size": 1}));
+        cfg.validate().unwrap();
+        let restored: ForwardPassPerfModelConfig =
+            serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(restored.dcp, Some(8));
+        assert_eq!(config(serde_json::json!({})).dcp, None);
+        for value in [0, 3, 16] {
+            assert!(
+                config(serde_json::json!({"tp": 8, "dcp": value}))
+                    .validate()
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn unrecorded_profile_quantization_rejects_explicit_overrides() {
+        let mut cfg = config(serde_json::json!({"estimation_mode": "fpm_interpolation",
+            "estimator_config": {"fpm_interpolation": {"text_only": true, "unrecorded_quant_modes": ["fmha", "comm"]}}}));
+        cfg.validate().unwrap();
+        cfg.fmha_quant_mode = Some("bfloat16".into());
+        assert!(cfg.validate().is_err());
     }
 }

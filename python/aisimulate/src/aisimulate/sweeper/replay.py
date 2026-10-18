@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 import math
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass, field, is_dataclass
+from dataclasses import dataclass, field, fields, is_dataclass
 from enum import Enum
 from numbers import Real
 from typing import Any, Protocol, runtime_checkable
@@ -16,10 +16,14 @@ from typing import Any, Protocol, runtime_checkable
 from pydantic import BaseModel
 
 from ..config.common import ENGINE_MODEL_CONTROL_FIELDS, is_active_engine_model_control
+from ..config.traffic import AgenticProfileOptions
+from ..fpm_profile import load_fpm_profile
 from ..power import POWER_FIELDS, normalize_power_summary
 from .provider import AdapterReplaySpec, JSONValue, RuntimeHookSpec
 
 REPLAY_SPEC_API_VERSION = 1
+# Dataclass field metadata: leave the field out of canonical JSON while it is None.
+OMIT_IF_NONE = "aisimulate.omit_if_none"
 
 
 @dataclass(frozen=True)
@@ -151,6 +155,9 @@ class BackendDeploymentSpec:
     performance_model_metadata: dict[str, JSONValue] = field(default_factory=dict)
     forward_pass_estimators: dict[str, ForwardPassEstimatorSpec] = field(default_factory=dict)
     encoder: EncoderPoolSpec | None = None
+    # Per-worker tokenization: ``{"workers", "base_ms", "per_input_token_ms"}``.
+    # Omitted from canonical JSON when unset, so existing spec identities hold.
+    tokenization: dict[str, JSONValue] | None = field(default=None, metadata={OMIT_IF_NONE: True})
 
 
 @dataclass(frozen=True)
@@ -237,6 +244,77 @@ class HookCapability:
         )
 
 
+def _require_agentic_g2_scope(spec: ReplaySpec, roles: list[tuple[str, Mapping[str, Any]]]) -> None:
+    """Constrain agentic offload without narrowing ordinary HBM-only replay.
+
+    Inspect every role, including roles without G2: the supported P/D fleet is
+    one DP1 worker per role. Canonical timing and flat topology aliases must
+    receive the same early gate before a runner materializes either form.
+    """
+
+    ranks = [(role, args, args.get("rank", args)) for role, args in roles]
+    if not any(isinstance(rank, Mapping) and rank.get("native_host_offload") is not None for _, _, rank in ranks):
+        return
+    deployment = spec.backend_deployment
+    if spec.execution_mode != "offline":
+        raise ValueError("agentic host offload requires offline execution")
+    if deployment.backend != "vllm":
+        raise ValueError("agentic host offload requires backend=vllm on every role")
+    if deployment.deployment_mode == "agg":
+        counts = (deployment.num_workers,)
+    elif deployment.deployment_mode == "disagg":
+        counts = (deployment.num_prefill_workers, deployment.num_decode_workers)
+    else:
+        raise ValueError("agentic host offload supports only aggregated or disaggregated workers")
+    if any(type(count) is not int or count != 1 for count in counts):
+        raise ValueError("agentic host offload requires one aggregated worker or one prefill and one decode worker")
+    if any(hook.kind == "scaling_policy" for hook in spec.runtime_hooks):
+        raise ValueError("agentic host offload requires static worker pools without a scaling policy")
+    for role, args, rank in ranks:
+        if not isinstance(rank, Mapping):
+            continue  # The engine descriptor validator reports malformed ranks.
+        offload = rank.get("native_host_offload")
+        if isinstance(offload, Mapping) and offload.get("scope", "dp_rank_local") not in (
+            "dp_rank_local",
+            "cluster_shared",
+        ):
+            raise ValueError("agentic host offload requires scope=dp_rank_local or scope=cluster_shared")
+        timing = rank.get("timing_model")
+        identity = timing.get("config", {}) if isinstance(timing, Mapping) else {}
+        if not isinstance(identity, Mapping):
+            identity = {}
+        if any(
+            source.get(name) is not None and source[name] != "vllm"
+            for source, names in (
+                (args, ("engine_type", "aic_backend")),
+                (rank, ("backend", "engine_type", "aic_backend")),
+                (identity, ("backend",)),
+            )
+            for name in names
+        ):
+            raise ValueError("agentic host offload requires backend=vllm on every role")
+        if (
+            any(rank.get(name) is not None for name in ("aic_nextn", "nextn", "speculation"))
+            or any(identity.get(name) is not None for name in ("aic_nextn", "speculation"))
+            or identity.get("nextn") not in (None, 0)
+        ):
+            raise ValueError("agentic replay requires speculative decoding disabled")
+        prefix = "" if role == "aggregated" else f"{role}_"
+        dp_values = [
+            source[name]
+            for source, names in (
+                (args, ("dp_size", "aic_attention_dp_size")),
+                (rank, ("dp_size", "aic_attention_dp_size")),
+                (identity, ("attention_dp", "attention_dp_size")),
+                (deployment.parallel_config, (f"{prefix}attention_dp",)),
+            )
+            for name in names
+            if name in source
+        ]
+        if any(type(value) is not int or value != 1 for value in dp_values):
+            raise ValueError("agentic host offload requires attention DP=1 on every role")
+
+
 @dataclass(frozen=True)
 class RunnerCapabilities:
     """Replay-spec, backend/topology, and runtime-hook support advertised up front."""
@@ -260,6 +338,10 @@ class RunnerCapabilities:
     supported_engine_model_controls: tuple[str, ...] = ()
     supports_mtp_expected_acceptance: bool = False
     supports_state_cache: bool = False
+    supports_agentic_profile: bool = False
+    supports_grouped_kv_cache: bool = False
+    supports_generic_speculation: bool = False
+    supports_tokenization: bool = False
 
     def supports_backend_topology(self, backend: str, topology: str) -> bool:
         """Return whether a backend/topology pair is supported.
@@ -316,7 +398,11 @@ class RunnerCapabilities:
                 raise ValueError("cached_prefix_tokens is unsupported for AFD")
             if not self.supports_cached_prefix_tokens:
                 raise ValueError("runner does not support cached_prefix_tokens; use --stack engine")
-        for args in (deployment.agg_engine_args, deployment.prefill_engine_args, deployment.decode_engine_args):
+        for role, args in (
+            ("aggregated", deployment.agg_engine_args),
+            ("prefill", deployment.prefill_engine_args),
+            ("decode", deployment.decode_engine_args),
+        ):
             if not isinstance(args, Mapping):
                 continue
             rank = args.get("rank", args)
@@ -327,6 +413,40 @@ class RunnerCapabilities:
             if not isinstance(identity, Mapping):
                 # The timing validator handles malformed identities; still inspect flat controls.
                 identity = {}
+            for selection in (rank.get("speculation"), identity.get("speculation")):
+                if selection is not None and not isinstance(selection, Mapping):
+                    raise ValueError("speculation must be a mapping")
+                if isinstance(selection, Mapping) and not isinstance(selection.get("params", {}), Mapping):
+                    raise ValueError("speculation params must be a mapping")
+            profile = identity.get("fpm_profile") or rank.get("aic_fpm_profile") or rank.get("fpm_profile")
+            grouped_profile = False
+            if not self.supports_grouped_kv_cache and profile is not None:
+                # Match the runner's canonical and flat identity defaults before
+                # inspecting resources; another profile deployment is irrelevant.
+                selected = load_fpm_profile(profile).select(
+                    model=identity.get("model", args.get("aic_model_path")),
+                    system=identity.get("system", args.get("aic_system")),
+                    backend=identity.get("backend", rank.get("aic_backend", rank.get("backend", deployment.backend))),
+                    backend_version=identity.get(
+                        "backend_version",
+                        rank.get("aic_backend_version", rank.get("backend_version", deployment.backend_version)),
+                    ),
+                    worker_type=identity.get("worker_type", rank.get("worker_type", role)),
+                    tp_size=identity.get("tp", args.get("tensor_parallel_size", args.get("aic_tp_size", 1))),
+                    pp_size=identity.get("pp", rank.get("aic_pp_size", 1)),
+                    attention_dp_size=identity.get(
+                        "attention_dp", args.get("dp_size", args.get("aic_attention_dp_size", 1))
+                    ),
+                    moe_tp_size=identity.get("moe_tp_size", rank.get("moe_tp_size", rank.get("aic_moe_tp_size"))),
+                    moe_ep_size=identity.get("moe_ep_size", rank.get("moe_ep_size", rank.get("aic_moe_ep_size"))),
+                )
+                grouped_profile = selected.resources.cache_layout == "grouped"
+            if not self.supports_grouped_kv_cache and (
+                grouped_profile
+                or rank.get("kv_cache_groups") is not None
+                or rank.get("kv_cache_capacity_bytes") is not None
+            ):
+                raise ValueError("runner does not support grouped FPM caches; use --stack engine")
             active_controls = [
                 name
                 for name in ENGINE_MODEL_CONTROL_FIELDS
@@ -344,7 +464,17 @@ class RunnerCapabilities:
                 raise ValueError(
                     f"runner does not support engine model controls {unsupported_controls}; use --stack engine"
                 )
-            if any(rank.get(name) is not None for name in ("aic_nextn_accepted", "nextn_accepted")):
+            requested_speculation = rank.get("speculation")
+            if any(
+                isinstance(selection, Mapping) and selection.get("kind") not in (None, "none", "ngram")
+                for selection in (requested_speculation, identity.get("speculation"))
+            ):
+                if is_afd:
+                    raise ValueError("generic speculation is unsupported for AFD")
+                if not self.supports_generic_speculation:
+                    raise ValueError("runner does not support generic speculation; use --stack engine")
+            explicit_mtp = isinstance(requested_speculation, Mapping) and requested_speculation.get("kind") == "mtp"
+            if explicit_mtp or any(rank.get(name) is not None for name in ("aic_nextn_accepted", "nextn_accepted")):
                 if is_afd:
                     raise ValueError("explicit MTP expected acceptance is unsupported for AFD")
                 if not self.supports_mtp_expected_acceptance:
@@ -360,6 +490,11 @@ class RunnerCapabilities:
                     raise ValueError(
                         "runner does not support state_cache; select a stack that advertises this capability"
                     )
+        if deployment.tokenization is not None:
+            if not self.supports_tokenization:
+                raise ValueError("runner does not support engine.tokenization; use --stack engine")
+            if spec.execution_mode != "offline":
+                raise ValueError("engine.tokenization requires offline replay")
         if deployment.encoder is not None and deployment.deployment_mode not in {"agg", "disagg"}:
             raise ValueError("analytical EPD supports only agg/disagg language deployments; AFD is unsupported")
         if deployment.encoder is not None and not self.supports_analytical_epd:
@@ -386,6 +521,15 @@ class RunnerCapabilities:
             if not self.supports_agentic_lanes:
                 raise ValueError("runner does not support agentic_lanes")
         agentic_snapshot = spec.workload.get("agentic_snapshot")
+        agentic_profile = spec.workload.get("agentic_profile")
+        if agentic_profile is not None:
+            AgenticProfileOptions.model_validate(agentic_profile)
+            if agentic_snapshot is None:
+                raise ValueError("agentic_profile requires agentic_snapshot")
+            if spec.workload.get("max_sim_time_ms") is not None:
+                raise ValueError("agentic_profile cannot be combined with max_sim_time_ms")
+            if not self.supports_agentic_profile:
+                raise ValueError("runner does not support agentic profile")
         agentic_warmup = spec.workload.get("agentic_warmup", False)
         if type(agentic_warmup) is not bool:
             raise ValueError("agentic_warmup must be a boolean")
@@ -419,23 +563,40 @@ class RunnerCapabilities:
         if agentic_topology_required:
             if "*" not in self.supported_agentic_backends and deployment.backend not in self.supported_agentic_backends:
                 raise ValueError(f"runner does not support agentic execution with backend {deployment.backend!r}")
-            role_args = (
-                [deployment.agg_engine_args]
+            roles = (
+                [("aggregated", deployment.agg_engine_args)]
                 if deployment.deployment_mode == "agg"
-                else [deployment.prefill_engine_args, deployment.decode_engine_args]
+                else [("prefill", deployment.prefill_engine_args), ("decode", deployment.decode_engine_args)]
             )
-            for args in role_args:
-                if not args:
-                    continue
-                rank = args.get("rank", args)
-                if not isinstance(rank, Mapping):
-                    continue  # The engine descriptor validator reports malformed ranks.
-                if not self.supports_agentic_host_offload and rank.get("native_host_offload") is not None:
-                    raise ValueError("agentic replay requires HBM-only KV cache; host offload is unsupported")
-                if not self.supports_agentic_speculative_decoding and any(
-                    rank.get(key) is not None for key in ("aic_nextn", "nextn", "speculation")
-                ):
+            roles = [(role, args) for role, args in roles if isinstance(args, Mapping)]
+            # The engine descriptor validator reports malformed ranks.
+            ranks = [args.get("rank", args) for _, args in roles]
+            ranks = [rank for rank in ranks if isinstance(rank, Mapping)]
+            if not self.supports_agentic_host_offload and any(
+                rank.get("native_host_offload") is not None for rank in ranks
+            ):
+                raise ValueError("agentic replay requires HBM-only KV cache; host offload is unsupported")
+            if any(rank.get("g3_offload") is not None for rank in ranks):
+                raise ValueError("agentic replay does not support G3 offload")
+            _require_agentic_g2_scope(spec, roles)
+            for rank in ranks:
+                timing = rank.get("timing_model")
+                timing_config = timing.get("config", {}) if isinstance(timing, Mapping) else {}
+                if not isinstance(timing_config, Mapping):
+                    timing_config = {}
+                selections = (rank.get("speculation"), timing_config.get("speculation"))
+                has_sd = (
+                    any(rank.get(key) not in (None, 0) for key in ("aic_nextn", "nextn"))
+                    or any(
+                        selection is not None
+                        and (not isinstance(selection, Mapping) or selection.get("kind") != "none")
+                        for selection in selections
+                    )
+                    or timing_config.get("nextn") not in (None, 0)
+                )
+                if has_sd and not self.supports_agentic_speculative_decoding:
                     raise ValueError("agentic replay requires speculative decoding disabled")
+
         unsupported = [hook for hook in spec.runtime_hooks if not self.supports_hook(hook)]
         if unsupported:
             labels = ", ".join(f"{hook.provider}:{hook.kind}@{hook.api_version}" for hook in unsupported)
@@ -471,7 +632,11 @@ def _jsonable(value: Any) -> JSONValue:
     if isinstance(value, BaseModel):
         return _jsonable(value.model_dump(mode="json"))
     if is_dataclass(value) and not isinstance(value, type):
-        return _jsonable(asdict(value))
+        return {
+            item.name: _jsonable(getattr(value, item.name))
+            for item in fields(value)
+            if not (item.metadata.get(OMIT_IF_NONE) and getattr(value, item.name) is None)
+        }
     if isinstance(value, Enum):
         return _jsonable(value.value)
     if isinstance(value, Mapping):
