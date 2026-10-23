@@ -1443,3 +1443,22 @@ https://github.com/alibaba/tair-kvcache/blob/85402f1a012fb4279be5bb4b57613bb0a06
 
 The AISimulate files are modified re-implementations, not verbatim copies.
 Both derived files carry the source URLs and revisions in their headers.
+
+## SGLang v0.5.20 partial-edge access recency and reinsertion of an already cached prefix
+
+The following repository-root files independently model partial-edge access recency and reinsertion of an already cached prefix:
+
+- `crates/core/src/engine/cache/radix_cache.rs`
+
+The modified Rust behavior and synthetic regression fixtures adapt the contract
+observed in SGLang v0.5.20, commit `94602c9c2b7cbdb8efd5c52802dac6a1c180089e`.
+Original source paths: python/sglang/srt/mem_cache/radix_cache.py (_match_prefix_helper and _insert_helper).
+
+Source: https://github.com/sgl-project/sglang/tree/94602c9c2b7cbdb8efd5c52802dac6a1c180089e
+
+Copyright 2023-2024 SGLang Team and SGLang contributors. Apache-2.0;
+the upstream license is at
+https://github.com/sgl-project/sglang/blob/94602c9c2b7cbdb8efd5c52802dac6a1c180089e/LICENSE
+and its full text is included in this repository as `LICENSE`.
+Modified for AISimulate request leases, physical page accounting and replay.
+No serving implementation, production request content or upstream test fixture is vendored.
