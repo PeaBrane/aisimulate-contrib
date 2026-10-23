@@ -80,12 +80,17 @@ in `requests.jsonl`:
 
 | Field | Meaning |
 | --- | --- |
+| `first_admission_reused_input_tokens` | Prompt tokens reused from all tiers when the request was first admitted; later readmissions do not change it. |
+| `reused_input_tokens` | Largest reuse across the request's prefill admissions, or across all admissions without a prefill stage. |
 | `first_admission_g1_reused_input_tokens` | Prompt tokens served from G1 when the request was first admitted. |
 | `first_admission_host_reused_input_tokens` | Prompt tokens restored from G2, including G3 restores and KVCR pulls. |
 | `admission_history` | Every admission of the request, including after preemption, with the pool it reused from. |
 
 The Dynamo KV Router's overlap score is a routing estimate; these fields record
-what Replay actually reused.
+what Replay actually reused. A readmission after preemption can reuse KV the
+request itself computed, which raises `reused_input_tokens` but not
+`first_admission_reused_input_tokens`; the summary's
+`first_admission_prefix_cache_reused_ratio` aggregates the latter.
 
 <a id="host-offload-g2"></a>
 <a id="native-vllm-host-offload-prediction"></a>
