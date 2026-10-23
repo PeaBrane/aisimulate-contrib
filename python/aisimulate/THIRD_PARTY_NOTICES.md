@@ -1443,3 +1443,24 @@ https://github.com/alibaba/tair-kvcache/blob/85402f1a012fb4279be5bb4b57613bb0a06
 
 The AISimulate files are modified re-implementations, not verbatim copies.
 Both derived files carry the source URLs and revisions in their headers.
+
+## SGLang v0.5.20 stable length-policy retraction order and post-release cache eviction toward the survivor reserve
+
+The following repository-root files independently model stable length-policy retraction order and post-release cache eviction toward the survivor reserve:
+
+- `crates/core/src/engine/scheduler/sglang/core.rs`
+- `crates/core/src/engine/scheduler/sglang/decode.rs`
+- `crates/core/src/engine/scheduler/sglang/tests.rs`
+
+The modified Rust behavior and synthetic regression fixtures adapt the contract
+observed in SGLang v0.5.20, commit `94602c9c2b7cbdb8efd5c52802dac6a1c180089e`.
+Original source paths: python/sglang/srt/managers/schedule_batch.py (_get_decode_retraction_order, retract_decode and release_req).
+
+Source: https://github.com/sgl-project/sglang/tree/94602c9c2b7cbdb8efd5c52802dac6a1c180089e
+
+Copyright 2023-2024 SGLang Team and SGLang contributors. Apache-2.0;
+the upstream license is at
+https://github.com/sgl-project/sglang/blob/94602c9c2b7cbdb8efd5c52802dac6a1c180089e/LICENSE
+and its full text is included in this repository as `LICENSE`.
+Modified for AISimulate request leases, physical page accounting and replay.
+No serving implementation, production request content or upstream test fixture is vendored.

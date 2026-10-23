@@ -1,5 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-FileCopyrightText: Copyright 2023-2024 SGLang Team
 // SPDX-License-Identifier: Apache-2.0
+// Modified behavioral adaptation of SGLang v0.5.20; see THIRD_PARTY_NOTICES.md.
+// Source: https://github.com/sgl-project/sglang/tree/94602c9c2b7cbdb8efd5c52802dac6a1c180089e
 
 //! Behavioral model of the SGLang scheduler loop (`Scheduler.get_next_batch_to_run`,
 //! `update_running_batch`, `ScheduleBatch.retract_decode`) as of sgl-project/sglang v0.5.6.post2
@@ -7,8 +10,9 @@
 //! Rust from the observed semantics; no SGLang source is copied. The overlap-iteration wiring
 //! hosted here (the `HostLoop` drain, `inflight_source`, the prefix-cache commits deferred until
 //! the forward's result is observed, and the pricing of vision-cache misses) was verified against
-//! v0.5.19 (`0bcd822`); batch selection, retraction and the prefill/decode interval keep the
-//! `5c8bd8b5` pin.
+//! v0.5.19 (`0bcd822`); batch selection and the prefill/decode interval keep the `5c8bd8b5` pin.
+//! The decode retraction order and its post-release eviction (`retract_decode`, `release_req`)
+//! were verified against v0.5.20 (`94602c9c`).
 //!
 //! The optional prefill/decode interval follows the scheduling contract at
 //! https://github.com/sgl-project/sglang/blob/20621aa14bda7726a8a968f326198eac61717fef/python/sglang/srt/managers/scheduler.py
@@ -1236,7 +1240,8 @@ impl SglangCore {
                 let observed = observed.unwrap_or_default();
                 // `maybe_cache_unfinished_req`: the observed forward's prefixes enter the
                 // radix cache now, after this iteration's batch was selected. The commits
-                // are in batch order, which `running` keeps, so search on from the last match.
+                // are in batch order, which `running` keeps unless this pass retracted and
+                // reordered it, so search on from the last match, wrapping around.
                 // A retracted or cancelled request's commits were discarded with its outputs.
                 let mut cursor = 0;
                 let len = self.running.len();

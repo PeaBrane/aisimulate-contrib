@@ -1,5 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-FileCopyrightText: Copyright 2023-2024 SGLang Team
 // SPDX-License-Identifier: Apache-2.0
+// Modified behavioral adaptation of SGLang v0.5.20; see THIRD_PARTY_NOTICES.md.
+// Source: https://github.com/sgl-project/sglang/tree/94602c9c2b7cbdb8efd5c52802dac6a1c180089e
 
 use super::request::WaitingQueue;
 
@@ -674,12 +677,155 @@ fn fresh_prefill_tracks_cache_owned_prefix_pages_and_pressure_event() {
     assert_eq!(pressure.logical_available_blocks_before, Some(0));
     assert_eq!(pressure.required_blocks_before, Some(1));
     assert!(pressure.state_after.active_blocks <= pressure.state_before.active_blocks);
-    // The retracted request frees the page it owned beyond the cached prefix (one stored block
-    // removed); the cached first page survives, the second cached page had already been evicted
-    // for the blocker.
-    assert_eq!(removed_event_count(&buffer.drain()), 1);
-    assert_eq!(kv_manager.cache().page_pool.available(), 4);
-    assert_eq!(kv_manager.cache_mut().match_prefix(&prompt).0, 4);
+    // The retraction itself frees only the page the request owned beyond the cached prefix; the
+    // second cached page had already been evicted for the blocker.
+    assert_eq!(pressure.state_before.active_blocks, 3);
+    assert_eq!(pressure.state_after.active_blocks, 2);
+    // That leaves the cached first page unprotected, and `release_req` evicts it toward the
+    // blocker's 20-token reserve: two stored blocks are removed in total.
+    assert_eq!(removed_event_count(&buffer.drain()), 2);
+    assert_eq!(kv_manager.cache().page_pool.available(), 8);
+    assert_eq!(kv_manager.cache_mut().match_prefix(&prompt).0, 0);
+}
+
+mod decode_retraction {
+    use super::*;
+
+    /// A page-size-1 decode row that owns KV for its whole sequence.
+    fn row(
+        kv_manager: &mut SglangKvManager,
+        id: u128,
+        prompt: &[u32],
+        output: &[u32],
+    ) -> SglangRequest {
+        let sequence_tokens = [prompt, output].concat();
+        let sequence_len = sequence_tokens.len();
+        let allocation = kv_manager.allocate_for_request(&sequence_tokens).unwrap();
+        SglangRequest {
+            is_decode_handoff: false,
+            uuid: Uuid::from_u128(id),
+            sequence_tokens,
+            prompt_len: prompt.len(),
+            max_output_tokens: 8,
+            planned_output_ids: None,
+            kv_lease: allocation.lease,
+            materialized_tokens: sequence_len,
+            allocated_tokens: sequence_len,
+            images: Vec::new(),
+            pending_terminal: false,
+        }
+    }
+
+    /// A page-size-1 host-loop ghost row that finished on its first output token; the next
+    /// decode step still allocates that token's slot.
+    fn ghost_row(
+        kv_manager: &mut SglangKvManager,
+        id: u128,
+        prompt: &[u32],
+        output: u32,
+    ) -> SglangRequest {
+        let allocation = kv_manager.allocate_for_request(prompt).unwrap();
+        let mut sequence_tokens = prompt.to_vec();
+        sequence_tokens.push(output);
+        SglangRequest {
+            is_decode_handoff: false,
+            uuid: Uuid::from_u128(id),
+            sequence_tokens,
+            prompt_len: prompt.len(),
+            max_output_tokens: 1,
+            planned_output_ids: None,
+            kv_lease: allocation.lease,
+            materialized_tokens: prompt.len(),
+            allocated_tokens: prompt.len(),
+            images: Vec::new(),
+            pending_terminal: true,
+        }
+    }
+
+    fn ids(requests: &[SglangRequest]) -> Vec<u128> {
+        requests
+            .iter()
+            .map(|request| request.uuid.as_u128())
+            .collect()
+    }
+
+    #[test]
+    fn victim_has_the_shortest_output_then_the_longest_prompt_and_is_the_latest_tie() {
+        // No free slot and each row needs one for its next token: retracting any three-token
+        // row lets the other three decode.
+        let config = SglangConfig::from_args(&test_args(11, 1, 16));
+        let mut kv_manager = SglangKvManager::new(11, 1, KvEventPublishers::default(), 0);
+        let mut running = vec![
+            row(&mut kv_manager, 1, &[10, 11], &[12]),
+            row(&mut kv_manager, 2, &[20, 21, 22], &[]),
+            row(&mut kv_manager, 3, &[30, 31, 32], &[]),
+            row(&mut kv_manager, 4, &[40, 41], &[]),
+        ];
+        assert_eq!(kv_manager.cache().available_tokens(), 0);
+
+        let retracted = decode::check_decode_mem(&mut running, &mut kv_manager, &config);
+
+        // Rows 2 to 4 have no output and row 4 has the shortest prompt. Rows 2 and 3 tie
+        // exactly, and the later one is retracted first.
+        assert_eq!(ids(&retracted), vec![3]);
+        // The survivors keep the retraction order: longest output, then shortest prompt.
+        assert_eq!(ids(&running), vec![1, 4, 2]);
+    }
+
+    #[test]
+    fn ghost_rows_are_sorted_with_the_batch_but_never_retracted() {
+        let config = SglangConfig::from_args(&test_args(10, 1, 16));
+        let mut kv_manager = SglangKvManager::new(10, 1, KvEventPublishers::default(), 0);
+        // The ghost has the shortest output and the longest prompt, so it sorts last.
+        let mut running = vec![
+            ghost_row(&mut kv_manager, 1, &[10, 11, 12], 13),
+            row(&mut kv_manager, 2, &[20, 21], &[22, 23]),
+            row(&mut kv_manager, 3, &[30, 31], &[32]),
+        ];
+        assert_eq!(kv_manager.cache().available_tokens(), 0);
+
+        let retracted = decode::check_decode_mem(&mut running, &mut kv_manager, &config);
+
+        assert_eq!(ids(&retracted), vec![3]);
+        assert_eq!(ids(&running), vec![2, 1]);
+        assert!(running[1].pending_terminal);
+
+        // With only ghost rows to choose from, nothing is retracted or reordered.
+        let mut kv_manager = SglangKvManager::new(5, 1, KvEventPublishers::default(), 0);
+        let mut running = vec![
+            ghost_row(&mut kv_manager, 4, &[40, 41, 42], 43),
+            ghost_row(&mut kv_manager, 5, &[50, 51], 52),
+        ];
+        assert!(decode::check_decode_mem(&mut running, &mut kv_manager, &config).is_empty());
+        assert_eq!(ids(&running), vec![4, 5]);
+    }
+
+    #[test]
+    fn retraction_evicts_toward_the_reserve_without_retracting_for_it() {
+        let config = SglangConfig::from_args(&test_args(11, 1, 16));
+        let mut kv_manager = SglangKvManager::new(11, 1, KvEventPublishers::default(), 0);
+        let prefix = [1, 2, 3, 4];
+        let cached = kv_manager.allocate_for_request(&prefix).unwrap();
+        kv_manager.finish(&prefix, cached.lease);
+        // Only the row without output protects the cached prefix.
+        let mut running = vec![
+            row(&mut kv_manager, 1, &[10, 11], &[12]),
+            row(&mut kv_manager, 2, &[20, 21], &[22]),
+            row(&mut kv_manager, 3, &[1, 2, 3, 4, 5], &[]),
+        ];
+        assert_eq!(running[2].cached_tokens(), prefix.len());
+        assert_eq!(kv_manager.cache().available_tokens(), 0);
+        assert_eq!(kv_manager.cache().evictable_size, 0);
+
+        let retracted = decode::check_decode_mem(&mut running, &mut kv_manager, &config);
+
+        // Its own slot covers the survivors' next step, so nothing else is retracted although
+        // even evicting the unprotected prefix stays short of 20 tokens for each survivor.
+        assert_eq!(ids(&retracted), vec![3]);
+        assert_eq!(ids(&running), vec![1, 2]);
+        assert_eq!(kv_manager.cache().prefix_match_len(&prefix), 0);
+        assert_eq!(kv_manager.cache().available_tokens(), 5);
+    }
 }
 
 mod source_holds {
