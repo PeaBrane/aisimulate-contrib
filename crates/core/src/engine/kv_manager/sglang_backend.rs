@@ -1,5 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-FileCopyrightText: Copyright 2023-2024 SGLang Team
 // SPDX-License-Identifier: Apache-2.0
+// Modified behavioral adaptation of SGLang v0.5.20; see THIRD_PARTY_NOTICES.md.
+// Source: https://github.com/sgl-project/sglang/tree/94602c9c2b7cbdb8efd5c52802dac6a1c180089e
 
 //! SGLang KV manager — wraps [`RadixCache`] with request-level lifecycle
 //! operations and KV event publishing.
@@ -635,7 +638,7 @@ impl SglangKvManager {
         // An interleaved insert can retain different physical pages for the same prefix.
         // Move the active request to canonical pages before releasing its duplicates.
         // Acquire the extended path before releasing the old prefix so
-        // destination activation never leaves valid transferred KV unprotected.
+        // publishing a transferred prompt never leaves its valid KV unprotected.
         if new_last_node != last_node {
             self.cache.inc_lock_ref(new_last_node);
         }
@@ -695,13 +698,15 @@ impl SglangKvManager {
         })
     }
 
+    /// Hand the transferred prompt to its request without caching it: SGLang
+    /// inserts it into the radix tree only when the request is selected into a
+    /// running batch, so until then only the matched prefix stays locked.
     pub(crate) fn activate_destination_lease(
         &mut self,
         reservation: SglangDestinationReservation,
         token_ids: &[u32],
         lease: &mut RadixRequestLease,
     ) -> usize {
-        let token_count = token_ids.len();
         let SglangDestinationReservation {
             prefix_len,
             mut prefix_pages,
@@ -712,26 +717,11 @@ impl SglangKvManager {
             allocated_tokens: _,
         } = reservation;
         prefix_pages.append(&mut unpublished_pages);
-        let (new_last_node, cached_tokens) = if self.enable_prefix_caching {
-            (
-                self.cache_unfinished_hashes(
-                    lease.page_hashes_through(token_count, self.cache.page_size()),
-                    &mut prefix_pages,
-                    last_node,
-                    prefix_len,
-                    token_ids,
-                    lease.session_id.as_deref(),
-                ),
-                token_count / self.cache.page_size() * self.cache.page_size(),
-            )
-        } else {
-            (last_node, 0)
-        };
         self.log_trace("activate_destination", missing_tokens);
         lease.pages = prefix_pages;
-        lease.materialized_tokens = token_count;
-        lease.cached_tokens = cached_tokens;
-        lease.last_node = Some(new_last_node);
+        lease.materialized_tokens = token_ids.len();
+        lease.cached_tokens = prefix_len;
+        lease.last_node = Some(last_node);
         prefix_len
     }
 
@@ -1344,7 +1334,7 @@ mod tests {
     }
 
     #[test]
-    fn destination_activation_bounds_hashes_to_materialized_tokens() {
+    fn destination_publication_bounds_hashes_to_materialized_tokens() {
         for emit_token_ids in [false, true] {
             let sink = Arc::new(MockSink::new());
             let mut mgr = SglangKvManager::new_with_prefix_caching(
@@ -1366,6 +1356,13 @@ mod tests {
                 mgr.activate_destination_lease(reservation, &tokens[..4], &mut lease),
                 0
             );
+            // Activation keeps the transferred page private until the request runs.
+            assert!(sink.clone_events().is_empty());
+            assert_eq!(lease.page_count(), 1);
+            assert_eq!(lease.cached_tokens(), 0);
+            assert_eq!(mgr.cache().prefix_match_len(&tokens), 0);
+
+            mgr.extend_cached_prefix(&tokens[..4], &mut lease);
 
             let events = sink.clone_events();
             let [
@@ -1375,7 +1372,7 @@ mod tests {
                 },
             ] = events.as_slice()
             else {
-                panic!("expected one activation store");
+                panic!("expected one publication store");
             };
             assert_eq!(stored.blocks.len(), 1);
             assert_eq!(stored.blocks[0].tokens_hash, lease.page_hashes()[0].0);

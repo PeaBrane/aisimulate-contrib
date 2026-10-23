@@ -1,5 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-FileCopyrightText: Copyright 2023-2024 SGLang Team
 // SPDX-License-Identifier: Apache-2.0
+// Modified behavioral adaptation of SGLang v0.5.20; see THIRD_PARTY_NOTICES.md.
+// Source: https://github.com/sgl-project/sglang/tree/94602c9c2b7cbdb8efd5c52802dac6a1c180089e
 
 //! Behavioral model of the SGLang scheduler loop (`Scheduler.get_next_batch_to_run`,
 //! `update_running_batch`, `ScheduleBatch.retract_decode`) as of sgl-project/sglang v0.5.6.post2
@@ -417,15 +420,11 @@ impl SglangCore {
                 let Some((_, reservation)) = self.destination_holds.remove(handoff_id) else {
                     return Ok(SchedulerCommandEffects::new(SchedulerCommandResult::Noop));
                 };
-                let available_before = self.kv_manager.cache().available_tokens();
                 let request = reservation.activate(&mut self.kv_manager, self.config.block_size);
                 self.active_destination_handoffs
                     .insert(handoff_id, request.uuid);
                 self.active_request_ids.insert(request.uuid);
                 self.prebuilt_ready.push_back(request);
-                if self.kv_manager.cache().available_tokens() > available_before {
-                    self.bump_capacity_generation();
-                }
                 Ok(self.effects_after_capacity_change(SchedulerCommandResult::Applied))
             }
             SchedulerCommand::CancelDestination { handoff_id } => {
@@ -691,7 +690,12 @@ impl SglangCore {
             .iter()
             .position(|request| request.uuid == request_id)
         {
-            self.prebuilt_ready.remove(index)
+            // SGLang releases a transferred request aborted from its waiting queue
+            // through the inserting `release_kv_cache` path.
+            self.prebuilt_ready.remove(index).map(|mut request| {
+                cache_materialized_prefix(&mut request, &mut self.kv_manager, &self.config);
+                request
+            })
         } else if let Some(index) = self
             .running
             .iter()
@@ -1411,18 +1415,29 @@ impl SglangCore {
         actual_used.div_ceil(self.config.block_size) as u64
     }
 
+    /// SGLang v0.5.20 `get_new_prebuilt_batch`: transferred requests fill the free
+    /// running slots, and `process_prebuilt` caches each selected prompt, so it
+    /// becomes reusable only once its request runs.
     fn promote_prebuilt_ready(&mut self) -> Vec<crate::engine::scheduler::AdmissionEvent> {
         let mut admissions = Vec::new();
+        let mut published = false;
         while self.running.len() < self.config.max_running_requests {
-            let Some(request) = self.prebuilt_ready.pop_front() else {
+            let Some(mut request) = self.prebuilt_ready.pop_front() else {
                 break;
             };
+            let cached_before = request.cached_tokens();
+            cache_materialized_prefix(&mut request, &mut self.kv_manager, &self.config);
+            published |= request.cached_tokens() > cached_before;
             admissions.push(crate::engine::scheduler::AdmissionEvent {
                 uuid: request.uuid,
                 reused_input_tokens: 0,
                 cache_tier_attribution: None,
             });
             self.running.push(request);
+        }
+        if published {
+            // A newly cached prefix can let a pending destination reserve fewer pages.
+            self.bump_capacity_generation();
         }
         admissions
     }

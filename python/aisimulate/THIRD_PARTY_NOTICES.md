@@ -1443,3 +1443,26 @@ https://github.com/alibaba/tair-kvcache/blob/85402f1a012fb4279be5bb4b57613bb0a06
 
 The AISimulate files are modified re-implementations, not verbatim copies.
 Both derived files carry the source URLs and revisions in their headers.
+
+## SGLang v0.5.20 transferred-prompt publication at running admission and release on ready-queue cancellation
+
+The following repository-root files independently model transferred-prompt publication at running admission and release on ready-queue cancellation:
+
+- `crates/core/src/engine/kv_manager/sglang_backend.rs`
+- `crates/core/src/engine/scheduler/sglang/core.rs`
+- `crates/core/src/engine/scheduler/sglang/tests.rs`
+- `crates/core/src/replay/disagg_tests.rs`
+- `crates/core/src/replay/handoff.rs`
+
+The modified Rust behavior and synthetic regression fixtures adapt the contract
+observed in SGLang v0.5.20, commit `94602c9c2b7cbdb8efd5c52802dac6a1c180089e`.
+Original source paths: python/sglang/srt/disaggregation/decode.py (get_new_prebuilt_batch), python/sglang/srt/disaggregation/decode_schedule_batch_mixin.py (process_prebuilt), and python/sglang/srt/managers/scheduler.py (waiting-queue cancellation).
+
+Source: https://github.com/sgl-project/sglang/tree/94602c9c2b7cbdb8efd5c52802dac6a1c180089e
+
+Copyright 2023-2024 SGLang Team and SGLang contributors. Apache-2.0;
+the upstream license is at
+https://github.com/sgl-project/sglang/blob/94602c9c2b7cbdb8efd5c52802dac6a1c180089e/LICENSE
+and its full text is included in this repository as `LICENSE`.
+Modified for AISimulate request leases, physical page accounting and replay.
+No serving implementation, production request content or upstream test fixture is vendored.

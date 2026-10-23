@@ -1,5 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-FileCopyrightText: Copyright 2023-2024 SGLang Team
 // SPDX-License-Identifier: Apache-2.0
+// Modified behavioral adaptation of SGLang v0.5.20; see THIRD_PARTY_NOTICES.md.
+// Source: https://github.com/sgl-project/sglang/tree/94602c9c2b7cbdb8efd5c52802dac6a1c180089e
 
 use super::request::WaitingQueue;
 
@@ -1043,8 +1046,8 @@ mod destination_lifecycle {
         core.execute_pass(&mut collector, now_ms)
     }
 
-    fn assert_no_republished_stores(activation: &[u64], later: &[u64]) {
-        assert!(later.iter().all(|hash| !activation.contains(hash)));
+    fn assert_no_republished_stores(published: &[u64], later: &[u64]) {
+        assert!(later.iter().all(|hash| !published.contains(hash)));
     }
 
     fn occupied_tokens(core: &SglangCore) -> usize {
@@ -1104,7 +1107,7 @@ mod destination_lifecycle {
             .apply_command_effects(
                 SchedulerCommand::ReserveDestination {
                     handoff_id,
-                    request: request(logical_uuid, logical_tokens, 2),
+                    request: request(logical_uuid, logical_tokens.clone(), 2),
                 },
                 true,
             )
@@ -1142,10 +1145,21 @@ mod destination_lifecycle {
             .prebuilt_request(logical_uuid)
             .expect("activated request must be prebuilt-ready");
         assert_eq!(ready.kv_pages(), reserved_pages);
+        assert_eq!(ready.cached_tokens(), 4);
         assert_eq!(destination.running.len(), 1);
-        assert!(destination.kv_manager.cache().protected_size >= protected_before_activation);
-        let activation_stores = stored_hashes(&destination.drain_kv_events());
-        assert!(!activation_stores.is_empty());
+        // The transferred page stays private: only the matched prefix is cached and locked.
+        assert_eq!(
+            destination.kv_manager.cache().protected_size,
+            protected_before_activation
+        );
+        assert!(stored_hashes(&destination.drain_kv_events()).is_empty());
+        assert_eq!(
+            destination
+                .kv_manager
+                .cache()
+                .prefix_match_len(&logical_tokens),
+            4
+        );
 
         assert_eq!(
             source
@@ -1167,7 +1181,14 @@ mod destination_lifecycle {
             .prebuilt_request(logical_uuid)
             .expect("full running batch must keep request ready");
         assert_eq!(ready.kv_pages(), reserved_pages);
-        assert_no_republished_stores(&activation_stores, &stored_hashes(&blocked.kv_events));
+        assert!(stored_hashes(&blocked.kv_events).is_empty());
+        assert_eq!(
+            destination
+                .kv_manager
+                .cache()
+                .prefix_match_len(&logical_tokens),
+            4
+        );
 
         let blocker_terminal = execute(&mut destination, blocked.end_ms);
         assert!(
@@ -1183,6 +1204,13 @@ mod destination_lifecycle {
                 .any(|signal| signal.uuid == blocker_uuid && signal.completed)
         );
         assert!(destination.prebuilt_request(logical_uuid).is_some());
+        assert_eq!(
+            destination
+                .kv_manager
+                .cache()
+                .prefix_match_len(&logical_tokens),
+            4
+        );
 
         let admitted = execute(&mut destination, blocker_terminal.end_ms);
         let logical_admissions = admitted
@@ -1198,7 +1226,16 @@ mod destination_lifecycle {
             .find(|request| request.uuid == logical_uuid)
             .expect("prebuilt request must enter the running batch");
         assert!(running.kv_pages().starts_with(&reserved_pages));
-        assert_no_republished_stores(&activation_stores, &stored_hashes(&admitted.kv_events));
+        // Running admission caches the transferred page and publishes it once.
+        assert_eq!(
+            destination
+                .kv_manager
+                .cache()
+                .prefix_match_len(&logical_tokens),
+            8
+        );
+        let admission_stores = stored_hashes(&admitted.kv_events);
+        assert_eq!(admission_stores.len(), 1);
 
         let terminal = execute(&mut destination, admitted.end_ms);
         assert!(
@@ -1211,6 +1248,7 @@ mod destination_lifecycle {
         assert!(destination.is_drained());
         assert!(!destination.destination_is_held(handoff_id));
         assert_eq!(destination.kv_manager.cache().protected_size, 0);
+        assert_no_republished_stores(&admission_stores, &stored_hashes(&terminal.kv_events));
     }
 
     #[test]
@@ -1330,6 +1368,161 @@ mod destination_lifecycle {
             SchedulerCommandResult::Applied
         );
         core.kv_manager.release_decode_reservation(blocker);
+    }
+
+    #[test]
+    fn running_admission_of_a_shared_prompt_retries_the_pending_destination() {
+        let args = MockEngineArgs::builder()
+            .engine_type(EngineType::Sglang)
+            .num_gpu_blocks(4)
+            .block_size(4)
+            .max_num_seqs(Some(1))
+            .worker_type(WorkerType::Decode)
+            .speedup_ratio(0.0)
+            .sglang(Some(SglangArgs {
+                page_size: Some(4),
+                chunked_prefill_size: Some(16),
+                ..Default::default()
+            }))
+            .build()
+            .unwrap();
+        let mut core = SglangCore::new_with_kv_capture(args, 44);
+        let blocker = core.kv_manager.reserve_decode_pages(1).unwrap();
+        let tokens = (0..8).collect::<Vec<_>>();
+        let first_handoff = HandoffId::from(Uuid::from_u128(20_301));
+        let second_handoff = HandoffId::from(Uuid::from_u128(20_302));
+        let second_request = Uuid::from_u128(20_303);
+
+        let first = core
+            .apply_command_effects(
+                SchedulerCommand::ReserveDestination {
+                    handoff_id: first_handoff,
+                    request: request(Uuid::from_u128(20_304), tokens.clone(), 2),
+                },
+                true,
+            )
+            .unwrap();
+        assert_eq!(first.lifecycle_events.len(), 1);
+        core.apply_command(SchedulerCommand::ActivateDestination {
+            handoff_id: first_handoff,
+        })
+        .unwrap();
+
+        // The ready prompt is not reusable yet: the same prompt needs two fresh
+        // pages and only one is free.
+        let second = core
+            .apply_command_effects(
+                SchedulerCommand::ReserveDestination {
+                    handoff_id: second_handoff,
+                    request: request(second_request, tokens.clone(), 2),
+                },
+                true,
+            )
+            .unwrap();
+        assert!(second.lifecycle_events.is_empty());
+        let attempts = core.destination_reservation_attempts();
+        assert!(core.retry_pending_destinations().is_empty());
+        assert_eq!(core.destination_reservation_attempts(), attempts);
+
+        let admitted = execute(&mut core, 0.0);
+        assert_eq!(admitted.admissions.len(), 1);
+        assert_eq!(core.kv_manager.cache().prefix_match_len(&tokens), 8);
+        assert_eq!(stored_hashes(&admitted.kv_events).len(), 2);
+
+        // Publication changes what the pending head can reuse, so it is retried.
+        let retried = core.retry_pending_destinations();
+        assert!(matches!(
+            retried.as_slice(),
+            [SchedulerLifecycleEvent::DestinationReserved {
+                handoff_id: reserved_handoff,
+                request_id: reserved_request,
+                transferable_prompt_tokens: 0,
+            }] if *reserved_handoff == second_handoff && *reserved_request == second_request
+        ));
+        assert_eq!(core.destination_reservation_attempts(), attempts + 1);
+
+        for handoff_id in [second_handoff, first_handoff] {
+            assert_eq!(
+                core.apply_command(SchedulerCommand::CancelDestination { handoff_id })
+                    .unwrap(),
+                SchedulerCommandResult::Applied
+            );
+        }
+        core.kv_manager.release_decode_reservation(blocker);
+        assert!(core.is_drained());
+        assert_eq!(core.kv_manager.cache().protected_size, 0);
+    }
+
+    #[test]
+    fn cancelled_ready_transfer_caches_its_full_pages_and_frees_the_tail() {
+        let mut core = SglangCore::new_with_kv_capture(args(WorkerType::Decode), 45);
+        let tokens = (0..10).collect::<Vec<_>>();
+        let handoff_id = HandoffId::from(Uuid::from_u128(20_401));
+        core.apply_command(SchedulerCommand::ReserveDestination {
+            handoff_id,
+            request: request(Uuid::from_u128(20_402), tokens.clone(), 2),
+        })
+        .unwrap();
+        core.apply_command(SchedulerCommand::ActivateDestination { handoff_id })
+            .unwrap();
+        assert_eq!(occupied_tokens(&core), 12);
+        assert_eq!(core.kv_manager.cache().prefix_match_len(&tokens), 0);
+        assert!(core.drain_kv_events().is_empty());
+
+        assert_eq!(
+            core.apply_command(SchedulerCommand::CancelDestination { handoff_id })
+                .unwrap(),
+            SchedulerCommandResult::Applied
+        );
+        assert!(core.is_drained());
+        assert_eq!(stored_hashes(&core.drain_kv_events()).len(), 2);
+        assert_eq!(core.kv_manager.cache().prefix_match_len(&tokens), 8);
+        assert_eq!(occupied_tokens(&core), 8);
+        assert_eq!(core.kv_manager.cache().protected_size, 0);
+        assert_eq!(core.kv_manager.cache().evictable_size, 8);
+    }
+
+    #[test]
+    fn decode_without_prefix_caching_never_caches_transferred_prompts() {
+        let mut config = args(WorkerType::Decode);
+        config.enable_prefix_caching = false;
+        let mut core = SglangCore::new_with_kv_capture(config, 46);
+        let tokens = (0..8).collect::<Vec<_>>();
+        let mut now_ms = 0.0;
+        for (handoff, request_id) in [(20_501, 20_503), (20_502, 20_504)] {
+            let handoff_id = HandoffId::from(Uuid::from_u128(handoff));
+            let reserved = core
+                .apply_command_effects(
+                    SchedulerCommand::ReserveDestination {
+                        handoff_id,
+                        request: request(Uuid::from_u128(request_id), tokens.clone(), 2),
+                    },
+                    true,
+                )
+                .unwrap();
+            assert!(matches!(
+                reserved.lifecycle_events.as_slice(),
+                [SchedulerLifecycleEvent::DestinationReserved {
+                    transferable_prompt_tokens: 8,
+                    ..
+                }]
+            ));
+            core.apply_command(SchedulerCommand::ActivateDestination { handoff_id })
+                .unwrap();
+            now_ms = execute(&mut core, now_ms).end_ms;
+            assert_eq!(core.kv_manager.cache().prefix_match_len(&tokens), 0);
+        }
+        for _ in 0..8 {
+            if core.is_drained() {
+                break;
+            }
+            now_ms = execute(&mut core, now_ms).end_ms;
+            assert_eq!(core.kv_manager.cache().prefix_match_len(&tokens), 0);
+        }
+        assert!(core.is_drained());
+        assert_eq!(occupied_tokens(&core), 0);
+        assert_eq!(core.kv_manager.cache().evictable_size, 0);
+        assert!(core.drain_kv_events().is_empty());
     }
 }
 
