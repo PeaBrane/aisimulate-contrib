@@ -1,5 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-FileCopyrightText: Copyright 2023-2024 SGLang Team
 // SPDX-License-Identifier: Apache-2.0
+// Modified event-cadence adaptation of SGLang v0.5.20; see THIRD_PARTY_NOTICES.md.
+// Source: https://github.com/sgl-project/sglang/tree/94602c9c2b7cbdb8efd5c52802dac6a1c180089e
 
 //! Iteration structure that turns one AIS pass into one SGLang loop iteration.
 //!
@@ -52,6 +55,8 @@ pub(super) struct IterationTiming {
 /// What a forward produced for the scheduler, held back until it is observed.
 #[derive(Debug, Default)]
 pub(super) struct ForwardOutputs {
+    /// The observed batch selects the KV-event publication cadence.
+    pub(super) prefill: bool,
     pub(super) output_signals: Vec<OutputSignal>,
     /// Requests whose prefix the radix cache learns when this batch is observed,
     /// with the sequence length the forward materialized for them.
@@ -182,7 +187,7 @@ mod tests {
     fn outputs(signals: Vec<OutputSignal>) -> ForwardOutputs {
         ForwardOutputs {
             output_signals: signals,
-            cache_commits: Vec::new(),
+            ..Default::default()
         }
     }
 
@@ -227,6 +232,7 @@ mod tests {
                 ForwardOutputs {
                     output_signals: vec![signal(cancelled), signal(Uuid::nil())],
                     cache_commits: vec![(cancelled, 4), (Uuid::nil(), 4)],
+                    ..Default::default()
                 },
             )),
         );

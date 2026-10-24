@@ -10,8 +10,9 @@
 //! Rust from the observed semantics; no SGLang source is copied. The overlap-iteration wiring
 //! hosted here (the `HostLoop` drain, `inflight_source`, the prefix-cache commits deferred until
 //! the forward's result is observed, and the pricing of vision-cache misses) was verified against
-//! v0.5.19 (`0bcd822`); batch selection, retraction and the prefill/decode interval keep the
-//! `5c8bd8b5` pin.
+//! v0.5.19 (`0bcd822`); batch selection and the prefill/decode interval keep the `5c8bd8b5` pin.
+//! The decode retraction order and its post-release eviction (`retract_decode`, `release_req`)
+//! were verified against v0.5.20 (`94602c9c`).
 //!
 //! The optional prefill/decode interval follows the scheduling contract at
 //! https://github.com/sgl-project/sglang/blob/20621aa14bda7726a8a968f326198eac61717fef/python/sglang/srt/managers/scheduler.py
@@ -58,6 +59,9 @@ use crate::engine::scheduler::{
     capture_kv_event_sink,
 };
 
+/// SGLang publishes queued events every 40 decode forwards.
+const DECODE_LOG_INTERVAL: usize = 40;
+
 pub(crate) struct SglangCore {
     pub(super) config: SglangConfig,
     dp_rank: u32,
@@ -96,6 +100,7 @@ pub(crate) struct SglangCore {
     group_pass_prepared: bool,
     prefill_in_pass: bool,
     model_work_in_pass: bool,
+    decode_forwards: usize,
     interval_idle_in_pass: bool,
 }
 
@@ -249,6 +254,7 @@ impl SglangCore {
             group_pass_prepared: false,
             prefill_in_pass: false,
             model_work_in_pass: false,
+            decode_forwards: 0,
             interval_idle_in_pass: false,
             #[cfg(test)]
             destination_reservation_attempts: 0,
@@ -296,6 +302,23 @@ impl SglangCore {
 
     /// Apply a command at `now_ms`; `None` keeps the frontend clock where it is.
     pub(crate) fn apply_command_effects_at(
+        &mut self,
+        command: SchedulerCommand,
+        allow_destination_admission: bool,
+        now_ms: Option<f64>,
+    ) -> anyhow::Result<SchedulerCommandEffects> {
+        let effects = self.dispatch_command(command, allow_destination_admission, now_ms);
+        self.publish_kv_events_if_idle();
+        effects
+    }
+
+    fn publish_kv_events_if_idle(&mut self) {
+        if self.running.is_empty() {
+            self.kv_manager.flush_events();
+        }
+    }
+
+    fn dispatch_command(
         &mut self,
         command: SchedulerCommand,
         allow_destination_admission: bool,
@@ -482,6 +505,7 @@ impl SglangCore {
         let reservation = self
             .kv_manager
             .reserve_destination_lease(request.kv_lease.page_hashes(), request.prompt_len());
+        self.publish_kv_events_if_idle();
         self.pending_destinations.mark_front_attempted(generation);
         let Some(kv) = reservation else {
             return Vec::new();
@@ -609,9 +633,17 @@ impl SglangCore {
         request
     }
 
-    fn complete_source(&mut self, request: SglangRequest) {
+    fn complete_source(&mut self, mut request: SglangRequest) {
         let uuid = request.uuid;
         self.active_request_ids.remove(&uuid);
+        // SGLang v0.5.20 `process_batch_result_disagg_prefill` caches the completed
+        // prompt's full pages before the request waits for its KV transfer; the hold
+        // keeps the partial tail page and the path lock until release.
+        let cached_before = request.cached_tokens();
+        if self.source_holds.contains_request(uuid) {
+            cache_materialized_prefix(&mut request, &mut self.kv_manager, &self.config);
+        }
+        let published = request.cached_tokens() > cached_before;
         let transfer_timing = prefill_handoff_transfer_timing(
             request.prompt_len(),
             self.config.kv_transfer_bandwidth,
@@ -636,7 +668,8 @@ impl SglangCore {
             }
         };
         self.active_destination_handoffs.remove_request(uuid);
-        if released {
+        // A newly cached prefix can also let a pending destination reserve fewer pages.
+        if released || published {
             self.bump_capacity_generation();
         }
     }
@@ -679,6 +712,7 @@ impl SglangCore {
     fn cancel_active_request(&mut self, request_id: Uuid, now_ms: Option<f64>) -> bool {
         let frontend_now_ms =
             now_ms.or_else(|| self.frontend.as_ref().map(FrontendRuntime::now_ms));
+        let mut was_running = false;
         let request = if let Some(index) = self
             .waiting
             .iter()
@@ -701,6 +735,7 @@ impl SglangCore {
             .iter()
             .position(|request| request.uuid == request_id)
         {
+            was_running = true;
             Some(self.running.remove(index))
         } else if let Some(index) = self
             .inflight_source
@@ -732,7 +767,13 @@ impl SglangCore {
         if let Some(oracle) = &self.belady {
             oracle.retire_requests([request_id]);
         }
-        let capacity_improved = self.kv_manager.abort(std::mem::take(&mut request.kv_lease));
+        let capacity_improved = if was_running {
+            let releases_kv = request.kv_lease.is_active();
+            cleanup_completed_request(&mut request, &mut self.kv_manager, self.config.block_size);
+            releases_kv
+        } else {
+            self.kv_manager.abort(std::mem::take(&mut request.kv_lease))
+        };
         self.source_holds.remove_request(request_id);
         self.active_destination_handoffs.remove_request(request_id);
         if capacity_improved {
@@ -1203,7 +1244,7 @@ impl SglangCore {
             self.complete_source(request);
         }
         self.last_forward_ms = None;
-        let (end_ms, mut output_signals) = match &mut self.host {
+        let (end_ms, mut output_signals, observed_forward) = match &mut self.host {
             Some(host) => {
                 debug_assert!(
                     forward || decode.output_signals.is_empty(),
@@ -1216,6 +1257,7 @@ impl SglangCore {
                         (
                             forward_ms,
                             ForwardOutputs {
+                                prefill: prefill_pass,
                                 output_signals: std::mem::take(&mut decode.output_signals),
                                 cache_commits: std::mem::take(&mut decode.cache_commits),
                             },
@@ -1237,10 +1279,12 @@ impl SglangCore {
                             });
                     }
                 }
+                let observed_forward = observed.as_ref().map(|outputs| outputs.prefill);
                 let observed = observed.unwrap_or_default();
                 // `maybe_cache_unfinished_req`: the observed forward's prefixes enter the
                 // radix cache now, after this iteration's batch was selected. The commits
-                // are in batch order, which `running` keeps, so search on from the last match.
+                // are in batch order, which `running` keeps unless this pass retracted and
+                // reordered it, so search on from the last match, wrapping around.
                 // A retracted or cancelled request's commits were discarded with its outputs.
                 let mut cursor = 0;
                 let len = self.running.len();
@@ -1270,9 +1314,13 @@ impl SglangCore {
                 for request in terminals {
                     self.complete_source(request);
                 }
-                (timing.end_ms, observed.output_signals)
+                (timing.end_ms, observed.output_signals, observed_forward)
             }
-            None => (decode.end_ms, std::mem::take(&mut decode.output_signals)),
+            None => (
+                decode.end_ms,
+                std::mem::take(&mut decode.output_signals),
+                self.model_work_in_pass.then_some(prefill_pass),
+            ),
         };
         if let Some(oracle) = &self.belady {
             oracle.retire_requests(rejected.iter().map(|request| request.uuid));
@@ -1314,6 +1362,20 @@ impl SglangCore {
             // The ratio decays in `update_running_batch`, i.e. only on decode passes.
             self.new_token_ratio = (self.new_token_ratio - self.config.new_token_ratio_decay_step)
                 .max(self.config.min_new_token_ratio);
+        }
+
+        // Overlap launches the next batch before observing the previous one. Publication
+        // follows the observed result, so a prefill prompt is not delayed by a decode launch.
+        if observed_forward == Some(false) {
+            self.decode_forwards += 1;
+        }
+        if observed_forward == Some(true)
+            || (observed_forward == Some(false)
+                && self.decode_forwards.is_multiple_of(DECODE_LOG_INTERVAL))
+        {
+            self.kv_manager.flush_events();
+        } else {
+            self.publish_kv_events_if_idle();
         }
 
         // Build FPM snapshot now that all state has settled.
