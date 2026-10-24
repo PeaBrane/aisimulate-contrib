@@ -767,6 +767,14 @@ impl SglangCore {
         if let Some(oracle) = &self.belady {
             oracle.retire_requests([request_id]);
         }
+        self.source_holds.remove_request(request_id);
+        self.active_destination_handoffs.remove_request(request_id);
+        if was_running && let Some(host) = &mut self.host {
+            let Some(ready) = host.defer_cancelled_request(request) else {
+                return true;
+            };
+            request = ready;
+        }
         let capacity_improved = if was_running {
             let releases_kv = request.kv_lease.is_active();
             cleanup_completed_request(&mut request, &mut self.kv_manager, self.config.block_size);
@@ -774,8 +782,6 @@ impl SglangCore {
         } else {
             self.kv_manager.abort(std::mem::take(&mut request.kv_lease))
         };
-        self.source_holds.remove_request(request_id);
-        self.active_destination_handoffs.remove_request(request_id);
         if capacity_improved {
             self.bump_capacity_generation();
         }
@@ -1260,6 +1266,7 @@ impl SglangCore {
                                 prefill: prefill_pass,
                                 output_signals: std::mem::take(&mut decode.output_signals),
                                 cache_commits: std::mem::take(&mut decode.cache_commits),
+                                ..Default::default()
                             },
                         )
                     }),
@@ -1302,6 +1309,17 @@ impl SglangCore {
                         &self.config,
                         tokens,
                     );
+                }
+                for mut request in observed.cancelled_requests {
+                    let releases_kv = request.kv_lease.is_active();
+                    cleanup_completed_request(
+                        &mut request,
+                        &mut self.kv_manager,
+                        self.config.block_size,
+                    );
+                    if releases_kv {
+                        self.bump_capacity_generation();
+                    }
                 }
                 let mut terminals = self
                     .running

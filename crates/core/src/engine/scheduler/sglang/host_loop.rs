@@ -24,9 +24,9 @@
 //! sees `finished()` after that result is processed. Everything a forward
 //! produces for the scheduler's bookkeeping travels with the batch: its output
 //! tokens and the prefix-cache commits of `maybe_cache_unfinished_req` become
-//! visible together when the batch is observed, and a retracted or cancelled
-//! request takes its share of that payload with it while the device work stays
-//! charged.
+//! visible together when the batch is observed. Retraction or cancellation
+//! discards the request's outputs while the device work stays charged; a
+//! cancelled running request retains its KV until that observation cleans it up.
 //!
 //! The scheduler thread itself is modeled as free: request preparation is
 //! priced in the frontend stages ahead of the inbox, and batch selection,
@@ -61,6 +61,8 @@ pub(super) struct ForwardOutputs {
     /// Requests whose prefix the radix cache learns when this batch is observed,
     /// with the sequence length the forward materialized for them.
     pub(super) cache_commits: Vec<(Uuid, usize)>,
+    /// Cancelled running requests whose KV cannot be cached or released before observation.
+    pub(super) cancelled_requests: Vec<SglangRequest>,
 }
 
 impl ForwardOutputs {
@@ -132,6 +134,19 @@ impl HostLoop {
         self.in_flight
             .as_mut()
             .map_or(0, |batch| batch.outputs.discard_request(uuid))
+    }
+
+    /// Keep a cancelled request's KV until the current forward is observed.
+    /// Return it for immediate cleanup when no forward is in flight.
+    pub(super) fn defer_cancelled_request(
+        &mut self,
+        request: SglangRequest,
+    ) -> Option<SglangRequest> {
+        let Some(batch) = &mut self.in_flight else {
+            return Some(request);
+        };
+        batch.outputs.cancelled_requests.push(request);
+        None
     }
 
     /// Lay this iteration's forward and result observation on the GPU timeline.

@@ -4062,22 +4062,196 @@ mod host_loop_passes {
         }
     }
 
-    #[test]
-    fn a_cancelled_request_emits_no_output_from_the_forward_in_flight() {
-        let mut core = core(true);
-        let uuid = core.receive(direct_request((0..16).collect(), 1));
+    #[rstest::rstest]
+    fn a_cancelled_request_keeps_its_kv_private_until_the_forward_is_observed(
+        #[values(1, 8)] output_tokens: usize,
+        #[values(1, 4)] block_size: usize,
+        #[values(false, true)] prefix_caching: bool,
+    ) {
+        let mut args = test_args(128, block_size, 8192);
+        args.enable_prefix_caching = prefix_caching;
+        args.sglang.as_mut().unwrap().host_loop = true;
+        args.perf_model = crate::engine::common::perf_model::PerfModel::External {
+            timing: Arc::new(FixedTiming {
+                prefill_ms: 20.0,
+                decode_ms: 4.0,
+            }),
+        }
+        .into();
+        let mut core = SglangCore::new_with_kv_capture(args, 0);
+        let prompt: Vec<u32> = (0..16).collect();
+        let uuid = core.receive(direct_request(prompt.clone(), output_tokens));
         let first = core.execute_hidden_pass(0.0);
+        assert_eq!(first.end_ms, 0.0);
         assert!(first.output_signals.is_empty());
+        assert!(first.kv_events.is_empty());
+        assert!(core.drain_kv_events().is_empty());
+        let available_in_flight = core.kv_manager.cache().available_tokens();
+        let materialized_pages = core.running[0].materialized_tokens / block_size;
 
-        // Cancelled while its prefill result is in flight.
+        // SGLang marks a running abort for result processing, after synchronization.
         assert_eq!(
             core.apply_command(SchedulerCommand::CancelRequest { request_id: uuid })
                 .unwrap(),
             SchedulerCommandResult::Applied
         );
-        let second = core.execute_hidden_pass(first.end_ms);
-        assert!(second.output_signals.is_empty());
+        assert_eq!(core.kv_manager.cache().prefix_match_len(&prompt), 0);
+        assert!(core.drain_kv_events().is_empty());
+        assert_eq!(
+            core.kv_manager.cache().available_tokens(),
+            available_in_flight
+        );
+        assert!(!core.is_drained());
+        assert_eq!(
+            core.apply_command(SchedulerCommand::CancelRequest { request_id: uuid })
+                .unwrap(),
+            SchedulerCommandResult::Noop
+        );
+
+        // Selection precedes observation, so the next follower cannot reuse future KV.
+        let cold_follower = core.receive(direct_request(prompt.clone(), 2));
+        let observed = core.execute_hidden_pass(first.end_ms);
+        assert_eq!(observed.end_ms, 20.0);
+        assert!(observed.output_signals.is_empty());
+        assert_eq!(observed.admissions[0].uuid, cold_follower);
+        assert_eq!(observed.admissions[0].reused_input_tokens, 0);
+        assert_eq!(
+            core.kv_manager.cache().prefix_match_len(&prompt),
+            if prefix_caching { prompt.len() } else { 0 }
+        );
+        assert_eq!(
+            stored_hashes(&observed.kv_events).len(),
+            if prefix_caching {
+                materialized_pages
+            } else {
+                0
+            }
+        );
+
+        let warm_follower = core.receive(direct_request(prompt.clone(), 2));
+        let warm = core.execute_hidden_pass(observed.end_ms);
+        assert_eq!(warm.admissions[0].uuid, warm_follower);
+        assert_eq!(
+            warm.admissions[0].reused_input_tokens,
+            if prefix_caching {
+                (prompt.len() - 1) / block_size * block_size
+            } else {
+                0
+            }
+        );
+        assert!(warm.output_signals.iter().all(|signal| signal.uuid != uuid));
+        let mut now_ms = warm.end_ms;
+        for _ in 0..16 {
+            if core.is_drained() {
+                break;
+            }
+            let pass = core.execute_hidden_pass(now_ms);
+            assert!(pass.output_signals.iter().all(|signal| signal.uuid != uuid));
+            now_ms = pass.end_ms;
+        }
         assert!(core.is_drained());
+        let total_tokens = core.kv_manager.cache().total_tokens();
+        core.kv_manager.evict(total_tokens);
+        assert_eq!(core.kv_manager.cache().available_tokens(), total_tokens);
+        core.drain_kv_events();
+        assert!(core.execute_hidden_pass(now_ms).output_signals.is_empty());
+        assert!(core.drain_kv_events().is_empty());
+    }
+
+    #[test]
+    fn cancelled_decode_caches_and_releases_kv_when_an_idle_pass_observes_it() {
+        let mut args = test_args(128, 1, 8192);
+        args.sglang.as_mut().unwrap().host_loop = true;
+        args.perf_model = crate::engine::common::perf_model::PerfModel::External {
+            timing: Arc::new(FixedTiming {
+                prefill_ms: 20.0,
+                decode_ms: 4.0,
+            }),
+        }
+        .into();
+        let mut core = SglangCore::new_with_kv_capture(args, 0);
+        let prompt: Vec<u32> = (0..8).collect();
+        let uuid = core.receive(direct_request(prompt.clone(), 50));
+        let mut now_ms = 0.0;
+        for _ in 0..6 {
+            now_ms = core.execute_hidden_pass(now_ms).end_ms;
+        }
+        let sequence = core.running[0]
+            .sequence_prefix(core.running[0].materialized_tokens)
+            .to_vec();
+        assert!(sequence.len() > prompt.len());
+        assert_eq!(
+            core.kv_manager.cache().prefix_match_len(&sequence),
+            prompt.len()
+        );
+        let available_in_flight = core.kv_manager.cache().available_tokens();
+        core.apply_command(SchedulerCommand::CancelRequest { request_id: uuid })
+            .unwrap();
+        assert_eq!(
+            core.kv_manager.cache().prefix_match_len(&sequence),
+            prompt.len()
+        );
+        assert_eq!(
+            core.kv_manager.cache().available_tokens(),
+            available_in_flight
+        );
+        assert!(core.drain_kv_events().is_empty());
+        assert!(!core.is_drained());
+
+        let observed = core.execute_hidden_pass(now_ms);
+        assert_eq!(observed.end_ms, now_ms + 4.0);
+        assert!(observed.output_signals.is_empty());
+        assert_eq!(
+            core.kv_manager.cache().prefix_match_len(&sequence),
+            sequence.len()
+        );
+        assert_eq!(
+            stored_hashes(&observed.kv_events).len(),
+            sequence.len() - prompt.len()
+        );
+        assert!(core.is_drained());
+        let idle = core.execute_hidden_pass(observed.end_ms);
+        assert_eq!(idle.end_ms, observed.end_ms);
+        assert!(idle.output_signals.is_empty());
+        assert!(idle.kv_events.is_empty());
+        let total_tokens = core.kv_manager.cache().total_tokens();
+        core.kv_manager.evict(total_tokens);
+        assert_eq!(core.kv_manager.cache().available_tokens(), total_tokens);
+    }
+
+    #[test]
+    fn deferred_cancellation_cleanup_preserves_a_reused_request_id() {
+        let mut core = core(true);
+        let uuid = core.receive(direct_request((0..16).collect(), 1));
+        let launched = core.execute_hidden_pass(0.0);
+        core.apply_command(SchedulerCommand::CancelRequest { request_id: uuid })
+            .unwrap();
+        let mut replacement = direct_request((100..116).collect(), 2);
+        replacement.uuid = Some(uuid);
+        assert_eq!(core.receive(replacement), uuid);
+        let observed = core.execute_hidden_pass(launched.end_ms);
+        assert_eq!(observed.admissions[0].uuid, uuid);
+        assert!(observed.output_signals.is_empty());
+        assert_eq!(core.running.len(), 1);
+        let mut now_ms = observed.end_ms;
+        let mut output_tokens = 0;
+        for _ in 0..8 {
+            if core.is_drained() {
+                break;
+            }
+            let pass = core.execute_hidden_pass(now_ms);
+            output_tokens += pass
+                .output_signals
+                .iter()
+                .filter(|signal| signal.token_id.is_some())
+                .count();
+            now_ms = pass.end_ms;
+        }
+        assert_eq!(output_tokens, 2);
+        assert!(core.is_drained());
+        let total_tokens = core.kv_manager.cache().total_tokens();
+        core.kv_manager.evict(total_tokens);
+        assert_eq!(core.kv_manager.cache().available_tokens(), total_tokens);
     }
 
     #[test]

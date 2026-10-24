@@ -1530,3 +1530,7 @@ No serving implementation, production request content or upstream test fixture i
 ## SGLang cache publication and KV event cadence
 
 The modified behavior and synthetic tests in `crates/core/src/engine/kv_manager/sglang_backend.rs`, `crates/core/src/engine/scheduler/sglang/core.rs`, `crates/core/src/engine/scheduler/sglang/decode.rs`, `crates/core/src/engine/scheduler/sglang/host_loop.rs`, and `crates/core/src/engine/scheduler/sglang/tests.rs` adapt the cache insert points and event queue/publish contract from SGLang v0.5.20, immutable commit `94602c9c2b7cbdb8efd5c52802dac6a1c180089e`: `python/sglang/srt/mem_cache/radix_cache.py`, `python/sglang/srt/mem_cache/events.py`, `python/sglang/srt/managers/scheduler.py`, `python/sglang/srt/managers/scheduler_components/batch_result_processor.py`, and `python/sglang/srt/managers/scheduler_components/metrics_reporter.py`. Source: https://github.com/sgl-project/sglang/tree/94602c9c2b7cbdb8efd5c52802dac6a1c180089e . Copyright 2023-2024 SGLang Team and contributors, Apache-2.0. The license text is included as `LICENSE`. Modified for AISimulate request leases, overlap observation, and physical page accounting. No production fixture is included.
+
+Running-request cancellation retains its KV lease until the in-flight forward
+is observed, adapting `Scheduler.abort_request` and result-time
+`release_kv_cache` from the same pinned scheduler and batch-result sources.
