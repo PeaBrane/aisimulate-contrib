@@ -15,7 +15,9 @@ import pytest
 
 from aisimulate_core.sdk import common, config
 from aisimulate_core.sdk.afd_partition import build_afd_ops_partition
+from aisimulate_core.sdk.backends.factory import get_backend
 from aisimulate_core.sdk.models import get_model
+from aisimulate_core.sdk.perf_database import get_database
 
 pytestmark = pytest.mark.unit
 
@@ -152,3 +154,64 @@ def test_moe_context_logits_stays_on_the_afd_boundary(boundary_on_attn):
     assert sum(op is logits for op in selected_ops) == 1
     assert logits not in other_ops
     assert logits not in partition.skipped_ops
+
+
+@pytest.fixture(scope="module")
+def afd_database():
+    return get_database("b200_sxm", "vllm", "current")
+
+
+@pytest.mark.parametrize("use_op_list", [True, False], ids=["compiled-list", "single-op-fallback"])
+@pytest.mark.parametrize("boundary_on_attn", [True, False], ids=["a-boundary", "f-boundary"])
+@pytest.mark.parametrize(
+    ("is_context", "seq_len", "prefix"),
+    [(True, 1, 0), (True, 1024, 0), (True, 512, 512), (False, 1024, 512)],
+    ids=["prefill-one-token", "prefill-1024", "prefill-cached-prefix", "decode"],
+)
+def test_moe_afd_logits_latency_uses_one_token_per_request(
+    monkeypatch, afd_database, use_op_list, boundary_on_attn, is_context, seq_len, prefix
+):
+    from aisimulate.sdk.inference_session import AFDInferenceSession
+
+    model_config = config.ModelConfig(tp_size=4, moe_tp_size=1, moe_ep_size=4, **_BF16)
+    model = get_model("Qwen/Qwen3-30B-A3B", model_config, "vllm")
+    session = AFDInferenceSession(
+        model.model_path,
+        model_config,
+        model_config,
+        afd_database,
+        get_backend("vllm"),
+        config.AFDConfig(gpus_per_node=8),
+    )
+    if not use_op_list:
+        # Exercise the per-op path used when an op is outside the compiled list.
+        monkeypatch.setattr(session, "_sum_latency_with_rust", lambda *args, **kwargs: None)
+
+    phase = "context" if is_context else "generation"
+    partition = build_afd_ops_partition(model, phase=phase, boundary_on_attn=boundary_on_attn)
+    runtime = config.RuntimeConfig(batch_size=4, isl=seq_len + prefix, osl=2, prefix=prefix)
+    per_op = {}
+    for worker_ops in (partition.attn_ops, partition.ffn_ops):
+        # Use the real graph's GEMMs on both sides of the A/F boundary. The
+        # QKV control must retain all uncached tokens while logits emits only
+        # one token per request. Native tables supply all performance values.
+        gemms = [op for op in worker_ops if op._name in {f"{phase}_qkv_gemm", f"{phase}_logits_gemm"}]
+        total, values = session._sum_latency(
+            gemms, batch_size=4, seq_len=seq_len, model=model, runtime_config=runtime, is_context=is_context
+        )
+        assert total == pytest.approx(sum(values.values()))
+        per_op.update(values)
+
+    phase_ops = model.context_ops if is_context else model.generation_ops
+    logits = next(op for op in phase_ops if op._name == f"{phase}_logits_gemm")
+    qkv = next(op for op in phase_ops if op._name == f"{phase}_qkv_gemm")
+    # Independent shape anchors: four requests project four final hidden
+    # states, while QKV processes 4*1024 tokens for the uncached prefill case.
+    expected_logits = float(logits._engine_query(afd_database, x=4))
+    expected_qkv = float(qkv._engine_query(afd_database, x=4 * seq_len if is_context else 4))
+    assert per_op == {
+        logits._name: pytest.approx(expected_logits),
+        qkv._name: pytest.approx(expected_qkv),
+    }
+    if is_context and seq_len > 1:
+        assert float(logits._engine_query(afd_database, x=4 * seq_len)) > expected_logits

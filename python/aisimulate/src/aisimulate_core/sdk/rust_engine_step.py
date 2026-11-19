@@ -1137,8 +1137,8 @@ def evaluate_context_ops_with_rust(
     energy_wms, source)`` tuples, name-folded (repeated names accumulate,
     sources merge to ``"mixed"`` on mismatch) — the orchestration itself
     stays in Python. ``x`` overrides the token count verbatim for callers
-    with their own x policy (AFD's uniform ``batch * s``); ``None`` keeps
-    the base-phase rule (logits-GEMM exception).
+    with a custom token-count policy; ``None`` keeps the base-phase rule
+    (``batch * s``, except ``batch`` for the logits GEMM), as used by AFD.
     """
     handle = _cached_engine_handle(model, database)
     result = handle.evaluate_context_ops(

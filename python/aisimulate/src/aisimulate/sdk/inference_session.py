@@ -1068,7 +1068,8 @@ class AFDInferenceSession:
         For prefill (``is_context=True``) we pass ``seq_imbalance_correction_scale``;
         for decode we pass ``gen_seq_imbalance_correction_scale``.  Tokens
         processed per call = ``batch_size`` for decode, ``batch_size*seq_len``
-        for prefill (one token per sequence vs. full sequence).
+        for prefill, except the logits GEMM projects only the last hidden
+        state of each request (``batch_size`` tokens in either phase).
 
         The per-op values come from the compiled engine when the routing gate
         allows (the op-list evaluation FFI); the AFD orchestration — the A/F
@@ -1107,6 +1108,7 @@ class AFDInferenceSession:
 
         per_op = defaultdict(float)
         for op in ops:
+            kwargs_common["x"] = batch_size if is_context and "logits_gemm" in op._name else x
             # Internal shim entry (no DeprecationWarning): same engine-backed
             # value as the deprecated public op.query().
             result = op._engine_query(self._database, **kwargs_common)
@@ -1130,10 +1132,11 @@ class AFDInferenceSession:
         Maps the partitioned op objects to their positions in
         ``model.context_ops`` / ``model.generation_ops`` (the compiled spec
         preserves that order 1:1) and evaluates them through the thin op-list
-        FFI with ``_sum_latency``'s exact query shape: uniform ``x`` (no
-        logits-GEMM exception) and the runtime ``prefix`` threaded into BOTH
-        phases. Falls back (returns ``None``) for ops outside the model lists
-        and for op graphs the spec cannot express.
+        FFI with the context phase's default token counts (including the
+        logits-GEMM exception), decode's explicit ``x``, and the runtime
+        ``prefix`` threaded into BOTH phases. Falls back (returns ``None``)
+        for ops outside the model lists and for op graphs the spec cannot
+        express.
         """
         from aisimulate.sdk.rust_engine_step import (
             RustEngineUnsupportedError,
@@ -1179,7 +1182,6 @@ class AFDInferenceSession:
                     s=seq_len,
                     prefix=prefix,
                     seq_imbalance_correction_scale=runtime_config.seq_imbalance_correction_scale,
-                    x=x,
                 )
             else:
                 entries = evaluate_generation_ops_with_rust(

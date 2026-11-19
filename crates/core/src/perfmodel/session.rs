@@ -277,8 +277,8 @@ pub(crate) fn run_context_ops_planned<'a>(
 /// context walk shares. Default token count is `x = batch * effective_isl`,
 /// except the logits GEMM's `x = batch` (mirroring `base_backend.py:337`);
 /// `x_override` replaces it verbatim for Python orchestrations with their own
-/// x policy (AFD's `_sum_latency` uses a uniform `batch * s` with NO logits
-/// exception). The index-addressed `evaluate` FFI calls this directly.
+/// token-count policy; AFD leaves it unset to retain the phase rule. The
+/// index-addressed `evaluate` FFI calls this directly.
 pub(crate) fn query_context_op(
     op: &Op,
     db: &PerfDatabase,
