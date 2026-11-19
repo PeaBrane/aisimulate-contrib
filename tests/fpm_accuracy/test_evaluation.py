@@ -1,11 +1,19 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import hashlib
+import importlib
 import json
+import math
+import os
+import pickle
+import subprocess
+import sys
+import textwrap
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -35,6 +43,281 @@ def case(tmp_path):
         tmp_path, protocol_id="forward-pass-measurement-v1", files=[("truth", "traffic.jsonl", content)]
     )
     return dataset.measurement_case(CONFIGURATION_PATH)
+
+
+def test_configuration_worker_preserves_results_and_measurement_membership(case):
+    from scripts.fpm_accuracy.run_fpm_accuracy import evaluate_configuration, evaluate_isolated
+
+    unavailable = replace(case, status="no_measurements", observations=(), fpm_artifacts=())
+    expected = evaluate_configuration(unavailable, False, True)
+    actual = evaluate_isolated(unavailable, False, True)
+    assert actual == expected
+    assert actual[0]["configuration_id"] == case.configuration.configuration_id
+
+
+def test_measured_configuration_crosses_spawn_boundary_with_scenarios_and_comparison(case):
+    from scripts.fpm_accuracy.run_fpm_accuracy import evaluate_configuration, evaluate_isolated
+
+    assert str(case.status) == "ready"
+    assert case.observations and case.fpm_artifacts
+    expected = evaluate_configuration(case, True, True)
+    actual = evaluate_isolated(case, True, True)
+
+    def semantic_output(value):
+        if isinstance(value, (tuple, list)):
+            return [semantic_output(item) for item in value]
+        if not isinstance(value, dict):
+            return value
+        output = {key: semantic_output(item) for key, item in value.items()}
+        if "cost" in output:
+            for field in ("fit_ms", "predict_us", "update_us"):
+                duration = output["cost"][field]
+                if duration is not None:
+                    assert math.isfinite(duration) and duration >= 0
+                    output["cost"][field] = "recorded"
+        return output
+
+    assert semantic_output(actual) == semantic_output(expected)
+    row, details, scenario, comparison = actual
+    assert row["measurement_count"] == len(case.observations)
+    assert details and scenario["measurement_count"] == len(case.observations)
+    assert comparison.keys() == {case.configuration_id + "/" + case.configuration.snapshot_id}
+    for method in row["results"].values():
+        assert method["metrics"]["all"]["measured_count"] == len(case.observations)
+
+
+def test_worker_exit_zero_cannot_look_like_a_completed_configuration():
+    from scripts.fpm_accuracy.run_fpm_accuracy import evaluate_isolated
+
+    class ExitInWorker:
+        configuration = SimpleNamespace(configuration_path="fixture/worker-exit-zero")
+
+        def __reduce__(self):
+            # Fault injection runs only when the spawned worker receives its
+            # case; the parent must reject even a successful native exit.
+            return os._exit, (0,)
+
+    with pytest.raises(RuntimeError, match="FPM configuration did not complete: fixture/worker-exit-zero"):
+        evaluate_isolated(ExitInWorker(), True, True)
+
+
+def test_cli_worker_exit_fails_without_publishing_partial_results(case, tmp_path):
+    case_file = tmp_path / "case.pkl"
+    case_file.write_bytes(pickle.dumps(case))
+    wheel = tmp_path / "fixture.whl"
+    wheel.write_bytes(b"synthetic wheel identity for worker-exit test")
+    output = tmp_path / "public"
+    comparison = tmp_path / "comparison.json"
+    harness = tmp_path / "worker_exit.py"
+    harness.write_text(
+        textwrap.dedent("""\
+        import hashlib, json, os, pickle, sys
+        from pathlib import Path
+        from types import SimpleNamespace
+        from scripts.fpm_accuracy import run_fpm_accuracy as cli
+
+        def exit_during_prediction(*args, **kwargs):
+            os._exit(0)
+
+        # spawn imports this harness in the child. Apply the same controlled
+        # native-exit fault there, without replacing the production worker.
+        cli.evaluate_case = exit_during_prediction
+
+        if __name__ == "__main__":
+            case_path, wheel_path, output, comparison = sys.argv[1:]
+            case = pickle.loads(Path(case_path).read_bytes())
+            digest = hashlib.sha256(Path(wheel_path).read_bytes()).hexdigest()
+            sys.modules["aisim_core.sdk"] = SimpleNamespace(RustForwardPassPerfModel=object())
+            cli.installed_distribution = lambda: SimpleNamespace(
+                read_text=lambda _: json.dumps({"archive_info": {"hashes": {"sha256": digest}}})
+            )
+            cli.HfDataset.from_hub = lambda **_: SimpleNamespace(
+                revision="a" * 40,
+                configurations=lambda: [case.configuration],
+                measurement_case=lambda *a, **kw: case,
+            )
+            sys.argv = [
+                "run_fpm_accuracy", "--branch", "main", "--commit", "a" * 40,
+                "--evaluator-sha", "a" * 40, "--hf-revision", "a" * 40,
+                "--wheel", wheel_path, "--run-id", "1", "--run-attempt", "1",
+                "--scenarios", "--output", output, "--comparison-output", comparison,
+            ]
+            cli.main()
+    """)
+    )
+    root = Path(__file__).resolve().parents[2]
+    completed = subprocess.run(
+        [sys.executable, str(harness), str(case_file), str(wheel), str(output), str(comparison)],
+        cwd=root,
+        env={**os.environ, "PYTHONPATH": str(root)},
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert completed.returncode != 0, "an early native exit must fail the CLI"
+    assert "FPM configuration did not complete" in completed.stderr
+    assert not (output / "summary.json").exists()
+    assert not (output / "qualification.json").exists()
+    assert not comparison.exists()
+
+
+def test_cli_duplicate_comparison_identity_cannot_publish_partial_results(case, tmp_path, monkeypatch):
+    from scripts.fpm_accuracy import run_fpm_accuracy as cli
+
+    wheel = tmp_path / "fixture.whl"
+    wheel.write_bytes(b"synthetic wheel identity for duplicate-comparison test")
+    digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
+    monkeypatch.setattr(cli, "runtime_module", lambda _: SimpleNamespace(RustForwardPassPerfModel=object()))
+    monkeypatch.setattr(
+        cli,
+        "installed_distribution",
+        lambda: SimpleNamespace(read_text=lambda _: json.dumps({"archive_info": {"hashes": {"sha256": digest}}})),
+    )
+    configurations = [
+        case.configuration,
+        SimpleNamespace(configuration_path="fixture/second-configuration", snapshot_id=case.configuration.snapshot_id),
+    ]
+    monkeypatch.setattr(
+        cli.HfDataset,
+        "from_hub",
+        lambda **_: SimpleNamespace(
+            revision="a" * 40,
+            configurations=lambda: configurations,
+            measurement_case=lambda *args, **kwargs: case,
+        ),
+    )
+    evaluated = []
+
+    def evaluate(*args):
+        evaluated.append(args)
+        return {}, [], None, {"duplicated-identity": {}}
+
+    monkeypatch.setattr(cli, "evaluate_isolated", evaluate)
+    output, comparison = tmp_path / "public", tmp_path / "comparison.json"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_fpm_accuracy",
+            "--branch",
+            "main",
+            "--commit",
+            "a" * 40,
+            "--evaluator-sha",
+            "a" * 40,
+            "--hf-revision",
+            "a" * 40,
+            "--wheel",
+            str(wheel),
+            "--run-id",
+            "1",
+            "--run-attempt",
+            "1",
+            "--output",
+            str(output),
+            "--comparison-output",
+            str(comparison),
+        ],
+    )
+    with pytest.raises(ValueError, match="duplicate configuration comparison identity"):
+        cli.main()
+    assert len(evaluated) == 2
+    assert not (output / "summary.json").exists()
+    assert not (output / "qualification.json").exists()
+    assert not comparison.exists()
+
+
+@pytest.mark.parametrize("namespace", ["aisim_core", "aisimulate_core"])
+def test_fpm_predictor_reaches_current_and_historical_runtime_namespaces(tmp_path, namespace):
+    package = tmp_path / namespace
+    package.mkdir()
+    (package / "__init__.py").touch()
+    (package / "sdk.py").write_text("class RustForwardPassPerfModel: pass\nclass ForwardPassPerfModelConfig: pass\n")
+    harness = tmp_path / "runtime_probe.py"
+    harness.write_text(
+        textwrap.dedent("""\
+        import importlib.abc, sys
+        namespace = sys.argv[1]
+        if namespace == "aisimulate_core":
+            class HistoricalEnvironment(importlib.abc.MetaPathFinder):
+                def find_spec(self, fullname, path, target=None):
+                    if fullname == "aisim_core":
+                        raise ModuleNotFoundError("current namespace is absent", name=fullname)
+            sys.meta_path.insert(0, HistoricalEnvironment())
+        from scripts.fpm_accuracy.models.aic_predictors import (
+            _canonical_config_type, _import_aisim_forward_pass_perf_model,
+        )
+        assert _import_aisim_forward_pass_perf_model().__module__ == namespace + ".sdk"
+        assert _canonical_config_type().__module__ == namespace + ".sdk"
+    """)
+    )
+    root = Path(__file__).resolve().parents[2]
+    completed = subprocess.run(
+        [sys.executable, str(harness), namespace],
+        cwd=tmp_path,
+        env={**os.environ, "PYTHONPATH": os.pathsep.join((str(tmp_path), str(root)))},
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+@pytest.mark.parametrize("method", ["warmup", "learned"])
+@pytest.mark.parametrize("failure", ["missing_export", "initialization_error"])
+def test_predictor_export_absence_preserves_scoring_classification(case, monkeypatch, method, failure):
+    from scripts.fpm_accuracy.evaluate import score
+    from scripts.fpm_accuracy.models import learned_predictor
+
+    def load_runtime(name):
+        if failure == "initialization_error":
+            raise AttributeError("unrelated module initialization failure")
+        return SimpleNamespace()
+
+    adapter = aic_predictors if method == "warmup" else learned_predictor
+    monkeypatch.setattr(adapter, "runtime_module", load_runtime)
+    result = score(case, method, case.fpm_artifacts[0] if method == "warmup" else None)
+    failed = failure == "initialization_error"
+    assert result["status"] == ("predictor_error" if failed else "unsupported_predictor")
+    metrics = result["metrics"]["all"]
+    assert metrics["measured_count"] == len(case.observations) == 12
+    assert metrics["predicted_count"] == metrics["tuning_error_count"] == 0
+    assert metrics["error_count"] == (12 if failed else 0)
+    assert metrics["unavailable_count"] == (0 if failed else 12)
+
+
+def test_lazy_sdk_export_with_missing_implementation_remains_unsupported(case, monkeypatch):
+    from scripts.fpm_accuracy.evaluate import score
+
+    root = ModuleType("aisim_core")
+    root.__path__ = []
+    sdk = ModuleType("aisim_core.sdk")
+    sdk.__path__ = []
+
+    def lazy_export(name):
+        if name == "RustForwardPassPerfModel":
+            return importlib.import_module("aisim_core.sdk.rust_engine_step").RustForwardPassPerfModel
+        raise AttributeError(name)
+
+    sdk.__getattr__ = lazy_export
+    monkeypatch.setitem(sys.modules, root.__name__, root)
+    monkeypatch.setitem(sys.modules, sdk.__name__, sdk)
+    monkeypatch.delitem(sys.modules, "aisim_core.sdk.rust_engine_step", raising=False)
+    result = score(case, "warmup", case.fpm_artifacts[0])
+    assert result["status"] == "unsupported_predictor"
+    metric = result["metrics"]["all"]
+    assert metric["measured_count"] == metric["unavailable_count"] == len(case.observations) == 12
+    assert metric["predicted_count"] == metric["error_count"] == metric["tuning_error_count"] == 0
+
+
+def test_successful_dependency_exit_cannot_qualify_an_incomplete_campaign(case, monkeypatch):
+    from scripts.fpm_accuracy import run_fpm_accuracy
+
+    def exit_early(*args, **kwargs):
+        raise SystemExit(0)
+
+    monkeypatch.setattr(run_fpm_accuracy, "evaluate_case", exit_early)
+    with pytest.raises(RuntimeError, match="exited before returning results: 0"):
+        run_fpm_accuracy.evaluate_configuration(case, False, True)
 
 
 class Predictor(ForwardPassTimePredictor):
@@ -99,16 +382,17 @@ def test_membership_cold_start_and_predict_before_tune(case):
         assert predict[0] == "predict" and tune == ("tune", predict[1])
 
 
+@pytest.mark.parametrize("fpm_schema_version", [7, 8])
 @pytest.mark.parametrize("execution_profile", ["full", "decoder_bounded"])
 def test_v7_keeps_measurements_and_regression_without_staging_incomplete_identity(
-    tmp_path, monkeypatch, execution_profile
+    tmp_path, monkeypatch, execution_profile, fpm_schema_version
 ):
     content = "\n".join(json.dumps(_fpm_payload(counter=index)) for index in range(12)).encode()
     dataset = _build_dataset(
         tmp_path,
         protocol_id="forward-pass-measurement-v1",
         files=[("truth", "traffic.jsonl", content)],
-        fpm_schema_version=7,
+        fpm_schema_version=fpm_schema_version,
     )
     parquet = tmp_path / CONFIGURATION_PATH / "fpm/fpm.parquet"
     table = pq.read_table(parquet)
@@ -130,7 +414,7 @@ def test_v7_keeps_measurements_and_regression_without_staging_incomplete_identit
     # Reaching native model construction would fail on this sentinel.
     monkeypatch.setattr(aic_predictors, "_import_aisim_forward_pass_perf_model", lambda: SimpleNamespace())
     case = dataset.measurement_case(CONFIGURATION_PATH)
-    with pytest.raises(DependencyError, match="schema v7"):
+    with pytest.raises(DependencyError, match=f"schema v{fpm_schema_version}"):
         prepare_aic_fpm_database({}, case.fpm_artifacts[0])
 
     def factory(method, context):
@@ -378,7 +662,7 @@ def recommended_regression_config():
 @pytest.mark.parametrize("dcp", [1, 8])
 @pytest.mark.parametrize("role", ["prefill", "decode", "aggregated"])
 def test_real_regression_uses_recommended_gym_config_only(tmp_path, dcp, role, recommended_regression_config):
-    sdk = pytest.importorskip("aisimulate_core.sdk")
+    sdk = pytest.importorskip("aisim_core.sdk")
     from scripts.fpm_accuracy.models.fpt_predictor import PredictorContext
 
     case = _build_dataset(tmp_path, protocol_id=None, files=[], tp=8, dcp=dcp).measurement_case(CONFIGURATION_PATH)
@@ -414,7 +698,7 @@ def test_real_regression_uses_recommended_gym_config_only(tmp_path, dcp, role, r
     "grid_options,bins", [({}, [4, 1]), ({"bucket_count": 9}, [3, 3]), ({"bucket_shape": [2, 3]}, [2, 3])]
 )
 def test_real_regression_preserves_explicit_controls(case, grid_options, bins, recommended_regression_config):
-    pytest.importorskip("aisimulate_core.sdk")
+    pytest.importorskip("aisim_core.sdk")
     from scripts.fpm_accuracy.models.fpt_predictor import PredictorContext
 
     context = PredictorContext(
@@ -452,7 +736,7 @@ def test_real_regression_preserves_explicit_controls(case, grid_options, bins, r
     ],
 )
 def test_real_regression_preserves_explicit_canonical_sampling(case, sampling, recommended_regression_config):
-    sdk = pytest.importorskip("aisimulate_core.sdk")
+    sdk = pytest.importorskip("aisim_core.sdk")
     from scripts.fpm_accuracy.models.fpt_predictor import PredictorContext
 
     context = PredictorContext(
@@ -476,7 +760,7 @@ def test_real_regression_preserves_explicit_canonical_sampling(case, sampling, r
 
 @pytest.mark.parametrize("options", [{"bucket_count": 9}, {"bucket_shape": [3, 2]}])
 def test_real_regression_rejects_conflicting_canonical_and_legacy_grids(case, options):
-    pytest.importorskip("aisimulate_core.sdk")
+    pytest.importorskip("aisim_core.sdk")
     from scripts.fpm_accuracy.models.fpt_predictor import PredictorContext
 
     context = PredictorContext(
@@ -492,7 +776,7 @@ def test_real_regression_rejects_conflicting_canonical_and_legacy_grids(case, op
 
 
 def test_worker_regression_reports_resolved_native_grid(case):
-    pytest.importorskip("aisimulate_core.sdk")
+    pytest.importorskip("aisim_core.sdk")
     from scripts.fpm_accuracy.evaluate import create_predictor
     from scripts.fpm_accuracy.models.fpt_predictor import PredictorContext
 
@@ -507,7 +791,7 @@ def test_worker_regression_reports_resolved_native_grid(case):
 
 
 def test_worker_regression_preserves_canonical_sampling_and_explicit_options(case):
-    pytest.importorskip("aisimulate_core.sdk")
+    pytest.importorskip("aisim_core.sdk")
     from scripts.fpm_accuracy.evaluate import create_predictor
     from scripts.fpm_accuracy.models.fpt_predictor import PredictorContext
 
@@ -545,7 +829,7 @@ def test_predictor_uses_canonical_api_or_older_wheel_adapter(case, tmp_path, mon
     from scripts.fpm_accuracy.models.fpt_predictor import PredictorContext
 
     if canonical:
-        pytest.importorskip("aisimulate_core.sdk")
+        pytest.importorskip("aisim_core.sdk")
     else:
         monkeypatch.setattr(aic_predictors, "_canonical_config_type", lambda: None)
     calls = []
@@ -777,3 +1061,29 @@ def test_learned_split_is_per_workload_kind():
     kinds = ["decode"] * 5 + ["prefill"] * 3
     observations = [SimpleNamespace(observation_id=f"o{i}", workload_kind=kind) for i, kind in enumerate(kinds)]
     assert training_observation_ids(observations) == {"o0", "o2", "o4", "o5", "o7"}
+
+
+def test_learned_fit_uses_the_small_tree_hyperparameters(monkeypatch):
+    import sys
+
+    from scripts.fpm_accuracy.models.learned_predictor import HYPERPARAMETERS, LearnedFpm5Predictor
+
+    calls = []
+
+    def train(iterations, worker_type, **kwargs):
+        calls.append(kwargs)
+        raise ValueError("too few rows")
+
+    # Stand-ins for the evaluated wheel and scikit-learn, which this job does not install.
+    fpm_learned = SimpleNamespace(FEATURE_PRESETS={"fpm5": ("num_prefill_requests",)}, train=train)
+    sdk = SimpleNamespace(fpm_learned=fpm_learned)
+    monkeypatch.setitem(sys.modules, "aisim_core", SimpleNamespace(sdk=sdk))
+    monkeypatch.setitem(sys.modules, "aisim_core.sdk", sdk)
+    monkeypatch.setitem(sys.modules, "aisim_core.sdk.fpm_learned", fpm_learned)
+    monkeypatch.setitem(sys.modules, "aisim_core.sdk.rust_engine_step", SimpleNamespace(RustForwardPassPerfModel=None))
+    monkeypatch.setitem(sys.modules, "sklearn", SimpleNamespace())
+    predictor = LearnedFpm5Predictor.fit(SimpleNamespace(worker_role="decode"), [])
+    assert calls == [{"features": ("num_prefill_requests",), **HYPERPARAMETERS}]
+    assert HYPERPARAMETERS == {"max_iter": 150, "max_leaf_nodes": 15, "learning_rate": 0.2}
+    assert predictor.diagnostics()["hyperparameters"] == HYPERPARAMETERS
+    assert predictor.diagnostics()["hyperparameters"] is not HYPERPARAMETERS

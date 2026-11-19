@@ -9,11 +9,15 @@ import http.server
 import json
 import os
 import shutil
+import sys
 import tempfile
 import threading
 from pathlib import Path
 
 from playwright.async_api import async_playwright, expect
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.e2e_accuracy.summary_contract import normalize_summary
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -28,7 +32,7 @@ async def check():
         site = Path(directory)
         shutil.copytree(ROOT / "pages/e2e-accuracy", site / "e2e-accuracy")
         path = site / "e2e-accuracy/summary.json"
-        data = json.loads(path.read_text())
+        data = normalize_summary(json.loads(path.read_text()))
         # Synthetic chart values exercise the rich contract; never publish this fixture.
         for model in data["models"]:
             for workload in model["workloads"]:
@@ -36,7 +40,7 @@ async def check():
                     for topology in gpu["topologies"]:
                         topology.update(total_gpus=8, is_multinode=False)
                         for point in topology["points"]:
-                            for name in ("measured", "aic", "aisimulate"):
+                            for name in ("measured", "aic", "aisim"):
                                 values = point[name]
                                 for metric in ("ttft", "tpot"):
                                     relative = values[f"{metric}_relative"]
@@ -47,6 +51,7 @@ async def check():
                                     output_per_gpu=100 if exists else None,
                                     total_per_gpu=200 if exists else None,
                                 )
+        data["models"][0]["workloads"][0]["gpus"][0]["topologies"][0]["spec_method"] = "mtp"
         path.write_text(json.dumps(data))
         server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(QuietHandler, directory=site))
         threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -59,6 +64,14 @@ async def check():
                 await page.goto(f"http://127.0.0.1:{server.server_port}/e2e-accuracy/")
                 await expect(page.locator(".model-row").first).to_be_visible()
                 await expect(page.locator("#exclude-multinode")).not_to_be_checked()
+                await page.locator("#decoding-select").select_option("mtp")
+                await expect(page.locator(".model-row").first).to_be_visible()
+                assert "spec=mtp" in page.url
+                mtp_summary = await page.locator("#summary-grid").inner_text()
+                await page.reload()
+                await expect(page.locator("#decoding-select")).to_have_value("mtp")
+                await expect(page.locator("#summary-grid")).to_have_text(mtp_summary)
+                await page.locator("#decoding-select").select_option("all")
                 await page.locator("#tab-details").click()
                 await expect(page.locator("#details-view")).to_be_visible()
                 await expect(page.locator("#matrix-layout")).to_be_hidden()

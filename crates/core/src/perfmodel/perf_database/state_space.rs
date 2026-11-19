@@ -20,7 +20,10 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::OnceLock;
+
+use pep440_rs::Version;
 
 use super::perf_interp::{LeafValue, Node, OpInterpConfig, PreparedGrid};
 use super::{SourceResolver, kernel_source_ok};
@@ -36,20 +39,115 @@ pub struct StateSpaceTable {
     mamba2_sources: Vec<PerfSource>,
     gdn_sources: Vec<PerfSource>,
     kda_sources: Vec<PerfSource>,
-    /// vLLM versions whose collected tables persist per-system physical
-    /// context-scan labels (`chunk_gated_delta_rule_{flashinfer,triton,cutedsl}`)
-    /// instead of the logical `chunk_gated_delta_rule`. The 0.22.0-era
-    /// tables persist the logical label directly and stay outside this gate.
-    vllm_gdn_physical_aliases: bool,
+    /// Which backend-specific physical GDN kernel labels this
+    /// (backend, version) persists in place of the logical modeling names
+    /// (see [`GdnAliasProfile`]).
+    gdn_alias_profile: GdnAliasProfile,
     /// SM-major-10 (sm 100/103, NOT sm 120) sglang serving auto-selects the
     /// FlashInfer bf16-state GDN decode kernel when the model's
     /// `mamba_ssm_dtype` is bfloat16 (see `query_gdn`'s alias branch below —
     /// the dtype half of the predicate is per-query). Computed once at
-    /// construction, same convention as `vllm_gdn_physical_aliases`.
+    /// construction, same convention as `gdn_alias_profile`.
     sglang_sm100_gdn_flashinfer_lane: bool,
     mamba2: OnceLock<Result<Mamba2Grids, AicError>>,
     gdn: OnceLock<Result<GdnGrids, AicError>>,
     kda: OnceLock<Result<KdaGrids, AicError>>,
+}
+
+/// The physical GDN kernel labels a backend persists in place of the
+/// logical modeling names, per version. The lookup ranks candidates by the
+/// source that contributed them (the requested version's own table first,
+/// then the shared-layer donors in resolver order), prefers the backend's own
+/// physical rows over a logical lane from the same or a later source (after
+/// the shared-layer merge that lane can hold cross-backend donor rows), and
+/// fails closed only when one source carries several physical labels for the
+/// same shape.
+///
+/// - `VllmPhysical`: vLLM >= 0.24.0 persists per-system context-scan labels
+///   (`chunk_gated_delta_rule_{flashinfer,triton,cutedsl}`) and the packed
+///   decode recurrence. 0.22.0-era tables persist the logical label directly
+///   and stay outside the gate (their only physical-labelled rows would be
+///   donors).
+/// - `TrtllmPhysical`: TRT-LLM >= 1.3.0rc29 persists the FlashInfer context
+///   scan (`chunk_gated_delta_rule_flashinfer`) and the decode recurrence of
+///   whichever kernel the platform runs
+///   (`fused_sigmoid_gating_delta_rule_update_{flashinfer,triton}`; L40S and
+///   RTX PRO 6000 run the Triton one); rc20 persisted the logical names.
+/// - `SglangPhysical`: SGLang >= 0.5.21 persists the fused decode convolution
+///   (`fused_qkvzba_causal_conv1d_update_contiguous`) instead of
+///   `causal_conv1d_update`, and on Hopper the FlashInfer context scan
+///   (`flashinfer_chunk_gated_delta_rule`) instead of `chunk_gated_delta_rule`.
+///
+/// The same TRT-LLM floor also covers Mamba2 (`mamba2_aliases`): rc29
+/// persists the token-major context convolution
+/// (`causal_conv1d_fn_token_major`) where rc20 persisted `causal_conv1d_fn`,
+/// and the decode state update under `selective_state_update_flashinfer` or
+/// `selective_state_update_triton` where rc20 held no such rows.
+///
+/// Versions are compared as PEP 440; an unparseable version gets no profile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GdnAliasProfile {
+    None,
+    VllmPhysical,
+    TrtllmPhysical,
+    SglangPhysical,
+}
+
+impl GdnAliasProfile {
+    fn for_backend_version(backend: &str, version: &str) -> Self {
+        let at_least = |floor: &str| match (Version::from_str(version), Version::from_str(floor)) {
+            (Ok(v), Ok(f)) => v >= f,
+            _ => false,
+        };
+        match backend {
+            "vllm" if at_least("0.24.0") => Self::VllmPhysical,
+            "trtllm" if at_least("1.3.0rc29") => Self::TrtllmPhysical,
+            "sglang" if at_least("0.5.21") => Self::SglangPhysical,
+            _ => Self::None,
+        }
+    }
+
+    /// Physical Mamba2 labels to try for a logical `(kernel_source, phase)` query.
+    fn mamba2_aliases(self, kernel_source: &str, phase: &str) -> &'static [&'static str] {
+        match (self, kernel_source, phase) {
+            (Self::TrtllmPhysical, "causal_conv1d_fn", "context") => {
+                &["causal_conv1d_fn_token_major"]
+            }
+            (Self::TrtllmPhysical, "selective_state_update", "generation") => &[
+                "selective_state_update_flashinfer",
+                "selective_state_update_triton",
+            ],
+            _ => &[],
+        }
+    }
+
+    /// Physical GDN labels to try (in this order) for a logical `(kernel_source, phase)` query.
+    fn aliases(self, kernel_source: &str, phase: &str) -> &'static [&'static str] {
+        match (self, kernel_source, phase) {
+            (Self::VllmPhysical, "chunk_gated_delta_rule", "context") => &[
+                "chunk_gated_delta_rule_flashinfer",
+                "chunk_gated_delta_rule_triton",
+                "chunk_gated_delta_rule_cutedsl",
+            ],
+            (Self::VllmPhysical, "fused_sigmoid_gating_delta_rule_update", "generation") => {
+                &["fused_recurrent_gated_delta_rule_packed_decode"]
+            }
+            (Self::TrtllmPhysical, "chunk_gated_delta_rule", "context") => {
+                &["chunk_gated_delta_rule_flashinfer"]
+            }
+            (Self::TrtllmPhysical, "fused_sigmoid_gating_delta_rule_update", "generation") => &[
+                "fused_sigmoid_gating_delta_rule_update_flashinfer",
+                "fused_sigmoid_gating_delta_rule_update_triton",
+            ],
+            (Self::SglangPhysical, "chunk_gated_delta_rule", "context") => {
+                &["flashinfer_chunk_gated_delta_rule"]
+            }
+            (Self::SglangPhysical, "causal_conv1d_update", "generation") => {
+                &["fused_qkvzba_causal_conv1d_update_contiguous"]
+            }
+            _ => &[],
+        }
+    }
 }
 
 /// Per shape-key engine table. Context keys hold a 2-level `[batch][seq]`
@@ -61,6 +159,10 @@ struct Mamba2Grids {
 
 struct GdnGrids {
     by_keys: BTreeMap<GdnKey, PreparedGrid>,
+    /// Position, in the priority-sorted source list, of the first source that
+    /// contributed rows to each key: 0 is the requested version's own table,
+    /// higher values are shared-layer donors in resolver order.
+    source_rank: BTreeMap<GdnKey, usize>,
 }
 
 struct KdaGrids {
@@ -154,7 +256,7 @@ impl StateSpaceTable {
             mamba2_sources,
             gdn_sources,
             kda_sources,
-            vllm_gdn_physical_aliases: backend == "vllm" && matches!(version, "0.24.0" | "0.27.1"),
+            gdn_alias_profile: GdnAliasProfile::for_backend_version(backend, version),
             // Mirror sglang's `is_sm100_supported` (utils/common.py @ pinned
             // v0.5.14 clone): device capability major EXACTLY 10, so sm
             // 100/103 qualify and sm 120 (rtx_pro_6000_server) does not.
@@ -169,7 +271,8 @@ impl StateSpaceTable {
     /// Mamba2 latency for a layer instance, resolved on the perf_interp
     /// engine (context: 2-axis `(batch, seq_len)` Grid RAW; see module
     /// doc). `sol` is the operator's analytic SOL in `(batch, seq)` order
-    /// — it anchors util-hold beyond the collected range.
+    /// — it anchors util-hold beyond the collected range. `Ok(None)` when
+    /// the table has no row for the exact shape.
     #[allow(clippy::too_many_arguments)]
     pub fn query_mamba2(
         &self,
@@ -185,31 +288,7 @@ impl StateSpaceTable {
         n_groups: u32,
         chunk_size: u32,
         sol: &dyn Fn(f64, f64) -> f64,
-    ) -> Result<LeafValue, AicError> {
-        // Mirror Python v2's `load_mamba2_data` defaultdict bug (still
-        // present today, verified 2026-07-09): the row-population pattern
-        // `try { data[ks][ph][mk][bs] } except KeyError: ... = entry` never
-        // reaches the `except` branch for generation rows because the
-        // fourth level is a `defaultdict(dict)` that lazily materialises an
-        // empty dict on `[bs]` access (no KeyError). Generation leaves end
-        // up as empty `{}`; `_query_mamba2_table`'s generation branch then
-        // normalizes them to an empty curve, the perf_interp engine raises,
-        // and the op falls back to SOL (`db.query_mamba2(generation)`
-        // returns `source="sol"` for every query). The Rust parquet loader
-        // populates the rows correctly, so returning silicon here would
-        // give a numerically different (and arguably "more correct")
-        // answer — but for apple-to-apple parity we mirror Python by
-        // returning a PerfDatabase error so the operator-layer SOL branch
-        // fires. GDN's loader is fine (uses explicit `in` checks), so this
-        // workaround is Mamba2-generation-only.
-        if phase == "generation" {
-            return Err(AicError::PerfDatabase(format!(
-                "Mamba2 generation data intentionally not used (matches Python v2 \
-                 `load_mamba2_data` defaultdict bug in operations/mamba.py — generation \
-                 leaves load empty, so every generation query degrades to SOL); \
-                 operator must fall to SOL. ks={kernel_source}, d_model={d_model}"
-            )));
-        }
+    ) -> Result<Option<LeafValue>, AicError> {
         let grids = self.load_mamba2()?;
         let key = Mamba2Key {
             kernel_source: kernel_source.to_string(),
@@ -222,34 +301,34 @@ impl StateSpaceTable {
             n_groups,
             chunk_size,
         };
-        // Mirror Python `_query_mamba2_table`: on exact-shape miss, fall back
-        // to the first table entry sharing the same `d_model` (insertion order
-        // in Python; sorted order here — which agrees whenever the per-d_model
-        // bucket has a single entry, as in all current matrices). If no entry
-        // shares d_model, surface as `PerfDatabase` so the operator layer's
-        // SOL fallback applies.
+        // Exact per-shard geometry only, the same rule as `query_gdn`: a row
+        // with the same `d_model` but another head, group, state or chunk
+        // geometry is a different kernel launch, so it is never substituted.
+        // A miss is `Ok(None)` with no message: the operator prices it at
+        // SOL, and a TP >= 2 shard misses on every query against TP 1 rows.
         //
-        // Only the context phase reaches this point — generation queries are
-        // short-circuited above to match Python's degenerate behaviour.
-        let node = match grids.by_keys.get(&key) {
+        // The backend's own persisted physical label (TRT-LLM rc29 renamed
+        // the context convolution `causal_conv1d_fn_token_major`) takes
+        // precedence over the logical lane, which after the shared-layer
+        // merge can hold an earlier version's or another backend's rows.
+        let aliases = self
+            .gdn_alias_profile
+            .mamba2_aliases(key.kernel_source.as_str(), key.phase.as_str());
+        let own_physical = aliases.iter().find_map(|alias| {
+            let mut alias_key = key.clone();
+            alias_key.kernel_source = (*alias).to_string();
+            grids.by_keys.get(&alias_key)
+        });
+        let node = match own_physical.or_else(|| grids.by_keys.get(&key)) {
             Some(node) => node,
-            None => grids
-                .by_keys
-                .iter()
-                .find(|(k, _)| {
-                    k.kernel_source == key.kernel_source
-                        && k.phase == key.phase
-                        && k.d_model == key.d_model
-                })
-                .map(|(_, node)| node)
-                .ok_or_else(|| missing("Mamba2", &self.data_root, format!("{key:?}")))?,
+            None => return Ok(None),
         };
-        engine_query(node, phase, batch_size, seq_len, sol)
+        engine_query(node, phase, batch_size, seq_len, sol).map(Some)
     }
 
     /// GDN latency for a layer instance. Same engine resolution as Mamba2
-    /// (and, unlike Mamba2, generation queries really resolve: 1-axis
-    /// `(batch,)` Grid RAW over the generation curve, per Python v2).
+    /// (generation queries resolve on a 1-axis `(batch,)` Grid RAW over the
+    /// generation curve, per Python v2).
     #[allow(clippy::too_many_arguments)]
     pub fn query_gdn(
         &self,
@@ -265,7 +344,7 @@ impl StateSpaceTable {
         head_v_dim: u32,
         mamba_ssm_dtype: &str,
         sol: &dyn Fn(f64, f64) -> f64,
-    ) -> Result<LeafValue, AicError> {
+    ) -> Result<Option<LeafValue>, AicError> {
         let causal_conv = matches!(kernel_source, "causal_conv1d_fn" | "causal_conv1d_update");
         let flashinfer_physical = kernel_source == "flashinfer_gated_delta_rule_decode";
         let flashinfer_bf16_query = self.sglang_sm100_gdn_flashinfer_lane
@@ -286,11 +365,7 @@ impl StateSpaceTable {
                 && !requires_flashinfer_alias
                 && !exact_flashinfer_query)
         {
-            return Err(AicError::PerfDatabase(format!(
-                "GDN state-sensitive silicon row is not keyed by mamba_ssm_dtype; \
-                 refusing kernel_source={kernel_source}, phase={phase}, \
-                 mamba_ssm_dtype={mamba_ssm_dtype}"
-            )));
+            return Ok(None);
         }
 
         let grids = self.load_gdn()?;
@@ -305,28 +380,26 @@ impl StateSpaceTable {
             head_v_dim,
         };
         // Mirror Python `_query_gdn_table`: exact geometry (or an exact
-        // physical-alias hit) only; any miss surfaces as `PerfDatabase` so
-        // the operator degrades to SOL.
+        // physical-alias hit) only. A miss is `Ok(None)` with no message: the
+        // operator prices it at SOL, and a slice the table does not ship
+        // misses on every query.
         //
-        // The framework's own persisted physical kernels (vLLM 0.24/0.27.1
-        // name their context scan chunk_gated_delta_rule_*; capability-major-10 sglang
-        // BF16 decode requires flashinfer_gated_delta_rule_decode) take
-        // precedence: after the
-        // shared-layer merge the logical lane can hold cross-backend donor
-        // rows, which only serve as gap fill when no own physical lane covers
-        // the shape. Ambiguous physical data fails closed.
-        let aliases: &[&str] = if self.vllm_gdn_physical_aliases {
-            match (key.kernel_source.as_str(), key.phase.as_str()) {
-                ("chunk_gated_delta_rule", "context") => &[
-                    "chunk_gated_delta_rule_flashinfer",
-                    "chunk_gated_delta_rule_triton",
-                    "chunk_gated_delta_rule_cutedsl",
-                ],
-                ("fused_sigmoid_gating_delta_rule_update", "generation") => {
-                    &["fused_recurrent_gated_delta_rule_packed_decode"]
-                }
-                _ => &[],
-            }
+        // The framework's own persisted physical kernels (see
+        // `GdnAliasProfile`: vLLM >= 0.24.0 context-scan labels, TRT-LLM
+        // >= 1.3.0rc29 context scan and decode recurrence, SGLang >= 0.5.21
+        // fused decode convolution and Hopper context scan; capability-major-10
+        // sglang BF16 decode requires flashinfer_gated_delta_rule_decode) take
+        // precedence over the logical lane, which after the shared-layer merge
+        // can hold cross-backend donor rows. Candidates are ranked by source
+        // first: the requested version's own rows, then its donors in resolver
+        // order. A donor's physical label therefore neither makes the own
+        // label ambiguous nor beats the own logical row; several physical
+        // labels from the same best source fail closed.
+        let profile_aliases = self
+            .gdn_alias_profile
+            .aliases(key.kernel_source.as_str(), key.phase.as_str());
+        let aliases: &[&str] = if !profile_aliases.is_empty() {
+            profile_aliases
         } else if requires_flashinfer_alias {
             // SM-major-10 sglang serving auto-selects the FlashInfer
             // bf16-state GDN decode kernel ONLY when the model's
@@ -344,6 +417,7 @@ impl StateSpaceTable {
         } else {
             &[]
         };
+        let rank_of = |k: &GdnKey| grids.source_rank.get(k).copied().unwrap_or(usize::MAX);
         let alias_matches: Vec<_> = aliases
             .iter()
             .filter_map(|alias| {
@@ -352,36 +426,43 @@ impl StateSpaceTable {
                 grids.by_keys.get_key_value(&alias_key)
             })
             .collect();
-        if alias_matches.len() > 1 {
-            let sources: Vec<_> = alias_matches
-                .iter()
-                .map(|(alias_key, _)| alias_key.kernel_source.as_str())
-                .collect();
-            return Err(AicError::PerfDatabase(format!(
-                "ambiguous vLLM GDN physical kernels for {key:?}: {}",
-                sources.join(", ")
-            )));
-        }
-        if let Some((_, node)) = alias_matches.first() {
-            // `sol` closes over the caller's logical kernel source, not the
-            // winning physical alias. For the only cross-dtype alias allowed
-            // here, both the BF16 logical recurrence and explicit FlashInfer
-            // formula use two-byte state, so beyond-range util-hold stays on
-            // the correct byte model.
-            return engine_query(node, phase, batch_size, seq_len, sol);
+        let logical = grids.by_keys.get_key_value(&key);
+        let logical_rank = logical.map(|(k, _)| rank_of(k));
+        if let Some(best_rank) = alias_matches.iter().map(|(k, _)| rank_of(k)).min() {
+            let logical_from_earlier_source =
+                !requires_flashinfer_alias && logical_rank.is_some_and(|rank| rank < best_rank);
+            if !logical_from_earlier_source {
+                let best_aliases: Vec<_> = alias_matches
+                    .iter()
+                    .filter(|(k, _)| rank_of(k) == best_rank)
+                    .collect();
+                if best_aliases.len() > 1 {
+                    let sources: Vec<_> = best_aliases
+                        .iter()
+                        .map(|(alias_key, _)| alias_key.kernel_source.as_str())
+                        .collect();
+                    return Err(AicError::PerfDatabase(format!(
+                        "ambiguous GDN physical kernels for {key:?}: {}",
+                        sources.join(", ")
+                    )));
+                }
+                // `sol` closes over the caller's logical kernel source, not the
+                // winning physical alias. For the only cross-dtype alias allowed
+                // here, both the BF16 logical recurrence and explicit FlashInfer
+                // formula use two-byte state, so beyond-range util-hold stays on
+                // the correct byte model.
+                let (_, node) = best_aliases[0];
+                return engine_query(node, phase, batch_size, seq_len, sol).map(Some);
+            }
         }
         if requires_flashinfer_alias {
-            return Err(missing(
-                "GDN FlashInfer BF16 alias",
-                &self.data_root,
-                format!("{key:?}"),
-            ));
+            return Ok(None);
         }
-        let node = match grids.by_keys.get(&key) {
-            Some(node) => node,
-            None => return Err(missing("GDN", &self.data_root, format!("{key:?}"))),
+        let node = match logical {
+            Some((_, node)) => node,
+            None => return Ok(None),
         };
-        engine_query(node, phase, batch_size, seq_len, sol)
+        engine_query(node, phase, batch_size, seq_len, sol).map(Some)
     }
 
     /// KDA (Kimi Delta Attention) latency for a layer instance. Same engine
@@ -406,7 +487,7 @@ impl StateSpaceTable {
         num_v_heads: u32,
         head_v_dim: u32,
         sol: &dyn Fn(f64, f64) -> f64,
-    ) -> Result<LeafValue, AicError> {
+    ) -> Result<Option<LeafValue>, AicError> {
         let grids = self.load_kda()?;
         let key = KdaKey {
             kernel_source: kernel_source.to_string(),
@@ -421,8 +502,8 @@ impl StateSpaceTable {
         // Mirror Python `_query_kda_table`: on exact-shape miss, fall back to
         // any same-d_model entry within the SAME kernel source and phase,
         // breaking ties by minimum `|num_v_heads - query.num_v_heads|`.
-        // Surface as `PerfDatabase` if no d_model match exists so the
-        // operator's SOL fallback fires.
+        // `Ok(None)` with no message if no d_model match exists: the operator
+        // prices it at SOL, and a model without rows misses on every query.
         let node = match grids.by_keys.get(&key) {
             Some(node) => node,
             None => {
@@ -437,11 +518,11 @@ impl StateSpaceTable {
                     .min_by_key(|(k, _)| (k.num_v_heads as i64 - key.num_v_heads as i64).abs());
                 match nearest {
                     Some((_, node)) => node,
-                    None => return Err(missing("KDA", &self.data_root, format!("{key:?}"))),
+                    None => return Ok(None),
                 }
             }
         };
-        engine_query(node, phase, batch_size, seq_len, sol)
+        engine_query(node, phase, batch_size, seq_len, sol).map(Some)
     }
 
     fn load_mamba2(&self) -> Result<&Mamba2Grids, AicError> {
@@ -506,6 +587,88 @@ impl StateSpaceTable {
             }),
             Err(_) => false,
         }
+    }
+
+    /// Whether the Mamba2 table holds rows for the logical `(kernel_source, phase)` under the
+    /// label `query_mamba2` would read: the physical aliases of this backend version or the
+    /// logical name. Shape coverage stays a query-time matter. A missing, empty, unreadable or
+    /// malformed table reads as `Ok(false)`: the loaders report all of those as missing
+    /// performance data.
+    pub fn mamba2_has_kernel(&self, kernel_source: &str, phase: &str) -> Result<bool, AicError> {
+        let Some(grids) = loaded(self.load_mamba2())? else {
+            return Ok(false);
+        };
+        let aliases = self.gdn_alias_profile.mamba2_aliases(kernel_source, phase);
+        Ok(grids.by_keys.keys().any(|k| {
+            k.phase == phase
+                && (k.kernel_source == kernel_source || aliases.contains(&k.kernel_source.as_str()))
+        }))
+    }
+
+    /// GDN twin of [`Self::mamba2_has_kernel`], resolved like `query_gdn`: the profile aliases
+    /// plus the logical name, except the SGLang SM-major-10 BF16 decode recurrence, which only
+    /// its own FlashInfer rows cover. The state dtype is otherwise ignored here.
+    pub fn gdn_has_kernel(
+        &self,
+        kernel_source: &str,
+        phase: &str,
+        mamba_ssm_dtype: &str,
+    ) -> Result<bool, AicError> {
+        let Some(grids) = loaded(self.load_gdn())? else {
+            return Ok(false);
+        };
+        let aliases = self.gdn_alias_profile.aliases(kernel_source, phase);
+        let requires_flashinfer_alias = aliases.is_empty()
+            && self.sglang_sm100_gdn_flashinfer_lane
+            && mamba_ssm_dtype == "bfloat16"
+            && phase == "generation"
+            && kernel_source == "fused_sigmoid_gating_delta_rule_update";
+        let covers = |label: &str| {
+            if requires_flashinfer_alias {
+                label == "flashinfer_gated_delta_rule_decode"
+            } else {
+                label == kernel_source || aliases.contains(&label)
+            }
+        };
+        Ok(grids
+            .by_keys
+            .keys()
+            .any(|k| k.phase == phase && covers(k.kernel_source.as_str())))
+    }
+
+    /// KDA twin of [`Self::mamba2_has_kernel`], resolved like `KdaOp::query`: the logical name,
+    /// plus the fused DSPARK verify row for the verify-phase recurrence and conv update, plus the
+    /// fused decode row for the generation-phase packed recurrence and conv update.
+    pub fn kda_has_kernel(&self, kernel_source: &str, phase: &str) -> Result<bool, AicError> {
+        let Some(grids) = loaded(self.load_kda())? else {
+            return Ok(false);
+        };
+        let fused = match (phase, kernel_source) {
+            ("verify", "fused_sigmoid_gating_delta_rule_update" | "causal_conv1d_update") => {
+                Some("fused_kda_decode_mtp_dspark")
+            }
+            ("generation", "fused_recurrent_kda_packed_decode" | "causal_conv1d_update") => {
+                Some("kda_fused_decode")
+            }
+            _ => None,
+        };
+        Ok(grids.by_keys.keys().any(|k| {
+            k.phase == phase
+                && (k.kernel_source == kernel_source || fused == Some(k.kernel_source.as_str()))
+        }))
+    }
+}
+
+/// The `*_has_kernel` probes' view of a loaded table: `None` when the loaders reported missing
+/// performance data. The loaders flatten every failure (no file, no rows, an unreadable or
+/// malformed parquet) into `PerfDatabase`, and `clone_err` keeps it there, so
+/// `is_missing_perf_data` covers every error that reaches this point.
+fn loaded<T>(table: Result<&T, AicError>) -> Result<Option<&T>, AicError> {
+    match table {
+        Ok(grids) => Ok(Some(grids)),
+        Err(e) if e.is_missing_perf_data() => Ok(None),
+        // Unreachable today; kept so a future typed load error propagates instead of reading as "no rows".
+        Err(e) => Err(e),
     }
 }
 
@@ -614,9 +777,7 @@ fn load_mamba2_parquet(sources: &[PerfSource]) -> Result<Mamba2Grids, AicError> 
             };
             // First-wins parity with Python `load_mamba2_data`, extended across
             // shared-layer sources (earlier source wins). Generation rows are
-            // keyed by batch only (Python drops seq for generation). Note the
-            // stored generation leaves are never read: `query_mamba2` mirrors
-            // Python's empty-generation-leaves bug by erroring first.
+            // keyed by batch only (Python drops seq for generation).
             let node = by_keys.entry(key).or_insert_with(Node::branch);
             let batch = row.u32(batch_size_col)?;
             let latency = row.f64(latency_col)?;
@@ -664,8 +825,9 @@ pub(crate) fn normalize_gdn_kernel_source(kernel_source: String) -> String {
 
 fn load_gdn_parquet(sources: &[PerfSource]) -> Result<GdnGrids, AicError> {
     let mut by_keys: BTreeMap<GdnKey, Node> = BTreeMap::new();
+    let mut source_rank: BTreeMap<GdnKey, usize> = BTreeMap::new();
     let mut any_source = false;
-    for source in sources {
+    for (rank, source) in sources.iter().enumerate() {
         let path = source.path();
         if !path.exists() {
             continue;
@@ -704,6 +866,7 @@ fn load_gdn_parquet(sources: &[PerfSource]) -> Result<GdnGrids, AicError> {
             // First-wins parity with Python `load_gdn_data`, extended across
             // shared-layer sources (earlier source wins): context leaves at
             // `[batch][seq]`, generation leaves at `[batch]`.
+            source_rank.entry(key.clone()).or_insert(rank);
             let node = by_keys.entry(key).or_insert_with(Node::branch);
             let batch = row.u32(batch_size_col)?;
             let latency = row.f64(latency_col)?;
@@ -728,6 +891,7 @@ fn load_gdn_parquet(sources: &[PerfSource]) -> Result<GdnGrids, AicError> {
     }
     Ok(GdnGrids {
         by_keys: prepare_nodes(by_keys),
+        source_rank,
     })
 }
 
@@ -826,13 +990,13 @@ mod tests {
 
     fn data_root(rel: &str) -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../python/aisimulate/src/aisimulate_core/systems/data")
+            .join("../../python/aisim/src/aisim_core/systems/data")
             .join(rel)
     }
 
     fn h100_sxm_mem_bw() -> f64 {
         let yaml = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../python/aisimulate/src/aisimulate_core/systems/h100_sxm.yaml");
+            .join("../../python/aisim/src/aisim_core/systems/h100_sxm.yaml");
         SystemSpec::load(&yaml)
             .expect("h100_sxm.yaml must parse")
             .gpu
@@ -869,8 +1033,36 @@ mod tests {
         version: &str,
         rows: &[(&str, &str, u32, f64)],
     ) -> StateSpaceTable {
+        let ranked: Vec<_> = rows
+            .iter()
+            .map(|&(kernel_source, phase, num_v_heads, latency)| {
+                (kernel_source, phase, num_v_heads, latency, 0)
+            })
+            .collect();
+        in_memory_gdn_table_ranked(backend, version, &ranked)
+    }
+
+    /// Like `in_memory_gdn_table`, with the source rank `load_gdn_parquet`
+    /// records per row (0 = the requested version's own table, higher =
+    /// shared-layer donors in resolver order).
+    fn in_memory_gdn_table_ranked(
+        backend: &str,
+        version: &str,
+        rows: &[(&str, &str, u32, f64, usize)],
+    ) -> StateSpaceTable {
+        let table = StateSpaceTable::new(PathBuf::from("test-data"), backend, version);
+        assert!(table.gdn.set(Ok(in_memory_gdn_grids(rows))).is_ok());
+        table
+    }
+
+    /// Builds the grids the way `load_gdn_parquet` does: sources are folded
+    /// in rank order, first source wins per leaf and per key rank.
+    fn in_memory_gdn_grids(rows: &[(&str, &str, u32, f64, usize)]) -> GdnGrids {
+        let mut rows = rows.to_vec();
+        rows.sort_by_key(|row| row.4);
         let mut by_keys: BTreeMap<GdnKey, Node> = BTreeMap::new();
-        for &(kernel_source, phase, num_v_heads, latency) in rows {
+        let mut source_rank: BTreeMap<GdnKey, usize> = BTreeMap::new();
+        for (kernel_source, phase, num_v_heads, latency, rank) in rows {
             let key = GdnKey {
                 kernel_source: kernel_source.to_string(),
                 phase: phase.to_string(),
@@ -881,6 +1073,7 @@ mod tests {
                 num_v_heads,
                 head_v_dim: 128,
             };
+            source_rank.entry(key.clone()).or_insert(rank);
             let node = by_keys.entry(key).or_insert_with(Node::branch);
             let leaf = LeafValue::latency_only(latency);
             if phase == "generation" {
@@ -889,16 +1082,10 @@ mod tests {
                 insert_first_wins(node, &[1, 1024], leaf);
             }
         }
-        let table = StateSpaceTable::new(PathBuf::from("test-data"), backend, version);
-        assert!(
-            table
-                .gdn
-                .set(Ok(GdnGrids {
-                    by_keys: prepare_nodes(by_keys),
-                }))
-                .is_ok()
-        );
-        table
+        GdnGrids {
+            by_keys: prepare_nodes(by_keys),
+            source_rank,
+        }
     }
 
     fn query_gdn_test_shape(
@@ -906,7 +1093,7 @@ mod tests {
         kernel_source: &str,
         phase: &str,
         num_v_heads: u32,
-    ) -> Result<f64, AicError> {
+    ) -> Option<f64> {
         // Default state dtype (every bundled Qwen3.5/3.6 config pins
         // float32); the flashinfer-lane tests below pass "bfloat16"
         // explicitly via query_gdn_test_shape_with_dtype.
@@ -919,7 +1106,18 @@ mod tests {
         phase: &str,
         num_v_heads: u32,
         mamba_ssm_dtype: &str,
-    ) -> Result<f64, AicError> {
+    ) -> Option<f64> {
+        query_gdn_result(table, kernel_source, phase, num_v_heads, mamba_ssm_dtype).unwrap()
+    }
+
+    /// `Ok(None)` is a miss; the ambiguity tests read the error.
+    fn query_gdn_result(
+        table: &StateSpaceTable,
+        kernel_source: &str,
+        phase: &str,
+        num_v_heads: u32,
+        mamba_ssm_dtype: &str,
+    ) -> Result<Option<f64>, AicError> {
         table
             .query_gdn(
                 kernel_source,
@@ -935,7 +1133,7 @@ mod tests {
                 mamba_ssm_dtype,
                 &dummy_sol,
             )
-            .map(|v| v.latency)
+            .map(|v| v.map(|v| v.latency))
     }
 
     #[test]
@@ -1031,7 +1229,7 @@ mod tests {
                     48,
                     dtype
                 )
-                .is_err()
+                .is_none()
             );
         }
     }
@@ -1062,8 +1260,181 @@ mod tests {
                 version,
                 &[("chunk_gated_delta_rule_flashinfer", "context", 48, 2.0)],
             );
-            assert!(query_gdn_test_shape(&table, "chunk_gated_delta_rule", "context", 48).is_err());
+            assert!(
+                query_gdn_test_shape(&table, "chunk_gated_delta_rule", "context", 48).is_none()
+            );
         }
+        // TRT-LLM rc20 and SGLang 0.5.14 persisted the logical names: a
+        // FlashInfer / fused-conv label in their tables could only be a donor.
+        let table = in_memory_gdn_table(
+            "trtllm",
+            "1.3.0rc20",
+            &[("chunk_gated_delta_rule_flashinfer", "context", 48, 2.0)],
+        );
+        assert!(query_gdn_test_shape(&table, "chunk_gated_delta_rule", "context", 48).is_none());
+        let table = in_memory_gdn_table(
+            "sglang",
+            "0.5.14",
+            &[(
+                "fused_qkvzba_causal_conv1d_update_contiguous",
+                "generation",
+                48,
+                2.0,
+            )],
+        );
+        assert!(query_gdn_test_shape(&table, "causal_conv1d_update", "generation", 48).is_none());
+    }
+
+    #[test]
+    fn gdn_alias_profile_follows_pep440_floors() {
+        use GdnAliasProfile::{None, SglangPhysical, TrtllmPhysical, VllmPhysical};
+        for (backend, version, expected) in [
+            ("vllm", "0.22.0", None),
+            ("vllm", "0.24.0", VllmPhysical),
+            ("vllm", "0.27.1", VllmPhysical),
+            ("vllm", "0.30.0", VllmPhysical),
+            ("vllm", "0.31.0", VllmPhysical),
+            ("trtllm", "1.3.0rc20", None),
+            ("trtllm", "1.3.0rc29", TrtllmPhysical),
+            ("trtllm", "1.3.0", TrtllmPhysical),
+            ("sglang", "0.5.14", None),
+            ("sglang", "0.5.20", None),
+            ("sglang", "0.5.21", SglangPhysical),
+            ("vllm", "next", None),
+            ("nccl", "2.30.7", None),
+        ] {
+            assert_eq!(
+                GdnAliasProfile::for_backend_version(backend, version),
+                expected,
+                "{backend} {version}"
+            );
+        }
+    }
+
+    #[test]
+    fn vllm_0300_gdn_resolves_physical_aliases_like_0240() {
+        // The 2026-10 campaign tables (0.30.0) and the GLM-5.3-Flash drop
+        // (0.31.0, no gdn table of its own -> 0.30.0 fallback) persist the
+        // same physical labels as 0.24.0; a version whitelist would silently
+        // send the model's context scan to SOL.
+        for version in ["0.30.0", "0.31.0"] {
+            let table = in_memory_gdn_table(
+                "vllm",
+                version,
+                &[
+                    ("chunk_gated_delta_rule", "context", 48, 1.0),
+                    ("chunk_gated_delta_rule_flashinfer", "context", 48, 2.0),
+                    (
+                        "fused_recurrent_gated_delta_rule_packed_decode",
+                        "generation",
+                        48,
+                        3.0,
+                    ),
+                ],
+            );
+            assert_eq!(
+                query_gdn_test_shape(&table, "chunk_gated_delta_rule", "context", 48).unwrap(),
+                2.0,
+                "{version}"
+            );
+            assert_eq!(
+                query_gdn_test_shape(
+                    &table,
+                    "fused_sigmoid_gating_delta_rule_update",
+                    "generation",
+                    48
+                )
+                .unwrap(),
+                3.0,
+                "{version}"
+            );
+        }
+    }
+
+    #[test]
+    fn trtllm_rc29_gdn_resolves_flashinfer_aliases_over_donor_logical_rows() {
+        let table = in_memory_gdn_table(
+            "trtllm",
+            "1.3.0rc29",
+            &[
+                ("chunk_gated_delta_rule", "context", 48, 1.0),
+                ("chunk_gated_delta_rule_flashinfer", "context", 48, 2.0),
+                (
+                    "fused_sigmoid_gating_delta_rule_update",
+                    "generation",
+                    48,
+                    1.0,
+                ),
+                (
+                    "fused_sigmoid_gating_delta_rule_update_flashinfer",
+                    "generation",
+                    48,
+                    3.0,
+                ),
+            ],
+        );
+        assert_eq!(
+            query_gdn_test_shape(&table, "chunk_gated_delta_rule", "context", 48).unwrap(),
+            2.0
+        );
+        assert_eq!(
+            query_gdn_test_shape(
+                &table,
+                "fused_sigmoid_gating_delta_rule_update",
+                "generation",
+                48
+            )
+            .unwrap(),
+            3.0
+        );
+    }
+
+    #[test]
+    fn sglang_0521_gdn_conv_update_resolves_fused_alias_for_any_state_dtype() {
+        let table = in_memory_gdn_table(
+            "sglang",
+            "0.5.21",
+            &[
+                ("causal_conv1d_update", "generation", 48, 1.0),
+                (
+                    "fused_qkvzba_causal_conv1d_update_contiguous",
+                    "generation",
+                    48,
+                    3.0,
+                ),
+            ],
+        );
+        for dtype in ["float32", "bfloat16"] {
+            assert_eq!(
+                query_gdn_test_shape_with_dtype(
+                    &table,
+                    "causal_conv1d_update",
+                    "generation",
+                    48,
+                    dtype
+                )
+                .unwrap(),
+                3.0,
+                "{dtype}"
+            );
+        }
+        // The context convolution and the fp32 context scan keep their logical rows.
+        let table = in_memory_gdn_table(
+            "sglang",
+            "0.5.21",
+            &[
+                ("causal_conv1d_fn", "context", 48, 2.0),
+                ("chunk_gated_delta_rule", "context", 48, 4.0),
+            ],
+        );
+        assert_eq!(
+            query_gdn_test_shape(&table, "causal_conv1d_fn", "context", 48).unwrap(),
+            2.0
+        );
+        assert_eq!(
+            query_gdn_test_shape(&table, "chunk_gated_delta_rule", "context", 48).unwrap(),
+            4.0
+        );
     }
 
     #[test]
@@ -1094,14 +1465,178 @@ mod tests {
                 ("chunk_gated_delta_rule_triton", "context", 48, 3.0),
             ],
         );
-        match query_gdn_test_shape(&table, "chunk_gated_delta_rule", "context", 48) {
+        match query_gdn_result(&table, "chunk_gated_delta_rule", "context", 48, "float32") {
             Err(AicError::PerfDatabase(message)) => {
-                assert!(message.contains("ambiguous vLLM GDN physical kernels"));
+                assert!(message.contains("ambiguous GDN physical kernels"));
                 assert!(message.contains("chunk_gated_delta_rule_flashinfer"));
                 assert!(message.contains("chunk_gated_delta_rule_triton"));
             }
             other => panic!("expected an explicit ambiguity error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn gdn_donor_physical_label_does_not_make_the_own_label_ambiguous() {
+        // RTX PRO 6000 vLLM 0.24.0 collected the Triton context scan; the
+        // shared layer adds TRT-LLM rc29's FlashInfer label (and 0.30.0's).
+        // Both are vLLM physical labels, but only the own one is this
+        // version's measurement (PR #517 review, simone-chen).
+        let table = in_memory_gdn_table_ranked(
+            "vllm",
+            "0.24.0",
+            &[
+                ("chunk_gated_delta_rule_triton", "context", 48, 3.0, 0),
+                ("chunk_gated_delta_rule_flashinfer", "context", 48, 2.0, 1),
+            ],
+        );
+        assert_eq!(
+            query_gdn_test_shape(&table, "chunk_gated_delta_rule", "context", 48).unwrap(),
+            3.0
+        );
+        // 0.30.0 collected FlashInfer; the 0.24.0 Triton rows are a donor.
+        let table = in_memory_gdn_table_ranked(
+            "vllm",
+            "0.30.0",
+            &[
+                ("chunk_gated_delta_rule_flashinfer", "context", 48, 2.0, 0),
+                ("chunk_gated_delta_rule_triton", "context", 48, 3.0, 2),
+            ],
+        );
+        assert_eq!(
+            query_gdn_test_shape(&table, "chunk_gated_delta_rule", "context", 48).unwrap(),
+            2.0
+        );
+        // With no own row, the earliest donor serves; two labels from that
+        // same donor are still ambiguous.
+        let table = in_memory_gdn_table_ranked(
+            "vllm",
+            "0.30.0",
+            &[
+                ("chunk_gated_delta_rule_flashinfer", "context", 48, 2.0, 1),
+                ("chunk_gated_delta_rule_triton", "context", 48, 3.0, 2),
+            ],
+        );
+        assert_eq!(
+            query_gdn_test_shape(&table, "chunk_gated_delta_rule", "context", 48).unwrap(),
+            2.0
+        );
+        let table = in_memory_gdn_table_ranked(
+            "vllm",
+            "0.30.0",
+            &[
+                ("chunk_gated_delta_rule_flashinfer", "context", 48, 2.0, 1),
+                ("chunk_gated_delta_rule_triton", "context", 48, 3.0, 1),
+            ],
+        );
+        assert!(matches!(
+            query_gdn_result(&table, "chunk_gated_delta_rule", "context", 48, "float32"),
+            Err(AicError::PerfDatabase(message)) if message.contains("ambiguous GDN physical kernels")
+        ));
+    }
+
+    #[test]
+    fn gdn_own_logical_row_beats_a_donor_physical_label() {
+        // L40S TRT-LLM rc29 persisted the logical context scan; a FlashInfer
+        // label reachable only through a donor must not replace it.
+        let table = in_memory_gdn_table_ranked(
+            "trtllm",
+            "1.3.0rc29",
+            &[
+                ("chunk_gated_delta_rule", "context", 48, 1.0, 0),
+                ("chunk_gated_delta_rule_flashinfer", "context", 48, 2.0, 1),
+            ],
+        );
+        assert_eq!(
+            query_gdn_test_shape(&table, "chunk_gated_delta_rule", "context", 48).unwrap(),
+            1.0
+        );
+        // Ambiguity between donor labels is irrelevant when the own logical
+        // row exists.
+        let table = in_memory_gdn_table_ranked(
+            "vllm",
+            "0.30.0",
+            &[
+                ("chunk_gated_delta_rule", "context", 48, 1.0, 0),
+                ("chunk_gated_delta_rule_flashinfer", "context", 48, 2.0, 1),
+                ("chunk_gated_delta_rule_triton", "context", 48, 3.0, 1),
+            ],
+        );
+        assert_eq!(
+            query_gdn_test_shape(&table, "chunk_gated_delta_rule", "context", 48).unwrap(),
+            1.0
+        );
+        // A donor's logical rows still lose to the own physical label.
+        let table = in_memory_gdn_table_ranked(
+            "vllm",
+            "0.30.0",
+            &[
+                ("chunk_gated_delta_rule", "context", 48, 1.0, 1),
+                ("chunk_gated_delta_rule_flashinfer", "context", 48, 2.0, 0),
+            ],
+        );
+        assert_eq!(
+            query_gdn_test_shape(&table, "chunk_gated_delta_rule", "context", 48).unwrap(),
+            2.0
+        );
+    }
+
+    #[test]
+    fn trtllm_rc29_gdn_resolves_the_triton_decode_recurrence() {
+        // L40S / RTX PRO 6000 rc29 persist the Triton recurrence.
+        let table = in_memory_gdn_table_ranked(
+            "trtllm",
+            "1.3.0rc29",
+            &[
+                (
+                    "fused_sigmoid_gating_delta_rule_update",
+                    "generation",
+                    48,
+                    1.0,
+                    1,
+                ),
+                (
+                    "fused_sigmoid_gating_delta_rule_update_triton",
+                    "generation",
+                    48,
+                    3.0,
+                    0,
+                ),
+            ],
+        );
+        assert_eq!(
+            query_gdn_test_shape(
+                &table,
+                "fused_sigmoid_gating_delta_rule_update",
+                "generation",
+                48
+            )
+            .unwrap(),
+            3.0
+        );
+    }
+
+    #[test]
+    fn sglang_0521_gdn_resolves_the_hopper_flashinfer_context_scan() {
+        // H100 / H200 SGLang 0.5.21 persist the FlashInfer context scan.
+        let table = in_memory_gdn_table_ranked(
+            "sglang",
+            "0.5.21",
+            &[
+                ("chunk_gated_delta_rule", "context", 48, 1.0, 1),
+                ("flashinfer_chunk_gated_delta_rule", "context", 48, 2.0, 0),
+            ],
+        );
+        assert_eq!(
+            query_gdn_test_shape(&table, "chunk_gated_delta_rule", "context", 48).unwrap(),
+            2.0
+        );
+        // SGLang 0.5.14 persisted the logical name: the label is donor-only there.
+        let table = in_memory_gdn_table(
+            "sglang",
+            "0.5.14",
+            &[("flashinfer_chunk_gated_delta_rule", "context", 48, 2.0)],
+        );
+        assert!(query_gdn_test_shape(&table, "chunk_gated_delta_rule", "context", 48).is_none());
     }
 
     #[test]
@@ -1111,7 +1646,7 @@ mod tests {
             "0.24.0",
             &[("chunk_gated_delta_rule_flashinfer", "context", 32, 2.0)],
         );
-        assert!(query_gdn_test_shape(&table, "chunk_gated_delta_rule", "context", 48).is_err());
+        assert!(query_gdn_test_shape(&table, "chunk_gated_delta_rule", "context", 48).is_none());
     }
 
     #[test]
@@ -1127,7 +1662,7 @@ mod tests {
                 ("chunk_gated_delta_rule", "context", 64, 5.0),
             ],
         );
-        assert!(query_gdn_test_shape(&table, "chunk_gated_delta_rule", "context", 48).is_err());
+        assert!(query_gdn_test_shape(&table, "chunk_gated_delta_rule", "context", 48).is_none());
     }
 
     /// Like `in_memory_gdn_table`, but threads an explicit `sm_version`
@@ -1141,26 +1676,12 @@ mod tests {
         sm_version: Option<u32>,
         rows: &[(&str, &str, u32, f64)],
     ) -> StateSpaceTable {
-        let mut by_keys: BTreeMap<GdnKey, Node> = BTreeMap::new();
-        for &(kernel_source, phase, num_v_heads, latency) in rows {
-            let key = GdnKey {
-                kernel_source: kernel_source.to_string(),
-                phase: phase.to_string(),
-                d_model: 5120,
-                d_conv: 4,
-                num_k_heads: 16,
-                head_k_dim: 128,
-                num_v_heads,
-                head_v_dim: 128,
-            };
-            let node = by_keys.entry(key).or_insert_with(Node::branch);
-            let leaf = LeafValue::latency_only(latency);
-            if phase == "generation" {
-                insert_first_wins(node, &[1], leaf);
-            } else {
-                insert_first_wins(node, &[1, 1024], leaf);
-            }
-        }
+        let ranked: Vec<_> = rows
+            .iter()
+            .map(|&(kernel_source, phase, num_v_heads, latency)| {
+                (kernel_source, phase, num_v_heads, latency, 0)
+            })
+            .collect();
         let table = StateSpaceTable::with_sources(
             PathBuf::from("test-data"),
             backend,
@@ -1169,14 +1690,7 @@ mod tests {
             &SourceResolver::fixed(PerfDbSources::default()),
         )
         .expect("fixed-map resolution is infallible");
-        assert!(
-            table
-                .gdn
-                .set(Ok(GdnGrids {
-                    by_keys: prepare_nodes(by_keys),
-                }))
-                .is_ok()
-        );
+        assert!(table.gdn.set(Ok(in_memory_gdn_grids(&ranked))).is_ok());
         table
     }
 
@@ -1282,7 +1796,7 @@ mod tests {
                     48,
                     dtype
                 )
-                .is_err()
+                .is_none()
             );
         }
     }
@@ -1310,7 +1824,7 @@ mod tests {
                 48,
                 "bfloat16"
             )
-            .is_err()
+            .is_none()
         );
     }
 
@@ -1353,7 +1867,7 @@ mod tests {
                     48,
                     dtype
                 )
-                .is_err()
+                .is_none()
             );
         }
     }
@@ -1399,7 +1913,7 @@ mod tests {
         kernel_source: &str,
         phase: &str,
         num_v_heads: u32,
-    ) -> Result<f64, AicError> {
+    ) -> Option<f64> {
         table
             .query_kda(
                 kernel_source,
@@ -1414,6 +1928,7 @@ mod tests {
                 128,
                 &dummy_sol,
             )
+            .unwrap()
             .map(|v| v.latency)
     }
 
@@ -1462,7 +1977,7 @@ mod tests {
         // querying the logical name against physical-only rows must miss
         // (the SOL byte model in the operator handles those names instead).
         let table = in_memory_kda_table(&[("chunk_kda_with_fused_gate", "context", 16, 2.0)]);
-        assert!(query_kda_test_shape(&table, "chunk_kda", "context", 16).is_err());
+        assert!(query_kda_test_shape(&table, "chunk_kda", "context", 16).is_none());
     }
 
     #[test]
@@ -1510,7 +2025,7 @@ mod tests {
         );
         eprintln!("query: {r:?}");
         assert!(r.is_ok(), "expected silicon lookup to succeed: {r:?}");
-        let latency = r.unwrap().latency;
+        let latency = r.unwrap().unwrap().latency;
         assert!(latency > 0.0, "non-zero latency: {latency}");
         eprintln!("latency: {latency}");
     }
@@ -1566,6 +2081,7 @@ mod tests {
                 "float32",
                 &dummy_sol,
             )
+            .unwrap()
             .unwrap();
         assert!((v.latency - 2.0).abs() < 1e-9, "latency {}", v.latency);
         assert!(
@@ -1573,5 +2089,524 @@ mod tests {
             "energy {}",
             v.energy
         );
+    }
+
+    fn in_memory_mamba2_table(
+        backend: &str,
+        version: &str,
+        rows: &[(&str, f64)],
+    ) -> StateSpaceTable {
+        let mut by_keys: BTreeMap<Mamba2Key, Node> = BTreeMap::new();
+        for &(kernel_source, latency) in rows {
+            let key = Mamba2Key {
+                kernel_source: kernel_source.to_string(),
+                phase: "context".to_string(),
+                d_model: 8192,
+                d_state: 128,
+                d_conv: 4,
+                nheads: 128,
+                head_dim: 64,
+                n_groups: 8,
+                chunk_size: 256,
+            };
+            let node = by_keys.entry(key).or_insert_with(Node::branch);
+            insert_first_wins(node, &[1, 1024], LeafValue::latency_only(latency));
+        }
+        let table = StateSpaceTable::new(PathBuf::from("test-data"), backend, version);
+        assert!(
+            table
+                .mamba2
+                .set(Ok(Mamba2Grids {
+                    by_keys: prepare_nodes(by_keys),
+                }))
+                .is_ok()
+        );
+        table
+    }
+
+    fn query_mamba2_conv(table: &StateSpaceTable) -> Option<f64> {
+        let dummy_sol = |_: f64, _: f64| 1.0;
+        table
+            .query_mamba2(
+                "causal_conv1d_fn",
+                "context",
+                1,
+                1024,
+                8192,
+                128,
+                4,
+                128,
+                64,
+                8,
+                256,
+                &dummy_sol,
+            )
+            .unwrap()
+            .map(|v| v.latency)
+    }
+
+    #[test]
+    fn trtllm_rc29_mamba2_context_conv_resolves_token_major_over_donor_logical_rows() {
+        let table = in_memory_mamba2_table(
+            "trtllm",
+            "1.3.0rc29",
+            &[
+                ("causal_conv1d_fn", 1.0),
+                ("causal_conv1d_fn_token_major", 2.0),
+            ],
+        );
+        assert_eq!(query_mamba2_conv(&table).unwrap(), 2.0);
+        // rc20 persisted the logical name: no alias, the logical row serves.
+        let table = in_memory_mamba2_table(
+            "trtllm",
+            "1.3.0rc20",
+            &[
+                ("causal_conv1d_fn", 1.0),
+                ("causal_conv1d_fn_token_major", 2.0),
+            ],
+        );
+        assert_eq!(query_mamba2_conv(&table).unwrap(), 1.0);
+        // Without any matching row the query still misses (SOL at the operator).
+        let table =
+            in_memory_mamba2_table("trtllm", "1.3.0rc29", &[("mamba_chunk_scan_combined", 3.0)]);
+        assert_eq!(query_mamba2_conv(&table), None);
+    }
+
+    fn in_memory_mamba2_decode_table(
+        backend: &str,
+        version: &str,
+        rows: &[(&str, f64)],
+    ) -> StateSpaceTable {
+        let mut by_keys: BTreeMap<Mamba2Key, Node> = BTreeMap::new();
+        for &(kernel_source, latency) in rows {
+            let key = Mamba2Key {
+                kernel_source: kernel_source.to_string(),
+                phase: "generation".to_string(),
+                d_model: 8192,
+                d_state: 128,
+                d_conv: 4,
+                nheads: 128,
+                head_dim: 64,
+                n_groups: 8,
+                chunk_size: 256,
+            };
+            let node = by_keys.entry(key).or_insert_with(Node::branch);
+            insert_first_wins(node, &[1], LeafValue::latency_only(latency));
+        }
+        let table = StateSpaceTable::new(PathBuf::from("test-data"), backend, version);
+        assert!(
+            table
+                .mamba2
+                .set(Ok(Mamba2Grids {
+                    by_keys: prepare_nodes(by_keys),
+                }))
+                .is_ok()
+        );
+        table
+    }
+
+    fn query_mamba2_update(table: &StateSpaceTable) -> Option<f64> {
+        let dummy_sol = |_: f64, _: f64| 1.0;
+        table
+            .query_mamba2(
+                "selective_state_update",
+                "generation",
+                1,
+                1,
+                8192,
+                128,
+                4,
+                128,
+                64,
+                8,
+                256,
+                &dummy_sol,
+            )
+            .unwrap()
+            .map(|v| v.latency)
+    }
+
+    #[test]
+    fn trtllm_rc29_mamba2_decode_update_resolves_flashinfer_then_triton_labels() {
+        let table = in_memory_mamba2_decode_table(
+            "trtllm",
+            "1.3.0rc29",
+            &[
+                ("selective_state_update", 1.0),
+                ("selective_state_update_flashinfer", 2.0),
+                ("selective_state_update_triton", 3.0),
+            ],
+        );
+        assert_eq!(query_mamba2_update(&table).unwrap(), 2.0);
+        let table = in_memory_mamba2_decode_table(
+            "trtllm",
+            "1.3.0rc29",
+            &[("selective_state_update_triton", 3.0)],
+        );
+        assert_eq!(query_mamba2_update(&table).unwrap(), 3.0);
+        // Without a physical row the merged logical lane still serves.
+        let table = in_memory_mamba2_decode_table(
+            "trtllm",
+            "1.3.0rc29",
+            &[("selective_state_update", 1.0)],
+        );
+        assert_eq!(query_mamba2_update(&table).unwrap(), 1.0);
+        // rc20 persisted no FlashInfer label: no alias, a physical-only table misses (SOL at the
+        // operator).
+        let table = in_memory_mamba2_decode_table(
+            "trtllm",
+            "1.3.0rc20",
+            &[("selective_state_update_flashinfer", 2.0)],
+        );
+        assert_eq!(query_mamba2_update(&table), None);
+    }
+
+    /// One Mamba2 shape written through the parquet loader: a context row at
+    /// `[batch=2][seq=512]` and a decode row at `[batch=2]`. Each query hits
+    /// its stored coordinate, so Grid RAW returns the stored fixture value
+    /// itself; `dummy_sol` returns 1.0, which would mark an analytic estimate.
+    #[test]
+    fn mamba2_decode_rows_resolve_like_context_rows() {
+        use crate::perf_database::energy_test_fixtures::{Col, write_parquet};
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        write_parquet(
+            &tmp.path().join("mamba2_perf.parquet"),
+            &[
+                Col::Str(
+                    "kernel_source",
+                    vec!["causal_conv1d_fn", "causal_conv1d_update"],
+                ),
+                Col::Str("phase", vec!["context", "generation"]),
+                Col::I64("batch_size", vec![2, 2]),
+                Col::I64("seq_len", vec![512, 1]),
+                Col::I64("d_model", vec![1024, 1024]),
+                Col::I64("d_state", vec![64, 64]),
+                Col::I64("d_conv", vec![4, 4]),
+                Col::I64("nheads", vec![16, 16]),
+                Col::I64("head_dim", vec![64, 64]),
+                Col::I64("n_groups", vec![4, 4]),
+                Col::I64("chunk_size", vec![128, 128]),
+                Col::F64("latency", vec![0.5, 0.25]),
+            ],
+        );
+        let table = StateSpaceTable::new(tmp.path().to_path_buf(), "test", "1.0");
+        let query = |kernel_source: &str, phase: &str, seq_len: u32| {
+            table
+                .query_mamba2(
+                    kernel_source,
+                    phase,
+                    2,
+                    seq_len,
+                    1024,
+                    64,
+                    4,
+                    16,
+                    64,
+                    4,
+                    128,
+                    &dummy_sol,
+                )
+                .unwrap()
+                .map(|v| v.latency)
+        };
+        // The context path keeps resolving on its 2-axis grid.
+        assert_eq!(query("causal_conv1d_fn", "context", 512).unwrap(), 0.5);
+        // Decode resolves on the 1-axis batch curve; its seq feeds SOL only.
+        assert_eq!(
+            query("causal_conv1d_update", "generation", 1024).unwrap(),
+            0.25
+        );
+    }
+
+    fn query_mamba2_conv_shape(
+        table: &StateSpaceTable,
+        d_model: u32,
+        nheads: u32,
+        n_groups: u32,
+    ) -> Option<f64> {
+        let dummy_sol = |_: f64, _: f64| 1.0;
+        table
+            .query_mamba2(
+                "causal_conv1d_fn",
+                "context",
+                1,
+                1024,
+                d_model,
+                128,
+                4,
+                nheads,
+                64,
+                n_groups,
+                256,
+                &dummy_sol,
+            )
+            .unwrap()
+            .map(|v| v.latency)
+    }
+
+    /// The in-memory table holds one full-layer row (d_model 8192, 128 heads,
+    /// 8 groups). A TP 2 shard of that layer (64 heads, 4 groups) has no row and
+    /// must not be priced with the full-layer row.
+    #[test]
+    fn mamba2_same_d_model_row_is_not_substituted_for_a_per_shard_shape() {
+        let table = in_memory_mamba2_table("trtllm", "1.3.0rc20", &[("causal_conv1d_fn", 1.0)]);
+        assert_eq!(query_mamba2_conv_shape(&table, 8192, 128, 8).unwrap(), 1.0);
+        assert_eq!(query_mamba2_conv_shape(&table, 8192, 64, 4), None);
+    }
+
+    #[test]
+    fn mamba2_rc29_alias_rows_are_not_substituted_for_a_per_shard_shape() {
+        let table = in_memory_mamba2_table(
+            "trtllm",
+            "1.3.0rc29",
+            &[
+                ("causal_conv1d_fn", 1.0),
+                ("causal_conv1d_fn_token_major", 2.0),
+            ],
+        );
+        assert_eq!(query_mamba2_conv_shape(&table, 8192, 128, 8).unwrap(), 2.0);
+        assert_eq!(query_mamba2_conv_shape(&table, 8192, 64, 4), None);
+    }
+
+    /// Packaged TRT-LLM rows hold the TP 1 geometry of each model. The TP 1
+    /// query of nvidia/Nemotron-H-56B-Base-8K hits; its TP 8 shard misses.
+    #[test]
+    fn mamba2_packaged_table_hits_tp1_shape_and_rejects_per_shard_shape() {
+        let table = StateSpaceTable::new(
+            data_root("b200_sxm/linear_attention/trtllm/1.3.0rc29"),
+            "trtllm",
+            "1.3.0rc29",
+        );
+        let dummy_sol = |_: f64, _: f64| 1.0;
+        let query = |nheads: u32, n_groups: u32| {
+            table.query_mamba2(
+                "causal_conv1d_fn",
+                "context",
+                1,
+                1024,
+                8192,
+                256,
+                4,
+                nheads,
+                64,
+                n_groups,
+                128,
+                &dummy_sol,
+            )
+        };
+        assert!(query(256, 8).unwrap().is_some_and(|v| v.latency > 0.0));
+        assert_eq!(query(32, 1).unwrap(), None);
+    }
+
+    #[test]
+    fn mamba2_has_kernel_resolves_the_rc29_decode_alias_and_reports_empty_tables() {
+        use crate::perf_database::energy_test_fixtures::{Col, write_parquet};
+        let table = in_memory_mamba2_decode_table(
+            "trtllm",
+            "1.3.0rc29",
+            &[("selective_state_update_flashinfer", 2.0)],
+        );
+        assert!(
+            table
+                .mamba2_has_kernel("selective_state_update", "generation")
+                .unwrap()
+        );
+        assert!(
+            !table
+                .mamba2_has_kernel("causal_conv1d_update", "generation")
+                .unwrap()
+        );
+        assert!(
+            !table
+                .mamba2_has_kernel("selective_state_update", "context")
+                .unwrap()
+        );
+        // rc20 has no decode alias: the physical label alone does not cover the logical kernel.
+        let table = in_memory_mamba2_decode_table(
+            "trtllm",
+            "1.3.0rc20",
+            &[("selective_state_update_flashinfer", 2.0)],
+        );
+        assert!(
+            !table
+                .mamba2_has_kernel("selective_state_update", "generation")
+                .unwrap()
+        );
+        // An absent table and an empty table both answer `false`, not an error.
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let table = StateSpaceTable::new(tmp.path().to_path_buf(), "vllm", "0.24.0");
+        assert!(
+            !table
+                .mamba2_has_kernel("causal_conv1d_fn", "context")
+                .unwrap()
+        );
+        write_parquet(
+            &tmp.path().join("mamba2_perf.parquet"),
+            &[
+                Col::Str("kernel_source", vec![]),
+                Col::Str("phase", vec![]),
+                Col::I64("batch_size", vec![]),
+                Col::I64("seq_len", vec![]),
+                Col::I64("d_model", vec![]),
+                Col::I64("d_state", vec![]),
+                Col::I64("d_conv", vec![]),
+                Col::I64("nheads", vec![]),
+                Col::I64("head_dim", vec![]),
+                Col::I64("n_groups", vec![]),
+                Col::I64("chunk_size", vec![]),
+                Col::F64("latency", vec![]),
+            ],
+        );
+        let table = StateSpaceTable::new(tmp.path().to_path_buf(), "vllm", "0.24.0");
+        assert!(
+            !table
+                .mamba2_has_kernel("causal_conv1d_fn", "context")
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn gdn_has_kernel_resolves_profile_aliases_and_the_bf16_flashinfer_lane() {
+        // vLLM >= 0.24.0 persists the context scan under physical labels.
+        let table = in_memory_gdn_table(
+            "vllm",
+            "0.24.0",
+            &[("chunk_gated_delta_rule_triton", "context", 32, 1.0)],
+        );
+        assert!(
+            table
+                .gdn_has_kernel("chunk_gated_delta_rule", "context", "float32")
+                .unwrap()
+        );
+        assert!(
+            !table
+                .gdn_has_kernel("causal_conv1d_fn", "context", "float32")
+                .unwrap()
+        );
+        assert!(
+            !table
+                .gdn_has_kernel("chunk_gated_delta_rule", "generation", "float32")
+                .unwrap()
+        );
+        // Readiness ignores the state dtype outside the SGLang SM-major-10 BF16 decode lane.
+        assert!(
+            table
+                .gdn_has_kernel("chunk_gated_delta_rule", "context", "bfloat16")
+                .unwrap()
+        );
+        // On that lane the BF16 decode recurrence needs its own FlashInfer rows; FP32 and the
+        // other versions keep the logical row.
+        let fla_only = in_memory_gdn_table_with_sm(
+            "sglang",
+            "0.5.14",
+            Some(103),
+            &[(
+                "fused_sigmoid_gating_delta_rule_update",
+                "generation",
+                48,
+                4.0,
+            )],
+        );
+        let kernel = "fused_sigmoid_gating_delta_rule_update";
+        assert!(
+            !fla_only
+                .gdn_has_kernel(kernel, "generation", "bfloat16")
+                .unwrap()
+        );
+        assert!(
+            fla_only
+                .gdn_has_kernel(kernel, "generation", "float32")
+                .unwrap()
+        );
+        let flashinfer_only = in_memory_gdn_table_with_sm(
+            "sglang",
+            "0.5.14",
+            Some(103),
+            &[("flashinfer_gated_delta_rule_decode", "generation", 48, 2.1)],
+        );
+        assert!(
+            flashinfer_only
+                .gdn_has_kernel(kernel, "generation", "bfloat16")
+                .unwrap()
+        );
+        assert!(
+            !flashinfer_only
+                .gdn_has_kernel(kernel, "generation", "float32")
+                .unwrap()
+        );
+        let sm120 = in_memory_gdn_table_with_sm(
+            "sglang",
+            "0.5.14",
+            Some(120),
+            &[(
+                "fused_sigmoid_gating_delta_rule_update",
+                "generation",
+                48,
+                4.0,
+            )],
+        );
+        assert!(
+            sm120
+                .gdn_has_kernel(kernel, "generation", "bfloat16")
+                .unwrap()
+        );
+        // No table at all answers `false`.
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let absent = StateSpaceTable::new(tmp.path().to_path_buf(), "vllm", "0.24.0");
+        assert!(
+            !absent
+                .gdn_has_kernel("causal_conv1d_fn", "context", "float32")
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn kda_has_kernel_accepts_fused_verify_and_fused_decode_routes() {
+        let table = in_memory_kda_table(&[("chunk_kda", "context", 16, 1.0)]);
+        assert!(table.kda_has_kernel("chunk_kda", "context").unwrap());
+        assert!(
+            !table
+                .kda_has_kernel("causal_conv1d_fn_qkv3", "context")
+                .unwrap()
+        );
+        assert!(!table.kda_has_kernel("chunk_kda", "generation").unwrap());
+        // Fused DSPARK verify rows cover the recurrence and the conv update, verify phase only.
+        let fused_verify =
+            in_memory_kda_table(&[("fused_kda_decode_mtp_dspark", "verify", 16, 2.5)]);
+        for kernel in [
+            "fused_sigmoid_gating_delta_rule_update",
+            "causal_conv1d_update",
+        ] {
+            assert!(
+                fused_verify.kda_has_kernel(kernel, "verify").unwrap(),
+                "{kernel}"
+            );
+            assert!(
+                !fused_verify.kda_has_kernel(kernel, "generation").unwrap(),
+                "{kernel}"
+            );
+        }
+        assert!(!fused_verify.kda_has_kernel("chunk_kda", "verify").unwrap());
+        // Fused decode rows cover the packed decode recurrence and the conv update, generation only.
+        let fused_decode = in_memory_kda_table(&[("kda_fused_decode", "generation", 12, 1.5)]);
+        for kernel in ["fused_recurrent_kda_packed_decode", "causal_conv1d_update"] {
+            assert!(
+                fused_decode.kda_has_kernel(kernel, "generation").unwrap(),
+                "{kernel}"
+            );
+            assert!(
+                !fused_decode.kda_has_kernel(kernel, "verify").unwrap(),
+                "{kernel}"
+            );
+        }
+        assert!(
+            !fused_decode
+                .kda_has_kernel("fused_kda_decode", "generation")
+                .unwrap()
+        );
+        // No table at all answers `false`.
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let absent = StateSpaceTable::new(tmp.path().to_path_buf(), "sglang", "0.5.14");
+        assert!(!absent.kda_has_kernel("chunk_kda", "context").unwrap());
     }
 }

@@ -1,11 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Build the public AISimulate E2E accuracy overview from a validated snapshot.
+"""Build the public AISim E2E accuracy overview from a validated snapshot.
 
 The source ``predictions.json`` retains historical ``dynamo_*`` field names for
 frontend compatibility. Rows with ``aisimulate_runner`` provenance are emitted
-as AISimulate results. The public output contains aggregate errors and identity
+as AISim results. The public output contains aggregate errors and identity
 dimensions and chart metrics, with public InferenceX GitHub run IDs for tracing
 measurements. Internal database run IDs are never published.
 """
@@ -21,10 +21,21 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 INFERENCEX_RELEASE_URL_PREFIX = "https://github.com/SemiAnalysisAI/InferenceX-app/releases/tag/"
+
+
+def measurement_source_url(release_tag: str) -> str:
+    if release_tag.startswith("hf/"):
+        revision = release_tag.removeprefix("hf/")
+        if not re.fullmatch(r"[0-9a-f]{40}", revision):
+            raise ValueError("HF measurement source requires a full commit")
+        return f"https://huggingface.co/datasets/ai-dynamo/aisim-infx-cache/tree/{revision}"
+    return INFERENCEX_RELEASE_URL_PREFIX + release_tag
+
+
 FORBIDDEN_PUBLIC_FRAGMENTS = (
-    "gitlab-master.nvidia.com",
+    "gitlab",
     "linear.app/nvidia",
     "slack.com/archives",
     "silicon_workflow_run_id",
@@ -287,8 +298,9 @@ def _prediction_error(row: dict[str, Any]) -> str | None:
     message = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", message)
     message = re.sub(r"https?://[^\s<>\"']+", "[URL]", message)
     message = re.sub(r"(?<![\w/])(?:/[\w.~-]+)+", "[path]", message)
+    message = re.sub(r"\b[a-z0-9.-]*gitlab[a-z0-9.-]*\b", "[redacted]", message, flags=re.IGNORECASE)
     for fragment in FORBIDDEN_PUBLIC_FRAGMENTS:
-        message = message.replace(fragment, "[redacted]")
+        message = re.sub(re.escape(fragment), "[redacted]", message, flags=re.IGNORECASE)
     message = " ".join(message.split())
     return message[:2047] + "…" if len(message) > 2048 else message
 
@@ -322,7 +334,7 @@ def _topology_summaries(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             }
             if "configuration_quality" in row:
                 point["configuration_quality"] = row["configuration_quality"]
-            for name, prefix in (("measured", "silicon"), ("aic", "aic"), ("aisimulate", "dynamo")):
+            for name, prefix in (("measured", "silicon"), ("aic", "aic"), ("aisim", "dynamo")):
                 point[name] = _chart_metrics(row, prefix)
                 for metric, anchor in anchors.items():
                     value = _finite(row.get(f"{prefix}_{metric}_ms"))
@@ -336,7 +348,7 @@ def _topology_summaries(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                         )
                 tpot = point[name]["tpot_ms"]
                 point[name]["interactivity_tok_s"] = 1000 / tpot if tpot else None
-                missing = (name == "aisimulate" and row["aisimulate_status"] != "success") or (
+                missing = (name == "aisim" and row["aisimulate_status"] != "success") or (
                     name == "aic" and row.get("aic_status", "success") != "success"
                 )
                 point[name]["unavailable_metrics"] = {
@@ -369,7 +381,7 @@ def _topology_summaries(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 },
                 "rows": len(topology_rows),
                 "aic": _series_metrics(topology_rows, "aic"),
-                "aisimulate": {
+                "aisim": {
                     **_series_metrics(topology_rows, "dynamo"),
                     "status_counts": _status_counts(topology_rows),
                 },
@@ -414,24 +426,26 @@ def _aic_source(
     source = runtime.get("source_checkout") if isinstance(runtime, dict) else None
     if (
         not isinstance(source, dict)
-        or source.get("repository") != "https://github.com/ai-dynamo/aisimulate"
+        or source.get("repository")
+        not in {"https://github.com/ai-dynamo/aisim", "https://github.com/ai-dynamo/aisimulate"}
         or source.get("clean") is not True
         or not isinstance(source.get("branch"), str)
         or not isinstance(source.get("commit_sha"), str)
         or not re.fullmatch(r"[0-9a-f]{40}", source["commit_sha"])
         or source["commit_sha"] != predictions.get("aic_commit_sha")
-        or runtime.get("cli_entry_point") not in {"aisimulate.legacy_cli.entrypoint:main", "aiconfigurator.main:main"}
+        or runtime.get("cli_entry_point")
+        not in {"aisim.legacy_cli.entrypoint:main", "aisimulate.legacy_cli.entrypoint:main", "aiconfigurator.main:main"}
     ):
-        raise SnapshotError("AIC baseline must use the legacy CLI bundled in a clean AISimulate checkout")
+        raise SnapshotError("AIC baseline must use the legacy CLI bundled in a clean AISim checkout")
     if revision and any(source[key] != revision[key] for key in ("branch", "commit_sha")):
-        raise SnapshotError("AIC baseline and AISimulate replay must evaluate the same branch and commit")
+        raise SnapshotError("AIC baseline and AISim replay must evaluate the same branch and commit")
     result = {key: source[key] for key in ("repository", "branch", "commit_sha")}
     if "baseline_api" in runtime or "config_adapter" in runtime:
-        expected = (
-            ("aiconfigurator.cli.api", "aiconfigurator.sdk.config_adapter")
-            if runtime["cli_entry_point"] == "aiconfigurator.main:main"
-            else ("aisimulate.legacy_cli.api", "aisimulate.sdk.config_adapter")
-        )
+        expected = {
+            "aiconfigurator.main:main": ("aiconfigurator.cli.api", "aiconfigurator.sdk.config_adapter"),
+            "aisimulate.legacy_cli.entrypoint:main": ("aisimulate.legacy_cli.api", "aisimulate.sdk.config_adapter"),
+            "aisim.legacy_cli.entrypoint:main": ("aisim.legacy_cli.api", "aisim.sdk.config_adapter"),
+        }[runtime["cli_entry_point"]]
         if (runtime.get("baseline_api"), runtime.get("config_adapter")) != expected:
             raise SnapshotError("baseline entry point and predictor modules disagree")
         result["cli_entry_point"] = runtime["cli_entry_point"]
@@ -456,7 +470,7 @@ def _model_summary(model: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
                     "rows": len(gpu_rows),
                     "precisions": sorted({str(row["precision"]) for row in gpu_rows}),
                     "aic": _series_metrics(gpu_rows, "aic"),
-                    "aisimulate": {
+                    "aisim": {
                         **_series_metrics(gpu_rows, "dynamo"),
                         "status_counts": gpu_statuses,
                         "coverage_pct": _round_metric(
@@ -473,7 +487,7 @@ def _model_summary(model: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
                 "gpu_skus": sorted({str(row["hardware"]) for row in workload_rows}),
                 "precisions": sorted({str(row["precision"]) for row in workload_rows}),
                 "aic": _series_metrics(workload_rows, "aic"),
-                "aisimulate": {
+                "aisim": {
                     **_series_metrics(workload_rows, "dynamo"),
                     "status_counts": statuses,
                     "coverage_pct": _round_metric(
@@ -498,7 +512,7 @@ def _model_summary(model: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
         "rows": len(rows),
         **identities,
         "aic": _series_metrics(rows, "aic"),
-        "aisimulate": {
+        "aisim": {
             **_series_metrics(rows, "dynamo"),
             "status_counts": statuses,
             "coverage_pct": _round_metric(statuses["success"] / len(rows) * 100),
@@ -562,15 +576,18 @@ def _validate_inputs(
         has_ttft = _finite(row.get("dynamo_ttft_ms")) is not None
         has_tpot = _finite(row.get("dynamo_tpot_ms")) is not None
         if has_ttft != has_tpot:
-            raise SnapshotError("AISimulate TTFT and TPOT must be present or absent together")
+            raise SnapshotError("AISim TTFT and TPOT must be present or absent together")
         if has_ttft and (row["dynamo_ttft_ms"] <= 0 or row["dynamo_tpot_ms"] <= 0):
-            raise SnapshotError("successful AISimulate latencies must be positive")
+            raise SnapshotError("successful AISim latencies must be positive")
         if status == "success" and not has_ttft:
-            raise SnapshotError("successful AISimulate row is missing latency metrics")
+            raise SnapshotError("successful AISim row is missing latency metrics")
         if status != "success" and has_ttft:
-            raise SnapshotError("non-success AISimulate row contains latency metrics")
-        if status == "success" and row.get("aisimulate_runner") != "aisimulate.engine_replay":
-            raise SnapshotError("successful row does not identify the public AISimulate runner")
+            raise SnapshotError("non-success AISim row contains latency metrics")
+        if status == "success" and row.get("aisimulate_runner") not in {
+            "aisim.engine_replay",
+            "aisimulate.engine_replay",
+        }:
+            raise SnapshotError("successful row does not identify the public AISim runner")
 
     aisimulate_run = metadata.get("aisimulate_run")
     if not isinstance(aisimulate_run, dict):
@@ -597,7 +614,7 @@ def build_summary(
     if research_preview and branch is not None:
         raise SnapshotError("research previews cannot qualify an evaluated branch")
     all_rows = _validate_inputs(predictions, metadata, coverage, research_preview=research_preview)
-    expected_source_url = f"{INFERENCEX_RELEASE_URL_PREFIX}{predictions['release_tag']}"
+    expected_source_url = measurement_source_url(predictions["release_tag"])
     if source_url != expected_source_url:
         raise SnapshotError("source URL does not match the validated predictions.release_tag")
     scoped_rows = [row for row in all_rows if not (exclude_multinode and _is_multinode(row))]
@@ -633,7 +650,7 @@ def build_summary(
 
     result = {
         "schema_version": SCHEMA_VERSION,
-        "title": "AISimulate E2E Accuracy Overview",
+        "title": "AISim E2E Accuracy Overview",
         "snapshot": {
             "release_tag": predictions["release_tag"],
             "measurement_source": "SemiAnalysis InferenceX",
@@ -642,10 +659,10 @@ def build_summary(
             "prediction_generated_at": predictions.get("generated_at"),
             "predictions_sha256": predictions_sha256,
             "aic_commit_sha": predictions.get("aic_commit_sha"),
-            "aisimulate_completed_at": aisimulate_run.get("completed_at"),
-            "aisimulate_method": aisimulate_run.get("method"),
-            "aisimulate_packages": dict(sorted(packages.items())),
-            "aisimulate_sot_sha256": metadata.get("sha256"),
+            "aisim_completed_at": aisimulate_run.get("completed_at"),
+            "aisim_method": aisimulate_run.get("method"),
+            "aisim_packages": dict(sorted(packages.items())),
+            "aisim_sot_sha256": metadata.get("sha256"),
             "corrections": sorted(
                 correction["id"]
                 for correction in aisimulate_run.get("corrections", [])
@@ -670,7 +687,7 @@ def build_summary(
             **identities,
             "rows": len(scoped_rows),
             "aic": _series_metrics(scoped_rows, "aic"),
-            "aisimulate": {
+            "aisim": {
                 **_series_metrics(scoped_rows, "dynamo"),
                 "status_counts": statuses,
                 "coverage_pct": _round_metric(statuses["success"] / len(scoped_rows) * 100),
@@ -682,7 +699,7 @@ def build_summary(
         quality: {
             "rows": len(group),
             "aic": _series_metrics(group, "aic"),
-            "aisimulate": _series_metrics(group, "dynamo"),
+            "aisim": _series_metrics(group, "dynamo"),
         }
         for quality in ("verified", "estimated", "not_recorded")
         if (group := [row for row in scoped_rows if row.get("configuration_quality", "not_recorded") == quality])
@@ -732,7 +749,7 @@ def build_summary(
         }
     serialized = json.dumps(result, sort_keys=True)
     for fragment in FORBIDDEN_PUBLIC_FRAGMENTS:
-        if fragment in serialized:
+        if fragment in serialized.lower():
             raise SnapshotError(f"public output contains forbidden fragment: {fragment}")
     return result
 

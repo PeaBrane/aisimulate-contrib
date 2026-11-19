@@ -63,6 +63,8 @@ use super::source_resolution::PrioritizedSource;
 use super::{SourceResolver, kernel_source_ok};
 use crate::common::error::AicError;
 use crate::config::{PerfDbSources, PerfSource};
+use crate::memo::Memo;
+use crate::operators::moe_ll_monte_carlo::{self, MonteCarloRequest};
 use crate::perf_database::parquet_loader::{PerfReader, PerfRow};
 
 /// `(comm_backend, phase, comm_dtype, ep_size, node_num, hidden_size, topk,
@@ -409,9 +411,16 @@ pub struct MoeA2aTable {
     legacy_ll_sources: Vec<PrioritizedSource>,
     legacy_trtllm_alltoall_sources: Vec<PrioritizedSource>,
     grids: OnceLock<Result<MoeA2aGrids, AicError>>,
+    /// DeepEP-LL Monte Carlo P50 estimates ([`moe_ll_monte_carlo::memo`]).
+    monte_carlo: OnceLock<Memo<MonteCarloRequest, f64>>,
 }
 
 impl MoeA2aTable {
+    /// The DeepEP-LL Monte Carlo memo, allocated on first use.
+    pub(crate) fn monte_carlo(&self) -> &Memo<MonteCarloRequest, f64> {
+        self.monte_carlo.get_or_init(moe_ll_monte_carlo::memo)
+    }
+
     /// Construct an empty table for the given data directory. No I/O. Each
     /// perf file is sourced solely from `data_root/<basename>` with no
     /// `kernel_source` filter (pre-shared-layer behaviour).
@@ -451,6 +460,7 @@ impl MoeA2aTable {
             legacy_ll_sources,
             legacy_trtllm_alltoall_sources,
             grids: OnceLock::new(),
+            monte_carlo: OnceLock::new(),
         })
     }
 
@@ -1430,7 +1440,7 @@ mod tests {
     #[test]
     fn deepep_ll_dtype_candidates_match_shared_coverage_fixture() {
         let cases: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../../../python/aisimulate/tests/fixtures/deepep_ll_dtype_candidates.json"
+            "../../../../../python/aisim/tests/fixtures/deepep_ll_dtype_candidates.json"
         ))
         .unwrap();
         for case in cases.as_array().unwrap() {
@@ -1459,7 +1469,7 @@ mod tests {
     #[test]
     fn deepep_ll_runtime_matches_shared_coverage_viability_fixture() {
         let cases: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../../../python/aisimulate/tests/fixtures/deepep_ll_calibration_viability.json"
+            "../../../../../python/aisim/tests/fixtures/deepep_ll_calibration_viability.json"
         ))
         .unwrap();
         for case in cases.as_array().unwrap() {
@@ -3043,7 +3053,7 @@ mod tests {
             serde_json::from_str(include_str!("testdata/moe_a2a_oracle.json"))
                 .expect("oracle fixture must parse");
         let systems = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../python/aisimulate/src/aisimulate_core/systems");
+            .join("../../python/aisim/src/aisim_core/systems");
         let samples = oracle["samples"].as_array().expect("samples array");
         let mut tables: BTreeMap<String, MoeA2aTable> = BTreeMap::new();
         let mut max_rel = 0.0_f64;

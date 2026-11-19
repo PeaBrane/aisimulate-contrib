@@ -1,0 +1,245 @@
+{
+  "evidence_type": "local synthetic/fake-runner; not hosted CI, model predictions, or agent evals",
+  "source_head": "8ff6bea813be86762d2f3d4dc3ddb64cabe646bb",
+  "oracle_comparison": [
+    {
+      "changes": {},
+      "sla": {
+        "ttft_ms": 500,
+        "itl_ms": 50
+      },
+      "expected_pass": true,
+      "aisim_violations": [],
+      "fallback_violations": []
+    },
+    {
+      "changes": {
+        "mean_ttft_ms": 500
+      },
+      "sla": {
+        "ttft_ms": 500,
+        "itl_ms": 50
+      },
+      "expected_pass": true,
+      "aisim_violations": [],
+      "fallback_violations": []
+    },
+    {
+      "changes": {
+        "mean_ttft_ms": 500.01
+      },
+      "sla": {
+        "ttft_ms": 500,
+        "itl_ms": 50
+      },
+      "expected_pass": false,
+      "aisim_violations": [
+        "ttft 500.01ms > 500ms"
+      ],
+      "fallback_violations": [
+        "ttft 500.01ms > 500ms"
+      ]
+    },
+    {
+      "changes": {
+        "mean_tpot_ms": 50
+      },
+      "sla": {
+        "ttft_ms": 500,
+        "itl_ms": 50
+      },
+      "expected_pass": true,
+      "aisim_violations": [],
+      "fallback_violations": []
+    },
+    {
+      "changes": {
+        "mean_tpot_ms": 50.01
+      },
+      "sla": {
+        "ttft_ms": 500,
+        "itl_ms": 50
+      },
+      "expected_pass": false,
+      "aisim_violations": [
+        "tpot 50.01ms > 50ms"
+      ],
+      "fallback_violations": [
+        "tpot 50.01ms > 50ms"
+      ]
+    },
+    {
+      "changes": {
+        "mean_e2e_latency_ms": 3000
+      },
+      "sla": {
+        "e2e_ms": 3000
+      },
+      "expected_pass": true,
+      "aisim_violations": [],
+      "fallback_violations": []
+    },
+    {
+      "changes": {
+        "mean_e2e_latency_ms": 3000.01
+      },
+      "sla": {
+        "e2e_ms": 3000
+      },
+      "expected_pass": false,
+      "aisim_violations": [
+        "e2e 3000.01ms > 3000ms"
+      ],
+      "fallback_violations": [
+        "e2e 3000.01ms > 3000ms"
+      ]
+    },
+    {
+      "changes": {
+        "completed_requests": 0
+      },
+      "sla": {
+        "ttft_ms": 500,
+        "itl_ms": 50
+      },
+      "expected_pass": false,
+      "aisim_violations": [
+        "completed_requests is zero"
+      ],
+      "fallback_violations": [
+        "completed_requests is missing, non-finite or zero"
+      ]
+    },
+    {
+      "changes": {
+        "completed_requests": null
+      },
+      "sla": {
+        "ttft_ms": 500,
+        "itl_ms": 50
+      },
+      "expected_pass": false,
+      "aisim_violations": [
+        "completed_requests is missing"
+      ],
+      "fallback_violations": [
+        "completed_requests is missing, non-finite or zero"
+      ]
+    },
+    {
+      "changes": {
+        "num_ttft_samples": 0
+      },
+      "sla": {
+        "ttft_ms": 500,
+        "itl_ms": 50
+      },
+      "expected_pass": false,
+      "aisim_violations": [
+        "ttft has no qualifying samples (num_ttft_samples=0)"
+      ],
+      "fallback_violations": [
+        "ttft has no qualifying samples"
+      ]
+    },
+    {
+      "changes": {
+        "num_tpot_samples": null
+      },
+      "sla": {
+        "ttft_ms": 500,
+        "itl_ms": 50
+      },
+      "expected_pass": false,
+      "aisim_violations": [
+        "tpot sample count num_tpot_samples is missing"
+      ],
+      "fallback_violations": [
+        "tpot has no qualifying samples"
+      ]
+    },
+    {
+      "changes": {
+        "mean_ttft_ms": null
+      },
+      "sla": {
+        "ttft_ms": 500,
+        "itl_ms": 50
+      },
+      "expected_pass": false,
+      "aisim_violations": [
+        "ttft metric mean_ttft_ms is missing"
+      ],
+      "fallback_violations": [
+        "ttft metric mean_ttft_ms is missing or non-finite"
+      ]
+    }
+  ],
+  "negative_controls": [
+    {
+      "historical_fix": "bdb0a4a0",
+      "source": "bdb0a4a0^",
+      "version": "before",
+      "test_filter": "headroom_preserves_arrival_window_at_double_rate",
+      "exit_code": 1,
+      "output": "FFF                                                                      [100%]\n=================================== FAILURES ===================================\nE   assert [50.0, 25.0] == [300, 300]\n      \n      At index 0 diff: 50.0 != 300\n      Use -v to get more diff\n$SCRATCH/test_bdb0a4a0_before.py:532: assert [50.0, 25.0] == [300, 300]\nE   assert [300.0, 150.0] == [300, 300]\n      \n      At index 1 diff: 150.0 != 300\n      Use -v to get more diff\n$SCRATCH/test_bdb0a4a0_before.py:532: assert [300.0, 150.0] == [300, 300]\nE   assert [600.0, 300.0] == [600, 600]\n      \n      At index 1 diff: 300.0 != 600\n      Use -v to get more diff\n$SCRATCH/test_bdb0a4a0_before.py:532: assert [600.0, 300.0] == [600, 600]\n=========================== short test summary info ============================\nFAILED ::test_headroom_preserves_arrival_window_at_double_rate[1000-300] - as...\nFAILED ::test_headroom_preserves_arrival_window_at_double_rate[6000-300] - as...\nFAILED ::test_headroom_preserves_arrival_window_at_double_rate[12000-600] - a...\n3 failed, 49 deselected in 0.31s\n"
+    },
+    {
+      "historical_fix": "bdb0a4a0",
+      "source": "HEAD",
+      "version": "after",
+      "test_filter": "headroom_preserves_arrival_window_at_double_rate",
+      "exit_code": 0,
+      "output": "...                                                                      [100%]\n3 passed, 49 deselected in 0.33s\n"
+    },
+    {
+      "historical_fix": "92c2564e",
+      "source": "92c2564e^",
+      "version": "before",
+      "test_filter": "probe_timeout_stops_before_next_probe_or_recommend",
+      "exit_code": 1,
+      "output": "FF                                                                       [100%]\n=================================== FAILURES ===================================\nE   AssertionError: assert 2 <= 1\n     +  where 2 = len([['aisim', 'predict', '--config', '/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-937-2...T235915111611Z/scratch/committed-controls/tmp-92c2564e-before/test_probe_timeout_stops_befor0/out/probe/probe-sglang']])\n$SCRATCH/test_92c2564e_before.py:107: AssertionError: assert 2 <= 1\nE   AssertionError: assert 'recommend' == 'predict'\n      \n      - predict\n      + recommend\n$SCRATCH/test_92c2564e_before.py:106: AssertionError: assert 'recommend' == 'predict'\n=========================== short test summary info ============================\nFAILED ::test_probe_timeout_stops_before_next_probe_or_recommend[1] - Asserti...\nFAILED ::test_probe_timeout_stops_before_next_probe_or_recommend[2] - Asserti...\n2 failed, 50 deselected in 0.31s\n"
+    },
+    {
+      "historical_fix": "92c2564e",
+      "source": "HEAD",
+      "version": "after",
+      "test_filter": "probe_timeout_stops_before_next_probe_or_recommend",
+      "exit_code": 0,
+      "output": "..                                                                       [100%]\n2 passed, 50 deselected in 0.30s\n"
+    },
+    {
+      "historical_fix": "16da056e",
+      "source": "16da056e^",
+      "version": "before",
+      "test_filter": "invalid_effective_config_stops_before_execution",
+      "exit_code": 1,
+      "output": "FFFFFFF                                                                  [100%]\n=================================== FAILURES ===================================\nE   ZeroDivisionError: float division by zero\n$SCRATCH/16da056e-before-size_ladder.py:224: ZeroDivisionError: float division by zero\nE   Failed: invalid config must not start AISim\n$SCRATCH/test_16da056e_before.py:83: Failed: invalid config must not start AISim\nE   Failed: invalid config must not start AISim\n$SCRATCH/test_16da056e_before.py:83: Failed: invalid config must not start AISim\nE   ValueError: could not convert string to float: 'fast'\n$SCRATCH/16da056e-before-size_ladder.py:222: ValueError: could not convert string to float: 'fast'\nE   Failed: invalid config must not start AISim\n$SCRATCH/test_16da056e_before.py:83: Failed: invalid config must not start AISim\nE   Failed: invalid config must not start AISim\n$SCRATCH/test_16da056e_before.py:83: Failed: invalid config must not start AISim\nE   TypeError: 'int' object does not support item assignment\n$SCRATCH/16da056e-before-size_ladder.py:62: TypeError: 'int' object does not support item assignment\n=========================== short test summary info ============================\nFAILED ::test_invalid_effective_config_stops_before_execution[traffic.load.requests_per_second=0]\nFAILED ::test_invalid_effective_config_stops_before_execution[traffic.load.requests_per_second=-1]\nFAILED ::test_invalid_effective_config_stops_before_execution[traffic.load.requests_per_second=.nan]\nFAILED ::test_invalid_effective_config_stops_before_execution[traffic.load.requests_per_second=fast]\nFAILED ::test_invalid_effective_config_stops_before_execution[optimizer.max_trials=0]\nFAILED ::test_invalid_effective_config_stops_before_execution[optimization.constraints.min_candidate_gpus=2]\nFAILED ::test_invalid_effective_config_stops_before_execution[traffic.load.requests_per_second.bad=1]\n7 failed, 45 deselected in 0.34s\n"
+    },
+    {
+      "historical_fix": "16da056e",
+      "source": "HEAD",
+      "version": "after",
+      "test_filter": "invalid_effective_config_stops_before_execution",
+      "exit_code": 0,
+      "output": ".......                                                                  [100%]\n7 passed, 45 deselected in 0.34s\n"
+    },
+    {
+      "historical_fix": "f49e7925",
+      "source": "f49e7925^",
+      "version": "before",
+      "test_filter": "retry_above_rejected_two_gpu_answer",
+      "exit_code": 1,
+      "output": "F.                                                                       [100%]\n=================================== FAILURES ===================================\nE   AssertionError: assert 2 == 0\n     +  where 2 = invoke(<module 'size_ladder' from '$SCRATCH/f49e7925-before-size_ladder.py'>, <_pytest.monkeypatch.MonkeyPatch object at 0x7b1e53844f50>, PosixPath('$SCRATCH/tmp-f49e7925-before/test_retry_above_rejected_two_0/sizing.yaml'), PosixPath('$SCRATCH/tmp-f49e7925-before/test_retry_above_rejected_two_0'), '--budgets', '3,4,8,16', '--no-refine', '--set', 'optimization.constraints.min_candidate_gpus=3')\n----------------------------- Captured stderr call -----------------------------\nerror: invalid recommendation config: 1 validation error for CoreRecommendationConfig\noptimization.constraints\n  Value error, min_candidate_gpus cannot exceed max_candidate_gpus [type=value_error, input_value={'max_candidate_gpus': 2,...'min_candidate_gpus': 3}, input_type=dict]\n    For further information visit https://errors.pydantic.dev/2.14/v/value_error\n$SCRATCH/test_f49e7925_before.py:188: AssertionError: assert 2 == 0\n=========================== short test summary info ============================\nFAILED ::test_retry_above_rejected_two_gpu_answer[2] - AssertionError: assert...\n1 failed, 1 passed, 50 deselected in 0.31s\n"
+    },
+    {
+      "historical_fix": "f49e7925",
+      "source": "HEAD",
+      "version": "after",
+      "test_filter": "retry_above_rejected_two_gpu_answer",
+      "exit_code": 0,
+      "output": "..                                                                       [100%]\n2 passed, 50 deselected in 0.32s\n"
+    }
+  ],
+  "diagnostics": "Both checkers agree on verdicts; missing/zero-sample message wording differs. The fallback rejects numeric strings and booleans; these are outside the numeric report contract."
+}

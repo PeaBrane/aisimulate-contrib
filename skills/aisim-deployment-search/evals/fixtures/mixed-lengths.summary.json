@@ -1,0 +1,32 @@
+{
+  "provenance": "synthetic deterministic alternating lengths; recipe reconstructed from the committed fixture",
+  "sha256": "90d88640e2bffdb038a06a4daf4b0e439de325181edf468698d9f6236a22a451",
+  "records": 200,
+  "block_size_tokens": 512,
+  "timestamp_unit": "ms",
+  "timestamp_range": [
+    0,
+    19900
+  ],
+  "timestamp_step": 100,
+  "input_length_counts": {
+    "512": 100,
+    "2048": 100
+  },
+  "output_length_counts": {
+    "16": 100,
+    "1024": 100
+  },
+  "hash_id_range": [
+    0,
+    499
+  ],
+  "unique_hash_ids": 500,
+  "anomalies": {
+    "non_increasing_timestamps": 0,
+    "invalid_lengths": 0,
+    "block_count_mismatches": 0,
+    "repeated_hash_ids": 0,
+    "hash_ids_outside_expected_range": 0
+  }
+}

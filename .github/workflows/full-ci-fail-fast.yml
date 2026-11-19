@@ -1,0 +1,35 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Full CI fail-fast
+
+on:
+  workflow_run:
+    workflows: [Full CI]
+    types: [in_progress]
+
+# This workflow runs from the default branch, never from the revision it watches.
+permissions: {}
+
+concurrency:
+  group: full-ci-fail-fast-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}
+  cancel-in-progress: true
+
+jobs:
+  cancel-on-failure:
+    name: Cancel Full CI after a blocking failure
+    runs-on: ubuntu-24.04
+    timeout-minutes: 125
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+          sparse-checkout: scripts/ci
+      - name: Watch the triggering Full CI attempt
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci/watch_full_ci.py

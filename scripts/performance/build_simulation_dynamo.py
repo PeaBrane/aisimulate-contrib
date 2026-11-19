@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Build the pinned Dynamo replay adapter against one exact AISimulate checkout."""
+"""Build the pinned Dynamo replay adapter against one exact AISim checkout."""
 
 import argparse
 import hashlib
@@ -10,6 +10,10 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import NamedTuple
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from scripts.release.package_identity import core_package
 
 DYNAMO_REVISION = "def3b79b15c266805540a678dd400aeb6ccada1d"
 REPLAY_ADAPTER_SHA256 = "2d03eb4fe0d62f2dd09521fc3cb1e5e97f6d956ef9efd2fb43eabc48d2318af3"
@@ -27,7 +31,7 @@ SPECULATION_DEPTH_OLD = """    let nextn = config
         .as_ref()
         .map_or(config.nextn, |spec| spec.num_speculative_tokens());
 """
-SPECULATION_DEPTH_NEW = """    // Modified by AISimulate CI: preserve the Ngram-only replay contract
+SPECULATION_DEPTH_NEW = """    // Modified by AISim CI: preserve the Ngram-only replay contract
     // across the enum-to-struct cost-configuration migration.
     let nextn = match config.speculation.as_ref() {
         None => config.nextn,
@@ -88,21 +92,22 @@ def patch_handoff_timing(core: Path, dynamo: Path) -> dict:
         "kv_bytes_per_token": "Option<usize>",
         "bandwidth_gb_s": "Option<f64>",
     }
-    if fields not in (legacy, legacy | {"state_bytes": "usize"}):
-        raise ValueError("unreviewed AISimulate handoff API; update the pinned adapter")
+    state_bytes = {"state_bytes": "usize"}
+    pipeline_fill = {"pipeline_fill_ms": "f64"}
+    if fields not in (legacy, legacy | state_bytes, legacy | state_bytes | pipeline_fill):
+        raise ValueError("unreviewed AISim handoff API; update the pinned adapter")
     patched = original
     if "state_bytes" in fields:
         anchor = b"        kv_bytes_per_token: timing.kv_bytes_per_token,\n"
         if original.count(anchor) != 1:
             raise ValueError("pinned handoff conversion anchor is not unique")
-        patched = original.replace(
-            anchor,
-            anchor
-            + (
-                b"        // Modified by AISimulate CI: this legacy DTO models token KV only.\n"
-                b"        state_bytes: 0,\n"
-            ),
-        )
+        added = b"        // Modified by AISim CI: this legacy DTO models token KV only.\n        state_bytes: 0,\n"
+        if "pipeline_fill_ms" in fields:
+            added += (
+                b"        // Modified by AISim CI: the pinned Dynamo has no pipeline-parallel prefill.\n"
+                b"        pipeline_fill_ms: 0.0,\n"
+            )
+        patched = original.replace(anchor, anchor + added)
         path.write_bytes(patched)
     return {
         "path": str(path.relative_to(dynamo)),
@@ -110,6 +115,7 @@ def patch_handoff_timing(core: Path, dynamo: Path) -> dict:
         "after_sha256": hashlib.sha256(patched).hexdigest(),
         "token_only_state_bytes": 0,
         "api_has_state_bytes": "state_bytes" in fields,
+        "api_has_pipeline_fill_ms": "pipeline_fill_ms" in fields,
     }
 
 
@@ -117,15 +123,18 @@ class LiteralSite(NamedTuple):
     path: str  # Dynamo source file containing the literal.
     sha256: str  # Reviewed content of that file at DYNAMO_REVISION.
     anchor: str  # Text that occurs once in the file and precedes the literal.
-    struct: str  # AISimulate struct built by the literal.
-    api: str  # AISimulate core source file that defines the struct.
+    struct: str  # AISim struct built by the literal.
+    api: str  # AISim core source file that defines the struct.
 
 
 # Compatibility adaptation of NVIDIA Dynamo's Apache-2.0 sources at DYNAMO_REVISION:
 # https://github.com/ai-dynamo/dynamo/blob/def3b79b15c266805540a678dd400aeb6ccada1d/lib/mocker/src/grouped_scheduler/compatibility.rs
 # https://github.com/ai-dynamo/dynamo/blob/def3b79b15c266805540a678dd400aeb6ccada1d/lib/mocker/src/replay/offline/extensions/kv_router/mod.rs
-# Adds `field: None` for new optional AISimulate fields to these exhaustive
-# struct literals only; Dynamo behavior is otherwise unchanged.
+# https://github.com/ai-dynamo/dynamo/blob/def3b79b15c266805540a678dd400aeb6ccada1d/lib/mocker/src/replay/offline/entrypoints.rs
+# https://github.com/ai-dynamo/dynamo/blob/def3b79b15c266805540a678dd400aeb6ccada1d/lib/mocker/src/replay/offline/extensions/kv_events/mod.rs
+# https://github.com/ai-dynamo/dynamo/blob/def3b79b15c266805540a678dd400aeb6ccada1d/lib/bindings/python/rust/llm/replay.rs
+# Adds `field: None` for new optional AISim fields and empty images for the
+# pinned text-only Request; retain the recorded Weka client behavior.
 OPTIONAL_FIELD_LITERALS = (
     LiteralSite(
         "lib/mocker/src/grouped_scheduler/compatibility.rs",
@@ -140,6 +149,34 @@ OPTIONAL_FIELD_LITERALS = (
         "fn placement(&self, admission: WorkerAdmission) -> Placement {",
         "Placement",
         "src/replay/core/mod.rs",
+    ),
+    LiteralSite(
+        "lib/mocker/src/replay/offline/entrypoints.rs",
+        "df54ed60160f23b421c309004ac370b17ad5f28ecc4dab4b4495574f72678217",
+        "fn replay_spec(",
+        "ReplaySpec",
+        "src/replay/spec.rs",
+    ),
+    LiteralSite(
+        "lib/mocker/src/replay/offline/extensions/kv_events/mod.rs",
+        "f28f1faf84c16b17271b24c204cf5792af4438478968d186f28bc2db94b1ead8",
+        "pub(in crate::replay) fn generate_trace_worker_artifacts_with_visibility(",
+        "ReplaySpec",
+        "src/replay/spec.rs",
+    ),
+    LiteralSite(
+        "lib/bindings/python/rust/llm/replay.rs",
+        "5f0f5910a77f6bb1bd315c67b75e161d792dddc8fd6381ea35e2046855470f41",
+        "fn build_synthetic_workload(",
+        "SyntheticTraceSpec",
+        "src/replay/loadgen/types.rs",
+    ),
+    LiteralSite(
+        "lib/bindings/python/rust/llm/replay.rs",
+        "5f0f5910a77f6bb1bd315c67b75e161d792dddc8fd6381ea35e2046855470f41",
+        "fn parse_weka_import_options(",
+        "WekaImportOptions",
+        "src/replay/loadgen/weka.rs",
     ),
 )
 _OPTION_TYPE = re.compile(r"(?:(?:std|core)::option::)?Option\s*<.*>", re.DOTALL)
@@ -192,19 +229,19 @@ def _struct_fields(api_source: str, struct: str) -> dict[str, tuple[bool, str]]:
     """Map each field of ``pub struct <struct>`` to (plain ``pub``, type)."""
     matches = list(re.finditer(rf"\bpub struct {struct}\b\s*(?:<[^>{{]*>)?\s*\{{", api_source))
     if len(matches) != 1:
-        raise ValueError(f"expected one AISimulate `pub struct {struct}` with named fields, found {len(matches)}")
+        raise ValueError(f"expected one AISim `pub struct {struct}` with named fields, found {len(matches)}")
     start, end = _braced(api_source, matches[0].start())
     fields = {}
     for item in _top_level_items(api_source[start:end], angle=True):
         field = re.fullmatch(r"(pub(?:\s*\([^)]*\))?\s+)?(?:r#)?(\w+)\s*:\s*(.+)", item, re.DOTALL)
         if not field:
-            raise ValueError(f"cannot parse AISimulate {struct} field {item!r}")
+            raise ValueError(f"cannot parse AISim {struct} field {item!r}")
         fields[field[2]] = ((field[1] or "").strip() == "pub", re.sub(r"\s+", " ", field[3]))
     return fields
 
 
 def _patch_literal(source: str, site: LiteralSite, struct_fields: dict) -> tuple[str, list[str]]:
-    """Insert ``None`` for missing optional fields into the literal after ``site.anchor``."""
+    """Fill optional request/placement fields and precisely reviewed text-only defaults."""
     if source.count(site.anchor) != 1:
         raise ValueError(f"{site.path}: literal anchor is not unique")
     literal = re.compile(rf"(?<![\w:]){site.struct}\s*\{{").search(source, source.index(site.anchor) + len(site.anchor))
@@ -219,28 +256,102 @@ def _patch_literal(source: str, site: LiteralSite, struct_fields: dict) -> tuple
         present.append(field[1])
     stale = [name for name in present if name not in struct_fields]
     if stale:
-        raise ValueError(f"{site.path}: {site.struct} literal sets fields AISimulate no longer has: {stale}")
+        raise ValueError(f"{site.path}: {site.struct} literal sets fields AISim no longer has: {stale}")
     missing = [name for name in struct_fields if name not in present]
+    defaults = {
+        "ReplaySpec": {"encoder": ((True, "Option<EncoderSpec>"), "None")},
+        "SyntheticTraceSpec": {"images": ((True, "Option<SyntheticImages>"), "None")},
+        "WekaImportOptions": {
+            "client": ((True, "WekaClient"), "WekaImportOptions::default().client"),
+            "chat_template": ((True, "Option<WekaChatTemplate>"), "None"),
+        },
+        "SglangConfig": {
+            "hicache": ((True, "Option<SglangHiCacheConfig>"), "None"),
+            "host_loop": ((True, "bool"), "false"),
+            "vlm_cache_bytes": ((True, "u64"), "SglangConfig::default().vlm_cache_bytes"),
+            "disaggregation_decode_enable_radix_cache": ((True, "bool"), "false"),
+            "num_reserved_decode_tokens": ((True, "usize"), "SglangConfig::default().num_reserved_decode_tokens"),
+            "disaggregation_decode_extra_slots": ((True, "Option<usize>"), "None"),
+            "swa_prefix_tails": ((True, "Option<usize>"), "None"),
+            "scheduler_select_time_ms": ((True, "f64"), "SglangConfig::default().scheduler_select_time_ms"),
+        },
+    }.get(site.struct)
+    if defaults is not None:
+        unreviewed = [name for name in missing if name not in defaults or struct_fields[name] != defaults[name][0]]
+        if unreviewed:
+            raise ValueError(f"{site.path}: unreviewed AISim {site.struct} fields: {unreviewed}")
+    empty_images = (
+        site.struct == "Request" and "images" in missing and struct_fields["images"] == (True, "Vec<ImageSpec>")
+    )
+    optional = [name for name in missing if not (empty_images and name == "images")]
     required = [
-        name for name in missing if not (struct_fields[name][0] and _OPTION_TYPE.fullmatch(struct_fields[name][1]))
+        name for name in optional if not (struct_fields[name][0] and _OPTION_TYPE.fullmatch(struct_fields[name][1]))
     ]
-    if required:
-        raise ValueError(
-            f"{site.path}: AISimulate {site.struct} adds fields Dynamo must set (not `pub` Option): {required}"
-        )
+    if required and defaults is None:
+        raise ValueError(f"{site.path}: AISim {site.struct} adds fields Dynamo must set (not `pub` Option): {required}")
     if not missing:
         return source, []
     line_start = source.rindex("\n", 0, close) + 1
     if source[line_start:close].strip() or not source[:line_start].rstrip().endswith(","):
         raise ValueError(f"{site.path}: {site.struct} literal is not multi-line with a trailing comma")
     indent = re.search(r"\n([ \t]*)\S", source[start - 1 : close])[1]
-    inserted = f"{indent}// Modified by AISimulate CI: Dynamo does not set these optional fields yet.\n"
-    inserted += "".join(f"{indent}{name}: None,\n" for name in missing)
+    inserted = ""
+    if defaults is not None:
+        inserted = f"{indent}// Modified by AISim CI: retain the pinned text-only replay configuration.\n"
+        inserted += "".join(f"{indent}{name}: {defaults[name][1]},\n" for name in missing)
+    elif optional:
+        inserted = f"{indent}// Modified by AISim CI: Dynamo does not set these optional fields yet.\n"
+        inserted += "".join(f"{indent}{name}: None,\n" for name in optional)
+    if empty_images:
+        inserted += f"{indent}// Modified by AISim CI: the pinned Dynamo request is text-only.\n"
+        inserted += (
+            f"{indent}images: {{\n"
+            f"{indent}    assert!(\n"
+            f"{indent}        request.images.is_empty(),\n"
+            f'{indent}        "pinned Dynamo CI adapter supports text-only requests",\n'
+            f"{indent}    );\n"
+            f"{indent}    Vec::new()\n"
+            f"{indent}}},\n"
+        )
     return source[:line_start] + inserted + source[line_start:], missing
 
 
-# Fail closed: each file must match its reviewed sha256, every field the literal
-# lacks must be a public `Option`, and the literal may not set a removed field.
+def _patch_ttft_lifecycle(source: str, api: str) -> tuple[str, list[str]]:
+    """The legacy Dynamo lifecycle DTO cannot represent host-loop milestones."""
+    enums = list(re.finditer(r"\bpub enum LifecycleEvent\s*\{", api))
+    if len(enums) != 1:
+        raise ValueError("expected one AISim LifecycleEvent enum")
+    start, end = _braced(api, enums[0].start())
+    variants = {}
+    for item in _top_level_items(api[start:end], angle=True):
+        variant = re.fullmatch(r"(\w+)\s*\{(.*)\}", item, re.DOTALL)
+        if not variant:
+            raise ValueError(f"unreviewed AISim lifecycle variant: {item}")
+        variants[variant[1]] = re.sub(r"\s+", "", variant[2])
+    legacy = {"SourceHeld", "DestinationReserved"}
+    if set(variants) == legacy:
+        return source, []
+    if set(variants) != legacy | {"TtftMilestone"} or variants["TtftMilestone"] != (
+        "request_id:Uuid,stage:TtftMilestone,at_ms:f64,"
+    ):
+        raise ValueError("unreviewed AISim lifecycle API; update the pinned adapter")
+    anchor = "        Ok(match event {\n"
+    if source.count(anchor) != 1:
+        raise ValueError("pinned Dynamo lifecycle conversion anchor is not unique")
+    arm = """            // Modified by AISim CI: host-loop/frontend events are unsupported.
+            LifecycleEvent::TtftMilestone { request_id, stage, at_ms } => {
+                return Err(anyhow!(
+                    "pinned Dynamo CI adapter does not support TTFT milestone {stage:?} for {request_id} at {at_ms}ms"
+                ));
+            }
+"""
+    return source.replace(anchor, anchor + arm), ["TtftMilestone"]
+
+
+# Fail closed: each file must match its reviewed sha256 before any file is written.
+# Request/placement additions must be public `Option`s or the reviewed Request.images;
+# ReplaySpec and SyntheticTraceSpec accept only reviewed text-only defaults.
+# Removed fields remain errors.
 def patch_optional_literal_fields(core: Path, dynamo: Path) -> list[dict]:
     originals, patched, records = {}, {}, []
     for site in OPTIONAL_FIELD_LITERALS:
@@ -249,11 +360,15 @@ def patch_optional_literal_fields(core: Path, dynamo: Path) -> list[dict]:
             patched[site.path] = originals[site.path].decode()
         if hashlib.sha256(originals[site.path]).hexdigest() != site.sha256:
             raise ValueError(f"pinned Dynamo {site.path} differs from reviewed source")
-        struct_fields = _struct_fields((core / site.api).read_text(), site.struct)
+        api = (core / site.api).read_text()
+        struct_fields = _struct_fields(api, site.struct)
         patched[site.path], inserted = _patch_literal(patched[site.path], site, struct_fields)
-        records.append(
-            {"path": site.path, "struct": site.struct, "before_sha256": site.sha256, "inserted_fields": inserted}
-        )
+        record = {"path": site.path, "struct": site.struct, "before_sha256": site.sha256, "inserted_fields": inserted}
+        if site.struct == "Request":
+            patched[site.path], rejected = _patch_ttft_lifecycle(patched[site.path], api)
+            if rejected:
+                record["rejected_lifecycle_events"] = rejected
+        records.append(record)
     for record in records:
         record["after_sha256"] = hashlib.sha256(patched[record["path"]].encode()).hexdigest()
     for path, text in patched.items():
@@ -264,8 +379,8 @@ def patch_optional_literal_fields(core: Path, dynamo: Path) -> list[dict]:
 
 # Compatibility adaptation of NVIDIA Dynamo's Apache-2.0 replay adapter:
 # https://github.com/ai-dynamo/dynamo/blob/def3b79b15c266805540a678dd400aeb6ccada1d/lib/mocker/src/engine_adapter.rs
-def patch_replay_context_parallelism(core: Path, dynamo: Path) -> dict:
-    """Keep the pinned adapter's CP=1 topology when replay gains explicit PCP."""
+def patch_replay_engine_config(core: Path, dynamo: Path) -> dict:
+    """Keep the pinned CP=1 topology and disabled SGLang host loop."""
     path = dynamo / "lib/mocker/src/engine_adapter.rs"
     original = path.read_bytes()
     if hashlib.sha256(original).hexdigest() != REPLAY_ADAPTER_SHA256:
@@ -276,7 +391,7 @@ def patch_replay_context_parallelism(core: Path, dynamo: Path) -> dict:
         for struct in ("ReplayEngineConfig", "ReplayRoleConfig")
     ]
     if fields not in ([None, None], [(True, "u32"), (True, "u32")]):
-        raise ValueError("unreviewed AISimulate replay PCP API; update the pinned adapter")
+        raise ValueError("unreviewed AISim replay PCP API; update the pinned adapter")
     patched = original
     if fields[0] is not None:
         anchor = b"        num_gpu_blocks_is_explicit: Some(true),\n"
@@ -284,9 +399,21 @@ def patch_replay_context_parallelism(core: Path, dynamo: Path) -> dict:
             raise ValueError("pinned replay adapter must have four capacity anchors")
         patched = original.replace(
             anchor,
-            b"        // Modified by AISimulate CI: the pinned adapter has no PCP control.\n"
+            b"        // Modified by AISim CI: the pinned adapter has no PCP control.\n"
             b"        prefill_context_parallel_size: 1,\n" + anchor,
         )
+    site = LiteralSite(
+        str(path.relative_to(dynamo)),
+        REPLAY_ADAPTER_SHA256,
+        "    let sglang = ",
+        "SglangConfig",
+        "src/engine/config.rs",
+    )
+    patched, sglang_fields = _patch_literal(
+        patched.decode(), site, _struct_fields((core / site.api).read_text(), site.struct)
+    )
+    patched = patched.encode()
+    if patched != original:
         path.write_bytes(patched)
     return {
         "path": str(path.relative_to(dynamo)),
@@ -294,6 +421,7 @@ def patch_replay_context_parallelism(core: Path, dynamo: Path) -> dict:
         "after_sha256": hashlib.sha256(patched).hexdigest(),
         "api_has_prefill_context_parallel_size": fields[0] is not None,
         "prefill_context_parallel_size": 1,
+        "inserted_sglang_fields": sglang_fields,
     }
 
 
@@ -304,10 +432,11 @@ def build(source: Path, dynamo: Path, output: Path) -> None:
         raise ValueError("unexpected Dynamo revision")
     subprocess.run(["git", "-C", str(dynamo), "diff", "--exit-code", "HEAD"], check=True)
     core = source / "crates/core"
+    package = core_package(core)
     handoff_compatibility = patch_handoff_timing(core, dynamo)
     literal_compatibility = patch_optional_literal_fields(core, dynamo)
     speculation_compatibility = patch_speculation_depth(dynamo)
-    replay_compatibility = patch_replay_context_parallelism(core, dynamo)
+    replay_compatibility = patch_replay_engine_config(core, dynamo)
     bindings = dynamo / "lib/bindings/python"
     for manifest, options in (
         (dynamo / "Cargo.toml", ""),
@@ -315,12 +444,14 @@ def build(source: Path, dynamo: Path, output: Path) -> None:
     ):
         text, count = re.subn(
             r"^aisimulate-core = .*",
-            lambda _: f"aisimulate-core = {{ path = {json.dumps(str(core))}{options} }}",
+            lambda _: (
+                f"aisimulate-core = {{ package = {json.dumps(package)}, path = {json.dumps(str(core))}{options} }}"
+            ),
             manifest.read_text(),
             flags=re.MULTILINE,
         )
         if count != 1:
-            raise ValueError(f"expected one AISimulate dependency in {manifest}")
+            raise ValueError(f"expected one AISim dependency in {manifest}")
         manifest.write_text(text)
     # Resolve the local core's dependency graph from Dynamo's existing lock.
     # Compilation stays locked to this resolved graph, which is saved below.
@@ -331,9 +462,9 @@ def build(source: Path, dynamo: Path, output: Path) -> None:
             cwd=bindings,
         )
     )
-    linked = [p["manifest_path"] for p in metadata["packages"] if p["name"] == "aisimulate-core"]
+    linked = [p["manifest_path"] for p in metadata["packages"] if p["name"] == package]
     if linked != [str(core / "Cargo.toml")]:
-        raise ValueError(f"Dynamo resolved a different AISimulate core: {linked}")
+        raise ValueError(f"Dynamo resolved a different AISim core: {linked}")
     subprocess.run(
         [
             sys.executable,

@@ -1,0 +1,25 @@
+traffic:
+  source: {type: synthetic, input_tokens: 1024, output_tokens: 128}
+  load: {type: concurrency, concurrency: 10}
+  stop: {requests: 100}
+
+engine:
+  mode: aggregated
+  model: Qwen/Qwen3.5-35B-A3B
+  hardware: b300_sxm
+  backend: {choices: [vllm, sglang, trtllm]}
+  context_length: 2048
+  workers:
+    aggregated:
+      parallelism: {preset: default}
+
+optimization:
+  target: throughput_per_gpu
+  constraints:
+    max_candidate_gpus: 8
+
+optimizer:
+  max_trials: 12
+
+execution:
+  resources: {memory_limit_gb: 8, cpu_limit: 4}

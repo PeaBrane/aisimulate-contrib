@@ -5,9 +5,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from aisimulate.sweeper.config import Workload
-from aisimulate.sweeper.kv_load import InfeasibleKVCapacity, resolve_kv_load
-from aisimulate.sweeper.parallel_enum import (
+from aisim.sweeper.config import Workload
+from aisim.sweeper.kv_load import InfeasibleKVCapacity, resolve_kv_load
+from aisim.sweeper.parallel_enum import (
     DisaggParallelConfig,
     ParallelShape,
     ReplicaParallelConfig,
@@ -16,7 +16,7 @@ from aisimulate.sweeper.parallel_enum import (
 
 @pytest.mark.parametrize("source", ["resolved", "custom", "legacy_custom"])
 def test_capacity_cache_includes_resolved_root(tmp_path, monkeypatch, source):
-    from aisimulate.sweeper import kv_load
+    from aisim.sweeper import kv_load
 
     roots = [tmp_path / "first", tmp_path / "second"]
     for root in roots:
@@ -60,7 +60,7 @@ def test_capacity_cache_includes_resolved_root(tmp_path, monkeypatch, source):
 
 @pytest.mark.parametrize("custom_role", ["prefill", "decode"])
 def test_mixed_timing_capacity_uses_each_roles_own_root(tmp_path, monkeypatch, custom_role):
-    from aisimulate.sweeper import kv_load
+    from aisim.sweeper import kv_load
 
     sample = _sample("disagg")
     roots = {role: tmp_path / role for role in ("prefill", "decode")}
@@ -116,7 +116,7 @@ def test_agg_capacity_scales_by_attention_dp_and_replicas(monkeypatch):
     shape = ParallelShape(tp=1, dp=2, moe_tp=1, moe_ep=2)
     config = ReplicaParallelConfig(shape=shape, replicas=3)
     monkeypatch.setattr(
-        "aisimulate.sweeper.kv_load._per_rank_capacity_tokens",
+        "aisim.sweeper.kv_load._per_rank_capacity_tokens",
         lambda *args, **kwargs: 10_000,
     )
 
@@ -144,7 +144,7 @@ def test_disagg_load_uses_decode_capacity_but_validates_prefill(monkeypatch):
         seen.append(role)
         return {"prefill": 100_000, "decode": 300_000}[role]
 
-    monkeypatch.setattr("aisimulate.sweeper.kv_load._role_capacity_tokens", fake_role)
+    monkeypatch.setattr("aisim.sweeper.kv_load._role_capacity_tokens", fake_role)
     resolution = resolve_kv_load(
         _sample("disagg"),
         workload=Workload(isl=1000, osl=1000, kv_load_ratio=1.0, num_request_ratio=10),
@@ -174,7 +174,7 @@ def test_disagg_kv_capacity_uses_role_hardware(monkeypatch):
         seen.append(hardware_sku)
         return 100_000
 
-    monkeypatch.setattr("aisimulate.sweeper.kv_load._per_rank_capacity_tokens", fake_capacity)
+    monkeypatch.setattr("aisim.sweeper.kv_load._per_rank_capacity_tokens", fake_capacity)
 
     resolve_kv_load(
         sample,
@@ -187,10 +187,64 @@ def test_disagg_kv_capacity_uses_role_hardware(monkeypatch):
     assert seen == ["prefill_sku", "decode_sku"]
 
 
+def test_disagg_kv_capacity_sizes_each_role_with_its_own_context_length(monkeypatch):
+    role = ReplicaParallelConfig(ParallelShape(tp=1, dp=1, moe_tp=1, moe_ep=1), replicas=1)
+    sample = _sample("disagg")
+    sample.update(context_length=2048, prefill_context_length=1024, decode_context_length=512)
+    seen = {}
+
+    def fake_capacity(*args, worker_type, context_length, **kwargs):
+        seen[worker_type] = context_length
+        return 100_000
+
+    monkeypatch.setattr("aisim.sweeper.kv_load._per_rank_capacity_tokens", fake_capacity)
+    resolve_kv_load(
+        sample,
+        workload=Workload(isl=1000, osl=1000, kv_load_ratio=1.0, num_request_ratio=10),
+        parallel_config=DisaggParallelConfig(prefill=role, decode=role),
+        ratio=1.0,
+        backend_version="v",
+    )
+
+    assert seen == {"prefill": 1024, "decode": 512}
+
+
+@pytest.mark.parametrize(
+    ("mode", "fields", "expected"),
+    [
+        ("disagg", {"context_length": 2048, "prefill_context_length": 1024}, {"prefill": 1024, "decode": 2048}),
+        ("agg", {"context_length": 2048, "agg_context_length": 1024}, {"aggregated": 1024}),
+        ("agg", {"context_length": 2048}, {"aggregated": 2048}),
+        ("agg", {}, {"aggregated": None}),
+    ],
+)
+def test_kv_capacity_reads_the_role_context_before_the_global_one(monkeypatch, mode, fields, expected):
+    role = ReplicaParallelConfig(ParallelShape(tp=1, dp=1, moe_tp=1, moe_ep=1), replicas=1)
+    parallel = DisaggParallelConfig(prefill=role, decode=role) if mode == "disagg" else role
+    sample = _sample(mode)
+    sample.update(fields)
+    seen = {}
+
+    def fake_capacity(*args, worker_type, context_length, **kwargs):
+        seen[worker_type] = context_length
+        return 100_000
+
+    monkeypatch.setattr("aisim.sweeper.kv_load._per_rank_capacity_tokens", fake_capacity)
+    resolve_kv_load(
+        sample,
+        workload=Workload(isl=1000, osl=1000, kv_load_ratio=1.0, num_request_ratio=10),
+        parallel_config=parallel,
+        ratio=1.0,
+        backend_version="v",
+    )
+
+    assert seen == expected
+
+
 def test_zero_ratio_maps_to_one_request(monkeypatch):
     config = ReplicaParallelConfig(ParallelShape(tp=1, dp=1, moe_tp=1, moe_ep=1), replicas=1)
     monkeypatch.setattr(
-        "aisimulate.sweeper.kv_load._role_capacity_tokens",
+        "aisim.sweeper.kv_load._role_capacity_tokens",
         lambda *args, **kwargs: 10_000,
     )
 
@@ -208,7 +262,7 @@ def test_zero_ratio_maps_to_one_request(monkeypatch):
 def test_capacity_smaller_than_one_average_request_is_infeasible(monkeypatch):
     config = ReplicaParallelConfig(ParallelShape(tp=1, dp=1, moe_tp=1, moe_ep=1), replicas=1)
     monkeypatch.setattr(
-        "aisimulate.sweeper.kv_load._role_capacity_tokens",
+        "aisim.sweeper.kv_load._role_capacity_tokens",
         lambda *args, **kwargs: 100,
     )
 
@@ -240,7 +294,7 @@ def test_block_size_must_be_positive():
 def test_average_tokens_per_request_must_be_positive(monkeypatch):
     config = ReplicaParallelConfig(ParallelShape(tp=1, dp=1, moe_tp=1, moe_ep=1), replicas=1)
     monkeypatch.setattr(
-        "aisimulate.sweeper.kv_load._role_capacity_tokens",
+        "aisim.sweeper.kv_load._role_capacity_tokens",
         lambda *args, **kwargs: 10_000,
     )
 
@@ -256,7 +310,7 @@ def test_average_tokens_per_request_must_be_positive(monkeypatch):
 
 @pytest.mark.parametrize("source", ["resolved", "custom"])
 def test_capacity_uses_nonnull_version_and_resolved_controls(monkeypatch, source):
-    from aisimulate.sweeper import kv_load
+    from aisim.sweeper import kv_load
 
     sample = _sample("agg")
     sample.update(enable_eplb=True, wideep_num_slots=32, moe_backend="deepep_moe")
@@ -301,7 +355,7 @@ def test_capacity_rejects_malformed_external_identity(invalid):
     ("backend", "block_size", "fraction"), [("vllm", 64, 0.9), ("sglang", 1, 0.88), ("trtllm", 32, 0.9)]
 )
 def test_missing_kv_geometry_uses_backend_defaults(monkeypatch, backend, block_size, fraction):
-    from aisimulate.sweeper import kv_load
+    from aisim.sweeper import kv_load
 
     observed = []
 
@@ -321,3 +375,85 @@ def test_missing_kv_geometry_uses_backend_defaults(monkeypatch, backend, block_s
     )
     assert result.role_capacity_tokens["agg"] == (4095 // block_size) * block_size
     assert observed == [fraction]
+
+
+def test_image_workloads_size_the_load_on_the_placeholders_the_runner_lays_out():
+    """Native VL and analytical EPD both count the visual tokens, overrides included."""
+    from aisim.sweeper.config import ImageWorkload
+
+    sample = {
+        "model_name": "Qwen/Qwen3-VL-8B-Instruct",
+        "backend": "sglang",
+        "agg_block_size": 16,
+        "agg_num_gpu_blocks": 6_250,
+        "agg_vision": {"cache_mib": 100, "encoder_parallel": "tp"},
+    }
+    parallel = ReplicaParallelConfig(ParallelShape(tp=1, dp=1, moe_tp=1, moe_ep=1), replicas=1)
+
+    def concurrency(**bounds):
+        return resolve_kv_load(
+            sample,
+            workload=Workload(
+                isl=128,
+                osl=4,
+                kv_load_ratio=1.0,
+                request_count=1,
+                images=ImageWorkload(height=448, width=448, **bounds),
+            ),
+            parallel_config=parallel,
+            ratio=1.0,
+            backend_version="0.5.14",
+        ).concurrency
+
+    # 448x448 -> 196 visual tokens; capped at 65536 pixels the image shrinks to 256x256 -> 64.
+    assert concurrency() == 100_000 // (128 + 196 + 2)
+    assert concurrency(max_pixels=65536) == 100_000 // (128 + 64 + 2)
+    # Analytical EPD (no vision tower on the language worker) sizes on the same placeholders.
+    del sample["agg_vision"]
+    assert concurrency() == 100_000 // (128 + 196 + 2)
+
+
+def test_encoder_pools_size_the_load_on_the_pools_visual_tokens():
+    """The runner prompts the language workers with the resolved pool's count, not a recomputed geometry."""
+    from aisim.sweeper.config import ImageWorkload
+
+    sample = {
+        "model_name": "Qwen/Qwen3-VL-8B-Instruct",
+        "backend": "sglang",
+        "agg_block_size": 16,
+        "agg_num_gpu_blocks": 6_250,
+        # Resolved under max_pixels=65536 (256x256 -> 64 tokens); the raw 448x448 geometry would say 196.
+        "encoder": {"visual_tokens": 64},
+    }
+    resolution = resolve_kv_load(
+        sample,
+        workload=Workload(
+            isl=128, osl=4, kv_load_ratio=1.0, request_count=1, images=ImageWorkload(height=448, width=448)
+        ),
+        parallel_config=ReplicaParallelConfig(ParallelShape(tp=1, dp=1, moe_tp=1, moe_ep=1), replicas=1),
+        ratio=1.0,
+        backend_version="0.5.14",
+    )
+    assert resolution.concurrency == 100_000 // (128 + 64 + 2)
+
+
+def test_disagg_prefill_vision_sizes_only_the_prefill_capacity_against_the_tower(monkeypatch):
+    controls = []
+
+    def fake_per_rank(shape, **kwargs):
+        controls.append(dict(kwargs.get("model_controls", ())))
+        return 10_000
+
+    monkeypatch.setattr("aisim.sweeper.kv_load._per_rank_capacity_tokens", fake_per_rank)
+    sample = {**_sample("disagg"), "backend": "sglang", "prefill_vision": {"cache_mib": 100, "encoder_parallel": "tp"}}
+    rank = ReplicaParallelConfig(ParallelShape(tp=1, dp=1, moe_tp=1, moe_ep=1), replicas=1)
+    resolve_kv_load(
+        sample,
+        workload=Workload(isl=100, osl=100, kv_load_ratio=1.0, num_request_ratio=10),
+        parallel_config=DisaggParallelConfig(prefill=rank, decode=rank),
+        ratio=1.0,
+        backend_version="v",
+    )
+    # The runtime deducts the tower and the embedding cache on the prefill rank only.
+    assert controls[0] == {"colocated_encoder": True, "reserved_bytes": 100 << 20, "encoder_parallel": "tp"}
+    assert "colocated_encoder" not in controls[1]

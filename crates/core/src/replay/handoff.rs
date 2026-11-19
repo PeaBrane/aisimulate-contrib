@@ -1,5 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-FileCopyrightText: Copyright 2023-2024 SGLang Team
 // SPDX-License-Identifier: Apache-2.0
+// Modified behavioral adaptation of SGLang v0.5.20; see THIRD_PARTY_NOTICES.md.
+// Source: https://github.com/sgl-project/sglang/tree/94602c9c2b7cbdb8efd5c52802dac6a1c180089e
 
 //! Replay-owned prefill/decode handoff ordering and virtual-transfer state.
 
@@ -171,8 +174,11 @@ impl NormalizedHandoffConformance {
         {
             bail!("normalized handoff output/completion counts do not match the fixture");
         }
+        // SGLang caches a transferred prompt when the request is selected into a
+        // running batch, after activation; the other backends store it on activation.
+        let stores_on_activation = self.engine_type != Backend::Sglang;
         if self.destination_stored.before_activation != 0
-            || self.destination_stored.on_activation == 0
+            || (self.destination_stored.on_activation != 0) != stores_on_activation
             || self
                 .destination_stored
                 .repeated_activation_hashes_after_activation
@@ -263,6 +269,15 @@ pub struct HandoffCoordinatorCore {
 impl HandoffCoordinatorCore {
     pub fn new(handoff_id: HandoffId, order: HandoffOrder) -> Self {
         Self::new_with_fallback(handoff_id, order, 0.0)
+    }
+
+    /// How long after the source is held its KV can start to move: the time
+    /// its last forward still spends in later pipeline stages (zero before the
+    /// source is held).
+    pub(crate) fn pipeline_fill_ms(&self) -> f64 {
+        self.source
+            .transfer_timing
+            .map_or(0.0, |timing| timing.pipeline_fill_ms)
     }
 
     pub fn new_with_fallback(
@@ -581,6 +596,11 @@ pub fn validate_transfer_timing(transfer_timing: HandoffTransferTiming) -> Resul
     {
         bail!("invalid handoff transfer bandwidth {bandwidth_gb_s}");
     }
+    // The fill delays the transfer whether or not its link work is priced.
+    let fill_ms = transfer_timing.pipeline_fill_ms;
+    if !fill_ms.is_finite() || fill_ms < 0.0 {
+        bail!("invalid handoff pipeline fill {fill_ms}");
+    }
     validate_transfer_delay_ms(transfer_timing.full_prompt_delay_ms())
 }
 
@@ -650,6 +670,7 @@ mod tests {
             kv_bytes_per_token: None,
             state_bytes: 0,
             bandwidth_gb_s: None,
+            pipeline_fill_ms: 0.0,
         };
         assert_eq!(start_transfer_delay(missing, 7.5), 7.5);
 
@@ -660,6 +681,25 @@ mod tests {
         };
         validate_transfer_timing(zero_bandwidth).unwrap();
         assert_eq!(start_transfer_delay(zero_bandwidth, 7.5), 7.5);
+
+        let filled = HandoffTransferTiming {
+            pipeline_fill_ms: 2.0,
+            ..missing
+        };
+        assert_eq!(
+            start_transfer_delay(filled, 7.5),
+            7.5,
+            "the fill is not link work"
+        );
+
+        // An unpriced transfer still rejects an invalid fill.
+        for fill_ms in [f64::NAN, f64::INFINITY, -1.0] {
+            let invalid = HandoffTransferTiming {
+                pipeline_fill_ms: fill_ms,
+                ..missing
+            };
+            assert!(validate_transfer_timing(invalid).is_err(), "{fill_ms}");
+        }
     }
 
     #[test]
@@ -670,6 +710,7 @@ mod tests {
             kv_bytes_per_token: Some(1024),
             state_bytes: 0,
             bandwidth_gb_s: Some(-1.0),
+            pipeline_fill_ms: 0.0,
         };
         assert!(validate_transfer_timing(timing).is_err());
     }

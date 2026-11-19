@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use super::{EngineConfig, TimingModelConfig, WorkerType, normalize_conditional_accept_rates};
-use crate::ForwardPassPerfModelConfig;
+use crate::{ForwardPassPerfModelConfig, UNKNOWN_SIZE};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -58,23 +58,115 @@ impl DerefMut for EngineLaunchConfig {
 impl EngineLaunchConfig {
     /// Parse the canonical launch shape. No downstream argument aliases are accepted.
     pub fn from_value(value: Value) -> Result<Self> {
+        Self::parse_value(value)?.normalized()
+    }
+
+    /// Parse and derive omitted launch controls without validating them.
+    fn parse_value(value: Value) -> Result<Self> {
         let mut result: Self = serde_path_to_error::deserialize(value.clone())
             .context("invalid engine launch config")?;
         if value.get("num_gpu_blocks_is_explicit").is_none() {
             result.num_gpu_blocks_is_explicit = value.pointer("/engine/num_gpu_blocks").is_some();
         }
         if let Some(config) = result.performance_config()? {
-            if value.get("tensor_parallel_size").is_none() {
+            // A size the identity records as unknown leaves the launch value.
+            if value.get("tensor_parallel_size").is_none() && config.tp != UNKNOWN_SIZE {
                 result.tensor_parallel_size = config.tp as usize;
             }
-            if value.get("dp_size").is_none() {
+            if value.get("dp_size").is_none() && config.attention_dp != UNKNOWN_SIZE {
                 result.dp_size = config.attention_dp;
             }
-            if value.pointer("/engine/aic_nextn").is_none() && config.nextn > 0 {
-                result.aic_nextn = Some(config.nextn as usize);
+            if value
+                .pointer("/engine/aic_nextn")
+                .is_none_or(Value::is_null)
+            {
+                result.derive_speculative_depth()?;
             }
         }
-        result.normalized()
+        Ok(result)
+    }
+
+    /// Derive an omitted scheduler depth from the canonical timing identity.
+    /// Callers retain whether the input was omitted, including explicit nulls.
+    pub(crate) fn derive_speculative_depth(&mut self) -> Result<()> {
+        if let Some(config) = self.performance_config()? {
+            let depth = match &config.speculation {
+                Some(speculation) => speculation.replay_depth()?,
+                None => config.nextn,
+            };
+            self.aic_nextn = (depth > 0).then_some(depth as usize);
+        }
+        Ok(())
+    }
+
+    /// Check whether `config` can time the engine described by launch
+    /// arguments `engine_args`, as when a saved AIS configuration replaces the
+    /// engine's timing model. The arguments use the [`Self::from_value`] shape;
+    /// their timing model, if any, is replaced by `config`, and omitted launch
+    /// controls derive from it exactly as at launch. Returns every launch rule
+    /// that would reject the combination, in the order launch validation
+    /// checks them; an empty list means the launch would accept it.
+    /// Malformed arguments, launch inputs that are invalid on their own (such
+    /// as a zero `dp_size` or a memory fraction above one) and an invalid
+    /// `config` are errors carrying launch's own message, not mismatches.
+    pub fn timing_config_mismatches(
+        mut engine_args: Value,
+        config: &ForwardPassPerfModelConfig,
+    ) -> Result<Vec<String>> {
+        config.validate()?;
+        let engine = engine_args
+            .as_object_mut()
+            .context("engine launch arguments must be an object")?
+            .entry("engine")
+            .or_insert_with(|| json!({}));
+        engine
+            .as_object_mut()
+            .context("engine launch arguments field 'engine' must be an object")?
+            .insert(
+                "timing_model".into(),
+                json!({"type": "external", "provider": "ais", "config": config}),
+            );
+        let launch = Self::parse_value(engine_args)?;
+        launch.validate_inputs()?;
+        launch.timing_identity_mismatches(config)
+    }
+
+    /// Launch rules relating a canonical AIS timing identity to this engine.
+    fn timing_identity_mismatches(
+        &self,
+        config: &ForwardPassPerfModelConfig,
+    ) -> Result<Vec<String>> {
+        let mut mismatches = Vec::new();
+        // An unknown size cannot conflict with the launch.
+        if config.pp != 1 && config.pp != UNKNOWN_SIZE {
+            mismatches.push(format!(
+                "engine launch supports only pp=1; got pp={}",
+                config.pp
+            ));
+        }
+        if config.tp != UNKNOWN_SIZE && config.tp as usize != self.tensor_parallel_size {
+            mismatches.push("tensor_parallel_size conflicts with canonical tp".into());
+        }
+        if config.attention_dp != UNKNOWN_SIZE && config.attention_dp != self.dp_size {
+            mismatches.push("dp_size conflicts with canonical attention_dp".into());
+        }
+        let identity = serde_json::to_value(config)?;
+        if identity["worker_type"] != serde_json::to_value(self.worker_type)? {
+            mismatches.push("AIS worker_type must match engine role".into());
+        }
+        if let Some(speculation) = &config.speculation {
+            mismatches.extend(super::speculation::speculative_role_mismatches(
+                &self.engine,
+                &speculation.kind,
+                config.backend.as_str(),
+                speculation.replay_depth()?,
+                self.num_gpu_blocks_is_explicit,
+            ));
+        } else if config.nextn as usize != self.aic_nextn.unwrap_or(0) {
+            mismatches
+                .push("canonical speculative depth conflicts with scheduler aic_nextn".into());
+        }
+        Ok(mismatches)
     }
 
     pub fn performance_config(&self) -> Result<Option<ForwardPassPerfModelConfig>> {
@@ -121,6 +213,17 @@ impl EngineLaunchConfig {
     /// Validate launch inputs and normalize shared engine controls.
     pub fn normalized(mut self) -> Result<Self> {
         self.validate()?;
+        if let Some(config) = self.performance_config()?
+            && let Some(speculation) = &config.speculation
+        {
+            super::speculation::resolve_speculative_role(
+                &mut self.engine,
+                &speculation.kind,
+                config.backend.as_str(),
+                speculation.replay_depth()?,
+                self.num_gpu_blocks_is_explicit,
+            )?;
+        }
         if let Some(nextn) = self.aic_nextn {
             let rates =
                 normalize_conditional_accept_rates(nextn, self.aic_nextn_accept_rates.as_deref())?;
@@ -136,6 +239,18 @@ impl EngineLaunchConfig {
     }
 
     pub fn validate(&self) -> Result<()> {
+        self.validate_inputs()?;
+        if let Some(config) = self.performance_config()?
+            && let Some(first) = self.timing_identity_mismatches(&config)?.into_iter().next()
+        {
+            anyhow::bail!(first);
+        }
+        Ok(())
+    }
+
+    /// Launch checks of each input on its own, before the rules relating the
+    /// timing identity to the engine.
+    fn validate_inputs(&self) -> Result<()> {
         self.engine.validate()?;
         ensure!(self.dp_size > 0, "dp_size must be positive");
         ensure!(
@@ -166,35 +281,9 @@ impl EngineLaunchConfig {
         }
         if let Some(config) = self.performance_config()? {
             config.validate()?;
-            ensure!(
-                config.pp == 1,
-                "engine launch supports only pp=1; got pp={}",
-                config.pp
-            );
-            ensure!(
-                config.tp as usize == self.tensor_parallel_size,
-                "tensor_parallel_size conflicts with canonical tp"
-            );
-            ensure!(
-                config.attention_dp == self.dp_size,
-                "dp_size conflicts with canonical attention_dp"
-            );
-            let identity = serde_json::to_value(&config)?;
-            ensure!(
-                identity["worker_type"] == serde_json::to_value(self.worker_type)?,
-                "AIS worker_type must match engine role"
-            );
-            ensure!(
-                identity
-                    .pointer("/speculation/kind")
-                    .and_then(Value::as_str)
-                    != Some("ngram"),
-                "engine launch does not implement ngram draft scheduling"
-            );
-            ensure!(
-                config.nextn as usize == self.aic_nextn.unwrap_or(0),
-                "canonical nextn conflicts with scheduler aic_nextn"
-            );
+        }
+        if let Some(nextn) = self.aic_nextn {
+            normalize_conditional_accept_rates(nextn, self.aic_nextn_accept_rates.as_deref())?;
         }
         Ok(())
     }
@@ -205,5 +294,277 @@ impl EngineLaunchConfig {
 
     pub fn is_decode(&self) -> bool {
         self.worker_type == WorkerType::Decode
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{BackendKind, EstimationMode, ForwardPassWorkerType};
+
+    fn speculative_launch(kind: &str) -> Value {
+        json!({
+            "engine": {
+                "backend": "vllm",
+                "num_gpu_blocks": 64,
+                "aic_nextn_accept_rates": "1,1,0.4",
+                "timing_model": {"type": "external", "provider": "ais", "config": {
+                    "model": "geometry-only", "system": "h200_sxm", "backend": "vllm",
+                    "worker_type": "aggregated", "estimation_mode": "op_level",
+                    "speculation": {"kind": kind, "params": {"num_speculative_tokens": 3}}
+                }}
+            }
+        })
+    }
+
+    #[test]
+    fn ngram_launch_infers_depth_and_round_trips() {
+        let config = EngineLaunchConfig::from_value(speculative_launch("ngram")).unwrap();
+        assert_eq!(config.aic_nextn, Some(3));
+        assert_eq!(config.async_scheduling, Some(false));
+        assert_eq!(config.aic_nextn_accept_rates.as_deref(), Some("1,1,0.4"));
+        assert_eq!(
+            EngineLaunchConfig::from_value(serde_json::to_value(&config).unwrap()).unwrap(),
+            config
+        );
+    }
+
+    #[test]
+    fn canonical_ngram_defaults_acceptance_and_rejects_conflicting_depth() {
+        for depth in [None, Some(Value::Null), Some(json!(3))] {
+            let mut value = speculative_launch("ngram");
+            value["engine"]
+                .as_object_mut()
+                .unwrap()
+                .remove("aic_nextn_accept_rates");
+            if let Some(depth) = depth {
+                value["engine"]["aic_nextn"] = depth;
+            }
+            let config = EngineLaunchConfig::from_value(value.clone()).unwrap();
+            assert_eq!(config.aic_nextn, Some(3));
+            assert_eq!(config.aic_nextn_accept_rates.as_deref(), Some("0.85,0.3,0"));
+            assert_eq!(config.async_scheduling, Some(false));
+            assert!(
+                EngineLaunchConfig::timing_config_mismatches(
+                    value,
+                    &config.performance_config().unwrap().unwrap(),
+                )
+                .unwrap()
+                .is_empty()
+            );
+            assert_eq!(
+                EngineLaunchConfig::from_value(serde_json::to_value(&config).unwrap()).unwrap(),
+                config,
+            );
+        }
+        let mut conflicting = speculative_launch("ngram");
+        conflicting["engine"]["aic_nextn"] = json!(2);
+        conflicting["engine"]["aic_nextn_accept_rates"] = json!("1,0.5");
+        assert!(
+            EngineLaunchConfig::from_value(conflicting)
+                .unwrap_err()
+                .to_string()
+                .contains("canonical speculative depth conflicts")
+        );
+    }
+
+    #[test]
+    fn speculative_timing_mismatches_share_launch_derivation_and_validation() {
+        let mut value = speculative_launch("ngram");
+        let timing: ForwardPassPerfModelConfig =
+            serde_json::from_value(value["engine"]["timing_model"]["config"].clone()).unwrap();
+        assert!(
+            EngineLaunchConfig::timing_config_mismatches(value.clone(), &timing)
+                .unwrap()
+                .is_empty()
+        );
+        value["engine"]["aic_nextn"] = json!(2);
+        value["engine"]
+            .as_object_mut()
+            .unwrap()
+            .remove("aic_nextn_accept_rates");
+        let mismatches =
+            EngineLaunchConfig::timing_config_mismatches(value.clone(), &timing).unwrap();
+        assert_eq!(
+            mismatches,
+            ["canonical speculative depth conflicts with scheduler aic_nextn"]
+        );
+        assert_eq!(
+            EngineLaunchConfig::from_value(value)
+                .unwrap_err()
+                .to_string(),
+            mismatches[0]
+        );
+    }
+
+    #[test]
+    fn ngram_launch_and_timing_mismatches_reject_async_scheduling() {
+        let mut value = speculative_launch("ngram");
+        value["engine"]["async_scheduling"] = json!(true);
+        let timing: ForwardPassPerfModelConfig =
+            serde_json::from_value(value["engine"]["timing_model"]["config"].clone()).unwrap();
+        let message = "vLLM does not support async scheduling with ngram speculative decoding";
+        assert_eq!(
+            EngineLaunchConfig::timing_config_mismatches(value.clone(), &timing).unwrap(),
+            [message]
+        );
+        assert_eq!(
+            EngineLaunchConfig::from_value(value)
+                .unwrap_err()
+                .to_string(),
+            message
+        );
+    }
+
+    #[test]
+    fn speculative_timing_backend_must_match_the_scheduler() {
+        let mut value = speculative_launch("ngram");
+        let timing: ForwardPassPerfModelConfig =
+            serde_json::from_value(value["engine"]["timing_model"]["config"].clone()).unwrap();
+        for backend in ["sglang", "trtllm"] {
+            value["engine"]["backend"] = json!(backend);
+            let message = "AIS backend must match engine backend";
+            assert_eq!(
+                EngineLaunchConfig::timing_config_mismatches(value.clone(), &timing).unwrap(),
+                [message]
+            );
+            assert_eq!(
+                EngineLaunchConfig::from_value(value.clone())
+                    .unwrap_err()
+                    .to_string(),
+                message
+            );
+        }
+    }
+
+    fn timing() -> ForwardPassPerfModelConfig {
+        let mut config = ForwardPassPerfModelConfig::new(
+            "test/model",
+            "test",
+            BackendKind::Vllm,
+            ForwardPassWorkerType::Aggregated,
+        );
+        config.estimation_mode = EstimationMode::FpmRegression;
+        config
+    }
+
+    #[test]
+    fn timing_config_mismatches_list_every_launch_rule_in_validation_order() {
+        let mut config = timing();
+        config.pp = 2;
+        config.tp = 2;
+        config.attention_dp = 4;
+        let args =
+            json!({"dp_size": 2, "tensor_parallel_size": 1, "engine": {"worker_type": "decode"}});
+        let mismatches =
+            EngineLaunchConfig::timing_config_mismatches(args.clone(), &config).unwrap();
+        assert_eq!(
+            mismatches,
+            [
+                "engine launch supports only pp=1; got pp=2",
+                "tensor_parallel_size conflicts with canonical tp",
+                "dp_size conflicts with canonical attention_dp",
+                "AIS worker_type must match engine role",
+            ]
+        );
+        // Launch itself rejects the same combination with the first rule.
+        let mut launch = args;
+        launch["engine"]["timing_model"] =
+            json!({"type": "external", "provider": "ais", "config": config});
+        let error = EngineLaunchConfig::from_value(launch).unwrap_err();
+        assert!(format!("{error:#}").contains(&mismatches[0]), "{error:#}");
+    }
+
+    #[test]
+    fn timing_config_mismatches_derive_omitted_controls_like_launch() {
+        let mut config = timing();
+        config.tp = 2;
+        config.attention_dp = 4;
+        // Omitted tensor_parallel_size and dp_size derive from the timing identity.
+        let args = json!({"engine": {}});
+        assert!(
+            EngineLaunchConfig::timing_config_mismatches(args.clone(), &config)
+                .unwrap()
+                .is_empty()
+        );
+        let mut launch = args;
+        launch["engine"]["timing_model"] =
+            json!({"type": "external", "provider": "ais", "config": config});
+        let launched = EngineLaunchConfig::from_value(launch).unwrap();
+        assert_eq!((launched.tensor_parallel_size, launched.dp_size), (2, 4));
+        // Invalid timing identities and malformed arguments are errors, not mismatches.
+        config.tp = 0;
+        assert!(EngineLaunchConfig::timing_config_mismatches(json!({}), &config).is_err());
+        assert!(EngineLaunchConfig::timing_config_mismatches(json!([]), &timing()).is_err());
+        assert!(
+            EngineLaunchConfig::timing_config_mismatches(json!({"dp_size": "two"}), &timing())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn timing_config_mismatches_reject_invalid_launch_inputs_with_launch_messages() {
+        let mut config = timing();
+        config.tp = 2;
+        config.attention_dp = 2;
+        for (args, message) in [
+            (json!({"dp_size": 0}), "dp_size must be positive"),
+            (
+                json!({"tensor_parallel_size": 0}),
+                "tensor_parallel_size must be positive",
+            ),
+            (
+                json!({"gpu_memory_utilization": 2.0}),
+                "gpu_memory_utilization must be finite and in [0, 1]",
+            ),
+            (
+                json!({"startup_time": -1.0}),
+                "startup_time must be finite and non-negative",
+            ),
+        ] {
+            let error = EngineLaunchConfig::timing_config_mismatches(args.clone(), &config)
+                .expect_err(message);
+            assert!(format!("{error:#}").contains(message), "{error:#}");
+            // Launch rejects the same arguments with the same message.
+            let mut launch = args;
+            launch["engine"] =
+                json!({"timing_model": {"type": "external", "provider": "ais", "config": config}});
+            let error = EngineLaunchConfig::from_value(launch).unwrap_err();
+            assert!(format!("{error:#}").contains(message), "{error:#}");
+        }
+        // Accepted inputs return no mismatches, and launch accepts them.
+        let args = json!({"gpu_memory_utilization": 0.9, "startup_time": 0.0});
+        assert!(
+            EngineLaunchConfig::timing_config_mismatches(args.clone(), &config)
+                .unwrap()
+                .is_empty()
+        );
+        let mut launch = args;
+        launch["engine"] =
+            json!({"timing_model": {"type": "external", "provider": "ais", "config": config}});
+        EngineLaunchConfig::from_value(launch).unwrap();
+    }
+
+    #[test]
+    fn unknown_timing_sizes_neither_conflict_nor_derive_launch_controls() {
+        let mut config = timing();
+        (config.tp, config.pp, config.attention_dp) = (UNKNOWN_SIZE, UNKNOWN_SIZE, UNKNOWN_SIZE);
+        let args = json!({"tensor_parallel_size": 4, "dp_size": 2, "engine": {}});
+        assert!(
+            EngineLaunchConfig::timing_config_mismatches(args.clone(), &config)
+                .unwrap()
+                .is_empty()
+        );
+        let mut launch = args;
+        launch["engine"]["timing_model"] =
+            json!({"type": "external", "provider": "ais", "config": config});
+        let launched = EngineLaunchConfig::from_value(launch).unwrap();
+        assert_eq!((launched.tensor_parallel_size, launched.dp_size), (4, 2));
+        // Omitted controls keep the launch defaults instead of the sentinel.
+        let mut launch = json!({"engine": {}});
+        launch["engine"]["timing_model"] =
+            json!({"type": "external", "provider": "ais", "config": config});
+        let launched = EngineLaunchConfig::from_value(launch).unwrap();
+        assert_eq!((launched.tensor_parallel_size, launched.dp_size), (1, 1));
     }
 }

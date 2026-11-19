@@ -4,7 +4,7 @@
 //! Basic MoE perf table.
 //!
 //! Mirrors the raw SILICON-path layout of
-//! `aisimulate.sdk.operations.moe.MoE._query_moe_table`:
+//! `aisim.sdk.operations.moe.MoE._query_moe_table`:
 //!
 //! `moe_data[quant][distribution][topk][num_experts][hidden][inter][moe_tp][moe_expert_compute]`
 //! returns a `{num_tokens -> latency_ms}` dict.
@@ -172,74 +172,18 @@ impl MoeTable {
     /// unclamped) and `sol` — the operator layer's MoE roofline — carries
     /// the growth. Mirrors Python `MoE._query_moe_table._resolve_tokens`.
     ///
+    /// `kernel_source: None` reads the default grid; `Some` reads that exact
+    /// collected lane, which is never merged with or substituted by another:
+    /// an unavailable lane is a typed missing-data error.
+    ///
     /// Falls back to the `"uniform"` distribution if the requested
-    /// distribution is absent for the given quant mode. A singleton curve
+    /// distribution is absent for the given quant mode. A slice absent from
+    /// the grid is `Ok(None)`, with nothing formatted;
+    /// [`Self::missing_slice`] is its typed error. A singleton curve
     /// queried below its only point is a structured miss (Python
     /// `_require_moe_token_points`).
     #[allow(clippy::too_many_arguments)]
     pub fn query(
-        &self,
-        num_tokens: u32,
-        hidden_size: u32,
-        inter_size: u32,
-        topk: u32,
-        num_experts: u32,
-        moe_tp_size: u32,
-        moe_ep_size: u32,
-        quant: MoeQuantMode,
-        workload_distribution: &str,
-        sol: &dyn Fn(f64) -> f64,
-    ) -> Result<LeafValue, AicError> {
-        self.query_for_kernel_source(
-            None,
-            num_tokens,
-            hidden_size,
-            inter_size,
-            topk,
-            num_experts,
-            moe_tp_size,
-            moe_ep_size,
-            quant,
-            workload_distribution,
-            sol,
-        )
-    }
-
-    /// Query one exact collected kernel-source lane. The requested lane is
-    /// never merged with or substituted by another lane: an unavailable lane
-    /// is a typed missing-data error instead of a silent fallback.
-    #[allow(clippy::too_many_arguments)]
-    pub fn query_kernel_source(
-        &self,
-        kernel_source: &str,
-        num_tokens: u32,
-        hidden_size: u32,
-        inter_size: u32,
-        topk: u32,
-        num_experts: u32,
-        moe_tp_size: u32,
-        moe_ep_size: u32,
-        quant: MoeQuantMode,
-        workload_distribution: &str,
-        sol: &dyn Fn(f64) -> f64,
-    ) -> Result<LeafValue, AicError> {
-        self.query_for_kernel_source(
-            Some(kernel_source),
-            num_tokens,
-            hidden_size,
-            inter_size,
-            topk,
-            num_experts,
-            moe_tp_size,
-            moe_ep_size,
-            quant,
-            workload_distribution,
-            sol,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn query_for_kernel_source(
         &self,
         kernel_source: Option<&str>,
         num_tokens: u32,
@@ -252,7 +196,7 @@ impl MoeTable {
         quant: MoeQuantMode,
         workload_distribution: &str,
         sol: &dyn Fn(f64) -> f64,
-    ) -> Result<LeafValue, AicError> {
+    ) -> Result<Option<LeafValue>, AicError> {
         let grids = self.grids_for_kernel_source(kernel_source)?;
         let quant_name = quant.name();
 
@@ -268,13 +212,9 @@ impl MoeTable {
             grids
                 .index
                 .resolve_uniform(quant_name, workload_distribution, &shape);
-        let by_tokens = by_tokens.ok_or_else(|| {
-            let key = MoeKey::from_shape(quant_name, dist, shape);
-            AicError::PerfDatabase(format!(
-                "MoE data missing for {key:?} at {}",
-                self.data_root.display()
-            ))
-        })?;
+        let Some(by_tokens) = by_tokens else {
+            return Ok(None);
+        };
         if by_tokens.is_empty() {
             let key = MoeKey::from_shape(quant_name, dist, shape);
             return Err(AicError::PerfDatabase(format!(
@@ -290,7 +230,45 @@ impl MoeTable {
                  measured_token={only}, key={key:?}"
             )));
         }
-        by_tokens.query(num_tokens as f64, sol)
+        by_tokens.query(num_tokens as f64, sol).map(Some)
+    }
+
+    /// The typed miss for a slice absent from the grid [`Self::query`]
+    /// looked in, keyed by the distribution that lookup resolved.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn missing_slice(
+        &self,
+        kernel_source: Option<&str>,
+        hidden_size: u32,
+        inter_size: u32,
+        topk: u32,
+        num_experts: u32,
+        moe_tp_size: u32,
+        moe_ep_size: u32,
+        quant: MoeQuantMode,
+        workload_distribution: &str,
+    ) -> AicError {
+        let grids = match self.grids_for_kernel_source(kernel_source) {
+            Ok(grids) => grids,
+            Err(err) => return err,
+        };
+        let quant_name = quant.name();
+        let shape = MoeShapeKey {
+            topk,
+            num_experts,
+            hidden_size,
+            inter_size,
+            moe_tp_size,
+            moe_ep_size,
+        };
+        let (dist, _) = grids
+            .index
+            .resolve_uniform(quant_name, workload_distribution, &shape);
+        let key = MoeKey::from_shape(quant_name, dist, shape);
+        AicError::PerfDatabase(format!(
+            "MoE data missing for {key:?} at {}",
+            self.data_root.display()
+        ))
     }
 
     /// Probe the TRT-LLM low-latency NVFP4 MoE kernel table.
@@ -806,7 +784,7 @@ mod tests {
     fn b200_vllm_data_root() -> PathBuf {
         PathBuf::from(REPO_ROOT_HINT)
             .join("../..")
-            .join("python/aisimulate/src/aisimulate_core/systems/data/b200_sxm/vllm/0.19.0")
+            .join("python/aisim/src/aisim_core/systems/data/b200_sxm/vllm/0.19.0")
     }
 
     #[test]
@@ -845,9 +823,11 @@ mod tests {
             (MoeQuantMode::W4a16Mxfp4Humming, 3.0),
         ] {
             let value = table
-                .query(1, 5120, 2304, 6, 384, 4, 1, mode, "uniform", &proxy_sol)
+                .query(
+                    None, 1, 5120, 2304, 6, 384, 4, 1, mode, "uniform", &proxy_sol,
+                )
                 .unwrap();
-            assert_eq!(value.latency, expected);
+            assert_eq!(value.map(|leaf| leaf.latency), Some(expected));
         }
     }
 
@@ -905,6 +885,7 @@ mod tests {
         // the error should be about the topology key, not about
         // missing distribution.
         let result = table.query(
+            None,
             1024,
             4096,
             2048,
@@ -916,12 +897,25 @@ mod tests {
             "nonexistent_distribution",
             &proxy_sol,
         );
-        // Either succeeds (uniform fallback found a match) or errors
+        // Either succeeds (uniform fallback found a match) or misses
         // with a topology mismatch — but not a distribution-specific
         // error.
         match result {
-            Ok(value) => assert!(value.latency > 0.0),
-            Err(AicError::PerfDatabase(msg)) => {
+            Ok(Some(value)) => assert!(value.latency > 0.0),
+            Ok(None) => {
+                let msg = table
+                    .missing_slice(
+                        None,
+                        4096,
+                        2048,
+                        2,
+                        128,
+                        1,
+                        8,
+                        MoeQuantMode::Bfloat16,
+                        "nonexistent_distribution",
+                    )
+                    .to_string();
                 assert!(
                     !msg.contains("nonexistent_distribution"),
                     "expected uniform fallback, not literal distribution name in error: {msg}"
@@ -1028,6 +1022,7 @@ mod tests {
 
         let legacy = table
             .query(
+                None,
                 1024,
                 8192,
                 2048,
@@ -1041,8 +1036,8 @@ mod tests {
             )
             .expect("default lane resolves");
         let flashinfer = table
-            .query_kernel_source(
-                "sglang_flashinfer_trtllm_moe",
+            .query(
+                Some("sglang_flashinfer_trtllm_moe"),
                 1024,
                 8192,
                 2048,
@@ -1056,12 +1051,12 @@ mod tests {
             )
             .expect("requested FlashInfer lane resolves");
 
-        assert_eq!(legacy.latency, 1.0);
-        assert_eq!(flashinfer.latency, 0.25);
+        assert_eq!(legacy.map(|leaf| leaf.latency), Some(1.0));
+        assert_eq!(flashinfer.map(|leaf| leaf.latency), Some(0.25));
 
         let error = table
-            .query_kernel_source(
-                "sglang_missing_moe",
+            .query(
+                Some("sglang_missing_moe"),
                 1024,
                 8192,
                 2048,
@@ -1111,6 +1106,7 @@ mod tests {
         let table = MoeTable::new(tmp.path().to_path_buf());
         let v = table
             .query(
+                None,
                 1536,
                 4096,
                 2048,
@@ -1122,6 +1118,7 @@ mod tests {
                 "uniform",
                 &proxy_sol,
             )
+            .unwrap()
             .unwrap();
         assert!((v.latency - 2.0).abs() < 1e-9, "latency {}", v.latency);
         assert!(

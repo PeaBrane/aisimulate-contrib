@@ -1,9 +1,19 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 // SPDX-License-Identifier: Apache-2.0
+// Copyright contributors to the vLLM project.
+// Part of a modified Rust simulation of the vLLM v0.29.0
+// (98dff2a81d747d1dba01a47f939f48c3526d4206) align-mode state cache.
+// Immutable sources and license: THIRD_PARTY_NOTICES.md.
+
+// Modified persistent speculative-capacity interface derived from vLLM:
+// https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/kv_cache_manager.py
+// https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/sched/scheduler.py
+// See THIRD_PARTY_NOTICES.md for the Apache-2.0 attribution.
 
 //! Scheduler-facing facade over the native vLLM-style G1 manager.
 //!
-//! AISimulate owns a single native G1 implementation. External tiers and
+//! AISim owns a single native G1 implementation. External tiers and
 //! provider selection are deliberately absent here.
 
 use uuid::Uuid;
@@ -17,7 +27,9 @@ use super::vllm_backend::{
     DestinationReservation as VllmDestinationReservation,
     StoreSourceSnapshot as VllmStoreSourceSnapshot, VllmAcquire, VllmKvManager,
 };
-pub(crate) use super::vllm_backend::{NativeAllocation, SourceReuseDependency};
+pub(crate) use super::vllm_backend::{
+    NativeAllocation, SourceReleaseOrder, SourceReuseDependency, StateHandoff,
+};
 use super::{AllocationRequirement, DestinationReservationMode, G1Acquire, GroupedKvPool};
 
 fn into_g1_acquire<T>(outcome: VllmAcquire<T>) -> G1Acquire<T> {
@@ -84,8 +96,8 @@ impl G1Manager {
 
     /// Hold each G1 block a host store reads until its copy completes, instead
     /// of letting a new owner write it behind a fence.
-    pub(crate) fn hold_native_store_sources(&mut self) {
-        self.inner.hold_store_sources();
+    pub(crate) fn hold_native_store_sources(&mut self, order: SourceReleaseOrder) {
+        self.inner.hold_store_sources(order);
     }
 
     pub(crate) fn new_with_event_sink(
@@ -133,6 +145,11 @@ impl G1Manager {
     /// Blocks one recurrent state occupies; zero without a state cache.
     pub(crate) fn state_blocks_per_request(&self) -> usize {
         self.inner.state_cache_blocks()
+    }
+
+    /// Blocks a request's state reserves, speculative scratch copies included.
+    pub(crate) fn state_reserved_blocks_per_request(&self) -> usize {
+        self.inner.state_reserved_blocks()
     }
 
     pub(crate) fn begin_step(&mut self) {
@@ -211,6 +228,15 @@ impl G1Manager {
         self
     }
 
+    pub(crate) fn prefix_junction(
+        &self,
+        sequence: &RequestSequence,
+        lease: &BlockRequestLease,
+        cached_tokens: usize,
+    ) -> Option<usize> {
+        self.inner.prefix_junction(sequence, lease, cached_tokens)
+    }
+
     pub(crate) fn allocate_native(
         &mut self,
         owner: Uuid,
@@ -220,6 +246,38 @@ impl G1Manager {
     ) -> NativeAllocation<usize> {
         self.inner
             .allocate_lease(owner, lease, cumulative_tokens, reusable_prefix_blocks)
+    }
+
+    /// Preserve grouped and recurrent-state managers' existing lifecycle.
+    pub(crate) fn supports_native_speculative_slots(&self) -> bool {
+        self.inner.supports_native_speculative_slots()
+    }
+
+    pub(crate) fn allocate_native_with_slots(
+        &mut self,
+        owner: Uuid,
+        lease: &mut BlockRequestLease,
+        known_target_tokens: usize,
+        physical_slot_target_tokens: usize,
+        reusable_prefix_blocks: usize,
+    ) -> NativeAllocation<usize> {
+        self.inner.allocate_lease_with_slots(
+            owner,
+            lease,
+            known_target_tokens,
+            physical_slot_target_tokens,
+            reusable_prefix_blocks,
+        )
+    }
+
+    pub(crate) fn bind_native_owned_capacity(
+        &mut self,
+        owner: Uuid,
+        lease: &mut BlockRequestLease,
+        known_target_tokens: usize,
+    ) -> NativeAllocation<usize> {
+        self.inner
+            .bind_lease_owned_capacity(owner, lease, known_target_tokens)
     }
 
     pub(crate) fn authorize_native_compute_after_dependencies(
@@ -265,6 +323,15 @@ impl G1Manager {
         self.inner.get_lease_prefill_cost(sequence, lease)
     }
 
+    /// See [`VllmKvManager::get_waiting_lease_prefill_cost`].
+    pub(crate) fn get_native_waiting_prefill_cost(
+        &self,
+        sequence: &RequestSequence,
+        lease: &mut BlockRequestLease,
+    ) -> PrefillCost {
+        self.inner.get_waiting_lease_prefill_cost(sequence, lease)
+    }
+
     pub(crate) fn reserve_native_destination_at(
         &mut self,
         owner: Uuid,
@@ -291,14 +358,43 @@ impl G1Manager {
         lease: &BlockRequestLease,
         g1_prefix_blocks: usize,
         transferred_suffix: &[crate::engine::common::hashing::SequenceHash],
+        restores_state: bool,
     ) -> G1Acquire<DestinationReservation> {
         into_g1_acquire(self.inner.reserve_external_prefix_lease(
             owner,
             lease,
             g1_prefix_blocks,
             transferred_suffix,
+            restores_state,
         ))
         .map(|inner| DestinationReservation { inner })
+    }
+
+    /// Queue newly published states for a host tier.
+    pub(crate) fn record_state_handoffs(&mut self) {
+        self.inner.record_state_handoffs();
+    }
+
+    pub(crate) fn take_state_handoffs(&mut self) -> Vec<StateHandoff> {
+        self.inner.take_state_handoffs()
+    }
+
+    pub(crate) fn take_state_handoffs_of(&mut self, owner: Uuid) -> Vec<StateHandoff> {
+        self.inner.take_state_handoffs_of(owner)
+    }
+
+    pub(crate) fn state_handoff_is_live(&self, handoff: &StateHandoff) -> bool {
+        self.inner.state_handoff_is_live(handoff)
+    }
+
+    pub(crate) fn attach_state_handoff_dependency(
+        &mut self,
+        handoff: &StateHandoff,
+        slots: &[usize],
+        dependency: SourceReuseDependency,
+    ) {
+        self.inner
+            .attach_state_handoff_dependency(handoff, slots, dependency);
     }
 
     pub(crate) fn native_destination_pending_dependencies(
@@ -361,6 +457,10 @@ impl G1Manager {
     ) {
         self.inner
             .activate_destination_lease(owner, sequence, lease, reservation.inner);
+    }
+
+    pub(crate) fn cache_native_restored_window(&mut self, lease: &mut BlockRequestLease) {
+        self.inner.cache_restored_window(lease);
     }
 
     pub(crate) fn cancel_destination(&mut self, reservation: DestinationReservation) {

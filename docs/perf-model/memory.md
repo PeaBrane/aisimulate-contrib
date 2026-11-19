@@ -32,7 +32,7 @@ metadata, while TRT-LLM and SGLang leave the scheduler limit unset.
 This is the simulator's normalized context-limit contract. It does not model
 backend-version-specific frontend validation margins or automatic prompt
 truncation. Successful replay alone does not establish silicon timing accuracy.
-See the [SGLang GPU parity observations](https://github.com/ai-dynamo/aisimulate/pull/261#pullrequestreview-5250881045)
+See the [SGLang GPU parity observations](https://github.com/ai-dynamo/aisim/pull/261#pullrequestreview-5250881045)
 for stricter boundary behavior; they do not establish a fixed token offset
 across versions or configurations.
 
@@ -77,7 +77,7 @@ but keep `memory_breakdown=None` because the other components are unavailable.
 The Rust `KvCacheEstimateRequest` exposes the same field. Engine replay accepts
 the value in its engine arguments and carries it through native AIC capacity
 rematerialization, so the Python estimator and native scheduler use the same
-rank-local KV capacity. The `aisimulate predict` YAML exposes it at
+rank-local KV capacity. The `aisim predict` YAML exposes it at
 `engine.workers.<role>.kv_cache.capacity.cuda_graph_reserved_bytes`. This API
 does not estimate the reservation; callers must supply a value from a source
 they trust.
@@ -91,8 +91,16 @@ for required source changes to request and memory-breakdown structs.
 FPM resources support `cache_layout: linear` with a positive
 `kv_bytes_per_token`, or `cache_layout: grouped` with a nonempty `cache_groups`
 list and no scalar token rate. Existing linear profiles keep their serialized
-shape. Python exports `FpmCacheGroup` from `aisimulate.fpm_profile` and
-`aisimulate_core.fpm_profile`; Rust exports it from `aisimulate_core::perfmodel`.
+shape. Python exports `FpmCacheGroup` from `aisim.fpm_profile` and
+`aisim_core.fpm_profile`; Rust exports it from `aisim_core::perfmodel`.
+
+An explicit profile can use `cache_layout: unmodeled` when the runtime cache
+allocator has no AIS model, such as Mamba checkpoint retention.
+This layout requires observed `runtime_memory` and omits both
+`kv_bytes_per_token` and `cache_groups`. Store the native cache descriptors in
+the referenced provenance artifact. Canonical standalone timing queries can
+consume this profile. Cache sizing and replay reject it. An observed allocation
+does not establish how request lengths, cache reuse, or speculation consume it.
 
 Memory can be pending, declared, or observed at runtime. The four legacy fields
 `weights_bytes`, `activations_bytes`, `runtime_overhead_bytes`, and
@@ -123,14 +131,155 @@ rejects pending resources. Rust exposes `FpmRuntimeMemoryConfig` and
 `FpmResourceConfig::require_memory()`. See [Rust literal migration](../aic-backward-compatibility/migration.md#rust-resource-and-memory-literals)
 for resource construction changes.
 
-Each group has a unique `name`, `kind` (`attention` or `convolution`), positive
-`num_layers`, `block_size_tokens`, and `page_size_bytes`, and an optional positive
-`sliding_window`. An omitted or null window retains full history; convolution
-groups require a window. `page_size_bytes` is the **rank-local aggregate for all
-layers in the group**, including runtime padding. Do not multiply it by
-`num_layers` again. Runtime block sizes and padding are deployment inputs; model
-geometry alone does not establish them. See the
+A runtime memory record can also keep the prefix-caching settings of the
+[runtime probe](fpm-self-service/implementation.md#resolve-cache-geometry-with-a-runtime-probe)
+that observed it: `enable_prefix_caching` (a boolean), `mamba_cache_mode`
+(`none` or `align`) and `hash_block_size_tokens` (the positive hash block size,
+in tokens, that the runtime resolved). All three are optional, and an absent
+field is left out of the serialized record. `align` requires
+`enable_prefix_caching` to be `true`. vLLM's `all` mode is not modeled and is
+rejected. Rust exports the mode type as `FpmMambaCacheMode`. These fields are
+evidence of the probe's settings. Selection, sizing and replay do not read them
+yet. The simulated deployment decides prefix caching. The vLLM 0.33.0 runtime
+probe fills these fields from the prefill phase of an aggregated or prefill
+role. A decode role takes them from its decode phase.
+
+The import of a vLLM 0.33.0 runtime probe record also writes
+`runtime_framework_version`: the version of the runtime that observed the cache
+groups and the prefix-caching settings, such as `0.33.0`. It is optional,
+nonempty text, and an absent field is left out of the serialized record. It
+can differ from the deployment's `backend_version`, because
+`onboard probe-runtime` keeps an explicit dataset label and probes the runtime
+of the image. The import of a record without hybrid evidence, a vLLM 0.27.0,
+0.28.0 or 0.32.0 record, does not write it,
+and the linear layout of a measured cache leaves it out with the groups.
+Sizing does not read it. A profile imported before this field existed has
+none; see the [migration guide](../aic-backward-compatibility/migration.md#rust-resource-and-memory-literals).
+
+Each group has a unique `name`, `kind` (`attention`, `convolution` or `state`),
+positive `num_layers`, `block_size_tokens`, and `page_size_bytes`, and an optional
+positive `sliding_window`. An omitted or null window retains full history;
+convolution groups require a window. In an attention or convolution group,
+`page_size_bytes` is the **rank-local aggregate for all layers in the group**,
+including runtime padding. Do not
+multiply it by `num_layers` again. Runtime block sizes and padding are deployment
+inputs; model geometry alone does not establish them. See the
 [grouped-profile review workflow](fpm-self-service/implementation.md#review-grouped-cache-resources).
+
+A `state` group holds fixed per-request state, such as the recurrent state of
+linear-attention layers. It has no `sliding_window`, and no other kind accepts
+`blocks_per_request`. Three fields have their own meaning in a `state` group:
+
+- `page_size_bytes` is one pool block: every byte that one block ID reserves in
+  the shared pool. This can be more than the bytes of the group's own layers.
+  vLLM pads each Mamba page to the attention page, and the group with the most
+  bytes per block sets the size of a pool block.
+- `block_size_tokens` is the block size of vLLM's state spec, as the runtime
+  probe records it. For a Mamba spec, that is the Mamba block: the scheduler
+  block in `align` mode and `max_model_len` in mode `none`. For a ring spec,
+  such as an indexer tail, it is the ring block. Sizing and replay do not read
+  this field yet. Planned grouped prefix caching will read it as the Mamba
+  block of `align` mode. So it stays part of the group shape that onboarding
+  compares with the runtime probe.
+- `blocks_per_request` is the positive number of pool blocks that a running
+  request holds between block boundaries. For a Mamba spec, that is `1 + k`,
+  where `k` is the spec's `num_speculative_blocks`. Grouped execution forbids
+  speculative decoding, so `k` is 0 there. A ring spec, such as
+  `CircularBufferSpec` in vLLM 0.33.0, holds 1 block for the whole life of
+  the request in every mode. The count does not change with
+  the request length. When a request crosses a block boundary in `align` mode,
+  a Mamba group also holds the previous block for one or two steps. vLLM's
+  startup sizing in that mode counts `2 + k + c` blocks per request for a
+  Mamba group, where `c` is the spec's `num_prefill_checkpoint_blocks`. It
+  counts 1 block for a ring group. See vLLM v0.33.0
+  [`kv_cache_interface.py:1135-1141`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/kv_cache_interface.py#L1135-L1141)
+  and
+  [`single_type_kv_cache_manager.py:1640-1657`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/single_type_kv_cache_manager.py#L1640-L1657).
+
+A `state` group can also hold two optional fields from the runtime probe
+import. A profile imported before these fields existed has neither of them, and
+an absent field is left out of the serialized group. Sizing and replay do not
+read them yet.
+
+- `prefill_checkpoint_blocks` is the number of prefill checkpoint blocks of a
+  Mamba spec: 0 or 1. Only a `state` group can have it. A vLLM 0.33.0 import
+  writes it for every Mamba group. It refuses a record with another count.
+  In `align` mode, vLLM's startup sizing counts these blocks as `c` in
+  `2 + k + c`.
+- `prefill_checkpoint_alignment` is the token alignment of that checkpoint. It
+  must be positive, and it needs `prefill_checkpoint_blocks` of 1. A vLLM
+  0.33.0 import writes it for a Mamba group with one checkpoint block. It
+  refuses a record whose alignment does not match the count. In vLLM
+  0.33.0, a GLM-5.3-Flash KDA layer that prefills with FlashKDA has one
+  checkpoint block with an alignment of 16 tokens. With the Triton kernel it
+  has no checkpoint block and no alignment. See vLLM v0.33.0
+  [`kda.py:168-176`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/models/glm5next/common/kda.py#L168-L176)
+  and
+  [`kda_checkpoint.py:9-10`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/model_executor/layers/mamba/kda_checkpoint.py#L9-L10).
+
+Every group can also hold two more optional fields. A profile imported before
+these fields existed has neither of them, and an absent field is left out of
+the serialized group. Sizing and replay do not read them yet.
+
+- `prefix_cacheable` tells whether vLLM's manager for the group takes part in
+  prefix caching. A ring spec (`CircularBufferSpec`) does not, and a uniform
+  group takes part only when every inner spec does. Import writes it for every
+  group except a group that holds a `SlidingWindowMLASpec` layer. Such a group
+  takes no part if it replays a bounded window, and the probe does not record
+  that setting. See vLLM v0.33.0
+  [`kv_cache_interface.py:998-1000`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/kv_cache_interface.py#L998-L1000),
+  [`:1027-1029`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/kv_cache_interface.py#L1027-L1029)
+  and
+  [`:1305-1307`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/kv_cache_interface.py#L1305-L1307).
+- `transfer_bytes_per_block` is the bytes that vLLM's P/D connector (NIXL)
+  reads for one block of the group in a transfer on one TP rank, for the vLLM
+  version of the deployment. It is positive and at most 2^53, and it can be
+  larger than `page_size_bytes`, because the connector reads a block in regions
+  that layers of other groups can share. A hand-made profile may state it only
+  for a group whose transfer size has been measured.
+
+  To measure the full-attention value and the combined transfer size of the
+  other groups, send two prompts of different length through a P/D pair, one at
+  a time, and read the change of
+  `vllm:nixl_bytes_transferred_sum` on the decode server for each. Divide each
+  change by the change of `vllm:nixl_bytes_transferred_count`, because each TP
+  rank makes its own transfer and the field holds the bytes of one rank. The
+  difference between the two results, divided by the difference in
+  full-attention blocks that move, is the value of the full-attention group.
+  The rest of one transfer is the sum of the values of the other groups when
+  each of them moves one block, as a state group does. With multiple state
+  groups, this determines only their combined transfer size.
+
+  Per-group values for models with several state groups are not supported by
+  this procedure or the current runtime probe. Leave `transfer_bytes_per_block`
+  unset for those groups until per-group transfer measurements or additional
+  runtime-observer evidence identifies the bytes read for each group on one TP
+  rank. Do not split the combined size evenly or use the page sizes as
+  substitutes.
+
+  The probe import of a vLLM 0.33.0 record writes it for no group, because what
+  the P/D connector of vLLM 0.33.0 reads for a block depends on
+  facts that the record does not hold. The connector registers one
+  region per layer address and lets layers of different groups share a region.
+  In a model with Mamba layers, it reads a block of an attention group, other
+  than the ring, in every region. The length of a region of a layer that is not
+  a Mamba layer depends on the layout: the padded page divided by a
+  kernel-block ratio that the connector chooses at start, or the whole storage
+  row of a block. A Mamba layer moves its state without padding, and a
+  `tp_replicated` Mamba layer moves its whole page. The record holds neither the
+  ratio nor `tp_replicated`. See vLLM v0.33.0
+  [`base_worker.py:1744-1756`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py#L1744-L1756),
+  [`:194-249`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py#L194-L249),
+  [`:1598-1603`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py#L1598-L1603),
+  [`:1693-1719`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py#L1693-L1719),
+  [`:1063-1082`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py#L1063-L1082),
+  [`:2013-2033`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py#L2013-L2033)
+  and
+  [`:1774-1779`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py#L1774-L1779).
+  A P/D model of a grouped profile for vLLM 0.33.0 needs these facts from the
+  runtime observer first. A claim in `resource_overrides.cache_groups` that
+  states this field is refused, because the probe evidence holds no value to
+  compare it with.
 
 Use `RustForwardPassPerfModel.estimate_cache_budget(config, budget)` with the
 same canonical `ForwardPassPerfModelConfig` used for timing. Rust exposes
@@ -192,8 +341,11 @@ is atomic across all groups against one shared rank-local byte budget. A window
 of `W` keeps the blocks covering the last `W - 1` computed tokens and all tokens
 scheduled for the next forward. Expired completed pages are evicted before
 subsequent forwards; temporary prefill pages remain charged through completion.
-Full-attention groups retain full history. This physical retention never truncates
-logical request progress or the context coordinates sent to FPM timing queries.
+Full-attention groups retain full history. A `state` group holds its
+`blocks_per_request` blocks from the request's first scheduled forward until the
+request finishes, is cancelled or is preempted. A resumed request reserves them
+again once. This physical retention never truncates logical request progress or
+the context coordinates sent to FPM timing queries.
 
 The Rust Replay observer's `ReplaySchedulerMetricsSnapshot` reports optional
 `kv_cache_used_bytes` and `kv_cache_capacity_bytes` for grouped caches; its
@@ -204,3 +356,37 @@ These fields are currently exposed through the Rust observer API, not the Python
 JSON replay runtime. Linear snapshots retain their existing block metrics.
 
 Cache reuse, eviction, and offload lifecycle are documented in [Replay KV cache](../replay/engine/kv-cache.md).
+
+### Observed Mamba align pools
+
+The `mamba_align` layout describes one full-attention group and padded
+Mamba groups that share one physical pool. Supply observed runtime memory,
+physical page bytes, block length, state-group count, prefix unit, and
+speculative state count. Set `mamba_cache.state_storage: full_state` explicitly.
+The count must match the measured draft depth. Internal prefill checkpoint
+slots are unsupported.
+
+| Field under `resources.mamba_cache` | Meaning |
+| --- | --- |
+| `state_storage` | Required `full_state`. Other policies are rejected. |
+| `block_size_tokens` | Physical attention block length, at least two tokens. |
+| `page_size_bytes` | Padded page size shared by attention and state groups. |
+| `state_groups` | Number of state pages in one complete working state. |
+| `prefix_match_unit` | Positive divisor of the block length. |
+| `num_speculative_states` | Full-state scratch copies, equal to the measured draft depth, from zero through five. |
+
+The native budget returns `replay_cache`. This descriptor excludes one reserved
+null page and includes working-state and speculative scratch reservations.
+Do not interpret its allocation byte rate as logical KV bytes per token.
+The profile does not expose an aggregate token capacity.
+
+Use aggregated vLLM replay with the measured block length and scheduler limits.
+Keep prefix caching enabled. Fixed capacity overrides, offload, and disaggregated
+FPM replay are unsupported for this layout. Original timing imports remain valid
+as timing-only evidence.
+
+ReplaySSM and RecoverSSM lay out and size their states differently, so
+profile them as `unmodeled` for timing only; do not relabel them `full_state`.
+Lookups follow vLLM revision `db9527a46873454610df6dbedf79a36d6bf1a7f6`, which
+applies the logits cap before the MTP hash-unit drop, so some exactly aligned
+prompts miss the cached tail.

@@ -23,15 +23,13 @@ The suite compares the live Rust engine against **golden fixtures** for:
   (`cli_estimate` has no cp knob)
 - `agg`: public `cli_estimate(mode="agg")`
 - `disagg`: public `cli_estimate(mode="disagg")`
-- `afd`: public `cli_estimate(mode="afd")` (ttft/tpot; the AFD session's
-  per-op values cross the op-list evaluate FFI)
 
 The case matrix: `SMOKE_CASES` x 4 surfaces, `POWER_CASES` (energy/power
 coverage) x 4, `CP_CASES` (mixed only), `DSV4_CP_CASES` (cp_static_ctx +
 mixed), `HYBRID_CASES` x 4 at a 1e-4 rtol, `SOL_CASES` (static+mixed) at
-1e-4, the two #1456 site-transfer tie-break anchors
-(`TIE_AGG_CASES`/`TIE_DISAGG_CASES`), and `AFD_CASES` — plus the
-typed-error/provenance contract tests and the anti-vacuous golden guards.
+1e-4, and the two #1456 site-transfer tie-break anchors
+(`TIE_AGG_CASES`/`TIE_DISAGG_CASES`) — plus the typed-error/provenance
+contract tests and the anti-vacuous golden guards.
 If an assertion fails, the message prints the golden value, Rust value,
 absolute delta, percent delta, tolerance, and status for each metric.
 
@@ -42,7 +40,7 @@ checks against the frozen references, and the per-op FFI anchor
 latency/energy/source dicts). Both suites run in the
 `rust-engine-step-parity` CI job (`build-test.yml`).
 
-Build the `aisimulate_core` extension first (the CI job does this with
+Build the `aisim_core` extension first (the CI job does this with
 `maturin develop --release`; from a clean checkout run
 `cd aic-core && ../.venv/bin/maturin develop --release`), then return to the
 repository root and run:
@@ -96,6 +94,103 @@ The pin script keeps the retired capture script's guards: clean-tree
 requirement, pinned thread caps, byte-reproducible output, and
 all-payloads-before-any-write. `TestGoldenComparisonGuards` proves the
 comparison itself still bites.
+
+### GLM-5.3-Flash Ops data and the fleet `next` slot
+
+Packaging the GLM-5.3-Flash Ops tables makes SGLang 0.5.20 and vLLM 0.31.0
+the derived fleet `next` versions. The two Kimi-K3 B300 cases follow `next`,
+so they now read the B300 SGLang 0.5.20 tables collected for GLM. The
+change comes from `gemm_perf` and `custom_allreduce_perf`: with only the
+GEMM table present, static context and generation change by +1.819 and
+-0.607 ms; with only the all-reduce table, by -0.913 and -0.213 ms. With
+only the 0.5.20 KDA, MoE, mHC or GLM attention table present, the records
+are unchanged. Only the failing static and
+disaggregated records were refreshed, from
+`9a08d1557462c02a6cc8552360afee89538a0540` with a matching native build:
+
+| Metric (ms), both cases | Before | After |
+| --- | ---: | ---: |
+| Static context | 87.881 | 88.761 |
+| Static generation | 13.912 | 13.091 |
+| Static total | 101.793 | 101.852 |
+| Disaggregated TTFT | 174.004 | 175.747 |
+| Disaggregated TPOT | 16.936 | 16.319 |
+| Disaggregated request | 190.940 | 192.066 |
+
+The aggregate references pass unchanged and the mixed records keep their
+`PerfDataNotAvailableError`. The four Qwen3.8-Max GB300 cases pin SGLang
+0.5.17 and vLLM 0.27.1, which are no longer queryable versions. They set
+`allow_unlisted_version=True` and keep their references unchanged; the
+parity tests and `pin_goldens.py` both admit that version through
+`_surface_metrics`.
+
+```bash
+python/aisim/.venv/bin/python crates/core/parity_tests/perfmodel/pin_goldens.py \
+  --refresh kimi-k3-b300-sglang-next-nospec::static \
+  kimi-k3-b300-sglang-next-nospec::disagg \
+  kimi-k3-b300-sglang-next-dspark-nextn7::static \
+  kimi-k3-b300-sglang-next-dspark-nextn7::disagg
+```
+
+To reproduce the attribution, start from this PR with its native extension
+built and with the pre-refresh `goldens/engine_step.json` from
+`9a08d1557462c02a6cc8552360afee89538a0540` checked out. Move every
+`data/b300_sxm/<family>/sglang/0.5.20` directory (`gemm`, `moe`, `kda`, `mhc`,
+`comm`, `glm53_attention`) out of the systems tree. Then restore one family
+at a time and run:
+
+```bash
+python/aisim/.venv/bin/python -m pytest -c python/aisim/pytest.ini -q -p no:timeout \
+  crates/core/parity_tests/perfmodel/test_engine_step_parity.py \
+  -k 'kimi-k3-b300-sglang-next-nospec and (TestRustEngineStepStaticParity or TestRustEngineStepDisaggParity)'
+```
+
+With no 0.5.20 families present, the static and disaggregated records pass
+against the old references. With only `gemm` or only `comm` present, both
+records drift. `gemm` alone moves disaggregated TTFT/TPOT by +2.07%/−2.01%,
+and `comm` alone moves them by −1.04%/−1.64%; the two together give the
+refreshed values above. With only `kda`, `moe`, `mhc` or `glm53_attention`
+present, both records pass.
+
+### B60 graph-timing data promotion in PR #329
+
+The `qwen3-30b-a3b-b60-vllm-scan-coverage` case follows the `current`
+version slot, which moves from vLLM 0.26.0 to 0.28.0. Its static, mixed,
+aggregate and disaggregated references were selectively refreshed from
+`8f6faf712d0d6288b31aa41714a4ddb2fa590095` with a matching native build.
+The aggregate reference also includes the new XPU backend's scheduling model.
+
+| Metric (ms) | Before | After |
+| --- | ---: | ---: |
+| Static context | 164.960 | 133.227 |
+| Static generation | 38.997 | 9.784 |
+| Mixed step | 168.776 | 135.781 |
+| Aggregate TTFT | 233.073 | 231.165 |
+| Aggregate TPOT | 168.776 | 131.905 |
+| Disaggregated TTFT | 326.621 | 263.788 |
+| Disaggregated TPOT | 33.115 | 19.844 |
+
+Selecting 0.26.0 explicitly on the PR reproduces the base revision's static
+per-operation latencies. With 0.28.0, generation MoE changes from 21.219994
+to 3.039994 ms, attention from 5.025209 to 2.485675 ms, and each MoE
+dispatch phase from 3.638394 to 1.008275 ms. The new measurements account
+for the static shift; these references do not independently establish
+whole-model B60 silicon accuracy.
+
+From a clean checkout of the source revision, with its native extension built
+and development dependencies installed, regenerate only these four records:
+
+```bash
+PYTHONPATH=python/aisim/src:python/aisim \
+python/aisim/.venv/bin/python crates/core/parity_tests/perfmodel/pin_goldens.py \
+  --refresh qwen3-30b-a3b-b60-vllm-scan-coverage::static \
+  qwen3-30b-a3b-b60-vllm-scan-coverage::mixed \
+  qwen3-30b-a3b-b60-vllm-scan-coverage::agg \
+  qwen3-30b-a3b-b60-vllm-scan-coverage::disagg
+```
+
+The fixture records the source revision in `post_freeze_pins`. Other cases,
+the test matrix and tolerances are unchanged.
 
 ### FP8-block correction in PR #244
 
@@ -163,7 +258,7 @@ The causal check kept Rust and the performance tables fixed and changed only den
 To reproduce the current calculations without modifying the references, build the matching native extension and run from the repository root:
 
 ```bash
-python/aisimulate/.venv/bin/python -m pytest -q -p no:timeout \
+python/aisim/.venv/bin/python -m pytest -q -p no:timeout \
   crates/core/parity_tests/perfmodel/test_engine_step_parity.py \
   -k 'deepseek-v32-b200-sglang-isl1024-osl2 or glm5-b200-sglang-empirical or glm5-b200-sglang-isl16384-osl2 or glm52-b200-sglang-isl1024-osl2'
 ```
@@ -225,7 +320,7 @@ The power import from AIConfigurator commit
 `915f590680d8a79fe9c39f6f3a9ff13bc267fcce` adds measured B200 TensorRT-LLM
 1.3.0rc20 power columns while preserving timing identities. The per-op goldens
 for GPT-OSS-20B and Nemotron-Super-49B were regenerated with the repository
-`pin_goldens.py --refresh` workflow at AISimulate commit
+`pin_goldens.py --refresh` workflow at AISim commit
 `36dcc8f3afe9e6e2e9de976737b6337fad8c4d74`, using that checkout's rebuilt native
 extension. All 29 changed numeric fields are energy values moving from zero
 to positive W-ms. Every latency and source tag is unchanged. For example,
@@ -243,11 +338,11 @@ for that checkout. The pin script requires a clean input tree; reproduce a
 historical refresh in an isolated checkout of that revision.
 
 ```bash
-python/aisimulate/.venv/bin/python crates/core/parity_tests/perfmodel/pin_goldens.py \
+python/aisim/.venv/bin/python crates/core/parity_tests/perfmodel/pin_goldens.py \
   --refresh gpt-oss-20b-b200-trtllm-isl1024-osl2 \
   nemotron-nas-b200-trtllm-isl1024-osl2
 
-python/aisimulate/.venv/bin/python -m pytest -q -p no:timeout \
+python/aisim/.venv/bin/python -m pytest -q -p no:timeout \
   crates/core/parity_tests/perfmodel/test_compile_engine_parity.py
 ```
 
@@ -257,16 +352,16 @@ as `574c0d9ce64438c4a1c4e0fbbe58c5a9d4cd4de8`. An engine-step suite result was
 not recorded with that historical refresh.
 
 Both suites subsequently passed in the
-[Engine Golden Regression job](https://github.com/ai-dynamo/aisimulate/actions/runs/35043503755/job/104628335804)
+[Engine Golden Regression job](https://github.com/ai-dynamo/aisim/actions/runs/35043503755/job/104628335804)
 at `a83ad4f162669b318786cc279f320650ec09d5b1`, using a release native build:
 **298 engine-step tests passed** and **67 compile-engine tests passed**. The
 job ran these exact commands from the repository root:
 
 ```bash
-python -m pytest -q -rx -n 4 -c python/aisimulate/pytest.ini \
+python -m pytest -q -rx -n 4 -c python/aisim/pytest.ini \
   crates/core/parity_tests/perfmodel/test_engine_step_parity.py
 
-python -m pytest -q -rx -n 4 -c python/aisimulate/pytest.ini \
+python -m pytest -q -rx -n 4 -c python/aisim/pytest.ini \
   crates/core/parity_tests/perfmodel/test_compile_engine_parity.py
 ```
 
@@ -277,7 +372,7 @@ records the verified revision rather than certifying future changes.
 
 The two identity-merged B200 attention tables include pinned upstream artifacts
 in `power_upstream/*.parquet.source`. Focused tests in
-`python/aisimulate/tests/unit/tools/test_power_data.py` check their upstream
+`python/aisim/tests/unit/tools/test_power_data.py` check their upstream
 SHA-256, every imported schema, identity and measurement, and the paired-zero
 sentinel on local-only identities. These evidence files are excluded from
 `*.parquet` runtime-table discovery.

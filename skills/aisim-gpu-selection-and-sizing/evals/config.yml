@@ -1,0 +1,10 @@
+# Only harbor.n_concurrent is confirmed from #nv-carps-support (Mohit Gupta, 2026-10-30).
+# CPU only: no GPU sandbox template needed. The missing-coverage case requires
+# HTTPS access to huggingface.co for the Granite config; other model configs ship with AISim.
+# Open question for NVCARPS: can the sandbox pip install aisim and reach huggingface.co?
+# Custom Dockerfiles are not supported in CI.
+# Tested with aisim==0.14.0; the eval environment must install exactly that version and
+# check `aisim --version` before running cases.
+schema_version: 1
+harbor:
+  n_concurrent: 4

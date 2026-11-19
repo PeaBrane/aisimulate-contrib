@@ -3,13 +3,13 @@
 
 use std::collections::VecDeque;
 
-use aisimulate_core::engine::{Backend, EngineConfig, TimingModelConfig};
-use aisimulate_core::replay::loadgen::{
+use aisim_core::engine::{Backend, EngineConfig, SglangConfig, TimingModelConfig};
+use aisim_core::replay::loadgen::{
     AGENTIC_MOONCAKE_SCHEMA, AGENTIC_MOONCAKE_VERSION, AgenticHashIdScope, AgenticMooncakeHeader,
     AgenticMooncakeRow, AgenticProfileOptions, AgenticSnapshotOptions, AgenticSourceProvenance,
     PreparedAgenticSnapshots, ValidatedAgenticGraph, WorkloadDriver,
 };
-use aisimulate_core::replay::{
+use aisim_core::replay::{
     CURRENT_REPLAY_SPEC_VERSION, DirectRequest, PerRequestRecord, ReplayEngineConfig,
     ReplayEngineFactory, ReplayError, ReplayReport, ReplayRuntimeInput, ReplaySpec,
     ReplayTerminalStatus, ReplayTopology, Replayer, WorkerPoolSpec,
@@ -27,6 +27,10 @@ fn engine(backend: Backend) -> ReplayEngineConfig {
             num_gpu_blocks: 64,
             max_num_seqs: 4,
             max_num_batched_tokens: 64,
+            sglang: SglangConfig {
+                num_reserved_decode_tokens: 0,
+                ..SglangConfig::default()
+            },
             timing_model: TimingModelConfig::Fixed {
                 prefill_ms: 1.0,
                 decode_ms: 1.0,
@@ -49,6 +53,7 @@ fn spec(
     };
     ReplaySpec {
         version: CURRENT_REPLAY_SPEC_VERSION,
+        encoder: None,
         topology: if disagg {
             ReplayTopology::Disaggregated {
                 prefill: pool,
@@ -305,7 +310,7 @@ fn agentic_driver(
         return WorkloadDriver::new_agentic_trace_with_lanes(graph, 4, 1).unwrap();
     };
     let prepared = graph
-        .prepare_snapshots(1, AgenticSnapshotOptions { seed: 42 })
+        .prepare_snapshots(1, AgenticSnapshotOptions::seeded(42))
         .unwrap();
     let play = prepared.context().prepare_play_from_start(0, 0).unwrap();
     let snapshots = PreparedAgenticSnapshots::from_plays(vec![play]).unwrap();

@@ -8,27 +8,28 @@ import uuid
 
 import pytest
 
-from aisimulate.sweeper.parallel_enum import (
+from aisim.sweeper.parallel_enum import (
     DisaggParallelConfig,
     ParallelShape,
     ReplicaParallelConfig,
 )
-from aisimulate.sweeper.parallel_projection import (
+from aisim.sweeper.parallel_projection import (
     AGG_ATTENTION_MODE,
     AGG_FFN_MODE,
     AGG_GPUS_PER_ENGINE,
     USED_GPU_RATIO,
 )
-from aisimulate.sweeper.sampler import (
+from aisim.sweeper.sampler import (
     InvalidSuggestionError,
     SeededBayesianBranchSampler,
+    SmallestFirstBranchSampler,
     Suggestion,
     _decoder_for,
     _index_decoder,
     _vizier_algorithm,
     make_branch_sampler,
 )
-from aisimulate.sweeper.search_space import BranchSpace, ConditionalDimensionSpace
+from aisim.sweeper.search_space import BranchSpace, ConditionalDimensionSpace
 
 pytestmark = [
     pytest.mark.timeout(300),
@@ -478,7 +479,7 @@ def test_pareto_study_sweeps_kv_load_and_returns_front(monkeypatch):
 
 
 def test_random_covers_topologies_and_exhausts_complete_configurations():
-    from aisimulate.sweeper.sampler import RandomBranchSampler
+    from aisim.sweeper.sampler import RandomBranchSampler
 
     branch = _branch()
     sampler = RandomBranchSampler(branch, seed=11)
@@ -494,7 +495,7 @@ def test_random_covers_topologies_and_exhausts_complete_configurations():
 def test_random_large_log_domain_is_lazy_and_honors_gpu_budget():
     from dataclasses import replace
 
-    from aisimulate.sweeper.sampler import RandomBranchSampler
+    from aisim.sweeper.sampler import RandomBranchSampler
 
     branch = replace(
         _branch(),
@@ -532,7 +533,7 @@ def test_conditional_random_skips_exhausted_arms():
 def test_continuous_random_batch_services_pending_retries_fifo():
     from dataclasses import replace
 
-    from aisimulate.sweeper.sampler import RandomBranchSampler
+    from aisim.sweeper.sampler import RandomBranchSampler
 
     sampler = RandomBranchSampler(replace(_branch(), float_ranges={"kv_load_ratio": (0.1, 0.9)}), seed=7)
     failed = sampler.suggest(2)
@@ -554,7 +555,7 @@ def test_continuous_random_batch_services_pending_retries_fifo():
 def test_single_slot_random_asks_allow_retries_and_new_configurations():
     from dataclasses import replace
 
-    from aisimulate.sweeper.sampler import RandomBranchSampler
+    from aisim.sweeper.sampler import RandomBranchSampler
 
     sampler = RandomBranchSampler(replace(_branch(), float_ranges={"kv_load_ratio": (0.1, 0.9)}), seed=7)
     failed = sampler.suggest(1)[0]
@@ -568,3 +569,105 @@ def test_single_slot_random_asks_allow_retries_and_new_configurations():
         assert len(batch) == 1 and batch[0] != failed
         fresh.extend(batch)
     assert len({(item.parallel_config, json.dumps(item.selection, sort_keys=True)) for item in fresh}) == 3
+
+
+def _replica_branch(*replica_counts: int, prefer_smallest: bool = True) -> BranchSpace:
+    configs = tuple(
+        ReplicaParallelConfig(ParallelShape(tp=1, dp=1, moe_tp=1, moe_ep=1), replicas=r) for r in replica_counts
+    )
+    return BranchSpace(
+        deployment_mode="agg",
+        parallel_configs=configs,
+        supported_backends={c: frozenset({"vllm"}) for c in configs},
+        knob_choices={"backend": ["vllm"], "agg_max_num_seqs": [128, 256]},
+        prefer_smallest=prefer_smallest,
+    )
+
+
+@pytest.mark.parametrize("algorithm", [None, "bayesian", "random"])
+def test_min_gpus_branches_use_smallest_first_sampler(algorithm):
+    sampler = make_branch_sampler(_replica_branch(8, 1, 4, 2), study_id="s", algorithm=algorithm, seed=3)
+    assert isinstance(sampler, SmallestFirstBranchSampler)
+
+
+def test_non_min_gpus_branches_keep_requested_sampler():
+    sampler = make_branch_sampler(
+        _replica_branch(8, 1, prefer_smallest=False), study_id="s", algorithm="bayesian", seed=3
+    )
+    assert not isinstance(sampler, SmallestFirstBranchSampler)
+
+
+def test_smallest_first_visits_gpu_counts_in_ascending_order():
+    sampler = SmallestFirstBranchSampler(_replica_branch(8, 1, 4, 2), seed=7)
+    first_pass = [suggestion.parallel_config.total_gpus for suggestion in sampler.suggest(4)]
+    assert first_pass == [1, 2, 4, 8]
+
+
+def test_smallest_first_drops_larger_shapes_after_a_qualifying_one():
+    sampler = SmallestFirstBranchSampler(_replica_branch(8, 1, 4, 2), seed=7)
+    one, two = sampler.suggest(2)
+    sampler.observe_infeasible(one, "sla")
+    sampler.observe(two, {"objective": -2.0})
+    assert sampler.best_gpus == 2
+    later = []
+    while not sampler.exhausted:
+        batch = sampler.suggest(4)
+        if not batch:
+            break
+        later.extend(suggestion.parallel_config.total_gpus for suggestion in batch)
+    # Knob revisits continue at or below the best count; 4 and 8 GPUs are never tried.
+    assert later and set(later) <= {1, 2}
+
+
+def test_smallest_first_keeps_the_smaller_best_when_a_larger_one_qualifies_later():
+    sampler = SmallestFirstBranchSampler(_replica_branch(1, 2, 4), seed=1)
+    one, two, four = sampler.suggest(3)
+    sampler.observe(one, {"objective": -1.0})
+    sampler.observe(four, {"objective": -4.0})
+    assert sampler.best_gpus == 1
+
+
+def test_smallest_first_bound_uses_observed_gpus_including_extra_pools():
+    # An encoder pool adds GPUs beyond the topology: 1 language GPU + 4 encoder GPUs
+    # qualify at 5. A 2-language-GPU topology can still beat that and must stay.
+    sampler = SmallestFirstBranchSampler(_replica_branch(1, 2, 8), seed=5)
+    one, two, eight = sampler.suggest(3)
+    sampler.observe(one, {"objective": -5.0})
+    assert sampler.best_gpus == 5
+    later = {suggestion.parallel_config.total_gpus for suggestion in sampler.suggest(8)}
+    assert 2 in later
+    assert 8 not in later
+
+
+def test_smallest_first_does_not_retry_shapes_above_the_bound():
+    sampler = SmallestFirstBranchSampler(_replica_branch(1, 2, 4), seed=1)
+    one, two, four = sampler.suggest(3)
+    sampler.observe(one, {"objective": -1.0})
+    sampler.retry(four)  # e.g. a timeout reported after the 1-GPU success
+    assert all(suggestion.parallel_config.total_gpus <= 1 for suggestion in sampler.suggest(4))
+
+
+def test_conditional_min_gpus_arms_share_the_qualifying_bound():
+    shapes = tuple(ReplicaParallelConfig(ParallelShape(tp=1, dp=1, moe_tp=1, moe_ep=1), replicas=r) for r in (1, 2, 4))
+    base = _conditional_branch()
+    branch = BranchSpace(
+        deployment_mode="agg",
+        parallel_configs=shapes,
+        supported_backends={shape: frozenset({"vllm"}) for shape in shapes},
+        knob_choices=base.knob_choices,
+        conditional_dimensions=base.conditional_dimensions,
+        prefer_smallest=True,
+    )
+    sampler = make_branch_sampler(branch, study_id="s", algorithm="bayesian", seed=11)
+    # The round-robin arm qualifies at 1 GPU; the KV-router arm must then stop
+    # suggesting 2- and 4-GPU pools even though it never observed a success itself.
+    first = sampler.suggest(2)
+    winner = next(
+        s for s in first if s.selection["adapter::router::mode"] == "round_robin" and s.parallel_config.total_gpus == 1
+    )
+    sampler.observe(winner, {"objective": -1.0})
+    later = []
+    for _ in range(6):
+        later.extend(sampler.suggest(2))
+    assert any(suggestion.selection["adapter::router::mode"] == "kv_router" for suggestion in later)
+    assert all(suggestion.parallel_config.total_gpus == 1 for suggestion in later)

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 
 use super::*;
 use crate::engine::{EngineConfig, G3Scope, TimingModelConfig};
@@ -11,8 +12,8 @@ use crate::replay::core::round_robin::AggregatedRoundRobinPlacement;
 use crate::replay::engine::{ReplayEngineConfig, ReplayEngineFactory};
 use crate::replay::scaling::ReplayScalingDecision;
 use crate::replay::{
-    ReplayArtifactKvEventVisibility, ReplaySpec, ReplayTelemetryObserver, ReplayTelemetrySnapshot,
-    Replayer, WorkerStage, run_engine_replay,
+    ReplayArtifactKvEventVisibility, ReplayCaptureOptions, ReplayDeterminism, ReplaySpec,
+    ReplayTelemetryObserver, ReplayTelemetrySnapshot, Replayer, WorkerStage, run_engine_replay,
 };
 use serde_json::{Value, json};
 
@@ -23,6 +24,15 @@ struct NoopTelemetryObserver;
 
 impl ReplayTelemetryObserver for NoopTelemetryObserver {
     fn on_sample(&mut self, _snapshot: ReplayTelemetrySnapshot) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+struct CaptureTelemetryObserver(Arc<Mutex<Vec<ReplayTelemetrySnapshot>>>);
+
+impl ReplayTelemetryObserver for CaptureTelemetryObserver {
+    fn on_sample(&mut self, sample: ReplayTelemetrySnapshot) -> anyhow::Result<()> {
+        self.0.lock().unwrap().push(sample);
         Ok(())
     }
 }
@@ -45,11 +55,19 @@ fn runtime_with_startup_time(
     pending: VecDeque<DirectRequest>,
     startup_time_ms: Option<f64>,
 ) -> RoundRobinAggRuntime {
+    runtime_with_timing(pending, startup_time_ms, 1.0)
+}
+
+fn runtime_with_timing(
+    pending: VecDeque<DirectRequest>,
+    startup_time_ms: Option<f64>,
+    pass_ms: f64,
+) -> RoundRobinAggRuntime {
     let config = ReplayEngineConfig {
         rank: EngineConfig {
             timing_model: TimingModelConfig::Fixed {
-                prefill_ms: 1.0,
-                decode_ms: 1.0,
+                prefill_ms: pass_ms,
+                decode_ms: pass_ms,
             },
             ..EngineConfig::default()
         },
@@ -84,6 +102,99 @@ fn telemetry_only_timestamps_do_not_enter_the_agg_semantic_drain() {
     );
 }
 
+#[test]
+fn aggregate_completion_feedback_matches_final_slo_and_gpu_accounting() {
+    let samples = Arc::new(Mutex::new(Vec::new()));
+    let sla = crate::replay::SlaThresholds {
+        ttft_ms: Some(10.0),
+        itl_ms: Some(5.0),
+        e2e_ms: None,
+    };
+    let report = runtime(VecDeque::from([request(1, 0.0), request(2, 10.0)]))
+        .with_sla_thresholds(sla)
+        .with_telemetry_observer(1.0, Box::new(CaptureTelemetryObserver(samples.clone())))
+        .run()
+        .unwrap()
+        .0
+        .finish();
+    let samples = samples.lock().unwrap();
+    let baseline = samples
+        .first()
+        .unwrap()
+        .completion_feedback
+        .as_ref()
+        .unwrap();
+    let final_sample = samples
+        .last()
+        .unwrap()
+        .completion_feedback
+        .as_ref()
+        .unwrap();
+    assert_eq!(baseline.terminal_requests, 0);
+    assert_eq!(final_sample.sla, sla);
+    assert_eq!(final_sample.completed_requests, 2);
+    assert_eq!(
+        final_sample.good_requests,
+        report.goodput.unwrap().completed_requests as u64
+    );
+    assert_eq!(final_sample.good_requests_strict_itl, 0); // Both outputs have one token.
+    assert!((final_sample.gpu_seconds - report.throughput.gpu_hours * 3600.0).abs() < 1e-9);
+    let encoded = serde_json::to_value(samples.last().unwrap()).unwrap();
+    assert_eq!(encoded["completion_feedback"]["schema_version"], 1);
+}
+
+#[test]
+fn aggregate_baseline_leaves_earlier_latency_pairs_for_the_first_interval_sample() {
+    let samples = Arc::new(Mutex::new(Vec::new()));
+    // Zero-latency passes complete the first request before telemetry starts.
+    runtime_with_timing(
+        VecDeque::from([request(1, 0.0), request(2, 10.0)]),
+        None,
+        0.0,
+    )
+    .with_telemetry_observer(1.0, Box::new(CaptureTelemetryObserver(samples.clone())))
+    .run()
+    .unwrap();
+    let samples = samples.lock().unwrap();
+    assert_eq!(samples[0].kind, ReplayTelemetrySampleKind::Baseline);
+    let baseline = samples[0].completion_feedback.as_ref().unwrap();
+    assert_eq!(baseline.completed_requests, 1);
+    assert!(baseline.latency_samples.is_empty());
+    assert_eq!(baseline.latency_population, 0);
+    let first = samples[1].completion_feedback.as_ref().unwrap();
+    assert_eq!(first.latency_samples, vec![(0.0, None)]);
+    assert_eq!(first.latency_population, 1);
+    let last = samples
+        .last()
+        .unwrap()
+        .completion_feedback
+        .as_ref()
+        .unwrap();
+    assert_eq!(last.completed_requests, 2);
+}
+
+#[test]
+fn aggregate_final_sample_reports_a_terminal_recorded_after_the_last_sample() {
+    let samples = Arc::new(Mutex::new(Vec::new()));
+    let mut runtime = runtime(VecDeque::from([request(1, 10.0)]))
+        .with_telemetry_observer(1.0, Box::new(CaptureTelemetryObserver(samples.clone())));
+    runtime.start_profile_observers().unwrap();
+    // A rejection at the instant of the last sample delivers no token and
+    // admits nothing, so only completion feedback knows about it.
+    let rejected = Uuid::from_u128(2);
+    runtime.collector.on_arrival(rejected, 0.0, 4, 1);
+    runtime
+        .collector
+        .on_terminal(rejected, 0.0, ReplayTerminalStatus::Rejected);
+    runtime.publish_final_telemetry_sample().unwrap();
+    let samples = samples.lock().unwrap();
+    let last = samples.last().unwrap();
+    assert_eq!(last.kind, ReplayTelemetrySampleKind::Final);
+    let feedback = last.completion_feedback.as_ref().unwrap();
+    assert_eq!(feedback.terminal_requests, 1);
+    assert_eq!(feedback.completed_requests, 0);
+}
+
 struct MismatchedPlacement;
 
 impl PlacementPolicy<ReplayRequestPayload> for MismatchedPlacement {
@@ -103,6 +214,7 @@ impl PlacementPolicy<ReplayRequestPayload> for MismatchedPlacement {
                 scheduler_id: 0,
                 reported_overlap_tokens: 0,
                 cache_sample: None,
+                kv_hints: None,
                 placement_replica_id: None,
             }),
             released: Vec::new(),
@@ -158,29 +270,19 @@ fn mismatched_placement_does_not_retain_arrival_or_offered_traffic() {
     let mut runtime =
         AggRuntimeImpl::<MismatchedPlacement, NoEngineEvents, NoReplayMetadata>::new_composed(
             role_factory,
-            AdmissionQueue::new_requests(VecDeque::new(), ReplayMode::Trace),
+            AdmissionQueue::new_requests(VecDeque::from([request(1, 0.0)]), ReplayMode::Trace),
             1,
             None,
             |_, _| Ok(MismatchedPlacement),
         )
-        .unwrap()
-        .into_steppable();
+        .unwrap();
     let uuid = Uuid::from_u128(1);
-    let error = runtime.submit_dynamic(request(1, 0.0)).unwrap_err();
+    let error = runtime.step().unwrap_err();
     assert!(error.to_string().contains("while placing"), "{error}");
     assert!(!runtime.collector.contains_request(uuid));
     assert_eq!(runtime.traffic.drain_planner(1_000.0).num_req, 0);
     assert!(runtime.requests.is_empty());
     assert_eq!(runtime.cluster_in_flight(), 0);
-    assert!(runtime.cancel_dynamic(uuid).unwrap().is_none());
-    assert_eq!(
-        runtime
-            .take_report_dynamic(0.0)
-            .unwrap()
-            .request_counts
-            .num_requests,
-        0
-    );
 }
 
 // G3 fixtures independently adapt vLLM behavioral contracts (Apache-2.0).
@@ -342,57 +444,6 @@ fn g3_fixed_scaling_policy_preserves_no_policy_results() {
             report
         });
         assert_eq!(summaries[0], summaries[1]);
-    }
-}
-
-#[test]
-fn g3_reused_runtime_reports_cumulative_counters_and_keeps_cache() {
-    fn submit_and_drain(runtime: &mut RoundRobinAggRuntime, id: u128, base: u32, count: u32) {
-        runtime
-            .submit_dynamic(DirectRequest {
-                tokens: (base..base + count).collect(),
-                max_output_tokens: 1,
-                uuid: Some(Uuid::from_u128(id)),
-                arrival_timestamp_ms: Some(runtime.now_ms()),
-                ..DirectRequest::default()
-            })
-            .unwrap();
-        for _ in 0..1000 {
-            runtime.step_dynamic_until(f64::INFINITY).unwrap();
-            runtime.take_step_tokens();
-            runtime.take_step_terminals();
-            if runtime.is_workload_done() {
-                return;
-            }
-        }
-        panic!("request and cache I/O did not drain");
-    }
-    for scope in [G3Scope::WorkerLocal, G3Scope::ClusterShared] {
-        let mut runtime = g3_runtime(g3_spec(scope, 1, 4, 3, 4, &[])).into_steppable();
-        submit_and_drain(&mut runtime, 1, 0, 9);
-        submit_and_drain(&mut runtime, 2, 100, 15);
-        let first = runtime.take_report_dynamic(0.0).unwrap();
-        assert_eq!(first.request_counts.completed_requests, 2);
-        let first = first.g3_offload.unwrap();
-        assert!(first.write.completed_bytes > 0);
-        assert_eq!(first.read.completed_jobs, 0);
-        assert!(first.resident_blocks > 0);
-        submit_and_drain(&mut runtime, 3, 0, 9);
-        let second = runtime.take_report_dynamic(0.0).unwrap();
-        assert_eq!(second.request_counts.completed_requests, 1);
-        let second = second.g3_offload.unwrap();
-        assert!(
-            second.read.completed_bytes > 0,
-            "second round restores the first round's G3 prefix"
-        );
-        assert_eq!(
-            second.write, first.write,
-            "reporting must not clear cache or counters"
-        );
-        assert_eq!(second.resident_blocks, first.resident_blocks);
-        let idle = runtime.take_report_dynamic(0.0).unwrap();
-        assert_eq!(idle.request_counts.num_requests, 0);
-        assert_eq!(idle.g3_offload.unwrap(), second);
     }
 }
 
@@ -731,6 +782,76 @@ fn g3_summary_serializes_g3_counters_only_when_enabled() {
 }
 
 #[test]
+fn kvcr_without_hints_replays_exactly_like_g2_only() {
+    // Request 2 pushes request 1's block out of the one-block G1; request 3 restores it from G2.
+    let replay = |kvcr: bool| {
+        let mut rank = json!({
+            "num_gpu_blocks": 1, "block_size": 4, "max_num_seqs": 2, "max_num_batched_tokens": 8,
+            "kv_cache_bytes_per_token": 250_000,
+            "native_host_offload": {"num_host_blocks": 2, "d2h_bandwidth_gbps": 1.0, "h2d_bandwidth_gbps": 1.0},
+            "timing_model": {"type": "fixed", "prefill_ms": 1.0, "decode_ms": 0.0},
+        });
+        if kvcr {
+            rank["kvcr"] = json!({});
+        }
+        let requests = [
+            (0.0, [1, 2, 3, 4]),
+            (2.0, [5, 6, 7, 8]),
+            (4.0, [1, 2, 3, 4]),
+        ]
+        .iter()
+        .enumerate()
+        .map(|(id, (arrival, tokens))| {
+            json!({"id": id.to_string(), "arrival_time_ms": arrival, "input_tokens": 4,
+                    "input_token_ids": tokens, "output_tokens": 0})
+        })
+        .collect::<Vec<_>>();
+        let spec = serde_json::from_value(json!({
+            "topology": {"kind": "aggregated", "workers": {"initial_workers": 1}},
+            "engine": {"rank": rank}, "requests": requests, "record_per_request": true,
+        }))
+        .unwrap();
+        Replayer::new(spec, ReplayEngineFactory::new())
+            .unwrap()
+            .with_capture_options(ReplayCaptureOptions {
+                determinism: ReplayDeterminism::CanonicalV1,
+                ..ReplayCaptureOptions::default()
+            })
+            .run()
+            .unwrap()
+    };
+    let (g2_only, with_kvcr) = (replay(false), replay(true));
+    assert!(
+        g2_only
+            .per_request
+            .iter()
+            .any(|record| record.first_admission_host_reused_input_tokens == Some(4)),
+        "the workload must exercise G2"
+    );
+    assert_eq!(
+        serde_json::to_value(&with_kvcr.per_request).unwrap(),
+        serde_json::to_value(&g2_only.per_request).unwrap()
+    );
+    // Only the canonical wall-clock exclusions and the idle `kvcr` section differ.
+    let summary = |report: &crate::replay::ReplayReport| {
+        let mut summary = serde_json::to_value(report).unwrap();
+        for pointer in crate::replay::CANONICAL_RESULT_EXCLUSIONS {
+            if let Some(field) = pointer.strip_prefix("/summary/") {
+                summary.as_object_mut().unwrap().remove(field);
+            }
+        }
+        summary
+    };
+    let (g2_only, mut with_kvcr) = (summary(&g2_only), summary(&with_kvcr));
+    assert_eq!(
+        with_kvcr["kvcr"]["pulls"],
+        json!({"success": 0, "partial": 0})
+    );
+    with_kvcr.as_object_mut().unwrap().remove("kvcr");
+    assert_eq!(with_kvcr, g2_only);
+}
+
+#[test]
 fn agg_settled_steps_resume_without_changing_the_result() {
     let pending = VecDeque::from([
         DirectRequest {
@@ -795,4 +916,105 @@ fn agg_first_step_settles_initial_scaling_and_zero_delay_worker_startup() {
     assert!(stepped.engine.starting_group_ids().is_empty());
     assert!(stepped.events.iter().all(|event| event.at_ms > 0.0));
     assert!(stepped.next_timestamps().1.unwrap() > 0.0);
+}
+
+#[test]
+fn native_replay_retracts_readmits_and_finishes_deterministically() {
+    use std::sync::Arc;
+
+    use crate::engine::{Backend, EngineConfig, TimingModelConfig, afd_timing_provider_for};
+    use crate::replay::{
+        CanonicalReplayCoverage, CanonicalReplayRecord, ReplayCaptureOptions, ReplayDeterminism,
+        ReplayEngineConfig, ReplayEngineFactory, ReplayRequest, ReplaySpec, ReplayTerminalStatus,
+        ReplayTopology, Replayer,
+    };
+
+    {
+        let mut rank = EngineConfig::for_backend(Backend::Sglang);
+        rank.block_size = 1;
+        rank.num_gpu_blocks = 330;
+        rank.max_num_seqs = 3;
+        rank.max_num_batched_tokens = 512;
+        rank.enable_prefix_caching = false;
+        rank.sglang.schedule_conservativeness = 0.0;
+        rank.sglang.num_reserved_decode_tokens = 0;
+        rank.sglang.clip_max_new_tokens = 1;
+        rank.timing_model = TimingModelConfig::Fixed {
+            prefill_ms: 1.0,
+            decode_ms: 1.0,
+        };
+        let spec = ReplaySpec {
+            version: 1,
+            topology: ReplayTopology::aggregated(1),
+            engine: serde_json::to_value(ReplayEngineConfig {
+                rank,
+                ..Default::default()
+            })
+            .unwrap(),
+            encoder: None,
+            adapters: Default::default(),
+            max_sim_time_ms: None,
+            max_in_flight: Some(3),
+            record_per_request: true,
+            sla: Default::default(),
+            requests: (0..3)
+                .map(|i| ReplayRequest {
+                    id: format!("pressure-{i}"),
+                    arrival_time_ms: 0.0,
+                    input_tokens: 96,
+                    input_token_ids: Some(vec![i; 96]),
+                    output_tokens: 24,
+                    output_token_ids: None,
+                    dp_rank: None,
+                    prefill_dp_rank: None,
+                    kv_hints: None,
+                    session_id: None,
+                    cache_salt: None,
+                    turn_index: None,
+                    metadata: serde_json::Value::Null,
+                })
+                .collect(),
+        };
+        let capture = ReplayCaptureOptions {
+            determinism: ReplayDeterminism::CanonicalV1,
+            capture_canonical_evidence: true,
+            ..Default::default()
+        };
+        let run = || {
+            let timing = Arc::new(afd_timing_provider_for(1, 3, 1));
+            let report =
+                Replayer::new(spec.clone(), ReplayEngineFactory::with_timing_model(timing))
+                    .unwrap()
+                    .with_capture_options(capture)
+                    .run()
+                    .unwrap();
+            assert_eq!(report.request_counts.completed_requests, 3);
+            assert_eq!(report.per_request.len(), 3);
+            assert!(report.per_request.iter().all(|r| {
+                r.terminal_status == ReplayTerminalStatus::Completed && r.output_length == 24
+            }));
+            let pressure = report.runtime_evidence.pressure.as_ref().unwrap();
+            assert!(
+                (1..=3).contains(&pressure.sglang_retractions_total),
+                "fixture must exercise bounded pressure: {pressure:?}"
+            );
+            assert!(
+                pressure
+                    .records
+                    .iter()
+                    .all(|r| r.readmitted_at_ms.is_some())
+            );
+            assert!(report.committed_prefill_tokens > 288);
+            CanonicalReplayRecord::build(
+                &report,
+                serde_json::json!({"timing": "afd"}),
+                &CanonicalReplayCoverage::from_report(&report, capture),
+                serde_json::Value::Null,
+            )
+            .unwrap()
+            .into_json_line()
+            .unwrap()
+        };
+        assert_eq!(run(), run());
+    }
 }

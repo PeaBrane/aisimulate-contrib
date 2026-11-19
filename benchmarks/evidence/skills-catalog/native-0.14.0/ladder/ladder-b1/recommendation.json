@@ -1,0 +1,1777 @@
+{
+  "candidate_retention": "all",
+  "candidates": [
+    {
+      "candidate_id": "candidate-000001",
+      "config": {
+        "agg_block_size": null,
+        "agg_enable_prefix_caching": true,
+        "agg_forward_model": "op_level",
+        "agg_fpm_parquet_path": null,
+        "agg_frontend": null,
+        "agg_frontend_by_transport": null,
+        "agg_gpu_memory_utilization": null,
+        "agg_host_loop": null,
+        "agg_kv_bytes_per_token": "auto",
+        "agg_max_num_batched_tokens": 16384,
+        "agg_max_num_seqs": 512,
+        "agg_native_host_offload": null,
+        "agg_num_gpu_blocks": null,
+        "agg_startup_time": 0.0,
+        "agg_timing_model": null,
+        "agg_vision": null,
+        "aic_nextn": null,
+        "attention_backend": null,
+        "attention_dp": 1,
+        "backend": "sglang",
+        "backend_version": "0.5.21",
+        "comm_quant_mode": null,
+        "context_length": 2048,
+        "deployment_mode": "agg",
+        "enable_chunked_prefill": null,
+        "enable_eplb": false,
+        "fmha_quant_mode": null,
+        "forward_pass_estimators": {
+          "agg": {
+            "config": {
+              "attention_backend": null,
+              "attention_dp": 1,
+              "backend": "sglang",
+              "backend_version": "0.5.21",
+              "comm_quant_mode": null,
+              "database_mode": "SILICON",
+              "dcp": null,
+              "decoder_replay": false,
+              "enable_eplb": false,
+              "enable_shared_layer": null,
+              "estimation_mode": "op_level",
+              "estimator_config": {
+                "correction": {
+                  "enabled": true,
+                  "factor_bounds": {
+                    "max": 2.0,
+                    "min": 0.5
+                  },
+                  "feature_space": "legacy_workload",
+                  "max_batch_size": 512,
+                  "max_kv_tokens": 2000000,
+                  "max_num_tokens": 8192,
+                  "min_observations": 5,
+                  "sampling": {
+                    "bins_per_axis": [
+                      4,
+                      4
+                    ],
+                    "max_observations": 64
+                  }
+                },
+                "features": {
+                  "attention_kv_weight": 1.0,
+                  "ffn_token_weight": 1.0,
+                  "prefill_attention_pair_weight": 1.0
+                },
+                "fpm_interpolation": {
+                  "method": "sol"
+                },
+                "fpm_regression": {
+                  "fit": {
+                    "kind": "standardized_nnls",
+                    "rebuild_interval": null,
+                    "singular_ridge_scale": 1e-09
+                  },
+                  "min_observations": 5,
+                  "sampling": {
+                    "bins_per_axis": [
+                      4,
+                      4
+                    ],
+                    "max_observations": 64
+                  }
+                },
+                "op_level": {}
+              },
+              "fallback_policy": "deny",
+              "fmha_quant_mode": null,
+              "fpm_fmha_quant_mode": null,
+              "fpm_profile": null,
+              "gemm_quant_mode": null,
+              "kv_block_size": 1,
+              "kvcache_quant_mode": null,
+              "model": "Qwen/Qwen3.5-35B-A3B",
+              "moe_backend": null,
+              "moe_ep_size": null,
+              "moe_kernel_source": null,
+              "moe_quant_mode": null,
+              "moe_tp_size": null,
+              "nextn": 0,
+              "pp": 1,
+              "speculation": null,
+              "strict_provenance": false,
+              "system": "b300_sxm",
+              "systems_paths": [
+                "/tmp/pr937-release-validation-m_jcw8cc/runtime/lib/python3.12/site-packages/aisim_core/systems"
+              ],
+              "tp": 1,
+              "transfer_policy": [
+                "xshape",
+                "xquant",
+                "xprofile",
+                "xop"
+              ],
+              "wideep_num_slots": null,
+              "worker_type": "aggregated"
+            },
+            "diagnostics": {
+              "correction_ready_buckets": 0,
+              "last_warning": null,
+              "provenance": {
+                "config": {
+                  "attention_backend": null,
+                  "attention_dp": 1,
+                  "backend": "sglang",
+                  "backend_version": "0.5.21",
+                  "comm_quant_mode": null,
+                  "database_mode": "SILICON",
+                  "dcp": null,
+                  "decoder_replay": false,
+                  "enable_eplb": false,
+                  "enable_shared_layer": null,
+                  "estimation_mode": "op_level",
+                  "estimator_config": {
+                    "correction": {
+                      "enabled": true,
+                      "factor_bounds": {
+                        "max": 2.0,
+                        "min": 0.5
+                      },
+                      "feature_space": "legacy_workload",
+                      "max_batch_size": 512,
+                      "max_kv_tokens": 2000000,
+                      "max_num_tokens": 8192,
+                      "min_observations": 5,
+                      "sampling": {
+                        "bins_per_axis": [
+                          4,
+                          4
+                        ],
+                        "max_observations": 64
+                      }
+                    },
+                    "features": {
+                      "attention_kv_weight": 1.0,
+                      "ffn_token_weight": 1.0,
+                      "prefill_attention_pair_weight": 1.0
+                    },
+                    "fpm_interpolation": {
+                      "method": "sol"
+                    },
+                    "fpm_regression": {
+                      "fit": {
+                        "kind": "standardized_nnls",
+                        "rebuild_interval": null,
+                        "singular_ridge_scale": 1e-09
+                      },
+                      "min_observations": 5,
+                      "sampling": {
+                        "bins_per_axis": [
+                          4,
+                          4
+                        ],
+                        "max_observations": 64
+                      }
+                    },
+                    "op_level": {}
+                  },
+                  "fallback_policy": "deny",
+                  "fmha_quant_mode": null,
+                  "fpm_fmha_quant_mode": null,
+                  "fpm_profile": null,
+                  "gemm_quant_mode": null,
+                  "kv_block_size": 1,
+                  "kvcache_quant_mode": null,
+                  "model": "Qwen/Qwen3.5-35B-A3B",
+                  "moe_backend": null,
+                  "moe_ep_size": null,
+                  "moe_kernel_source": null,
+                  "moe_quant_mode": null,
+                  "moe_tp_size": null,
+                  "nextn": 0,
+                  "pp": 1,
+                  "speculation": null,
+                  "strict_provenance": false,
+                  "system": "b300_sxm",
+                  "systems_paths": [
+                    "/tmp/pr937-release-validation-m_jcw8cc/runtime/lib/python3.12/site-packages/aisim_core/systems"
+                  ],
+                  "tp": 1,
+                  "transfer_policy": [
+                    "xshape",
+                    "xquant",
+                    "xprofile",
+                    "xop"
+                  ],
+                  "wideep_num_slots": null,
+                  "worker_type": "aggregated"
+                },
+                "requested_estimation_mode": "auto",
+                "selected_estimation_mode": "op_level",
+                "selected_systems_root": "/tmp/pr937-release-validation-m_jcw8cc/runtime/lib/python3.12/site-packages/aisim_core/systems",
+                "selection_failures": []
+              },
+              "readiness": "ready",
+              "retained_observations": 0,
+              "source": "aic"
+            },
+            "options": null
+          }
+        },
+        "gemm_quant_mode": null,
+        "gpu_budget": 1,
+        "hardware_sku": "b300_sxm",
+        "kvcache_quant_mode": null,
+        "min_gpu_budget": null,
+        "model_name": "Qwen/Qwen3.5-35B-A3B",
+        "moe_backend": null,
+        "moe_ep": 1,
+        "moe_kernel_source": null,
+        "moe_quant_mode": null,
+        "moe_tp": 1,
+        "nextn_accepted": null,
+        "pp": 1,
+        "replicas": 1,
+        "startup_time": null,
+        "strategy": "tp",
+        "tp": 1,
+        "used_gpus": 1,
+        "wideep_num_slots": null
+      },
+      "metrics": {
+        "committed_prefill_tokens": 307200.0,
+        "completed_requests": 300.0,
+        "decode_gpus_per_worker": 1.0,
+        "decode_worker_seconds": 299.37866766199147,
+        "duration_ms": 299378.66766200005,
+        "first_admission_prefix_cache_reused_ratio": 0.0,
+        "goodput_completed_requests": 300.0,
+        "goodput_output_throughput_tok_s": 128.26565199145645,
+        "goodput_request_throughput_rps": 1.0020754061832535,
+        "gpu_hours": 0.08316074101721985,
+        "input_throughput_tok_s": 1026.1252159316516,
+        "max_e2e_latency_ms": 378.66766200005077,
+        "max_itl_ms": 2.8260380000001533,
+        "max_output_token_throughput_per_user": 355.50297271645036,
+        "max_tpot_ms": 2.8195606456697355,
+        "max_ttft_ms": 20.58346000000165,
+        "max_ttst_ms": 2.8129160000244156,
+        "mean_e2e_latency_ms": 378.6676619999632,
+        "mean_itl_ms": 2.8195606456690343,
+        "mean_output_token_throughput_per_user": 354.6658378123162,
+        "mean_tpot_ms": 2.819560645669049,
+        "mean_ttft_ms": 20.583459999995874,
+        "mean_ttst_ms": 2.812916000000179,
+        "median_e2e_latency_ms": 378.6676619999489,
+        "median_itl_ms": 2.820741646728521,
+        "median_output_token_throughput_per_user": 354.60392308944677,
+        "median_tpot_ms": 2.8195606456689335,
+        "median_ttft_ms": 20.583459999994375,
+        "median_ttst_ms": 2.8129159999953117,
+        "min_e2e_latency_ms": 378.66766199990525,
+        "min_itl_ms": 2.8129159999953117,
+        "min_output_token_throughput_per_user": 353.85228365646384,
+        "min_tpot_ms": 2.8195606456685898,
+        "min_ttft_ms": 20.583459999994375,
+        "min_ttst_ms": 2.8129159999953117,
+        "num_e2e_latency_samples": 300.0,
+        "num_requests": 300.0,
+        "num_tpot_samples": 300.0,
+        "num_ttft_samples": 300.0,
+        "output_throughput_tok_s": 128.26565199145645,
+        "p75_e2e_latency_ms": 378.6676619999853,
+        "p75_itl_ms": 2.820741646728521,
+        "p75_output_token_throughput_per_user": 355.31384085338976,
+        "p75_tpot_ms": 2.8195606456691626,
+        "p75_ttft_ms": 20.583459999994375,
+        "p75_ttst_ms": 2.8129160000007687,
+        "p90_e2e_latency_ms": 378.66766200005077,
+        "p90_itl_ms": 2.8263887771524017,
+        "p90_output_token_throughput_per_user": 355.31384085338976,
+        "p90_tpot_ms": 2.8195606456697355,
+        "p90_ttft_ms": 20.58346000000165,
+        "p90_ttst_ms": 2.8129160000244156,
+        "p95_e2e_latency_ms": 378.66766200005077,
+        "p95_itl_ms": 2.8263887771524017,
+        "p95_output_token_throughput_per_user": 355.31384085338976,
+        "p95_tpot_ms": 2.8195606456697355,
+        "p95_ttft_ms": 20.58346000000165,
+        "p95_ttst_ms": 2.8129160000244156,
+        "p99_e2e_latency_ms": 378.66766200005077,
+        "p99_itl_ms": 2.8263887771524017,
+        "p99_output_token_throughput_per_user": 355.31384085338976,
+        "p99_tpot_ms": 2.8195606456697355,
+        "p99_ttft_ms": 20.58346000000165,
+        "p99_ttst_ms": 2.8129160000244156,
+        "power_coverage": 0.0,
+        "power_w": null,
+        "prefill_gpus_per_worker": 0.0,
+        "prefill_worker_seconds": 0.0,
+        "prefix_cache_reused_ratio": 0.0,
+        "processed_output_tokens_per_s": 31110.695732912223,
+        "processed_tokens": 345600.0,
+        "processed_tokens_per_s": 279996.26159621007,
+        "request_throughput_rps": 1.0020754061832535,
+        "std_e2e_latency_ms": 3.903675758620274e-11,
+        "std_itl_ms": 0.0038231725774448837,
+        "std_output_token_throughput_per_user": 0.480925241727766,
+        "std_tpot_ms": 3.0195463664267924e-13,
+        "std_ttft_ms": 2.8475034192563067e-12,
+        "std_ttst_ms": 9.41989202193334e-12,
+        "total_input_tokens": 307200.0,
+        "total_output_tokens": 38400.0,
+        "total_throughput_tok_s": 1154.390867923108,
+        "wall_time_ms": 1234.302194
+      },
+      "objectives": null,
+      "prediction_config": {
+        "engine": {
+          "backend": "sglang",
+          "backend_version": "0.5.21",
+          "context_length": 2048,
+          "database_mode": "SILICON",
+          "decoder_replay": false,
+          "enable_eplb": false,
+          "estimation_mode": "auto",
+          "estimator_config": {},
+          "fallback_policy": "deny",
+          "hardware": "b300_sxm",
+          "mode": "aggregated",
+          "model": "Qwen/Qwen3.5-35B-A3B",
+          "nextn": 0,
+          "workers": {
+            "aggregated": {
+              "kv_cache": {
+                "block_size": 1,
+                "bytes_per_token": "auto",
+                "capacity": {
+                  "cuda_graph_reserved_bytes": 0,
+                  "memory_fraction": 0.88,
+                  "type": "default"
+                },
+                "prefix_caching": true
+              },
+              "parallelism": {
+                "attention_data": 1,
+                "moe_expert": 1,
+                "moe_tensor": 1,
+                "pipeline": 1,
+                "replicas": 1,
+                "tensor": 1
+              },
+              "scheduler": {
+                "max_batched_tokens": 16384,
+                "max_sequences": 512,
+                "prefill_decode_interval": 0,
+                "prefill_schedule_interval": 1
+              },
+              "startup_seconds": 0.0,
+              "timing": {
+                "database_mode": "SILICON",
+                "estimation_mode": "op_level",
+                "estimator_config": {
+                  "correction": {
+                    "enabled": true,
+                    "factor_bounds": {
+                      "max": 2.0,
+                      "min": 0.5
+                    },
+                    "feature_space": "legacy_workload",
+                    "max_batch_size": 512,
+                    "max_kv_tokens": 2000000,
+                    "max_num_tokens": 8192,
+                    "min_observations": 5,
+                    "sampling": {
+                      "bins_per_axis": [
+                        4,
+                        4
+                      ],
+                      "max_observations": 64
+                    }
+                  },
+                  "features": {
+                    "attention_kv_weight": 1.0,
+                    "ffn_token_weight": 1.0,
+                    "prefill_attention_pair_weight": 1.0
+                  },
+                  "fpm_interpolation": {
+                    "method": "sol"
+                  },
+                  "fpm_regression": {
+                    "fit": {
+                      "kind": "standardized_nnls",
+                      "rebuild_interval": null,
+                      "singular_ridge_scale": 1e-09
+                    },
+                    "min_observations": 5,
+                    "sampling": {
+                      "bins_per_axis": [
+                        4,
+                        4
+                      ],
+                      "max_observations": 64
+                    }
+                  },
+                  "op_level": {}
+                },
+                "fallback_policy": "deny",
+                "systems_paths": [
+                  "/tmp/pr937-release-validation-m_jcw8cc/runtime/lib/python3.12/site-packages/aisim_core/systems"
+                ],
+                "transfer_policy": [
+                  "xshape",
+                  "xquant",
+                  "xprofile",
+                  "xop"
+                ],
+                "type": "default"
+              }
+            }
+          }
+        },
+        "evaluation": {
+          "sla": {
+            "itl_ms": 50.0,
+            "ttft_ms": 500.0
+          }
+        },
+        "execution": {
+          "resources": {
+            "available_memory_fraction": 0.9,
+            "cpu_limit": 4,
+            "initialization_timeout_seconds": 60.0,
+            "memory_limit_gb": 8.0,
+            "reserve_memory_fraction": 0.0,
+            "reserve_memory_gb": 1.0,
+            "shutdown_timeout_seconds": 5.0
+          }
+        },
+        "traffic": {
+          "load": {
+            "agentic_warmup": false,
+            "requests_per_second": 1.0,
+            "type": "constant_rate"
+          },
+          "source": {
+            "cached_prefix_tokens": 0,
+            "input_tokens": 1024,
+            "output_tokens": 128,
+            "type": "synthetic"
+          },
+          "stop": {
+            "requests": 300
+          }
+        }
+      },
+      "provenance": {
+        "backend": "sglang",
+        "backend_version": "0.5.21",
+        "hardware": "b300_sxm",
+        "model": "Qwen/Qwen3.5-35B-A3B",
+        "objective": {
+          "min_goodput_rps": 0.9,
+          "pareto_objectives": null,
+          "sla": {
+            "e2e_ms": null,
+            "itl_ms": 50.0,
+            "ttft_ms": 500.0
+          },
+          "strict_sla": false,
+          "target": "min_gpus"
+        },
+        "operations": [],
+        "performance_data": [
+          {
+            "config": {
+              "attention_backend": null,
+              "attention_dp": 1,
+              "backend": "sglang",
+              "backend_version": "0.5.21",
+              "comm_quant_mode": null,
+              "database_mode": "SILICON",
+              "dcp": null,
+              "decoder_replay": false,
+              "enable_eplb": false,
+              "enable_shared_layer": null,
+              "estimation_mode": "op_level",
+              "estimator_config": {
+                "correction": {
+                  "enabled": true,
+                  "factor_bounds": {
+                    "max": 2.0,
+                    "min": 0.5
+                  },
+                  "feature_space": "legacy_workload",
+                  "max_batch_size": 512,
+                  "max_kv_tokens": 2000000,
+                  "max_num_tokens": 8192,
+                  "min_observations": 5,
+                  "sampling": {
+                    "bins_per_axis": [
+                      4,
+                      4
+                    ],
+                    "max_observations": 64
+                  }
+                },
+                "features": {
+                  "attention_kv_weight": 1.0,
+                  "ffn_token_weight": 1.0,
+                  "prefill_attention_pair_weight": 1.0
+                },
+                "fpm_interpolation": {
+                  "method": "sol"
+                },
+                "fpm_regression": {
+                  "fit": {
+                    "kind": "standardized_nnls",
+                    "rebuild_interval": null,
+                    "singular_ridge_scale": 1e-09
+                  },
+                  "min_observations": 5,
+                  "sampling": {
+                    "bins_per_axis": [
+                      4,
+                      4
+                    ],
+                    "max_observations": 64
+                  }
+                },
+                "op_level": {}
+              },
+              "fallback_policy": "deny",
+              "fmha_quant_mode": null,
+              "fpm_fmha_quant_mode": null,
+              "fpm_profile": null,
+              "gemm_quant_mode": null,
+              "kv_block_size": 1,
+              "kvcache_quant_mode": null,
+              "model": "Qwen/Qwen3.5-35B-A3B",
+              "moe_backend": null,
+              "moe_ep_size": null,
+              "moe_kernel_source": null,
+              "moe_quant_mode": null,
+              "moe_tp_size": null,
+              "nextn": 0,
+              "pp": 1,
+              "speculation": null,
+              "strict_provenance": false,
+              "system": "b300_sxm",
+              "systems_paths": [
+                "/tmp/pr937-release-validation-m_jcw8cc/runtime/lib/python3.12/site-packages/aisim_core/systems"
+              ],
+              "tp": 1,
+              "transfer_policy": [
+                "xshape",
+                "xquant",
+                "xprofile",
+                "xop"
+              ],
+              "wideep_num_slots": null,
+              "worker_type": "aggregated"
+            },
+            "provider": "aic",
+            "role": "aggregated",
+            "selection": {
+              "correction_ready_buckets": 0,
+              "last_warning": null,
+              "provenance": {
+                "config": {
+                  "attention_backend": null,
+                  "attention_dp": 1,
+                  "backend": "sglang",
+                  "backend_version": "0.5.21",
+                  "comm_quant_mode": null,
+                  "database_mode": "SILICON",
+                  "dcp": null,
+                  "decoder_replay": false,
+                  "enable_eplb": false,
+                  "enable_shared_layer": null,
+                  "estimation_mode": "op_level",
+                  "estimator_config": {
+                    "correction": {
+                      "enabled": true,
+                      "factor_bounds": {
+                        "max": 2.0,
+                        "min": 0.5
+                      },
+                      "feature_space": "legacy_workload",
+                      "max_batch_size": 512,
+                      "max_kv_tokens": 2000000,
+                      "max_num_tokens": 8192,
+                      "min_observations": 5,
+                      "sampling": {
+                        "bins_per_axis": [
+                          4,
+                          4
+                        ],
+                        "max_observations": 64
+                      }
+                    },
+                    "features": {
+                      "attention_kv_weight": 1.0,
+                      "ffn_token_weight": 1.0,
+                      "prefill_attention_pair_weight": 1.0
+                    },
+                    "fpm_interpolation": {
+                      "method": "sol"
+                    },
+                    "fpm_regression": {
+                      "fit": {
+                        "kind": "standardized_nnls",
+                        "rebuild_interval": null,
+                        "singular_ridge_scale": 1e-09
+                      },
+                      "min_observations": 5,
+                      "sampling": {
+                        "bins_per_axis": [
+                          4,
+                          4
+                        ],
+                        "max_observations": 64
+                      }
+                    },
+                    "op_level": {}
+                  },
+                  "fallback_policy": "deny",
+                  "fmha_quant_mode": null,
+                  "fpm_fmha_quant_mode": null,
+                  "fpm_profile": null,
+                  "gemm_quant_mode": null,
+                  "kv_block_size": 1,
+                  "kvcache_quant_mode": null,
+                  "model": "Qwen/Qwen3.5-35B-A3B",
+                  "moe_backend": null,
+                  "moe_ep_size": null,
+                  "moe_kernel_source": null,
+                  "moe_quant_mode": null,
+                  "moe_tp_size": null,
+                  "nextn": 0,
+                  "pp": 1,
+                  "speculation": null,
+                  "strict_provenance": false,
+                  "system": "b300_sxm",
+                  "systems_paths": [
+                    "/tmp/pr937-release-validation-m_jcw8cc/runtime/lib/python3.12/site-packages/aisim_core/systems"
+                  ],
+                  "tp": 1,
+                  "transfer_policy": [
+                    "xshape",
+                    "xquant",
+                    "xprofile",
+                    "xop"
+                  ],
+                  "wideep_num_slots": null,
+                  "worker_type": "aggregated"
+                },
+                "requested_estimation_mode": "auto",
+                "selected_estimation_mode": "op_level",
+                "selected_systems_root": "/tmp/pr937-release-validation-m_jcw8cc/runtime/lib/python3.12/site-packages/aisim_core/systems",
+                "selection_failures": []
+              },
+              "readiness": "ready",
+              "retained_observations": 0,
+              "source": "aic"
+            },
+            "source": "backend_deployment"
+          }
+        ],
+        "power": {
+          "coverage_gate": 0.9,
+          "power_coverage": 0.0,
+          "power_w": null,
+          "power_w_unit": "W",
+          "publication_status": "withheld",
+          "scope": "active_forward_pass_per_gpu",
+          "source": "modeled",
+          "unavailable_reason": "insufficient energy coverage"
+        },
+        "runner_metadata": {
+          "power": {
+            "coverage_gate": 0.9,
+            "power_w_unit": "W",
+            "publication_status": "withheld",
+            "scope": "active_forward_pass_per_gpu",
+            "source": "modeled",
+            "unavailable_reason": "insufficient energy coverage"
+          },
+          "prediction_provenance": {
+            "aggregated": {
+              "data_identity": null,
+              "data_version": "0.5.21",
+              "data_version_unavailable_reason": null,
+              "estimator": "op_level",
+              "timing_source": "aic"
+            }
+          }
+        },
+        "sla": {
+          "e2e_ms": null,
+          "itl_ms": 50.0,
+          "ttft_ms": 500.0
+        },
+        "topology": {
+          "attention_dp": 1,
+          "deployment_mode": "agg",
+          "moe_ep": 1,
+          "moe_tp": 1,
+          "pp": 1,
+          "replicas": 1,
+          "strategy": "tp",
+          "tp": 1
+        },
+        "workload": {
+          "agentic_lanes": null,
+          "agentic_profile": null,
+          "agentic_snapshot": null,
+          "agentic_warmup": false,
+          "arrival_seed": 42,
+          "arrival_speedup_ratio": 1.0,
+          "cached_prefix_tokens": 0,
+          "concurrency": null,
+          "images": null,
+          "inter_turn_delay_ms": 0.0,
+          "isl": 1024,
+          "kv_load_ratio": null,
+          "load_choices": null,
+          "load_integer": false,
+          "load_log_scale": false,
+          "load_range": null,
+          "load_search_field": null,
+          "load_type": "constant_rate",
+          "max_sim_time_ms": null,
+          "num_prefix_groups": 0,
+          "num_request_ratio": null,
+          "osl": 128,
+          "random_range_ratio": 1.0,
+          "random_seed": 0,
+          "replay_concurrency": null,
+          "request_count": 300,
+          "request_rate": 1.0,
+          "shared_prefix_ratio": 0.0,
+          "source_type": "synthetic",
+          "trace_block_size": null,
+          "trace_format": "mooncake",
+          "trace_path": null,
+          "trace_paths": null,
+          "turns_per_session": 1,
+          "weka_nested_timestamp_basis": null
+        }
+      },
+      "reason": null,
+      "reason_category": null,
+      "score": -1.0,
+      "status": "feasible",
+      "used_gpus": 1
+    },
+    {
+      "candidate_id": "candidate-000002",
+      "config": {
+        "agg_block_size": null,
+        "agg_enable_prefix_caching": true,
+        "agg_forward_model": "op_level",
+        "agg_fpm_parquet_path": null,
+        "agg_frontend": null,
+        "agg_frontend_by_transport": null,
+        "agg_gpu_memory_utilization": null,
+        "agg_host_loop": null,
+        "agg_kv_bytes_per_token": "auto",
+        "agg_max_num_batched_tokens": 8192,
+        "agg_max_num_seqs": 256,
+        "agg_native_host_offload": null,
+        "agg_num_gpu_blocks": null,
+        "agg_startup_time": 0.0,
+        "agg_timing_model": null,
+        "agg_vision": null,
+        "aic_nextn": null,
+        "attention_backend": null,
+        "attention_dp": 1,
+        "backend": "vllm",
+        "backend_version": "0.30.0",
+        "comm_quant_mode": null,
+        "context_length": 2048,
+        "deployment_mode": "agg",
+        "enable_chunked_prefill": null,
+        "enable_eplb": false,
+        "fmha_quant_mode": null,
+        "forward_pass_estimators": {
+          "agg": {
+            "config": {
+              "attention_backend": null,
+              "attention_dp": 1,
+              "backend": "vllm",
+              "backend_version": "0.30.0",
+              "comm_quant_mode": null,
+              "database_mode": "SILICON",
+              "dcp": null,
+              "decoder_replay": false,
+              "enable_eplb": false,
+              "enable_shared_layer": null,
+              "estimation_mode": "op_level",
+              "estimator_config": {
+                "correction": {
+                  "enabled": true,
+                  "factor_bounds": {
+                    "max": 2.0,
+                    "min": 0.5
+                  },
+                  "feature_space": "legacy_workload",
+                  "max_batch_size": 512,
+                  "max_kv_tokens": 2000000,
+                  "max_num_tokens": 8192,
+                  "min_observations": 5,
+                  "sampling": {
+                    "bins_per_axis": [
+                      4,
+                      4
+                    ],
+                    "max_observations": 64
+                  }
+                },
+                "features": {
+                  "attention_kv_weight": 1.0,
+                  "ffn_token_weight": 1.0,
+                  "prefill_attention_pair_weight": 1.0
+                },
+                "fpm_interpolation": {
+                  "method": "sol"
+                },
+                "fpm_regression": {
+                  "fit": {
+                    "kind": "standardized_nnls",
+                    "rebuild_interval": null,
+                    "singular_ridge_scale": 1e-09
+                  },
+                  "min_observations": 5,
+                  "sampling": {
+                    "bins_per_axis": [
+                      4,
+                      4
+                    ],
+                    "max_observations": 64
+                  }
+                },
+                "op_level": {}
+              },
+              "fallback_policy": "deny",
+              "fmha_quant_mode": null,
+              "fpm_fmha_quant_mode": null,
+              "fpm_profile": null,
+              "gemm_quant_mode": null,
+              "kv_block_size": 64,
+              "kvcache_quant_mode": null,
+              "model": "Qwen/Qwen3.5-35B-A3B",
+              "moe_backend": null,
+              "moe_ep_size": null,
+              "moe_kernel_source": null,
+              "moe_quant_mode": null,
+              "moe_tp_size": null,
+              "nextn": 0,
+              "pp": 1,
+              "speculation": null,
+              "strict_provenance": false,
+              "system": "b300_sxm",
+              "systems_paths": [
+                "/tmp/pr937-release-validation-m_jcw8cc/runtime/lib/python3.12/site-packages/aisim_core/systems"
+              ],
+              "tp": 1,
+              "transfer_policy": [
+                "xshape",
+                "xquant",
+                "xprofile",
+                "xop"
+              ],
+              "wideep_num_slots": null,
+              "worker_type": "aggregated"
+            },
+            "diagnostics": {
+              "correction_ready_buckets": 0,
+              "last_warning": null,
+              "provenance": {
+                "config": {
+                  "attention_backend": null,
+                  "attention_dp": 1,
+                  "backend": "vllm",
+                  "backend_version": "0.30.0",
+                  "comm_quant_mode": null,
+                  "database_mode": "SILICON",
+                  "dcp": null,
+                  "decoder_replay": false,
+                  "enable_eplb": false,
+                  "enable_shared_layer": null,
+                  "estimation_mode": "op_level",
+                  "estimator_config": {
+                    "correction": {
+                      "enabled": true,
+                      "factor_bounds": {
+                        "max": 2.0,
+                        "min": 0.5
+                      },
+                      "feature_space": "legacy_workload",
+                      "max_batch_size": 512,
+                      "max_kv_tokens": 2000000,
+                      "max_num_tokens": 8192,
+                      "min_observations": 5,
+                      "sampling": {
+                        "bins_per_axis": [
+                          4,
+                          4
+                        ],
+                        "max_observations": 64
+                      }
+                    },
+                    "features": {
+                      "attention_kv_weight": 1.0,
+                      "ffn_token_weight": 1.0,
+                      "prefill_attention_pair_weight": 1.0
+                    },
+                    "fpm_interpolation": {
+                      "method": "sol"
+                    },
+                    "fpm_regression": {
+                      "fit": {
+                        "kind": "standardized_nnls",
+                        "rebuild_interval": null,
+                        "singular_ridge_scale": 1e-09
+                      },
+                      "min_observations": 5,
+                      "sampling": {
+                        "bins_per_axis": [
+                          4,
+                          4
+                        ],
+                        "max_observations": 64
+                      }
+                    },
+                    "op_level": {}
+                  },
+                  "fallback_policy": "deny",
+                  "fmha_quant_mode": null,
+                  "fpm_fmha_quant_mode": null,
+                  "fpm_profile": null,
+                  "gemm_quant_mode": null,
+                  "kv_block_size": 64,
+                  "kvcache_quant_mode": null,
+                  "model": "Qwen/Qwen3.5-35B-A3B",
+                  "moe_backend": null,
+                  "moe_ep_size": null,
+                  "moe_kernel_source": null,
+                  "moe_quant_mode": null,
+                  "moe_tp_size": null,
+                  "nextn": 0,
+                  "pp": 1,
+                  "speculation": null,
+                  "strict_provenance": false,
+                  "system": "b300_sxm",
+                  "systems_paths": [
+                    "/tmp/pr937-release-validation-m_jcw8cc/runtime/lib/python3.12/site-packages/aisim_core/systems"
+                  ],
+                  "tp": 1,
+                  "transfer_policy": [
+                    "xshape",
+                    "xquant",
+                    "xprofile",
+                    "xop"
+                  ],
+                  "wideep_num_slots": null,
+                  "worker_type": "aggregated"
+                },
+                "requested_estimation_mode": "auto",
+                "selected_estimation_mode": "op_level",
+                "selected_systems_root": "/tmp/pr937-release-validation-m_jcw8cc/runtime/lib/python3.12/site-packages/aisim_core/systems",
+                "selection_failures": []
+              },
+              "readiness": "ready",
+              "retained_observations": 0,
+              "source": "aic"
+            },
+            "options": null
+          }
+        },
+        "gemm_quant_mode": null,
+        "gpu_budget": 1,
+        "hardware_sku": "b300_sxm",
+        "kvcache_quant_mode": null,
+        "min_gpu_budget": null,
+        "model_name": "Qwen/Qwen3.5-35B-A3B",
+        "moe_backend": null,
+        "moe_ep": 1,
+        "moe_kernel_source": null,
+        "moe_quant_mode": null,
+        "moe_tp": 1,
+        "nextn_accepted": null,
+        "pp": 1,
+        "replicas": 1,
+        "startup_time": null,
+        "strategy": "tp",
+        "tp": 1,
+        "used_gpus": 1,
+        "wideep_num_slots": null
+      },
+      "metrics": {
+        "committed_prefill_tokens": 307200.0,
+        "completed_requests": 300.0,
+        "decode_gpus_per_worker": 1.0,
+        "decode_worker_seconds": 299.3755725820185,
+        "duration_ms": 299375.5725820004,
+        "first_admission_prefix_cache_reused_ratio": 0.0,
+        "goodput_completed_requests": 300.0,
+        "goodput_output_throughput_tok_s": 128.2669780597482,
+        "goodput_request_throughput_rps": 1.0020857660917828,
+        "gpu_hours": 0.08315988127278291,
+        "input_throughput_tok_s": 1026.1358244779856,
+        "max_e2e_latency_ms": 375.57258200040087,
+        "max_itl_ms": 2.807840000023134,
+        "max_output_token_throughput_per_user": 356.30363483499264,
+        "max_tpot_ms": 2.8073457401606996,
+        "max_ttft_ms": 19.039673000006587,
+        "max_ttst_ms": 2.8065950000018347,
+        "mean_e2e_latency_ms": 375.5725820000102,
+        "mean_itl_ms": 2.807345740157599,
+        "mean_output_token_throughput_per_user": 356.2083584963853,
+        "mean_tpot_ms": 2.8073457401575954,
+        "mean_ttft_ms": 19.039672999996863,
+        "mean_ttst_ms": 2.806594999997948,
+        "median_e2e_latency_ms": 375.5725820000007,
+        "median_itl_ms": 2.8094812122709567,
+        "median_output_token_throughput_per_user": 356.02517987411704,
+        "median_tpot_ms": 2.807345740157491,
+        "median_ttft_ms": 19.039672999992035,
+        "median_ttst_ms": 2.8065950000018347,
+        "min_e2e_latency_ms": 375.572581999877,
+        "min_itl_ms": 2.806594999972731,
+        "min_output_token_throughput_per_user": 356.14564932181355,
+        "min_tpot_ms": 2.8073457401565745,
+        "min_ttft_ms": 19.039672999992035,
+        "min_ttst_ms": 2.806594999972731,
+        "num_e2e_latency_samples": 300.0,
+        "num_requests": 300.0,
+        "num_tpot_samples": 300.0,
+        "num_ttft_samples": 300.0,
+        "output_throughput_tok_s": 128.2669780597482,
+        "p75_e2e_latency_ms": 375.57258200000797,
+        "p75_itl_ms": 2.8094812122709567,
+        "p75_output_token_throughput_per_user": 356.02517987411704,
+        "p75_tpot_ms": 2.807345740157491,
+        "p75_ttft_ms": 19.03967299999931,
+        "p75_ttst_ms": 2.8065950000018347,
+        "p90_e2e_latency_ms": 375.57258200040087,
+        "p90_itl_ms": 2.8094812122709567,
+        "p90_output_token_throughput_per_user": 356.02517987411704,
+        "p90_tpot_ms": 2.8073457401606996,
+        "p90_ttft_ms": 19.039673000006587,
+        "p90_ttst_ms": 2.8065950000018347,
+        "p95_e2e_latency_ms": 375.57258200040087,
+        "p95_itl_ms": 2.8094812122709567,
+        "p95_output_token_throughput_per_user": 356.02517987411704,
+        "p95_tpot_ms": 2.8073457401606996,
+        "p95_ttft_ms": 19.039673000006587,
+        "p95_ttst_ms": 2.8065950000018347,
+        "p99_e2e_latency_ms": 375.57258200040087,
+        "p99_itl_ms": 2.8094812122709567,
+        "p99_output_token_throughput_per_user": 356.02517987411704,
+        "p99_tpot_ms": 2.8073457401606996,
+        "p99_ttft_ms": 19.039673000006587,
+        "p99_ttst_ms": 2.8065950000018347,
+        "power_coverage": 0.0,
+        "power_w": null,
+        "prefill_gpus_per_worker": 0.0,
+        "prefill_worker_seconds": 0.0,
+        "prefix_cache_reused_ratio": 0.0,
+        "processed_output_tokens_per_s": 34967.21016341049,
+        "processed_tokens": 345600.0,
+        "processed_tokens_per_s": 314704.8914706944,
+        "request_throughput_rps": 1.0020857660917828,
+        "std_e2e_latency_ms": 1.5364243032662554e-10,
+        "std_itl_ms": 0.00037488667454407045,
+        "std_output_token_throughput_per_user": 0.04756996743851091,
+        "std_tpot_ms": 1.2119922735530663e-12,
+        "std_ttft_ms": 5.942853668385772e-12,
+        "std_ttst_ms": 9.500268365972615e-12,
+        "total_input_tokens": 307200.0,
+        "total_output_tokens": 38400.0,
+        "total_throughput_tok_s": 1154.4028025377338,
+        "wall_time_ms": 1098.1716820000001
+      },
+      "objectives": null,
+      "prediction_config": {
+        "engine": {
+          "backend": "vllm",
+          "backend_version": "0.30.0",
+          "context_length": 2048,
+          "database_mode": "SILICON",
+          "decoder_replay": false,
+          "enable_eplb": false,
+          "estimation_mode": "auto",
+          "estimator_config": {},
+          "fallback_policy": "deny",
+          "hardware": "b300_sxm",
+          "mode": "aggregated",
+          "model": "Qwen/Qwen3.5-35B-A3B",
+          "nextn": 0,
+          "workers": {
+            "aggregated": {
+              "kv_cache": {
+                "block_size": 64,
+                "bytes_per_token": "auto",
+                "capacity": {
+                  "cuda_graph_reserved_bytes": 0,
+                  "memory_fraction": 0.9,
+                  "type": "default"
+                },
+                "prefix_caching": true
+              },
+              "parallelism": {
+                "attention_data": 1,
+                "moe_expert": 1,
+                "moe_tensor": 1,
+                "pipeline": 1,
+                "replicas": 1,
+                "tensor": 1
+              },
+              "scheduler": {
+                "max_batched_tokens": 8192,
+                "max_sequences": 256,
+                "prefill_decode_interval": 0,
+                "prefill_schedule_interval": 1
+              },
+              "startup_seconds": 0.0,
+              "timing": {
+                "database_mode": "SILICON",
+                "estimation_mode": "op_level",
+                "estimator_config": {
+                  "correction": {
+                    "enabled": true,
+                    "factor_bounds": {
+                      "max": 2.0,
+                      "min": 0.5
+                    },
+                    "feature_space": "legacy_workload",
+                    "max_batch_size": 512,
+                    "max_kv_tokens": 2000000,
+                    "max_num_tokens": 8192,
+                    "min_observations": 5,
+                    "sampling": {
+                      "bins_per_axis": [
+                        4,
+                        4
+                      ],
+                      "max_observations": 64
+                    }
+                  },
+                  "features": {
+                    "attention_kv_weight": 1.0,
+                    "ffn_token_weight": 1.0,
+                    "prefill_attention_pair_weight": 1.0
+                  },
+                  "fpm_interpolation": {
+                    "method": "sol"
+                  },
+                  "fpm_regression": {
+                    "fit": {
+                      "kind": "standardized_nnls",
+                      "rebuild_interval": null,
+                      "singular_ridge_scale": 1e-09
+                    },
+                    "min_observations": 5,
+                    "sampling": {
+                      "bins_per_axis": [
+                        4,
+                        4
+                      ],
+                      "max_observations": 64
+                    }
+                  },
+                  "op_level": {}
+                },
+                "fallback_policy": "deny",
+                "systems_paths": [
+                  "/tmp/pr937-release-validation-m_jcw8cc/runtime/lib/python3.12/site-packages/aisim_core/systems"
+                ],
+                "transfer_policy": [
+                  "xshape",
+                  "xquant",
+                  "xprofile",
+                  "xop"
+                ],
+                "type": "default"
+              }
+            }
+          }
+        },
+        "evaluation": {
+          "sla": {
+            "itl_ms": 50.0,
+            "ttft_ms": 500.0
+          }
+        },
+        "execution": {
+          "resources": {
+            "available_memory_fraction": 0.9,
+            "cpu_limit": 4,
+            "initialization_timeout_seconds": 60.0,
+            "memory_limit_gb": 8.0,
+            "reserve_memory_fraction": 0.0,
+            "reserve_memory_gb": 1.0,
+            "shutdown_timeout_seconds": 5.0
+          }
+        },
+        "traffic": {
+          "load": {
+            "agentic_warmup": false,
+            "requests_per_second": 1.0,
+            "type": "constant_rate"
+          },
+          "source": {
+            "cached_prefix_tokens": 0,
+            "input_tokens": 1024,
+            "output_tokens": 128,
+            "type": "synthetic"
+          },
+          "stop": {
+            "requests": 300
+          }
+        }
+      },
+      "provenance": {
+        "backend": "vllm",
+        "backend_version": "0.30.0",
+        "hardware": "b300_sxm",
+        "model": "Qwen/Qwen3.5-35B-A3B",
+        "objective": {
+          "min_goodput_rps": 0.9,
+          "pareto_objectives": null,
+          "sla": {
+            "e2e_ms": null,
+            "itl_ms": 50.0,
+            "ttft_ms": 500.0
+          },
+          "strict_sla": false,
+          "target": "min_gpus"
+        },
+        "operations": [],
+        "performance_data": [
+          {
+            "config": {
+              "attention_backend": null,
+              "attention_dp": 1,
+              "backend": "vllm",
+              "backend_version": "0.30.0",
+              "comm_quant_mode": null,
+              "database_mode": "SILICON",
+              "dcp": null,
+              "decoder_replay": false,
+              "enable_eplb": false,
+              "enable_shared_layer": null,
+              "estimation_mode": "op_level",
+              "estimator_config": {
+                "correction": {
+                  "enabled": true,
+                  "factor_bounds": {
+                    "max": 2.0,
+                    "min": 0.5
+                  },
+                  "feature_space": "legacy_workload",
+                  "max_batch_size": 512,
+                  "max_kv_tokens": 2000000,
+                  "max_num_tokens": 8192,
+                  "min_observations": 5,
+                  "sampling": {
+                    "bins_per_axis": [
+                      4,
+                      4
+                    ],
+                    "max_observations": 64
+                  }
+                },
+                "features": {
+                  "attention_kv_weight": 1.0,
+                  "ffn_token_weight": 1.0,
+                  "prefill_attention_pair_weight": 1.0
+                },
+                "fpm_interpolation": {
+                  "method": "sol"
+                },
+                "fpm_regression": {
+                  "fit": {
+                    "kind": "standardized_nnls",
+                    "rebuild_interval": null,
+                    "singular_ridge_scale": 1e-09
+                  },
+                  "min_observations": 5,
+                  "sampling": {
+                    "bins_per_axis": [
+                      4,
+                      4
+                    ],
+                    "max_observations": 64
+                  }
+                },
+                "op_level": {}
+              },
+              "fallback_policy": "deny",
+              "fmha_quant_mode": null,
+              "fpm_fmha_quant_mode": null,
+              "fpm_profile": null,
+              "gemm_quant_mode": null,
+              "kv_block_size": 64,
+              "kvcache_quant_mode": null,
+              "model": "Qwen/Qwen3.5-35B-A3B",
+              "moe_backend": null,
+              "moe_ep_size": null,
+              "moe_kernel_source": null,
+              "moe_quant_mode": null,
+              "moe_tp_size": null,
+              "nextn": 0,
+              "pp": 1,
+              "speculation": null,
+              "strict_provenance": false,
+              "system": "b300_sxm",
+              "systems_paths": [
+                "/tmp/pr937-release-validation-m_jcw8cc/runtime/lib/python3.12/site-packages/aisim_core/systems"
+              ],
+              "tp": 1,
+              "transfer_policy": [
+                "xshape",
+                "xquant",
+                "xprofile",
+                "xop"
+              ],
+              "wideep_num_slots": null,
+              "worker_type": "aggregated"
+            },
+            "provider": "aic",
+            "role": "aggregated",
+            "selection": {
+              "correction_ready_buckets": 0,
+              "last_warning": null,
+              "provenance": {
+                "config": {
+                  "attention_backend": null,
+                  "attention_dp": 1,
+                  "backend": "vllm",
+                  "backend_version": "0.30.0",
+                  "comm_quant_mode": null,
+                  "database_mode": "SILICON",
+                  "dcp": null,
+                  "decoder_replay": false,
+                  "enable_eplb": false,
+                  "enable_shared_layer": null,
+                  "estimation_mode": "op_level",
+                  "estimator_config": {
+                    "correction": {
+                      "enabled": true,
+                      "factor_bounds": {
+                        "max": 2.0,
+                        "min": 0.5
+                      },
+                      "feature_space": "legacy_workload",
+                      "max_batch_size": 512,
+                      "max_kv_tokens": 2000000,
+                      "max_num_tokens": 8192,
+                      "min_observations": 5,
+                      "sampling": {
+                        "bins_per_axis": [
+                          4,
+                          4
+                        ],
+                        "max_observations": 64
+                      }
+                    },
+                    "features": {
+                      "attention_kv_weight": 1.0,
+                      "ffn_token_weight": 1.0,
+                      "prefill_attention_pair_weight": 1.0
+                    },
+                    "fpm_interpolation": {
+                      "method": "sol"
+                    },
+                    "fpm_regression": {
+                      "fit": {
+                        "kind": "standardized_nnls",
+                        "rebuild_interval": null,
+                        "singular_ridge_scale": 1e-09
+                      },
+                      "min_observations": 5,
+                      "sampling": {
+                        "bins_per_axis": [
+                          4,
+                          4
+                        ],
+                        "max_observations": 64
+                      }
+                    },
+                    "op_level": {}
+                  },
+                  "fallback_policy": "deny",
+                  "fmha_quant_mode": null,
+                  "fpm_fmha_quant_mode": null,
+                  "fpm_profile": null,
+                  "gemm_quant_mode": null,
+                  "kv_block_size": 64,
+                  "kvcache_quant_mode": null,
+                  "model": "Qwen/Qwen3.5-35B-A3B",
+                  "moe_backend": null,
+                  "moe_ep_size": null,
+                  "moe_kernel_source": null,
+                  "moe_quant_mode": null,
+                  "moe_tp_size": null,
+                  "nextn": 0,
+                  "pp": 1,
+                  "speculation": null,
+                  "strict_provenance": false,
+                  "system": "b300_sxm",
+                  "systems_paths": [
+                    "/tmp/pr937-release-validation-m_jcw8cc/runtime/lib/python3.12/site-packages/aisim_core/systems"
+                  ],
+                  "tp": 1,
+                  "transfer_policy": [
+                    "xshape",
+                    "xquant",
+                    "xprofile",
+                    "xop"
+                  ],
+                  "wideep_num_slots": null,
+                  "worker_type": "aggregated"
+                },
+                "requested_estimation_mode": "auto",
+                "selected_estimation_mode": "op_level",
+                "selected_systems_root": "/tmp/pr937-release-validation-m_jcw8cc/runtime/lib/python3.12/site-packages/aisim_core/systems",
+                "selection_failures": []
+              },
+              "readiness": "ready",
+              "retained_observations": 0,
+              "source": "aic"
+            },
+            "source": "backend_deployment"
+          }
+        ],
+        "power": {
+          "coverage_gate": 0.9,
+          "power_coverage": 0.0,
+          "power_w": null,
+          "power_w_unit": "W",
+          "publication_status": "withheld",
+          "scope": "active_forward_pass_per_gpu",
+          "source": "modeled",
+          "unavailable_reason": "insufficient energy coverage"
+        },
+        "runner_metadata": {
+          "power": {
+            "coverage_gate": 0.9,
+            "power_w_unit": "W",
+            "publication_status": "withheld",
+            "scope": "active_forward_pass_per_gpu",
+            "source": "modeled",
+            "unavailable_reason": "insufficient energy coverage"
+          },
+          "prediction_provenance": {
+            "aggregated": {
+              "data_identity": null,
+              "data_version": "0.30.0",
+              "data_version_unavailable_reason": null,
+              "estimator": "op_level",
+              "timing_source": "aic"
+            }
+          }
+        },
+        "sla": {
+          "e2e_ms": null,
+          "itl_ms": 50.0,
+          "ttft_ms": 500.0
+        },
+        "topology": {
+          "attention_dp": 1,
+          "deployment_mode": "agg",
+          "moe_ep": 1,
+          "moe_tp": 1,
+          "pp": 1,
+          "replicas": 1,
+          "strategy": "tp",
+          "tp": 1
+        },
+        "workload": {
+          "agentic_lanes": null,
+          "agentic_profile": null,
+          "agentic_snapshot": null,
+          "agentic_warmup": false,
+          "arrival_seed": 42,
+          "arrival_speedup_ratio": 1.0,
+          "cached_prefix_tokens": 0,
+          "concurrency": null,
+          "images": null,
+          "inter_turn_delay_ms": 0.0,
+          "isl": 1024,
+          "kv_load_ratio": null,
+          "load_choices": null,
+          "load_integer": false,
+          "load_log_scale": false,
+          "load_range": null,
+          "load_search_field": null,
+          "load_type": "constant_rate",
+          "max_sim_time_ms": null,
+          "num_prefix_groups": 0,
+          "num_request_ratio": null,
+          "osl": 128,
+          "random_range_ratio": 1.0,
+          "random_seed": 0,
+          "replay_concurrency": null,
+          "request_count": 300,
+          "request_rate": 1.0,
+          "shared_prefix_ratio": 0.0,
+          "source_type": "synthetic",
+          "trace_block_size": null,
+          "trace_format": "mooncake",
+          "trace_path": null,
+          "trace_paths": null,
+          "turns_per_session": 1,
+          "weka_nested_timestamp_basis": null
+        }
+      },
+      "reason": null,
+      "reason_category": null,
+      "score": -1.0,
+      "status": "feasible",
+      "used_gpus": 1
+    }
+  ],
+  "counts": {
+    "cache_hits": 0,
+    "evaluated": 2,
+    "failed": 0,
+    "feasible": 2,
+    "infeasible": 0,
+    "resource_limited": 0,
+    "timed_out": 0,
+    "unsupported": 0
+  },
+  "provenance": {
+    "config": {
+      "adapters": {},
+      "goal": {
+        "min_goodput_rps": 0.9,
+        "pareto_objectives": null,
+        "sla": {
+          "e2e_ms": null,
+          "itl_ms": 50.0,
+          "ttft_ms": 500.0
+        },
+        "strict_sla": false,
+        "target": "min_gpus"
+      },
+      "search_space": {
+        "afd_batch_size_candidates": null,
+        "afd_boundary_on_attn": true,
+        "afd_comm_overhead_factor": 1.0,
+        "afd_companion_parallel_configs": [],
+        "afd_f_moe_ep_size_candidates": null,
+        "afd_max_af_ratio": 4.0,
+        "afd_max_candidates": 10000,
+        "afd_microbatch_candidates": [
+          2,
+          3,
+          4
+        ],
+        "afd_phase": "decode",
+        "afd_pinned_topologies": [],
+        "afd_pipeline_model_candidates": [
+          "optimistic",
+          "conservative"
+        ],
+        "afd_tp_a_candidates": null,
+        "agg_block_size": null,
+        "agg_enable_prefix_caching": true,
+        "agg_fpm_parquet_path": null,
+        "agg_frontend": null,
+        "agg_frontend_by_transport": null,
+        "agg_gpu_memory_utilization": null,
+        "agg_host_loop": null,
+        "agg_kv_bytes_per_token": "auto",
+        "agg_max_num_batched_tokens": [
+          8192,
+          16384,
+          32768
+        ],
+        "agg_max_num_seqs": [
+          256,
+          512,
+          1024
+        ],
+        "agg_native_host_offload": null,
+        "agg_num_gpu_blocks": null,
+        "agg_startup_time": 0.0,
+        "agg_timing_model": null,
+        "agg_vision": null,
+        "aic_nextn": null,
+        "attention_backend": null,
+        "backend": [
+          "vllm",
+          "sglang"
+        ],
+        "backend_version": null,
+        "comm_quant_mode": null,
+        "context_length": 2048,
+        "database_mode": "SILICON",
+        "decode_block_size": 64,
+        "decode_context_length": null,
+        "decode_enable_prefix_caching": false,
+        "decode_fpm_parquet_path": null,
+        "decode_gpu_memory_utilization": 0.9,
+        "decode_hardware_sku": null,
+        "decode_kv_bytes_per_token": "auto",
+        "decode_max_num_batched_tokens": [
+          8192
+        ],
+        "decode_max_num_seqs": [
+          256,
+          512,
+          1024
+        ],
+        "decode_native_host_offload": null,
+        "decode_num_gpu_blocks": null,
+        "decode_startup_time": null,
+        "decode_timing_model": null,
+        "deployment_mode": [
+          "agg"
+        ],
+        "enable_chunked_prefill": null,
+        "enable_eplb": false,
+        "encoder": null,
+        "engine_float_ranges": {},
+        "engine_integer_log_ranges": {},
+        "engine_log_discrete": [],
+        "engine_log_ranges": [],
+        "estimation_mode": "auto",
+        "estimator_config": {},
+        "fallback_policy": "deny",
+        "flat_parallel_modes": [],
+        "fmha_quant_mode": null,
+        "fpm_profile": null,
+        "gemm_quant_mode": null,
+        "gpu_budget": 1,
+        "hardware_sku": "b300_sxm",
+        "kv_transfer_bandwidth": null,
+        "kv_transfer_bytes_per_token": null,
+        "kv_transfer_timing_mode": "destination_missing",
+        "kvcache_quant_mode": null,
+        "min_gpu_budget": null,
+        "model_name": "Qwen/Qwen3.5-35B-A3B",
+        "moe_backend": null,
+        "moe_kernel_source": null,
+        "moe_quant_mode": null,
+        "nextn_accepted": null,
+        "parallel_configs": [],
+        "parallel_configs_by_mode": {},
+        "parallel_custom_configs_by_mode": {},
+        "parallel_independent_by_mode": {},
+        "parallel_independent_log_ranges_by_mode": {},
+        "prefill_block_size": 64,
+        "prefill_context_length": null,
+        "prefill_enable_prefix_caching": true,
+        "prefill_fpm_parquet_path": null,
+        "prefill_frontend": null,
+        "prefill_frontend_by_transport": null,
+        "prefill_gpu_memory_utilization": 0.9,
+        "prefill_hardware_sku": null,
+        "prefill_host_loop": null,
+        "prefill_kv_bytes_per_token": "auto",
+        "prefill_max_num_batched_tokens": [
+          8192,
+          16384,
+          32768
+        ],
+        "prefill_max_num_seqs": [
+          1,
+          2,
+          4,
+          8,
+          16,
+          32,
+          64,
+          128,
+          256
+        ],
+        "prefill_native_host_offload": null,
+        "prefill_num_gpu_blocks": null,
+        "prefill_startup_time": null,
+        "prefill_timing_model": null,
+        "prefill_vision": null,
+        "role_estimator_controls": {
+          "agg": {}
+        },
+        "speculation": null,
+        "startup_time": null,
+        "systems_paths": null,
+        "transfer_policy": null,
+        "wideep_num_slots": null
+      },
+      "sweep": {
+        "algorithm": "bayesian",
+        "candidates_per_round": 2,
+        "max_eval_seconds": 600.0,
+        "max_rounds": 1,
+        "max_trials": 2,
+        "parallel_evals": 4,
+        "seed": 42
+      },
+      "workload": {
+        "agentic_lanes": null,
+        "agentic_profile": null,
+        "agentic_snapshot": null,
+        "agentic_warmup": false,
+        "arrival_seed": 42,
+        "arrival_speedup_ratio": 1.0,
+        "cached_prefix_tokens": 0,
+        "concurrency": null,
+        "images": null,
+        "inter_turn_delay_ms": 0.0,
+        "isl": 1024,
+        "kv_load_ratio": null,
+        "load_choices": null,
+        "load_integer": false,
+        "load_log_scale": false,
+        "load_range": null,
+        "load_search_field": null,
+        "load_type": "constant_rate",
+        "max_sim_time_ms": null,
+        "num_prefix_groups": 0,
+        "num_request_ratio": null,
+        "osl": 128,
+        "random_range_ratio": 1.0,
+        "random_seed": 0,
+        "replay_concurrency": null,
+        "request_count": 300,
+        "request_rate": 1.0,
+        "shared_prefix_ratio": 0.0,
+        "source_type": "synthetic",
+        "trace_block_size": null,
+        "trace_format": "mooncake",
+        "trace_path": null,
+        "trace_paths": null,
+        "turns_per_session": 1,
+        "weka_nested_timestamp_basis": null
+      }
+    },
+    "created_at": "2026-11-19T04:48:27.415496Z",
+    "implementation": "aisim.sweeper",
+    "implementation_version": "0.14.0",
+    "input_fingerprint": "sha256:45c2991da5ee27583ec4a3c287617949f33b8ec9260a53adfa74ae3cd901b421",
+    "run_id": "1f57286b2f7645499e894173cbac6b97",
+    "search_strategy": "optimizer_guided"
+  },
+  "schema_version": "1.1",
+  "views": {
+    "pareto_front": [],
+    "top_n": [
+      "candidate-000002",
+      "candidate-000001"
+    ]
+  }
+}

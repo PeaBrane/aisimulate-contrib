@@ -1,0 +1,165 @@
+{
+  "skill": "aisim-gpu-selection-and-sizing",
+  "_draft_note": "Pinned to aisim==0.14.0. Grade on the invariants in expected_behavior: reported GPU counts and metrics must match the artifacts the agent produced (size_ladder.py JSON, recommendation.json, headroom_scan.py JSON) within 1%. Do not grade on a specific GPU count. A sufficient-sizing result requires at least 300 s of arrivals; shorter runs are warning-only and cannot establish sufficient capacity even if the ladder qualifies a candidate. The missing-coverage case requires HTTPS access to huggingface.co for the Granite config; the other cases use configs bundled with AISim. These agent evals have not run against the public aisim==0.14.0 wheel; local synthetic consumer tests are separate evidence.",
+  "cases": [
+    {
+      "id": "size-two-gpu-types",
+      "question": "We expect 100 requests per second (Poisson) of Qwen/Qwen3.5-35B-A3B, 2048 input and 256 output tokens. TTFT must average under 500 ms and TPOT under 50 ms, and 99% of requests must meet that per-request SLA. We need at least 90 SLA-compliant requests per second. How many B200s (b200_sxm) or GB300s (gb300) do we need with vLLM?",
+      "expected_skill": "aisim-gpu-selection-and-sizing",
+      "expected_script": "scripts/size_ladder.py",
+      "ground_truth": "Writes sizing.yaml with a Poisson load of 100 rps, at least 300 s of arrivals (30000 requests), evaluation.sla ttft_ms 500 and itl_ms 50, target min_gpus and min_goodput_rps 90. Runs size_ladder.py once per GPU type, then headroom_scan.py on each answer with --min-compliant-share 0.99. Reports per type the smallest qualifying configuration found in the tested search space, whether 1.0x passed the 99% rule, and the highest tested passing multiplier. Does not present a GPU count as sufficient if its arrival window is shorter than 300 s, even if the ladder qualifies it and the 1.0x row passes.",
+      "expected_behavior": [
+        "Uses min_gpus with the user's 90 rps floor, not a silent default",
+        "Uses at least 300 s of arrivals (at least 30000 requests at 100 rps) before presenting a GPU count as sufficient",
+        "Runs the ladder per GPU type and the headroom scan with the 99% compliance rule",
+        "Reported counts and pass or fail per load match the script JSON",
+        "Says 'smallest qualifying configuration found in the tested search space', not 'minimum'",
+        "If a 1.0x row fails, does not present that GPU count as sufficient"
+      ]
+    },
+    {
+      "id": "hopper-comparison-window",
+      "question": "For comparison with Blackwell: how many H200s (h200_sxm) does Qwen/Qwen3.5-35B-A3B need at 20 requests per second (Poisson), 2048 in / 256 out, mean TTFT under 500 ms and TPOT under 50 ms, 18 SLA-compliant rps, 99% of requests within SLA, vLLM?",
+      "expected_skill": "aisim-gpu-selection-and-sizing",
+      "ground_truth": "Runs the ladder and headroom scan over at least 300 s of arrivals. Reports the GPU count and compliance share from saved artifacts. If the 1.0x row fails the 99% rule, does not present that GPU count as sufficient. No fixed GPU count or compliance share is assumed.",
+      "expected_behavior": [
+        "Runs the headroom scan with --min-compliant-share 0.99",
+        "Does not present a GPU count whose 1.0x row failed as sufficient"
+      ]
+    },
+    {
+      "id": "ladder-refinement",
+      "question": "Qwen/Qwen3.5-35B-A3B on B200 (b200_sxm), vLLM: 100 requests per second (Poisson), 2048 in / 256 out, mean TTFT under 500 ms, mean TPOT under 50 ms, at least 90 SLA-compliant requests per second, 3000 requests. Smallest deployment?",
+      "expected_skill": "aisim-gpu-selection-and-sizing",
+      "expected_script": "scripts/size_ladder.py",
+      "ground_truth": "Treats the requested 3000 requests at 100 rps (30 s) as a warning-only negative sizing case. Any reported answer.used_gpus from that run is explicitly provisional and cannot establish sufficient capacity, even if the ladder qualifies it and a headroom scan passes. When a qualifying upper budget leaves untested smaller budgets, verifies ascending refinement in the saved steps. Relays all warnings, including the short arrival window and any smaller qualifying configuration found after a lower-budget failure. Because each step is sampled, does not call the result a proven minimum. A sufficient-sizing conclusion requires a rerun with at least 300 s of arrivals (at least 30000 requests at 100 rps) and the agreed compliance-share and throughput checks.",
+      "expected_behavior": [
+        "Any reported 30-second ladder count equals answer.used_gpus and is labeled provisional, not sufficient capacity",
+        "Relays every warning in the ladder JSON",
+        "Does not accept the 30-second result as sufficient even if the ladder qualifies it and the headroom scan passes",
+        "Requires at least 300 s of arrivals and the agreed compliance-share and throughput checks before accepting a sufficient-sizing result",
+        "Does not call the result a proven minimum"
+      ]
+    },
+    {
+      "id": "cost-with-prices",
+      "question": "Qwen/Qwen3.5-35B-A3B, 100 requests per second (Poisson), 2048 in / 256 out, mean TTFT under 500 ms and TPOT under 50 ms, at least 90 SLA-compliant requests per second. B200 (b200_sxm) costs us $4.90 per GPU-hour and GB300 (gb300) $7.20. Which is cheaper per million SLA-compliant output tokens with vLLM?",
+      "expected_skill": "aisim-gpu-selection-and-sizing",
+      "ground_truth": "Sizes both types, then computes cost per hour = GPUs x price and cost per million SLA-compliant output tokens = cost per hour / (sla_compliant_output_tok_s x 3600 / 1e6), using the selected candidate's goodput output throughput.",
+      "expected_behavior": [
+        "Uses only the given prices",
+        "Uses SLA-compliant output tokens per second as the denominator and labels it so",
+        "Arithmetic matches the artifacts within 1%"
+      ]
+    },
+    {
+      "id": "no-qualifying-configuration",
+      "question": "How many B200s (b200_sxm) does Qwen/Qwen3.5-35B-A3B need at 20 requests per second (Poisson), 2048 in / 256 out, vLLM, if mean TTFT must stay under 5 ms? Require 18 SLA-compliant requests per second.",
+      "expected_skill": "aisim-gpu-selection-and-sizing",
+      "ground_truth": "size_ladder.py exits 1: no qualifying configuration up to 16 GPUs in the sampled search. The agent reports that, not 'impossible', and gives the closest TTFT from the not-feasible rows.",
+      "expected_behavior": [
+        "Recognizes ladder exit 1",
+        "Does not claim impossibility or give a GPU count",
+        "Quotes the closest observed TTFT from the artifacts"
+      ]
+    },
+    {
+      "id": "missing-coverage",
+      "question": "How many B200s (b200_sxm) would ibm-granite/granite-4.0-h-small need with vLLM at 20 requests per second (Poisson), 2048 in / 256 out, mean TTFT under 500 ms, at least 18 SLA-compliant requests per second?",
+      "expected_skill": "aisim-gpu-selection-and-sizing",
+      "ground_truth": "Prerequisite: the eval environment must have HTTPS access to huggingface.co to fetch this model's config, which is not bundled. If the config cannot be fetched, the case is blocked and must not be graded as an architecture-coverage result. With the config available, AISim 0.14.0 does not model this architecture (GraniteMoeHybridForCausalLM). size_ladder.py's coverage probe reports no coverage and exits 4 without running the ladder. The agent says AISim cannot size this model.",
+      "expected_behavior": [
+        "Reports missing coverage, not a GPU count and not 'needs more than 16'",
+        "Presents no fabricated numbers"
+      ]
+    },
+    {
+      "id": "decline-concurrency-load",
+      "question": "We run Qwen/Qwen3.5-35B-A3B at a steady concurrency of 64 users, 2048 in / 256 out, with mean TTFT under 500 ms. How many B200s do we need?",
+      "expected_skill": "aisim-gpu-selection-and-sizing",
+      "ground_truth": "This version sizes request-rate workloads only. The agent asks for the expected request rate (and arrival pattern) or declines; it does not size from concurrency.",
+      "expected_behavior": [
+        "Asks for a request rate or declines",
+        "Does not run the ladder with a concurrency load"
+      ]
+    },
+    {
+      "id": "decline-trace-load",
+      "question": "Here is a week of production traffic as a Mooncake trace. How many B200s do we need to replay it for Qwen/Qwen3.5-35B-A3B with mean TTFT under 500 ms?",
+      "expected_skill": "aisim-gpu-selection-and-sizing",
+      "ground_truth": "Trace-driven sizing is out of scope for this version. The agent says so and offers to size for a stated request rate.",
+      "expected_behavior": [
+        "Does not run the ladder on the trace",
+        "Offers a request-rate alternative"
+      ]
+    },
+    {
+      "id": "ask-for-throughput-floor",
+      "question": "How many H200s for Qwen/Qwen3.5-35B-A3B at 20 requests per second (Poisson), 2048 in / 256 out, mean TTFT under 500 ms and TPOT under 50 ms, vLLM?",
+      "expected_skill": "aisim-gpu-selection-and-sizing",
+      "ground_truth": "The user gave no SLA-compliant throughput requirement or compliance share. Both are user decisions (SKILL.md step 1). The agent asks for both before running any search, offering 20 rps and a stated share such as 99% as defaults, and waits for the answer. It never applies a hidden 90% discount. Failing example: the agent picks 18 rps and 99% itself, states them, and runs the search without the user confirming them.",
+      "expected_behavior": [
+        "Asks the user to confirm both min_goodput_rps and the compliance share before running a search",
+        "Does not run size_ladder.py or headroom_scan.py with values the user has not agreed to; stating self-chosen values does not substitute for agreement",
+        "Never applies a hidden 90% discount"
+      ]
+    },
+    {
+      "id": "e2e-only-sla",
+      "question": "How many B200s (b200_sxm) does Qwen/Qwen3.5-35B-A3B need with vLLM at 20 requests per second (Poisson), 2048 in / 256 out, if requests must finish end to end within 3 seconds on average? Require 18 SLA-compliant requests per second and 99% of requests within SLA.",
+      "expected_skill": "aisim-gpu-selection-and-sizing",
+      "ground_truth": "Uses evaluation.sla.e2e_ms: 3000 only. The headroom scan checks the E2E bound at every tested load. Reported mean E2E at the planned rate is at most 3000 ms in the artifacts for any configuration presented as qualifying.",
+      "expected_behavior": [
+        "SLA expressed as e2e_ms only",
+        "Every load reported as passing has mean E2E of at most 3000 ms in headroom_scan.py output"
+      ]
+    },
+    {
+      "id": "resource-limited",
+      "question": "Size B200s (b200_sxm) for Qwen/Qwen3.5-35B-A3B with vLLM at 20 requests per second (Poisson), 2048 in / 256 out, mean TTFT under 500 ms, 18 SLA-compliant rps, and set the AISim memory limit to 100000 GB.",
+      "expected_skill": "aisim-gpu-selection-and-sizing",
+      "ground_truth": "The memory limit exceeds free RAM, so the coverage probe or first step stops with a resource error and size_ladder.py exits 3. The agent reports a local resource problem and gives no GPU count.",
+      "expected_behavior": [
+        "Recognizes exit 3 as a local resource limit",
+        "Gives no sizing conclusion"
+      ]
+    },
+    {
+      "id": "boundary-allocate-from-owned",
+      "question": "I own eight B200s. How many must I allocate to Qwen/Qwen3.5-35B-A3B at 20 requests per second (Poisson), 2048 in / 256 out, mean TTFT under 500 ms and TPOT under 50 ms, 18 SLA-compliant rps?",
+      "expected_skill": "aisim-gpu-selection-and-sizing",
+      "ground_truth": "The decision variable is the GPU count, so this is sizing; budgets stop at 8.",
+      "expected_behavior": [
+        "Runs the ladder with budgets no larger than 8"
+      ]
+    },
+    {
+      "id": "boundary-can-these-meet-load",
+      "question": "Can my eight GB200s (gb200) serve Qwen/Qwen3.5-35B-A3B at 100 requests per second (Poisson), 2048 in / 256 out, mean TTFT under 500 ms and TPOT under 50 ms, with at least 90 SLA-compliant requests per second?",
+      "expected_skill": "aisim-gpu-selection-and-sizing",
+      "ground_truth": "Feasibility of a fixed GPU count for a load is sizing. Answers yes or no from a ladder capped at 8 and gives the GPU count found.",
+      "expected_behavior": [
+        "Runs the ladder with budgets up to 8",
+        "Answer agrees with the ladder JSON"
+      ]
+    },
+    {
+      "id": "neg-maximize-on-these",
+      "question": "Maximize throughput per GPU for Qwen/Qwen3.5-35B-A3B on these eight B300s at concurrency 10, 1024 in / 128 out.",
+      "expected_skill": "aisim-deployment-search",
+      "ground_truth": "Tuning a given GPU budget is deployment search, not sizing.",
+      "expected_behavior": [
+        "aisim-gpu-selection-and-sizing stays silent"
+      ]
+    },
+    {
+      "id": "neg-training",
+      "question": "How many GB200s do I need to pretrain a 70B model in two weeks?",
+      "expected_skill": null,
+      "ground_truth": "AISim sizes inference serving, not training.",
+      "expected_behavior": [
+        "aisim-gpu-selection-and-sizing stays silent"
+      ]
+    }
+  ]
+}

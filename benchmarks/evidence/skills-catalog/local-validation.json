@@ -1,0 +1,161 @@
+{
+  "evidence_type": "Local source tests over synthetic controls and recorded native 0.14.0 bytes; native CPU compatibility execution is recorded separately.",
+  "source_head": "0e2539f2ff363305aea4cd55c4434ceb33842f6f",
+  "tested_worktree": "This receipt accompanies native evidence, README corrections and six added replay tests. Exact tested script/test bytes are bound by tested_source_sha256.",
+  "recorded_at_utc": "2026-11-19T04:53:18.929681+00:00",
+  "environment": {
+    "python": "Python 3.12.3",
+    "ruff": "ruff 0.14.1",
+    "native_runtime_built": true,
+    "native_runtime_source_commit": "77d82652b2f83fd67afefc3141d69a5f06e630be"
+  },
+  "tested_source_sha256": {
+    "skills/aisim-deployment-search/scripts/summarize_recommendation.py": "fed0f41903114b521f98f406ebb4ec4468204660a8d0a4dd1bd5dd90ca419715",
+    "skills/aisim-gpu-selection-and-sizing/scripts/summarize_recommendation.py": "fed0f41903114b521f98f406ebb4ec4468204660a8d0a4dd1bd5dd90ca419715",
+    "skills/aisim-gpu-selection-and-sizing/scripts/size_ladder.py": "98c556c93dd5d341428e67cc702eeedc66ac65c874501e48613d4f9616c392dc",
+    "skills/aisim-gpu-selection-and-sizing/scripts/headroom_scan.py": "ae90a9f5dd260ef422209aecd4688195e54c090b8df6696bb3afee1d3f480f84",
+    "tests/sweeper/test_catalog_recommendation_summary.py": "a4676f9fa02a461e07b5257bc092196c99b451a5f4206488c3990715f9892930",
+    "tests/sweeper/test_catalog_size_ladder.py": "138b51146de9320373a6ae21789635c9a23c5f5f7c19bce2da106d2930ceaa21",
+    "tests/sweeper/test_score.py": "cd33dccb188776bc5f278715ca13048c1dda52ee534902f782cb3c17acb2ed44"
+  },
+  "tests": [
+    {
+      "command": [
+        "/tmp/pr937-release-validation-m_jcw8cc/runtime/bin/python",
+        "-m",
+        "pytest",
+        "tests/sweeper/test_catalog_size_ladder.py",
+        "tests/sweeper/test_catalog_recommendation_summary.py",
+        "tests/sweeper/test_score.py",
+        "-q",
+        "-p",
+        "no:cacheprovider"
+      ],
+      "exit_code": 0,
+      "passed": true,
+      "seconds": 1.237,
+      "stdout": "........................................................................ [ 43%]\n........................................................................ [ 86%]\n......................                                                   [100%]\n166 passed in 0.67s\n",
+      "stderr": ""
+    },
+    {
+      "command": [
+        "/tmp/pr937-release-validation-m_jcw8cc/runtime/bin/ruff",
+        "check",
+        "--config",
+        "python/aisim/pyproject.toml",
+        "python/aisim",
+        "tests",
+        "skills",
+        "benchmarks/evidence/skills-catalog"
+      ],
+      "exit_code": 0,
+      "passed": true,
+      "seconds": 0.075,
+      "stdout": "All checks passed!\n",
+      "stderr": ""
+    },
+    {
+      "command": [
+        "/tmp/pr937-release-validation-m_jcw8cc/runtime/bin/ruff",
+        "format",
+        "--check",
+        "--config",
+        "python/aisim/pyproject.toml",
+        "python/aisim",
+        "tests",
+        "skills",
+        "benchmarks/evidence/skills-catalog"
+      ],
+      "exit_code": 0,
+      "passed": true,
+      "seconds": 0.092,
+      "stdout": "1283 files already formatted\n",
+      "stderr": ""
+    },
+    {
+      "command": [
+        "/tmp/pr937-release-validation-m_jcw8cc/runtime/bin/python",
+        "scripts/ci/check_copyright.py"
+      ],
+      "exit_code": 0,
+      "passed": true,
+      "seconds": 0.092,
+      "stdout": "all 1890 tracked source files carry the required NVIDIA/Apache-2.0 SPDX header\n",
+      "stderr": ""
+    },
+    {
+      "command": [
+        "/tmp/pr937-release-validation-m_jcw8cc/runtime/bin/python",
+        "scripts/ci/check_packaged_legal_files.py"
+      ],
+      "exit_code": 0,
+      "passed": true,
+      "seconds": 0.016,
+      "stdout": "wheel-local LICENSE and THIRD_PARTY_NOTICES.md match the root files\n",
+      "stderr": ""
+    },
+    {
+      "command": [
+        "/tmp/pr937-release-validation-m_jcw8cc/runtime/bin/python",
+        ".github/codeowners/build_codeowners.py",
+        "--areas",
+        ".github/codeowners/areas.yaml",
+        "--repo",
+        ".",
+        "--strict"
+      ],
+      "exit_code": 0,
+      "passed": true,
+      "seconds": 0.311,
+      "stdout": "areas: 6 | tree files: 5317\nexplicitly owned: 5317/5317 (100.00%) | catch-all only: 0\n\nper-area glob counts:\n  replay                 37\n  infra                  37\n  maintainers            16\n  forward-pass-engine    12\n  sweeper                4\n  mocker                 1\n",
+      "stderr": ""
+    },
+    {
+      "command": [
+        "/tmp/pr937-release-validation-m_jcw8cc/runtime/bin/python",
+        "scripts/ci/check_documentation_links.py"
+      ],
+      "exit_code": 0,
+      "passed": true,
+      "seconds": 0.405,
+      "stdout": "Checked local destinations in 87 Markdown files (anchors and remote URLs excluded).\n",
+      "stderr": ""
+    },
+    {
+      "command": [
+        "/tmp/pr937-release-validation-m_jcw8cc/runtime/bin/python",
+        "skills/aisim-deployment-search/evals/fixtures/generate_mixed_lengths.py"
+      ],
+      "exit_code": 0,
+      "passed": true,
+      "seconds": 0.023,
+      "stdout": "synthetic trace bytes and anomaly summary verified\n",
+      "stderr": ""
+    },
+    {
+      "command": [
+        "git",
+        "diff",
+        "--check",
+        "--cached"
+      ],
+      "exit_code": 0,
+      "passed": true,
+      "stdout": "",
+      "stderr": ""
+    }
+  ],
+  "native_evidence": "native-0.14.0/provenance.json",
+  "development_failures_resolved": [
+    "15 initial oracle-test setup failures combined mutually exclusive E2E and TTFT/TPOT SLA bounds; corrected test configuration, all 160 current tests pass. Saved consumer-tests-first.log.",
+    "Initial documentation-link check lacked markdown-it-py in the isolated environment; installed the CI dependency and reran successfully. Saved verification-first.json.",
+    "Initial unformatted new files and adjacent zip lint corrected with pairwise and formatting; saved lint-first.log.",
+    "System Ruff 0.15.4 produced 9 lint and 7 formatting findings in unchanged files; required Ruff 0.14.1 passes full paths. Saved ruff-check.log and ruff-format.log; matching pinned reruns saved separately.",
+    "The first two new native text-render assertions expected candidate IDs that this text view does not print. Corrected the assertions to validate rendered counts and latency values; all 166 tests pass.",
+    "Plain captured terminal logs triggered whitespace checks; preserved their exact bytes in deterministic gzip archives. No producer JSON was normalized."
+  ],
+  "remaining_validation": [
+    "Final-head Fast CI and Full CI, required fresh bot reviews and approval.",
+    "Public 0.14.0 package release and the catalog agent eval/signing workflow remain separate prerequisites. Native CPU smoke checks do not represent catalog evals."
+  ]
+}

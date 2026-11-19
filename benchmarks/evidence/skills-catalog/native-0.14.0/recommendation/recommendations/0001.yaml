@@ -1,0 +1,105 @@
+traffic:
+  source:
+    type: synthetic
+    input_tokens: 1024
+    output_tokens: 128
+    cached_prefix_tokens: 0
+  stop:
+    requests: 100
+  load:
+    type: concurrency
+    concurrency: 10
+    agentic_warmup: false
+engine:
+  nextn: 0
+  enable_eplb: false
+  database_mode: SILICON
+  estimation_mode: auto
+  fallback_policy: deny
+  estimator_config: {}
+  mode: aggregated
+  model: Qwen/Qwen3.5-35B-A3B
+  hardware: b300_sxm
+  backend: sglang
+  backend_version: 0.5.21
+  decoder_replay: false
+  context_length: 2048
+  workers:
+    aggregated:
+      parallelism:
+        replicas: 1
+        tensor: 2
+        pipeline: 1
+        attention_data: 1
+        moe_tensor: 2
+        moe_expert: 1
+      scheduler:
+        max_batched_tokens: 16384
+        max_sequences: 256
+        prefill_schedule_interval: 1
+        prefill_decode_interval: 0
+      kv_cache:
+        block_size: 1
+        prefix_caching: true
+        bytes_per_token: auto
+        capacity:
+          type: default
+          memory_fraction: 0.88
+          cuda_graph_reserved_bytes: 0
+      timing:
+        type: default
+        estimation_mode: op_level
+        fallback_policy: deny
+        estimator_config:
+          features:
+            attention_kv_weight: 1.0
+            prefill_attention_pair_weight: 1.0
+            ffn_token_weight: 1.0
+          op_level: {}
+          fpm_interpolation:
+            method: sol
+          fpm_regression:
+            sampling:
+              bins_per_axis:
+              - 4
+              - 4
+              max_observations: 64
+            min_observations: 5
+            fit:
+              kind: standardized_nnls
+              singular_ridge_scale: 1.0e-09
+              rebuild_interval: null
+          correction:
+            enabled: true
+            feature_space: legacy_workload
+            sampling:
+              bins_per_axis:
+              - 4
+              - 4
+              max_observations: 64
+            min_observations: 5
+            factor_bounds:
+              min: 0.5
+              max: 2.0
+            max_num_tokens: 8192
+            max_batch_size: 512
+            max_kv_tokens: 2000000
+        systems_paths:
+        - /tmp/pr937-release-validation-m_jcw8cc/runtime/lib/python3.12/site-packages/aisim_core/systems
+        database_mode: SILICON
+        transfer_policy:
+        - xshape
+        - xquant
+        - xprofile
+        - xop
+      startup_seconds: 0.0
+evaluation: {}
+execution:
+  resources:
+    initialization_timeout_seconds: 60.0
+    shutdown_timeout_seconds: 5.0
+    memory_limit_gb: 8.0
+    cpu_limit: 4
+    reserve_memory_gb: 1.0
+    reserve_memory_fraction: 0.0
+    available_memory_fraction: 0.9

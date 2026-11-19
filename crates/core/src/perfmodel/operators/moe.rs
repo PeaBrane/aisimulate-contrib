@@ -3,7 +3,7 @@
 
 //! MoE operator.
 //!
-//! Mirrors `aisimulate.sdk.operations.moe.MoE._query_moe_table`. The
+//! Mirrors `aisim.sdk.operations.moe.MoE._query_moe_table`. The
 //! perf-DB layer handles workload-distribution fallback to `"uniform"` and
 //! resolves the token curve on the perf_interp v2 engine; this operator
 //! supplies the MoE roofline SOL closure the engine's beyond-range util-hold
@@ -40,11 +40,13 @@
 use crate::common::enums::{DatabaseMode, MoeQuantMode, TransferKind, TransferPolicy};
 use crate::common::error::AicError;
 use crate::common::system_spec::SystemSpec;
+use crate::memo::Memo;
 use crate::operators::base::{PerformanceResult, SolComponents, Source};
 use crate::operators::util_empirical::{self, UtilGrid};
 use crate::perf_database::PerfDatabase;
 use crate::perf_database::gemm::quant_tc_flops;
 use crate::perf_database::moe::MoeSiblingSlice;
+use quick_cache::Equivalent;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -176,6 +178,56 @@ struct MoeReferenceCandidate {
     provenance: &'static str,
 }
 
+/// Everything [`MoeOp::resolve_reference`] reads besides the loaded tables,
+/// which never change: a [`PerfDatabase`] view keeps what it resolved for as
+/// long as it lives. The memo owns its strings (`S = String`); a lookup
+/// borrows the op's.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct MoeReferenceKey<S = String> {
+    dims: MoeReferenceDims,
+    workload_distribution: S,
+    kernel_source: Option<S>,
+}
+
+/// The `Copy` part of a [`MoeReferenceKey`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct MoeReferenceDims {
+    quant: MoeQuantMode,
+    topk: u32,
+    num_experts: u32,
+    hidden_size: u32,
+    inter_size: u32,
+    moe_tp_size: u32,
+    moe_ep_size: u32,
+    is_gated: bool,
+    /// Whether the query probes the low-latency table first: the only use
+    /// of its token count.
+    low_latency_probe: bool,
+    policy: TransferPolicy,
+}
+
+impl Equivalent<MoeReferenceKey> for MoeReferenceKey<&str> {
+    fn equivalent(&self, key: &MoeReferenceKey) -> bool {
+        // A struct literal, so a new field cannot be left out.
+        *self
+            == MoeReferenceKey {
+                dims: key.dims,
+                workload_distribution: key.workload_distribution.as_str(),
+                kernel_source: key.kernel_source.as_deref(),
+            }
+    }
+}
+
+/// A slice's util grid (its own, or the one the transfer ladder borrowed;
+/// `None` when no permitted tier found data) and the cross-profile rescale,
+/// by [`MoeReferenceKey`].
+pub(crate) type MoeReferenceMemo = Memo<MoeReferenceKey, (Option<Arc<UtilGrid>>, f64)>;
+
+/// A view prices a handful of slices; the capacity only bounds the memo.
+pub(crate) fn reference_memo() -> MoeReferenceMemo {
+    Memo::clock(1024)
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MoeOp {
     pub name: String,
@@ -304,15 +356,17 @@ impl MoeOp {
             )
             .clamp_non_negative()
             .scaled(self.scale_factor)),
-            DatabaseMode::Hybrid => match self.silicon_pr(db, num_tokens) {
-                Ok(result) => Ok(result),
-                Err(err) if err.is_missing_perf_data() => Ok(PerformanceResult::new(
+            DatabaseMode::Hybrid => match self.try_silicon_pr(db, num_tokens) {
+                Ok(Some(result)) => Ok(result),
+                Err(err) if !err.is_missing_perf_data() => Err(err),
+                // A slice absent from its grid, or any other typed
+                // missing-data error.
+                Ok(None) | Err(_) => Ok(PerformanceResult::new(
                     self.empirical_latency(db, num_tokens)?,
                     Source::Empirical,
                 )
                 .clamp_non_negative()
                 .scaled(self.scale_factor)),
-                Err(err) => Err(err),
             },
             _ => self.silicon_pr(db, num_tokens),
         }
@@ -333,13 +387,36 @@ impl MoeOp {
         Ok(())
     }
 
-    /// SILICON resolution (retired-deepep gate + low-latency probe + the default
-    /// grid, scale/clamp applied per branch — the audit-PR body, unchanged).
+    /// [`Self::try_silicon_pr`], with a shape miss as the typed error.
     pub(crate) fn silicon_pr(
         &self,
         db: &PerfDatabase,
         num_tokens: u32,
     ) -> Result<PerformanceResult, AicError> {
+        self.try_silicon_pr(db, num_tokens)?.ok_or_else(|| {
+            db.moe.missing_slice(
+                self.moe_kernel_source.as_deref(),
+                self.hidden_size,
+                self.inter_size,
+                self.topk,
+                self.num_experts,
+                self.moe_tp_size,
+                self.moe_ep_size,
+                self.quant_mode,
+                &self.workload_distribution,
+            )
+        })
+    }
+
+    /// SILICON resolution (retired-deepep gate + low-latency probe + the
+    /// default grid or the exact kernel-source lane, scale/clamp applied per
+    /// branch). A slice absent from its grid is `Ok(None)`, with nothing
+    /// formatted: HYBRID prices it empirically and never reads the message.
+    fn try_silicon_pr(
+        &self,
+        db: &PerfDatabase,
+        num_tokens: u32,
+    ) -> Result<Option<PerformanceResult>, AicError> {
         self.validate_kernel_source(num_tokens)?;
         let is_sglang = db.backend == "sglang";
         // SGLang EPLB prefill correction — INSIDE get_silicon only (Python
@@ -378,36 +455,15 @@ impl MoeOp {
             )));
         }
 
-        if let Some(kernel_source) = self.moe_kernel_source.as_deref() {
-            let value = db.moe.query_kernel_source(
-                kernel_source,
-                num_tokens,
-                self.hidden_size,
-                self.inter_size,
-                self.topk,
-                self.num_experts,
-                self.moe_tp_size,
-                self.moe_ep_size,
-                self.quant_mode,
-                &self.workload_distribution,
-                &sol,
-            )?;
-            return Ok(PerformanceResult::with_energy(
-                value.latency,
-                value.energy,
-                Source::Silicon,
-            )
-            .clamp_non_negative()
-            .scaled(self.scale_factor));
-        }
-
+        let kernel_source = self.moe_kernel_source.as_deref();
         // Mirrors Python's MoE._query_moe_table TRT-LLM gate: for nvfp4
         // gated MoE at num_tokens <= 128, probe the
         // `moe_torch_flow_min_latency` grid first and fall back to the
         // default grid on a shape miss. Other backends (vLLM, SGLang) never
         // have `kernel_source` populated, so `low_latency_available()`
         // returns false and this short-circuits.
-        if num_tokens <= 128
+        if kernel_source.is_none()
+            && num_tokens <= 128
             && self.quant_mode == MoeQuantMode::Nvfp4
             && self.is_gated
             && db.moe.low_latency_available()?
@@ -424,14 +480,15 @@ impl MoeOp {
                 &self.workload_distribution,
                 &sol,
             )? {
-                return Ok(
+                return Ok(Some(
                     PerformanceResult::with_energy(ll.latency, ll.energy, Source::Silicon)
                         .clamp_non_negative()
                         .scaled(self.scale_factor),
-                );
+                ));
             }
         }
-        let value = db.moe.query(
+        let Some(value) = db.moe.query(
+            kernel_source,
             num_tokens,
             self.hidden_size,
             self.inter_size,
@@ -442,12 +499,15 @@ impl MoeOp {
             self.quant_mode,
             &self.workload_distribution,
             &sol,
-        )?;
-        Ok(
+        )?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(
             PerformanceResult::with_energy(value.latency, value.energy, Source::Silicon)
                 .clamp_non_negative()
                 .scaled(self.scale_factor),
-        )
+        ))
     }
 
     /// `SOL(query)/util` with the full transfer ladder. Mirrors Python
@@ -473,14 +533,6 @@ impl MoeOp {
             tc_flops,
         );
 
-        // Table selection mirrors get_silicon's (`_moe_table`,
-        // `operations/moe.py:364-397`) minus the retired SGLang deepep arm:
-        // nvfp4 + small tokens +
-        // gated probes the low-latency table for the FULL slice and falls
-        // back to the default table on a shape miss. Building util from the
-        // wrong table would over-estimate by the ~3x kernel gap. The tag
-        // folds the choice into every grid cache key so one table's grid
-        // can't be served to another's query at the same shape.
         // sglang deepep_moe compute retired — large-EP uses MoeExpertCompute (AIC-1601)
         if db.backend == "sglang" && self.moe_backend.as_deref() == Some("deepep_moe") {
             return Err(AicError::PerfDatabase(format!(
@@ -490,13 +542,80 @@ impl MoeOp {
                 self.name
             )));
         }
+
+        let key = self.reference_key(db, num_tokens);
+        let (grid, util_scale) = db.moe_references.get_or_price_by(
+            db,
+            &key,
+            |key| MoeReferenceKey {
+                dims: key.dims,
+                workload_distribution: key.workload_distribution.to_owned(),
+                kernel_source: key.kernel_source.map(str::to_owned),
+            },
+            || self.resolve_reference(db, key.dims.low_latency_probe),
+        )?;
+
+        let query = [num_tokens as f64];
+        let (latency, _) = util_empirical::estimate(sol_time, &query, grid.as_deref(), util_scale)?;
+        // Tier fired = the reference grid's transfer kind (xshape / xquant /
+        // xprofile), or own-shape "empirical" when no borrow happened —
+        // Python `prov` at moe.py:447/534/569 passed to estimate() at :571.
+        db.note_provenance(
+            grid.as_deref()
+                .and_then(|g| g.reference_provenance)
+                .and_then(util_empirical::ProvenanceTier::from_tag)
+                .unwrap_or(util_empirical::ProvenanceTier::Empirical),
+        );
+        Ok(latency)
+    }
+
+    /// The memo key of this op's reference for a `num_tokens` query on `db`.
+    fn reference_key(&self, db: &PerfDatabase, num_tokens: u32) -> MoeReferenceKey<&str> {
+        MoeReferenceKey {
+            dims: MoeReferenceDims {
+                quant: self.quant_mode,
+                topk: self.topk,
+                num_experts: self.num_experts,
+                hidden_size: self.hidden_size,
+                inter_size: self.inter_size,
+                moe_tp_size: self.moe_tp_size,
+                moe_ep_size: self.moe_ep_size,
+                is_gated: self.is_gated,
+                low_latency_probe: self.moe_kernel_source.is_none()
+                    && num_tokens <= 128
+                    && self.quant_mode == MoeQuantMode::Nvfp4
+                    && self.is_gated,
+                policy: db.transfer_policy,
+            },
+            workload_distribution: self.workload_distribution.as_str(),
+            kernel_source: self.moe_kernel_source.as_deref(),
+        }
+    }
+
+    /// The util grid [`Self::empirical_latency`] estimates from and its
+    /// rescale: the own-shape grid on the selected table, else the transfer
+    /// ladder's pick.
+    fn resolve_reference(
+        &self,
+        db: &PerfDatabase,
+        low_latency_probe: bool,
+    ) -> Result<(Option<Arc<UtilGrid>>, f64), AicError> {
+        let spec = &db.system_spec;
+        let quant = self.quant_mode;
+        let num_gemms: u64 = if self.is_gated { 3 } else { 2 };
+        let tc_flops = quant_tc_flops(spec, quant.mapping())?;
+
+        // Table selection mirrors get_silicon's (`_moe_table`,
+        // `operations/moe.py:364-397`) minus the retired SGLang deepep arm:
+        // nvfp4 + small tokens +
+        // gated probes the low-latency table for the FULL slice and falls
+        // back to the default table on a shape miss. Building util from the
+        // wrong table would over-estimate by the ~3x kernel gap. The tag
+        // folds the choice into every grid cache key so one table's grid
+        // can't be served to another's query at the same shape.
         let table = match self.moe_kernel_source.as_deref() {
             Some(kernel_source) => MoeTableSel::ExactKernelSource(kernel_source),
-            None if num_tokens <= 128
-                && quant == MoeQuantMode::Nvfp4
-                && self.is_gated
-                && db.moe.low_latency_available()? =>
-            {
+            None if low_latency_probe && db.moe.low_latency_available()? => {
                 match self.slice_points(db, MoeTableSel::LowLatency) {
                     Ok(_) => MoeTableSel::LowLatency,
                     Err(err) if err.is_missing_perf_data() => MoeTableSel::Standard,
@@ -619,18 +738,7 @@ impl MoeOp {
             }
         }
 
-        let query = [num_tokens as f64];
-        let (latency, _) = util_empirical::estimate(sol_time, &query, grid.as_deref(), util_scale)?;
-        // Tier fired = the reference grid's transfer kind (xshape / xquant /
-        // xprofile), or own-shape "empirical" when no borrow happened —
-        // Python `prov` at moe.py:447/534/569 passed to estimate() at :571.
-        db.note_provenance(
-            grid.as_deref()
-                .and_then(|g| g.reference_provenance)
-                .and_then(util_empirical::ProvenanceTier::from_tag)
-                .unwrap_or(util_empirical::ProvenanceTier::Empirical),
-        );
-        Ok(latency)
+        Ok((grid, util_scale))
     }
 
     /// This op's own-slice token curve on the selected table.
@@ -950,7 +1058,7 @@ mod tests {
     fn b200_vllm_db() -> PerfDatabase {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
-            .join("python/aisimulate/src/aisimulate_core/systems");
+            .join("python/aisim/src/aisim_core/systems");
         PerfDatabase::load(&root, "b200_sxm", "vllm", "0.19.0").expect("db loads")
     }
 
@@ -978,7 +1086,7 @@ mod tests {
     fn b200_trtllm_db() -> PerfDatabase {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
-            .join("python/aisimulate/src/aisimulate_core/systems");
+            .join("python/aisim/src/aisim_core/systems");
         PerfDatabase::load(&root, "b200_sxm", "trtllm", "1.3.0rc20").expect("db loads")
     }
 
@@ -1296,6 +1404,43 @@ mod tests {
         assert_routing(&rc, Source::Empirical, "conservative_xshape_t96");
     }
 
+    /// A HYBRID shape miss resolves its transfer reference once per slice
+    /// and policy: a query at another token count finds it and prices
+    /// exactly as a first query does. SILICON still reports the miss.
+    #[test]
+    fn moe_hybrid_shape_miss_reuses_its_resolved_reference() {
+        let mut op = qwen3_op(MoeQuantMode::Bfloat16);
+        op.inter_size = 1600;
+
+        let db = b200_vllm_db().with_mode(DatabaseMode::Hybrid, TransferPolicy::ALL);
+        op.query(&db, 96).expect("xshape transfer");
+        db.moe_references
+            .get_or_price_by(
+                &db,
+                &op.reference_key(&db, 333),
+                |_| unreachable!("a hit stores no key"),
+                || -> Result<_, AicError> { unreachable!("resolved twice") },
+            )
+            .unwrap();
+        let reused = op.query(&db, 333).expect("reference reused");
+        let fresh = b200_vllm_db().with_mode(DatabaseMode::Hybrid, TransferPolicy::ALL);
+        assert_eq!(reused, op.query(&fresh, 333).expect("first query"));
+
+        // A policy change on the same view is another reference.
+        let conservative = db
+            .silicon_view()
+            .with_mode(DatabaseMode::Hybrid, CONSERVATIVE);
+        op.query(&conservative, 96)
+            .expect("xshape under conservative policy");
+        assert_eq!(db.moe_references.len(), 2);
+
+        let miss = op.silicon_pr(&db, 96);
+        assert!(
+            matches!(&miss, Err(AicError::PerfDatabase(message)) if message.starts_with("MoE data missing for")),
+            "SILICON must keep the typed shape miss, got {miss:?}"
+        );
+    }
+
     /// Policy gating: disabled tiers are SKIPPED, and the terminal
     /// EmpiricalNotImplemented only fires when every permitted tier found
     /// nothing — `off` blocks everything for an uncollected quant, and
@@ -1357,7 +1502,7 @@ mod tests {
     fn moe_nvfp4_wo_ladder_matches_python_oracle() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
-            .join("python/aisimulate/src/aisimulate_core/systems");
+            .join("python/aisim/src/aisim_core/systems");
         let db = PerfDatabase::load(&root, "h200_sxm", "vllm", "0.19.0")
             .expect("h200/vllm/0.19.0 db loads")
             .with_mode(
@@ -1417,6 +1562,9 @@ mod tests {
         assert_routing(&ll, Source::Empirical, "ll_own_t100");
         let std_table = op.query(&db, 200).expect("std-table empirical t=200");
         assert_routing(&std_table, Source::Empirical, "std_own_t200");
+        // The t=100 query before it must not lend this one its table.
+        let fresh = b200_trtllm_db().with_mode(DatabaseMode::Empirical, TransferPolicy::ALL);
+        assert_eq!(std_table, op.query(&fresh, 200).expect("first query"));
 
         let mut off_shape = op.clone();
         off_shape.inter_size = 17000;

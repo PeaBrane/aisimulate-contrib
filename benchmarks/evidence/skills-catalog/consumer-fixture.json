@@ -1,0 +1,99 @@
+{
+  "evidence_type": "synthetic consumer contract; not a model prediction or agent eval",
+  "prediction_report": {
+    "num_requests": 6000,
+    "completed_requests": 6000,
+    "num_ttft_samples": 6000,
+    "num_tpot_samples": 6000,
+    "num_e2e_latency_samples": 6000,
+    "output_throughput_tok_s": 2000,
+    "goodput_output_throughput_tok_s": 1980,
+    "request_throughput_rps": 19.8,
+    "goodput_request_throughput_rps": 19.6,
+    "goodput_completed_requests": 5940,
+    "mean_ttft_ms": 100,
+    "mean_tpot_ms": 10,
+    "mean_e2e_latency_ms": 2500,
+    "duration_ms": 306000
+  },
+  "recommendation": {
+    "candidates": [
+      {
+        "candidate_id": "candidate-000001",
+        "status": "feasible",
+        "config": {
+          "deployment_mode": "agg",
+          "backend": "vllm",
+          "backend_version": "0.33.0",
+          "tp": 2,
+          "attention_dp": 1,
+          "moe_tp": 2,
+          "moe_ep": 1,
+          "replicas": 1,
+          "used_gpus": 2
+        },
+        "used_gpus": 2,
+        "score": 1000,
+        "metrics": {
+          "completed_requests": 6000,
+          "num_ttft_samples": 6000,
+          "num_tpot_samples": 6000,
+          "num_e2e_latency_samples": 6000,
+          "output_throughput_tok_s": 2000,
+          "goodput_output_throughput_tok_s": 1980,
+          "request_throughput_rps": 19.8,
+          "goodput_request_throughput_rps": 19.6,
+          "goodput_completed_requests": 5940,
+          "mean_ttft_ms": 100,
+          "mean_tpot_ms": 10,
+          "mean_e2e_latency_ms": 2500,
+          "duration_ms": 306000
+        },
+        "prediction_config": {
+          "engine": {
+            "model": "synthetic-contract-fixture"
+          }
+        }
+      },
+      {
+        "candidate_id": "candidate-000002",
+        "status": "infeasible",
+        "config": {
+          "deployment_mode": "agg",
+          "backend": "vllm",
+          "backend_version": "0.33.0",
+          "tp": 2,
+          "attention_dp": 1,
+          "moe_tp": 2,
+          "moe_ep": 1,
+          "replicas": 1,
+          "used_gpus": 2
+        },
+        "reason_category": "sla_constraint",
+        "reason": "synthetic TTFT exceeds bound"
+      }
+    ],
+    "views": {
+      "top_n": [
+        "candidate-000001"
+      ],
+      "pareto_front": []
+    },
+    "counts": {
+      "evaluated": 2,
+      "feasible": 1,
+      "infeasible": 1
+    }
+  },
+  "expected": {
+    "selected_total": 1,
+    "not_feasible_total": 1,
+    "output_tok_s_per_gpu": 1000,
+    "completed_requests": 6000,
+    "sla_compliant_requests": 5940,
+    "headroom_status": "pass",
+    "headroom_compliant_share": 0.99,
+    "headroom_goodput_share": 0.98,
+    "ladder_status": "qualified"
+  }
+}

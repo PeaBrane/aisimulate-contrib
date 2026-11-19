@@ -1,5 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-FileCopyrightText: Copyright 2023-2024 SGLang Team
 // SPDX-License-Identifier: Apache-2.0
+// Modified behavioral adaptation of SGLang v0.5.20; see THIRD_PARTY_NOTICES.md.
+// Source: https://github.com/sgl-project/sglang/tree/94602c9c2b7cbdb8efd5c52802dac6a1c180089e
+// HiCache residency adapts SGLang v0.5.22 (baa9befa381511cd4d56f83980951e5a45fffc6d); see THIRD_PARTY_NOTICES.md.
+// SWA prefix reuse adapts v0.5.21 (e00930c5489053f26d86b179cee0d087f846acbb); see THIRD_PARTY_NOTICES.md.
 
 //! Radix-tree KV cache for SGLang engine simulation.
 //!
@@ -13,8 +18,11 @@ use rustc_hash::FxHashMap;
 use slotmap::{SlotMap, new_key_type};
 use std::cmp::Reverse;
 use std::collections::BTreeSet;
-use std::sync::Arc;
 use std::time::Instant;
+
+mod hicache;
+use hicache::HostNodes;
+pub(crate) use hicache::HostPrefixMatch;
 
 new_key_type! {
     /// Stable identifier for a tree node inside the [`RadixCache`].
@@ -44,7 +52,6 @@ impl KvPageId {
 /// Manages free / allocated pages for the simulated SGLang KV cache.
 ///
 /// SGLang's paged allocator owns and frees whole pages in production.
-#[derive(Clone)]
 pub struct PagePool {
     next_fresh: usize,
     free: Vec<KvPageId>,
@@ -159,7 +166,6 @@ impl PagePool {
 }
 
 /// A single node in the radix tree.
-#[derive(Clone)]
 pub struct TreeNode {
     /// Children keyed by the first complete page on the child edge.
     pub children: FxHashMap<LocalBlockHash, NodeId>,
@@ -170,15 +176,25 @@ pub struct TreeNode {
     /// page identity so completed radix state does not retain token IDs.
     /// Consequently, as in router-side indexing, hash collisions are treated
     /// as identical pages rather than guarded by an exact-token comparison.
-    /// Admission snapshots share edge contents. Copy only an edge that changes
-    /// while a snapshot is live; normal decode extensions retain their capacity.
-    pub key: Arc<Vec<LocalBlockHash>>,
-    /// One physical page ID per key. Length = `key.len()`.
-    pub value: Arc<Vec<KvPageId>>,
+    pub key: Vec<LocalBlockHash>,
+    /// One physical page ID per key, or empty for a host-only HiCache edge.
+    pub value: Vec<KvPageId>,
     /// Walk-to-root reference count (protected when > 0).
     pub lock_ref: usize,
     /// Monotonic timestamp for LRU eviction.
     pub last_access_time: Instant,
+    /// Bumped whenever this edge's tail changes in place (leaf extension or partial eviction),
+    /// so a [`PrefixMatchHint`] ending at this node is not reused across such a change.
+    edge_version: u64,
+}
+
+/// Where a read-only prefix match fully matched its deepest node, so the same page hashes can be
+/// matched again from that node instead of from the root.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PrefixMatchHint {
+    node: NodeId,
+    edge_version: u64,
+    pages: usize,
 }
 
 /// Radix tree for SGLang KV cache simulation.
@@ -193,6 +209,8 @@ pub struct RadixCache {
     /// and O(1) oldest-victim lookup.
     evictable_leaves: BTreeSet<(Instant, NodeId)>,
     belady: Option<BeladyLeaves>,
+    hicache: Option<HostNodes>,
+    swa: Option<SwaBoundaries>,
     /// Total token count in evictable nodes.
     pub evictable_size: usize,
     /// Total token count in protected (locked) nodes.
@@ -200,7 +218,6 @@ pub struct RadixCache {
 }
 
 /// Optional forecast metadata; physical ownership and leaf eligibility stay in the radix tree.
-#[derive(Clone)]
 struct BeladyLeaves {
     oracle: BeladyOracle,
     cursor: usize,
@@ -210,58 +227,42 @@ struct BeladyLeaves {
     indexed: FxHashMap<NodeId, (SequenceHash, usize)>,
 }
 
-/// Leave the suffix in `edge` and return a compact prefix. When a snapshot
-/// shares the edge, copy each half once instead of cloning before splitting.
-fn split_edge_prefix<T: Clone>(edge: &mut Arc<Vec<T>>, at: usize) -> Vec<T> {
-    if let Some(values) = Arc::get_mut(edge) {
-        let suffix = values.split_off(at);
-        let mut prefix = std::mem::replace(values, suffix);
-        // The short prefix must not retain the original edge's allocation.
-        prefix.shrink_to_fit();
-        prefix
-    } else {
-        let prefix = edge[..at].to_vec();
-        *edge = Arc::new(edge[at..].to_vec());
-        prefix
-    }
+/// DeepSeek-V4 sliding-window prefix reuse, after SGLang v0.5.21
+/// `mem_cache/unified_cache/components/swa.py`. A running request frees its SWA KV behind the
+/// window, so a cached sequence carries SWA only on the pages before the points where it was
+/// inserted, and `create_match_validator` cuts a match back to the last page boundary whose
+/// preceding SWA page is cached. Each marked node ends at such a boundary. At most `max_pages`
+/// marks stay, least recently used first.
+struct SwaBoundaries {
+    /// One SWA page, in cache pages.
+    page_span: usize,
+    max_pages: usize,
+    clock: u64,
+    lru: BTreeSet<(u64, NodeId)>,
+    stamps: FxHashMap<NodeId, u64>,
 }
 
-fn truncate_edge<T: Clone>(edge: &mut Arc<Vec<T>>, len: usize) {
-    if let Some(values) = Arc::get_mut(edge) {
-        values.truncate(len);
-    } else {
-        *edge = Arc::new(edge[..len].to_vec());
-    }
+/// Leave the suffix in `edge` and return a compact prefix.
+fn split_edge_prefix<T>(edge: &mut Vec<T>, at: usize) -> Vec<T> {
+    let suffix = edge.split_off(at);
+    let mut prefix = std::mem::replace(edge, suffix);
+    // The short prefix must not retain the original edge's allocation.
+    prefix.shrink_to_fit();
+    prefix
 }
 
 impl RadixCache {
-    /// Snapshot allocator and radix metadata for a fallible admission transaction.
-    /// This is not a second owner of live request leases; only one cache state may commit.
-    pub(crate) fn admission_checkpoint(&self) -> Self {
-        Self {
-            nodes: self.nodes.clone(),
-            root: self.root,
-            page_pool: self.page_pool.clone(),
-            page_size: self.page_size,
-            #[cfg(test)]
-            test_now: self.test_now,
-            evictable_leaves: self.evictable_leaves.clone(),
-            belady: self.belady.clone(),
-            evictable_size: self.evictable_size,
-            protected_size: self.protected_size,
-        }
-    }
-
     pub fn new(total_tokens: usize, page_size: usize) -> Self {
         assert!(page_size >= 1, "page_size must be >= 1");
         let mut nodes = SlotMap::with_key();
         let root = nodes.insert(TreeNode {
             children: FxHashMap::default(),
             parent: None,
-            key: Arc::default(),
-            value: Arc::default(),
+            key: Vec::new(),
+            value: Vec::new(),
             lock_ref: 0,
             last_access_time: Instant::now(),
+            edge_version: 0,
         });
         Self {
             nodes,
@@ -272,12 +273,177 @@ impl RadixCache {
             test_now: None,
             evictable_leaves: BTreeSet::new(),
             belady: None,
+            hicache: None,
+            swa: None,
             evictable_size: 0,
             protected_size: 0,
         }
     }
 
+    /// Track DeepSeek-V4 SWA reuse on SWA pages of `page_span` cache pages, keeping at most
+    /// `max_pages` of them.
+    pub(crate) fn enable_swa_prefix(&mut self, max_pages: usize, page_span: usize) {
+        assert!(
+            max_pages > 0 && page_span > 0,
+            "SWA page count and span must be positive"
+        );
+        assert_eq!(
+            self.nodes.len(),
+            1,
+            "enable SWA before populating the cache"
+        );
+        self.swa = Some(SwaBoundaries {
+            page_span,
+            max_pages,
+            clock: 0,
+            lru: BTreeSet::new(),
+            stamps: FxHashMap::default(),
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn swa_max_pages(&self) -> usize {
+        self.swa.as_ref().map_or(0, |swa| swa.max_pages)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn swa_window_count(&self) -> usize {
+        self.swa.as_ref().map_or(0, |swa| swa.stamps.len())
+    }
+
+    /// One SWA page in cache pages; 1 without SWA tracking.
+    pub(crate) fn swa_page_span(&self) -> usize {
+        self.swa.as_ref().map_or(1, |swa| swa.page_span)
+    }
+
+    fn is_swa_boundary(&self, id: NodeId) -> bool {
+        self.swa
+            .as_ref()
+            .is_some_and(|swa| swa.stamps.contains_key(&id))
+    }
+
+    /// Pages of a `matched_pages` full-KV match that SWA reuse keeps: up to the deepest fully
+    /// matched node that ends on a cached SWA page. Without SWA tracking, all of them.
+    pub(crate) fn swa_reusable_pages(
+        &self,
+        page_keys: &[LocalBlockHash],
+        matched_pages: usize,
+    ) -> usize {
+        if self.swa.is_none() {
+            return matched_pages;
+        }
+        let (mut current, mut depth, mut reusable) = (self.root, 0, 0);
+        while depth < matched_pages {
+            let Some(&child) = self.nodes[current].children.get(&page_keys[depth]) else {
+                break;
+            };
+            let end = depth + self.nodes[child].key.len();
+            if end > matched_pages {
+                break;
+            }
+            depth = end;
+            current = child;
+            if self.is_swa_boundary(child) {
+                reusable = depth;
+            }
+        }
+        reusable
+    }
+
+    /// Record an insert on the path ending on `tail`, `tail_pages` deep, whose forward ended at
+    /// `end_tokens` (SGLang `cache_unfinished_req`). The request frees its SWA KV below the page
+    /// holding `end_tokens - 1 - page`, so the last whole SWA page before the end stays cached,
+    /// and the one before it too when the end is page-aligned.
+    pub(crate) fn mark_swa_window(&mut self, tail: NodeId, tail_pages: usize, end_tokens: usize) {
+        let Some(span) = self.swa.as_ref().map(|swa| swa.page_span) else {
+            return;
+        };
+        debug_assert_eq!(
+            std::iter::successors(Some(tail), |&id| self.nodes[id].parent)
+                .map(|id| self.nodes[id].key.len())
+                .sum::<usize>(),
+            tail_pages
+        );
+        let page_tokens = span * self.page_size;
+        let end = (end_tokens / page_tokens * span).min(tail_pages / span * span);
+        if end_tokens % page_tokens == 0 && end > span {
+            self.mark_swa_boundary(tail, tail_pages, end - span);
+        }
+        self.mark_swa_boundary(tail, tail_pages, end);
+    }
+
+    /// Mark the end of the first `pages` pages of the path ending on `tail`, `tail_pages` deep,
+    /// splitting the edge there if needed.
+    fn mark_swa_boundary(&mut self, tail: NodeId, tail_pages: usize, pages: usize) {
+        if pages == 0 {
+            return;
+        }
+        let mut current = tail;
+        let mut start = tail_pages - self.nodes[tail].key.len();
+        while pages <= start {
+            current = self.nodes[current]
+                .parent
+                .expect("SWA page lies on the path to its tail");
+            start -= self.nodes[current].key.len();
+        }
+        if pages - start < self.nodes[current].key.len() {
+            current = self.split_node(current, pages - start);
+        }
+        let swa = self.swa.as_mut().expect("SWA tracking is enabled");
+        swa.clock += 1;
+        if let Some(previous) = swa.stamps.insert(current, swa.clock) {
+            swa.lru.remove(&(previous, current));
+        }
+        swa.lru.insert((swa.clock, current));
+        while swa.lru.len() > swa.max_pages {
+            let (_, oldest) = swa.lru.pop_first().expect("over-capacity LRU is non-empty");
+            swa.stamps.remove(&oldest);
+        }
+    }
+
+    /// Refresh the recency of the SWA page a match ended on and of the page before it
+    /// (SGLang `refresh_lru` walks one window and one page up from the match end).
+    pub(crate) fn touch_swa_boundary(&mut self, id: NodeId) {
+        let Some(span) = self.swa.as_ref().map(|swa| swa.page_span) else {
+            return;
+        };
+        let (mut above, mut pages) = (id, 0);
+        while pages < span {
+            let node = &self.nodes[above];
+            let Some(parent) = node.parent else {
+                break;
+            };
+            pages += node.key.len();
+            above = parent;
+        }
+        if pages == span {
+            self.restamp_swa_boundary(above);
+        }
+        self.restamp_swa_boundary(id);
+    }
+
+    fn restamp_swa_boundary(&mut self, id: NodeId) {
+        let swa = self.swa.as_mut().expect("SWA tracking is enabled");
+        let Some(previous) = swa.stamps.get(&id).copied() else {
+            return;
+        };
+        swa.lru.remove(&(previous, id));
+        swa.clock += 1;
+        swa.stamps.insert(id, swa.clock);
+        swa.lru.insert((swa.clock, id));
+    }
+
+    /// The node's end moved or the node left the tree, so its window is gone.
+    fn forget_swa_boundary(&mut self, id: NodeId) {
+        if let Some(swa) = &mut self.swa
+            && let Some(stamp) = swa.stamps.remove(&id)
+        {
+            swa.lru.remove(&(stamp, id));
+        }
+    }
+
     pub(crate) fn set_belady_oracle(&mut self, oracle: BeladyOracle) {
+        assert!(self.hicache.is_none(), "HiCache requires LRU eviction");
         assert_eq!(
             self.nodes.len(),
             1,
@@ -365,7 +531,19 @@ impl RadixCache {
     }
 
     fn is_evictable_leaf(&self, id: NodeId) -> bool {
-        id != self.root && self.nodes[id].lock_ref == 0 && self.is_leaf(id)
+        id != self.root
+            && !self.nodes[id].value.is_empty()
+            && self.nodes[id].lock_ref == 0
+            && self.is_device_leaf(id)
+    }
+
+    fn is_device_leaf(&self, id: NodeId) -> bool {
+        self.nodes[id].children.is_empty()
+            || (self.hicache.is_some()
+                && self.nodes[id]
+                    .children
+                    .values()
+                    .all(|child| self.nodes[*child].value.is_empty()))
     }
 
     fn insert_evictable_leaf(&mut self, id: NodeId) {
@@ -410,18 +588,21 @@ impl RadixCache {
 
     fn touch_node(&mut self, id: NodeId, now: Instant) {
         let was_indexed = self.remove_evictable_leaf(id);
+        self.remove_host_candidate(id);
         self.nodes[id].last_access_time = now;
         if was_indexed {
             self.insert_evictable_leaf(id);
         }
+        self.insert_host_candidate(id);
     }
 
     #[cfg(test)]
     fn debug_assert_evictable_index(&self) {
+        self.assert_host_index();
         let expected = self
             .nodes
             .iter()
-            .filter(|(id, node)| *id != self.root && node.lock_ref == 0 && node.children.is_empty())
+            .filter(|(id, _)| self.is_evictable_leaf(*id))
             .map(|(id, node)| (node.last_access_time, id))
             .collect::<BTreeSet<_>>();
         assert_eq!(
@@ -529,6 +710,10 @@ impl RadixCache {
                 None => break,
             };
 
+            if self.nodes[child_id].value.is_empty() {
+                break;
+            }
+
             if let Some(id) = pending_touch.take() {
                 self.touch_node(id, now);
             }
@@ -543,6 +728,9 @@ impl RadixCache {
 
             if common_len < child_len {
                 if common_len > 0 {
+                    // Refresh the matched child before splitting it, so both the retained
+                    // suffix and the new prefix node it seeds count as just accessed.
+                    self.touch_node(child_id, now);
                     let intermediate = self.split_node(child_id, common_len);
                     current = intermediate;
                 }
@@ -562,7 +750,7 @@ impl RadixCache {
                 self.touch_node(id, now);
             }
         } else if lock_match {
-            // A partial edge match keeps the split node's inherited timestamp.
+            // A split node inherits the timestamp just given to its suffix.
             self.inc_lock_ref(current);
         }
 
@@ -581,9 +769,52 @@ impl RadixCache {
 
     /// Read-only prefix match using page hashes already owned by the request.
     pub(crate) fn prefix_match_hashes_len(&self, page_keys: &[LocalBlockHash]) -> usize {
-        let mut current = self.root;
-        let mut matched_pages: usize = 0;
+        self.prefix_match_hashes_from(self.root, 0, page_keys).0 * self.page_size
+    }
 
+    /// Read-only prefix match that resumes from `hint` when its node is unchanged, and updates
+    /// `hint` for the next call. `hint` must come from a match of the same request's page hashes,
+    /// which only grow, so the prefix it covers is unchanged.
+    ///
+    /// Content on the path to the hinted node can only change by evicting that node (its
+    /// descendants go first) or by changing its own tail in place; splits keep the path intact.
+    /// Matching beyond it walks on as usual, so newly inserted children are still found.
+    pub(crate) fn prefix_match_hashes_len_hinted(
+        &self,
+        page_keys: &[LocalBlockHash],
+        hint: &mut Option<PrefixMatchHint>,
+    ) -> usize {
+        let (start, start_pages) = match *hint {
+            Some(hint)
+                if hint.pages <= page_keys.len()
+                    && self
+                        .nodes
+                        .get(hint.node)
+                        .is_some_and(|node| node.edge_version == hint.edge_version) =>
+            {
+                (hint.node, hint.pages)
+            }
+            _ => (self.root, 0),
+        };
+        let (matched_pages, node, node_pages) =
+            self.prefix_match_hashes_from(start, start_pages, page_keys);
+        *hint = Some(PrefixMatchHint {
+            node,
+            edge_version: self.nodes[node].edge_version,
+            pages: node_pages,
+        });
+        matched_pages * self.page_size
+    }
+
+    /// Match `page_keys[matched_pages..]` below `current`, which fully matches
+    /// `page_keys[..matched_pages]`. Returns the matched page count and the deepest fully matched
+    /// node with its page count.
+    fn prefix_match_hashes_from(
+        &self,
+        mut current: NodeId,
+        mut matched_pages: usize,
+        page_keys: &[LocalBlockHash],
+    ) -> (usize, NodeId, usize) {
         while matched_pages < page_keys.len() {
             let child_id = match self.nodes[current]
                 .children
@@ -595,18 +826,20 @@ impl RadixCache {
             };
 
             let child_key = &self.nodes[child_id].key;
+            if self.nodes[child_id].value.is_empty() {
+                break;
+            }
             let common_len = Self::key_match(child_key, &page_keys[matched_pages..]);
 
             if common_len < child_key.len() {
-                matched_pages += common_len;
-                break;
+                return (matched_pages + common_len, current, matched_pages);
             }
 
             matched_pages += common_len;
             current = child_id;
         }
 
-        matched_pages * self.page_size
+        (matched_pages, current, matched_pages)
     }
 
     /// Insert a token sequence into the tree. Key is page-aligned before insertion.
@@ -718,9 +951,6 @@ impl RadixCache {
             prefix_len <= aligned_len,
             "prefix length {prefix_len} exceeds aligned key length {aligned_len}"
         );
-        if aligned_len == prefix_len {
-            return start_node;
-        }
         let page_keys = self.page_hashes(&key[prefix_len..aligned_len]);
         self.insert_page_hash_suffix(
             start_node,
@@ -743,17 +973,21 @@ impl RadixCache {
             page_keys.len(),
             page_ids.len()
         );
+        // Re-inserting an already cached sequence still refreshes its path.
+        let now = self.now();
+        self.touch_path(start_node, now);
         if page_keys.is_empty() {
             return start_node;
         }
-        let now = self.now();
-        self.touch_path(start_node, now);
 
         let mut current = start_node;
         let mut key_offset = 0;
 
         while key_offset < page_keys.len() {
+            // Extending a window's tail in place would move its end off the window.
             let can_extend_leaf = current != self.root
+                && self.hicache.is_none()
+                && !self.is_swa_boundary(current)
                 && self.nodes[current].children.is_empty()
                 && (self.nodes[current].lock_ref == 0
                     || (allow_locked_tail_extension
@@ -790,14 +1024,27 @@ impl RadixCache {
                     child_key.len(),
                 )
             };
+            // Refresh a partially matched child too, before it is split.
+            self.touch_node(child_id, now);
 
             if common_len == child_len {
+                if self.nodes[child_id].value.is_empty() {
+                    self.restore_device_pages(
+                        child_id,
+                        page_ids[key_offset..key_offset + common_len].to_vec(),
+                    );
+                }
                 key_offset += common_len;
                 current = child_id;
-                self.touch_node(current, now);
             } else {
                 if common_len > 0 {
                     let intermediate = self.split_node(child_id, common_len);
+                    if self.nodes[intermediate].value.is_empty() {
+                        self.restore_device_pages(
+                            intermediate,
+                            page_ids[key_offset..key_offset + common_len].to_vec(),
+                        );
+                    }
                     key_offset += common_len;
                     if key_offset < page_keys.len() {
                         return self.create_child(
@@ -824,6 +1071,22 @@ impl RadixCache {
         }
     }
 
+    /// Make room on `node`'s edge for `pages` more pages if the next insert from it extends the
+    /// edge in place: a non-root leaf that no request but the caller holds (see
+    /// [`Self::insert_page_hash_suffix`]). Pages beyond the reservation still grow amortized. The
+    /// leaf gives unused room back when it gains a child or its last holder unlocks it.
+    pub(crate) fn reserve_leaf_extension(&mut self, node: NodeId, pages: usize) {
+        if node == self.root || self.hicache.is_some() || self.is_swa_boundary(node) {
+            return;
+        }
+        let edge = &mut self.nodes[node];
+        if edge.children.is_empty() && edge.lock_ref <= 1 {
+            // Exact: doubling a long leaf for a short turn only gets shrunk back at unlock.
+            edge.key.reserve_exact(pages);
+            edge.value.reserve_exact(pages);
+        }
+    }
+
     fn extend_leaf(
         &mut self,
         node_id: NodeId,
@@ -837,8 +1100,9 @@ impl RadixCache {
         node.last_access_time = now;
         debug_assert!(node.children.is_empty());
         debug_assert!(node.lock_ref <= 1);
-        Arc::make_mut(&mut node.key).extend_from_slice(key);
-        Arc::make_mut(&mut node.value).extend_from_slice(value);
+        node.key.extend_from_slice(key);
+        node.value.extend_from_slice(value);
+        node.edge_version += 1;
         if node.lock_ref == 0 {
             self.evictable_size += key.len() * self.page_size;
         } else {
@@ -858,7 +1122,11 @@ impl RadixCache {
             let child_parent = child.parent;
             let original_ck = child.key[0];
             let prefix_key = split_edge_prefix(&mut child.key, split_pos);
-            let prefix_value = split_edge_prefix(&mut child.value, split_pos);
+            let prefix_value = if child.value.is_empty() {
+                Vec::new()
+            } else {
+                split_edge_prefix(&mut child.value, split_pos)
+            };
             let suffix_ck = child.key[0];
             (
                 child_parent,
@@ -877,12 +1145,20 @@ impl RadixCache {
         let intermediate = TreeNode {
             children: inter_children,
             parent: child_parent,
-            key: Arc::new(prefix_key),
-            value: Arc::new(prefix_value),
+            key: prefix_key,
+            value: prefix_value,
             lock_ref,
             last_access_time: accessed,
+            edge_version: 0,
         };
         let inter_id = self.nodes.insert(intermediate);
+        if let Some(host) = &mut self.hicache
+            && let Some(mut state) = host.nodes.get(&child_id).cloned()
+        {
+            state.identity = None;
+            state.duplicate_order = None;
+            host.nodes.insert(inter_id, state);
+        }
 
         let child = &mut self.nodes[child_id];
         child.parent = Some(inter_id);
@@ -890,6 +1166,8 @@ impl RadixCache {
         if let Some(parent_id) = child_parent {
             self.nodes[parent_id].children.insert(original_ck, inter_id);
         }
+
+        self.register_host_duplicate(inter_id);
 
         // Both size totals are unchanged: the intermediate and suffix split
         // the original edge without changing its lock state or token count.
@@ -908,17 +1186,24 @@ impl RadixCache {
         let new_node = TreeNode {
             children: FxHashMap::default(),
             parent: Some(parent_id),
-            key: Arc::new(key.to_vec()),
-            value: Arc::new(value.to_vec()),
+            key: key.to_vec(),
+            value: value.to_vec(),
             lock_ref: 0,
             last_access_time: now,
+            edge_version: 0,
         };
         let ck = key[0];
         let new_id = self.nodes.insert(new_node);
 
         self.remove_evictable_leaf(parent_id);
 
-        self.nodes[parent_id].children.insert(ck, new_id);
+        // A leaf that gains a child no longer extends in place; release room reserved for that.
+        let parent = &mut self.nodes[parent_id];
+        if parent.children.is_empty() {
+            parent.key.shrink_to_fit();
+            parent.value.shrink_to_fit();
+        }
+        parent.children.insert(ck, new_id);
 
         self.insert_evictable_leaf(new_id);
         self.evictable_size += key.len() * self.page_size;
@@ -948,11 +1233,12 @@ impl RadixCache {
                 break;
             }
             let was_unlocked = self.nodes[id].lock_ref == 0;
+            self.remove_host_candidate(id);
             if was_unlocked && !(is_terminal && terminal_unindexed) {
                 self.remove_evictable_leaf(id);
             }
             let node = &mut self.nodes[id];
-            let tokens = node.key.len() * self.page_size;
+            let tokens = node.value.len() * self.page_size;
             node.lock_ref += 1;
             if was_unlocked {
                 self.evictable_size -= tokens;
@@ -978,12 +1264,19 @@ impl RadixCache {
             }
             node.lock_ref -= 1;
             if node.lock_ref == 0 {
-                let tokens = node.key.len() * self.page_size;
+                let tokens = node.value.len() * self.page_size;
                 self.protected_size -= tokens;
                 self.evictable_size += tokens;
                 if self.is_leaf(id) {
+                    // Its last holder is gone; release room reserved for that holder's tail.
+                    let leaf = &mut self.nodes[id];
+                    leaf.key.shrink_to_fit();
+                    leaf.value.shrink_to_fit();
+                }
+                if self.is_evictable_leaf(id) {
                     self.insert_evictable_leaf(id);
                 }
+                self.insert_host_candidate(id);
             }
             current = self.nodes[id].parent;
         }
@@ -994,6 +1287,9 @@ impl RadixCache {
     /// Evict eligible leaf pages using the selected policy, rounding to full pages.
     /// Returns `(num_tokens_evicted, evicted_page_ids)`.
     pub fn evict(&mut self, num_tokens: usize) -> (usize, Vec<KvPageId>) {
+        if self.hicache.is_some() {
+            return self.evict_hicache_device(num_tokens);
+        }
         self.sync_belady_priorities();
         let mut evicted = 0;
         let mut evicted_indices =
@@ -1037,7 +1333,8 @@ impl RadixCache {
                 let split_pos = victim_pages - eviction_pages;
                 let (nodes, page_pool) = (&mut self.nodes, &mut self.page_pool);
                 let victim_node = &mut nodes[victim_id];
-                truncate_edge(&mut victim_node.key, split_pos);
+                victim_node.key.truncate(split_pos);
+                victim_node.edge_version += 1;
                 let evicted_values = &victim_node.value[split_pos..];
                 if let Some(belady) = &mut self.belady {
                     for page in evicted_values {
@@ -1046,10 +1343,11 @@ impl RadixCache {
                 }
                 page_pool.free_pages(evicted_values);
                 evicted_indices.extend_from_slice(evicted_values);
-                truncate_edge(&mut victim_node.value, split_pos);
+                victim_node.value.truncate(split_pos);
 
                 self.evictable_size -= eviction_len;
                 evicted += eviction_len;
+                self.forget_swa_boundary(victim_id);
                 self.insert_evictable_leaf(victim_id);
                 continue;
             }
@@ -1058,6 +1356,7 @@ impl RadixCache {
                 .nodes
                 .remove(victim_id)
                 .expect("evictable leaf disappeared before removal");
+            self.forget_swa_boundary(victim_id);
             let tokens = victim_node.key.len() * self.page_size;
             let parent_id = victim_node.parent;
 
@@ -1119,29 +1418,108 @@ mod tests {
         .unwrap()
     }
 
-    #[rstest::rstest]
-    fn belady_reranks_compressed_tail_before_evicting_its_prefix(
-        #[values(false, true)] shared: bool,
-    ) {
+    fn swa_reusable(cache: &RadixCache, tokens: &[u32]) -> usize {
+        cache.swa_reusable_pages(&cache.page_hashes(tokens), cache.prefix_match_len(tokens))
+    }
+
+    /// Insert `tokens` as one forward that ended `past_end` tokens after them.
+    fn insert_with_window(cache: &mut RadixCache, tokens: &[u32], past_end: usize) -> Vec<usize> {
+        let pages = cache.page_pool.allocate(tokens.len()).unwrap();
+        let tail = cache.insert(tokens, &pages);
+        cache.mark_swa_window(tail, tokens.len(), tokens.len() + past_end);
+        pages
+    }
+
+    #[test]
+    fn swa_reuse_ends_on_a_cached_swa_page() {
+        // One-token cache pages, two-token SWA pages.
+        let mut cache = RadixCache::new(32, 1);
+        cache.enable_swa_prefix(8, 2);
+        insert_with_window(&mut cache, &[1, 2, 3, 4, 5, 6, 7], 0);
+
+        assert_eq!(
+            swa_reusable(&cache, &[1, 2, 3, 4, 5, 6, 7, 8]),
+            6,
+            "an unaligned end keeps the last whole SWA page"
+        );
+        assert_eq!(
+            swa_reusable(&cache, &[1, 2, 3, 4, 9]),
+            0,
+            "a fork inside the sequence finds no SWA page"
+        );
+        // A recomputed fork point is a page-aligned insert end: it keeps two SWA pages. It is
+        // reached from the tail of the path it lies on, three pages below it.
+        let (_, tail) = cache.match_prefix(&[1, 2, 3, 4, 5, 6, 7]);
+        cache.mark_swa_window(tail, 7, 4);
+        assert_eq!(swa_reusable(&cache, &[1, 2, 3, 4, 9]), 4);
+        assert_eq!(swa_reusable(&cache, &[1, 2, 3, 9]), 2);
+        assert_eq!(
+            swa_reusable(&cache, &[1, 2, 3, 4, 5, 6, 7, 8]),
+            6,
+            "splitting the edge keeps the later SWA page"
+        );
+    }
+
+    #[test]
+    fn swa_pages_beyond_the_cap_drop_least_recent_first() {
+        let mut cache = RadixCache::new(32, 1);
+        cache.enable_swa_prefix(3, 2);
+        insert_with_window(&mut cache, &[1, 2, 3, 4], 0);
+        insert_with_window(&mut cache, &[5, 6], 1);
+        // Reuse refreshes the SWA page the match ended on and the one before it.
+        let (_, reused) = cache.match_prefix(&[1, 2, 3, 4]);
+        cache.touch_swa_boundary(reused);
+        insert_with_window(&mut cache, &[7, 8], 1);
+
+        assert_eq!(swa_reusable(&cache, &[1, 2, 3, 4, 9]), 4);
+        assert_eq!(swa_reusable(&cache, &[1, 2, 9]), 2);
+        assert_eq!(swa_reusable(&cache, &[5, 6, 9]), 0);
+        assert_eq!(swa_reusable(&cache, &[7, 8, 9]), 2);
+    }
+
+    #[test]
+    fn swa_page_leaves_with_its_tail_and_survives_tail_growth() {
+        let mut cache = RadixCache::new(4, 1);
+        cache.enable_swa_prefix(4, 2);
+        insert_with_window(&mut cache, &[1, 2], 1);
+        cache.evict(1);
+        assert_eq!(cache.prefix_match_len(&[1, 2]), 1);
+        assert_eq!(
+            swa_reusable(&cache, &[1, 2]),
+            0,
+            "trimming moved the tail off the SWA page"
+        );
+
+        let mut cache = RadixCache::new(4, 1);
+        cache.enable_swa_prefix(4, 2);
+        let mut pages = insert_with_window(&mut cache, &[1, 2], 1);
+        let (_, node) = cache.match_prefix(&[1, 2]);
+        cache.inc_lock_ref(node);
+        pages.extend(cache.page_pool.allocate(1).unwrap());
+        cache.insert_from_node(node, 2, &[1, 2, 3], &pages);
+        cache.dec_lock_ref(node);
+        assert_eq!(cache.prefix_match_len(&[1, 2, 3]), 3);
+        assert_eq!(
+            swa_reusable(&cache, &[1, 2, 3]),
+            2,
+            "growth past an SWA page keeps it"
+        );
+    }
+
+    #[test]
+    fn belady_reranks_compressed_tail_before_evicting_its_prefix() {
         let mut cache = RadixCache::new(3, 1);
         cache.set_belady_oracle(oracle_for_prompts(&[&[1], &[3], &[1, 2]]));
         let ab = cache.page_pool.allocate(2).unwrap();
         cache.insert(&[1, 2], &ab);
         let c = cache.page_pool.allocate(1).unwrap();
         cache.insert(&[3], &c);
-        let snapshot = shared.then(|| cache.admission_checkpoint());
 
         let (tokens, pages) = cache.evict(2);
         assert_eq!((tokens, pages), (2, vec![KvPageId(1), KvPageId(2)]));
         assert_eq!(cache.prefix_match_len(&[1, 2]), 1);
         assert_eq!(cache.prefix_match_len(&[3]), 0);
         assert_eq!(cache.available_tokens(), 2);
-        if let Some(mut saved) = snapshot {
-            assert_eq!(saved.prefix_match_len(&[1, 2]), 2);
-            assert_eq!(saved.prefix_match_len(&[3]), 1);
-            assert_eq!(saved.available_tokens(), 0);
-            assert_eq!(saved.evict(2).1, vec![KvPageId(1), KvPageId(2)]);
-        }
     }
 
     #[test]
@@ -1317,31 +1695,50 @@ mod tests {
         assert_eq!(cache.match_prefix(&[1, 2, 3, 4, 5, 6, 7, 8]).0, 8);
     }
 
-    #[rstest::rstest]
-    fn repeated_prefix_splits_keep_retained_capacity_proportional_to_live_pages(
-        #[values(false, true)] shared: bool,
-    ) {
+    #[test]
+    fn hinted_prefix_match_follows_tree_changes() {
+        let query = RadixCache::new(1, 1).page_hashes(&[1, 2, 3, 4, 5, 6]);
+        let check = |cache: &RadixCache, hint: &mut Option<PrefixMatchHint>, expected: usize| {
+            assert_eq!(cache.prefix_match_hashes_len_hinted(&query, hint), expected);
+            assert_eq!(cache.prefix_match_hashes_len(&query), expected);
+        };
+
+        // In-place changes to the hinted leaf's tail.
+        let mut cache = RadixCache::new(100, 1);
+        let mut hint = None;
+        cache.insert(&[1, 2, 3], &[0, 1, 2]);
+        check(&cache, &mut hint, 3);
+        let (_, leaf) = cache.match_prefix(&[1, 2, 3]);
+        cache.insert_from_node(leaf, 3, &[1, 2, 3, 4], &[0, 1, 2, 3]);
+        check(&cache, &mut hint, 4);
+        cache.evict(2);
+        check(&cache, &mut hint, 2);
+        cache.evict(2);
+        check(&cache, &mut hint, 0);
+
+        // A new child below the hinted internal node, then splits above and at the hinted node.
+        let mut cache = RadixCache::new(100, 1);
+        let mut hint = None;
+        cache.insert(&[1, 2, 3, 9], &[0, 1, 2, 3]);
+        cache.insert(&[1, 2, 3, 8], &[0, 1, 2, 4]);
+        check(&cache, &mut hint, 3);
+        cache.insert(&[1, 2, 3, 4, 5], &[0, 1, 2, 5, 6]);
+        check(&cache, &mut hint, 5);
+        cache.insert(&[1, 7], &[0, 7]);
+        check(&cache, &mut hint, 5);
+        cache.insert(&[1, 2, 3, 4, 7], &[0, 1, 2, 5, 8]);
+        check(&cache, &mut hint, 5);
+    }
+
+    #[test]
+    fn repeated_prefix_splits_keep_retained_capacity_proportional_to_live_pages() {
         let mut cache = RadixCache::new(512, 1);
         let tokens: Vec<u32> = (0..512).collect();
         let indices: Vec<usize> = (0..512).collect();
         cache.insert(&tokens, &indices);
 
         for prefix_len in (1..512).step_by(4) {
-            let snapshot = shared.then(|| cache.admission_checkpoint());
-            let saved_edges = snapshot.as_ref().map(|saved| {
-                saved
-                    .nodes
-                    .iter()
-                    .map(|(id, node)| (id, (node.key.to_vec(), node.value.to_vec())))
-                    .collect::<FxHashMap<_, _>>()
-            });
             assert_eq!(cache.match_prefix(&tokens[..prefix_len]).0, prefix_len);
-            if let Some(saved) = snapshot {
-                for (id, (key, pages)) in saved_edges.unwrap() {
-                    assert_eq!(*saved.node(id).key, key);
-                    assert_eq!(*saved.node(id).value, pages);
-                }
-            }
         }
         assert_eq!(cache.match_prefix(&tokens).0, tokens.len());
 
@@ -1391,6 +1788,9 @@ mod tests {
         cache.insert(&[1, 2, 3, 4], &[0, 1, 2, 3]);
         let (_, tail) = cache.match_prefix(&[1, 2, 3, 4]);
         cache.inc_lock_ref(tail);
+        // Its first holder made room to extend it before another request locked it.
+        cache.reserve_leaf_extension(tail, 65_536);
+        assert!(cache.node(tail).key.capacity() > cache.node(tail).key.len());
         cache.inc_lock_ref(tail);
         let nodes_before = cache.num_nodes();
 
@@ -1405,6 +1805,117 @@ mod tests {
         assert_eq!(cache.num_nodes(), nodes_before + 1);
         assert_eq!(*cache.node(tail).key, cache.page_hashes(&[1, 2, 3, 4]));
         assert_eq!(*cache.node(extended).key, cache.page_hashes(&[5, 6, 7, 8]));
+        // With a child the leaf no longer extends in place, so it gives the room back.
+        assert_eq!(cache.node(tail).key.capacity(), cache.node(tail).key.len());
+        assert_eq!(
+            cache.node(tail).value.capacity(),
+            cache.node(tail).value.len()
+        );
+
+        // The other holder finishes with a different output. Both completions stay cached,
+        // but the now-internal prompt edge must not regain the completion reservation.
+        cache.dec_lock_ref(tail);
+        cache.reserve_leaf_extension(tail, 65_536);
+        let other = cache.insert_from_node(
+            tail,
+            4,
+            &[1, 2, 3, 4, 9, 10, 11, 12],
+            &[0, 1, 2, 3, 8, 9, 10, 11],
+        );
+        assert_ne!(other, tail);
+        assert_ne!(other, extended);
+        cache.dec_lock_ref(tail);
+        assert_eq!(cache.protected_size, 0);
+        assert_eq!(cache.evictable_size, 12);
+        assert_eq!(cache.match_prefix(&[1, 2, 3, 4, 5, 6, 7, 8]).0, 8);
+        assert_eq!(cache.match_prefix(&[1, 2, 3, 4, 9, 10, 11, 12]).0, 8);
+        assert_eq!(cache.node(tail).key.capacity(), cache.node(tail).key.len());
+        assert_eq!(
+            cache.node(tail).value.capacity(),
+            cache.node(tail).value.len()
+        );
+    }
+
+    #[test]
+    fn continuing_turn_reserves_only_its_own_pages_on_the_leaf() {
+        let mut cache = RadixCache::new(100, 1);
+        cache.insert(&[1, 2, 3, 4, 5, 6, 7, 8], &[0, 1, 2, 3, 4, 5, 6, 7]);
+        let (_, tail) = cache.match_prefix(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        cache.inc_lock_ref(tail);
+
+        // A session's next turn adds two pages to the eight its last turn left cached.
+        cache.reserve_leaf_extension(tail, 2);
+
+        let node = cache.node(tail);
+        assert_eq!((node.key.capacity(), node.value.capacity()), (10, 10));
+    }
+
+    #[test]
+    fn swa_boundary_does_not_reserve_unusable_tail_capacity() {
+        let mut cache = RadixCache::new(32, 1);
+        cache.enable_swa_prefix(4, 2);
+        let mut pages = insert_with_window(&mut cache, &[1, 2, 3, 4], 0);
+        let (_, tail) = cache.match_prefix(&[1, 2, 3, 4]);
+        assert!(cache.is_swa_boundary(tail));
+        cache.inc_lock_ref(tail);
+        let capacities = (
+            cache.node(tail).key.capacity(),
+            cache.node(tail).value.capacity(),
+        );
+
+        cache.reserve_leaf_extension(tail, 65_536);
+
+        assert_eq!(
+            (
+                cache.node(tail).key.capacity(),
+                cache.node(tail).value.capacity()
+            ),
+            capacities,
+            "an SWA boundary cannot move when the request grows"
+        );
+        pages.extend(cache.page_pool.allocate(2).unwrap());
+        let tokens = [1, 2, 3, 4, 5, 6];
+        let extended = cache.insert_from_node(tail, 4, &tokens, &pages);
+        assert_ne!(extended, tail);
+        assert_eq!(cache.prefix_match_len(&tokens), 6);
+        assert_eq!(swa_reusable(&cache, &tokens), 4);
+        cache.dec_lock_ref(tail);
+        assert_eq!(cache.protected_size, 0);
+        assert_eq!(cache.evictable_size, 6);
+    }
+
+    #[test]
+    fn hicache_leaf_does_not_reserve_unusable_tail_capacity() {
+        let mut cache = RadixCache::new(100, 4);
+        cache.enable_hicache();
+        cache.insert(&[1, 2, 3, 4], &[0, 1, 2, 3]);
+        let (_, tail) = cache.match_prefix(&[1, 2, 3, 4]);
+        cache.inc_lock_ref(tail);
+        let capacities = (
+            cache.node(tail).key.capacity(),
+            cache.node(tail).value.capacity(),
+        );
+
+        cache.reserve_leaf_extension(tail, 65_536);
+
+        assert_eq!(
+            (
+                cache.node(tail).key.capacity(),
+                cache.node(tail).value.capacity()
+            ),
+            capacities,
+            "HiCache inserts create children instead of extending leaf edges"
+        );
+        let extended = cache.insert_from_node(
+            tail,
+            4,
+            &[1, 2, 3, 4, 5, 6, 7, 8],
+            &[0, 1, 2, 3, 4, 5, 6, 7],
+        );
+        assert_ne!(extended, tail);
+        cache.dec_lock_ref(tail);
+        assert_eq!(cache.protected_size, 0);
+        assert_eq!(cache.evictable_size, 8);
     }
 
     #[test]
@@ -1558,10 +2069,125 @@ mod tests {
         assert_eq!(cache.match_prefix(&[4, 5, 6]).0, 3);
     }
 
+    /// An older prompt cached one second before a two-page newer prompt, with the test clock
+    /// one more second later: unless something refreshes it, the older prompt is evicted first.
+    struct OlderAndNewer {
+        cache: RadixCache,
+        older: Vec<u32>,
+        older_indices: Vec<usize>,
+        older_node: NodeId,
+        newer: Vec<u32>,
+        newer_indices: Vec<usize>,
+    }
+
+    impl OlderAndNewer {
+        fn new(page_size: usize, older_pages: usize) -> Self {
+            let page_tokens = page_size as u32;
+            let mut cache = RadixCache::new((older_pages + 2) * page_size, page_size);
+            let older = (0..older_pages as u32 * page_tokens).collect::<Vec<_>>();
+            let newer = (1_000..1_000 + 2 * page_tokens).collect::<Vec<_>>();
+            let base = Instant::now();
+            cache.set_test_now(base);
+            let older_indices = cache.page_pool.allocate(older.len()).unwrap();
+            let older_node = cache.insert(&older, &older_indices);
+            cache.set_test_now(base + std::time::Duration::from_secs(1));
+            let newer_indices = cache.page_pool.allocate(newer.len()).unwrap();
+            cache.insert(&newer, &newer_indices);
+            cache.set_test_now(base + std::time::Duration::from_secs(2));
+            Self {
+                cache,
+                older,
+                older_indices,
+                older_node,
+                newer,
+                newer_indices,
+            }
+        }
+
+        fn assert_newer_is_evicted_first(mut self) {
+            let page_size = self.cache.page_size();
+            let newer_pages = self.cache.page_ids(&self.newer_indices, 2);
+            assert_eq!(
+                self.cache.evict(2 * page_size),
+                (2 * page_size, newer_pages)
+            );
+            assert_eq!(self.cache.prefix_match_len(&self.newer), 0);
+            assert_eq!(self.cache.prefix_match_len(&self.older), self.older.len());
+        }
+    }
+
     #[rstest::rstest]
-    fn partial_eviction_and_parent_promotion_keep_index_consistent(
-        #[values(false, true)] shared: bool,
+    fn partial_match_refreshes_the_suffix_it_splits(
+        #[values(1, 4, 64)] page_size: usize,
+        #[values(false, true)] lock: bool,
     ) {
+        let mut fixture = OlderAndNewer::new(page_size, 4);
+        let prefix = &fixture.older[..2 * page_size];
+        let (matched, node) = if lock {
+            let hashes = fixture.cache.page_hashes(prefix);
+            fixture.cache.match_prefix_hashes_and_lock(&hashes)
+        } else {
+            fixture.cache.match_prefix(prefix)
+        };
+        assert_eq!(matched, prefix.len());
+        if lock {
+            fixture.cache.dec_lock_ref(node);
+        }
+        fixture.assert_newer_is_evicted_first();
+    }
+
+    #[rstest::rstest]
+    fn partial_insert_refreshes_the_suffix_it_splits(
+        #[values(1, 4, 64)] page_size: usize,
+        #[values(false, true)] hashed: bool,
+    ) {
+        let mut fixture = OlderAndNewer::new(page_size, 4);
+        let prefix = &fixture.older[..2 * page_size];
+        let prefix_indices = &fixture.older_indices[..2 * page_size];
+        if hashed {
+            let hashes = fixture.cache.page_hashes(prefix);
+            let pages = fixture.cache.page_ids(prefix_indices, hashes.len());
+            let root = fixture.cache.root();
+            fixture
+                .cache
+                .insert_page_hashes_from_node(root, 0, &hashes, &pages);
+        } else {
+            fixture.cache.insert(prefix, prefix_indices);
+        }
+        fixture.assert_newer_is_evicted_first();
+    }
+
+    #[rstest::rstest]
+    fn reinserting_a_cached_sequence_without_new_pages_refreshes_its_path(
+        #[values(1, 4, 64)] page_size: usize,
+        #[values(false, true)] hashed: bool,
+    ) {
+        // A request holding the older prompt finishes without completing another page, so
+        // the insert that caches its sequence has no suffix to add.
+        let mut fixture = OlderAndNewer::new(page_size, 2);
+        let node = fixture.older_node;
+        fixture.cache.inc_lock_ref(node);
+        let inserted = if hashed {
+            let hashes = fixture.cache.page_hashes(&fixture.older);
+            let pages = fixture.cache.page_ids(&fixture.older_indices, hashes.len());
+            fixture
+                .cache
+                .insert_page_hashes_from_node(node, fixture.older.len(), &hashes, &pages)
+        } else {
+            fixture.cache.insert_from_node(
+                node,
+                fixture.older.len(),
+                &fixture.older,
+                &fixture.older_indices,
+            )
+        };
+        assert_eq!(inserted, node);
+        fixture.cache.dec_lock_ref(node);
+        fixture.assert_newer_is_evicted_first();
+    }
+
+    #[test]
+    fn partial_eviction_and_parent_promotion_keep_index_consistent() {
         let mut cache = RadixCache::new(100, 1);
         let base = Instant::now();
         cache.set_test_now(base);
@@ -1569,7 +2195,6 @@ mod tests {
         let (_, leaf) = cache.match_prefix(&[1, 2, 3, 4]);
         cache.set_test_now(base + std::time::Duration::from_secs(1));
         cache.insert(&[5, 6, 7], &[4, 5, 6]);
-        let snapshot = shared.then(|| cache.admission_checkpoint());
 
         assert_eq!(cache.evict(2).0, 2);
         assert_eq!(cache.node(leaf).key.len(), 2);
@@ -1577,15 +2202,6 @@ mod tests {
         assert_eq!(cache.evict(2).0, 2);
         assert_eq!(cache.match_prefix(&[1, 2, 3, 4]).0, 0);
         assert_eq!(cache.match_prefix(&[5, 6, 7]).0, 3);
-        if let Some(mut saved) = snapshot {
-            assert_eq!(*saved.node(leaf).key, saved.page_hashes(&[1, 2, 3, 4]));
-            assert_eq!(
-                *saved.node(leaf).value,
-                vec![KvPageId(0), KvPageId(1), KvPageId(2), KvPageId(3)]
-            );
-            assert!(saved.evictable_leaf_is_indexed(leaf));
-            assert_eq!(saved.evict(2).1, vec![KvPageId(2), KvPageId(3)]);
-        }
 
         let mut branched = RadixCache::new(100, 1);
         branched.set_test_now(base);

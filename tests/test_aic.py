@@ -3,9 +3,12 @@
 
 from __future__ import annotations
 
+import json
+import re
+
 import pytest
 
-from aisimulate import capacity as aic
+from aisim import capacity as aic
 
 pytestmark = [
     pytest.mark.unit,
@@ -71,7 +74,7 @@ def test_capacity_wrapper_owns_backend_defaults_and_quant_normalization(
         calls.append((args, kwargs))
         return 123
 
-    from aisimulate_core.sdk import memory, perf_database
+    from aisim_core.sdk import memory, perf_database
 
     monkeypatch.setattr(memory, "estimate_num_gpu_blocks", estimate)
     version_calls = []
@@ -212,9 +215,9 @@ def test_materialize_defaults_context_parallel_knobs_to_one(monkeypatch) -> None
 @pytest.mark.parametrize("backend", ["vllm", "sglang", "trtllm"])
 @pytest.mark.parametrize("timing", ["default", "fixed", "polynomial"])
 def test_prediction_omitted_version_uses_current_database_for_capacity(monkeypatch, backend, timing):
-    from aisimulate.compiler import prediction_to_replay_spec
-    from aisimulate.config import CorePredictionConfig
-    from aisimulate_core.sdk import perf_database
+    from aisim.compiler import prediction_to_replay_spec
+    from aisim.config import CorePredictionConfig
+    from aisim_core.sdk import perf_database
 
     expected = perf_database.get_version_slots("h200_sxm", backend)["current"]
     get_database = perf_database.get_database
@@ -253,7 +256,7 @@ def test_prediction_omitted_version_uses_current_database_for_capacity(monkeypat
 
 @pytest.mark.parametrize("version", ["current", "next", "0.24.0", "0.19.0"])
 def test_capacity_preserves_explicit_backend_version(monkeypatch, version):
-    from aisimulate_core.sdk import memory, perf_database
+    from aisim_core.sdk import memory, perf_database
 
     monkeypatch.setattr(
         perf_database,
@@ -283,7 +286,7 @@ def test_capacity_preserves_explicit_backend_version(monkeypatch, version):
 
 
 def test_capacity_without_a_database_fails_before_estimation(monkeypatch):
-    from aisimulate_core.sdk import memory, perf_database
+    from aisim_core.sdk import memory, perf_database
 
     monkeypatch.setattr(perf_database, "get_latest_database_version", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
@@ -300,3 +303,79 @@ def test_capacity_without_a_database_fails_before_estimation(monkeypatch):
             block_size=64,
             max_num_batched_tokens=4096,
         )
+
+
+_WRAPPER = "ExampleForConditionalGeneration"
+
+
+@pytest.mark.parametrize(
+    "document,expected",
+    [
+        ({"architectures": ["NemotronH_Omni_Reasoning_V3"], "llm_config": {"max_position_embeddings": 262144}}, 262144),
+        (
+            {
+                "architectures": [_WRAPPER],
+                "max_position_embeddings": 4096,
+                "llm_config": {"max_position_embeddings": 131072},
+            },
+            131072,
+        ),
+        (
+            {
+                "architectures": [_WRAPPER],
+                "max_position_embeddings": 4096,
+                "text_config": {"max_position_embeddings": 32768},
+            },
+            32768,
+        ),
+        (
+            {
+                "architectures": ["NemotronH_Omni_Reasoning_V3"],
+                "text_config": {"max_position_embeddings": 4096},
+                "llm_config": {"max_position_embeddings": 262144},
+            },
+            262144,
+        ),
+        ({"architectures": [_WRAPPER], "max_position_embeddings": 4096, "llm_config": {"hidden_size": 16}}, 4096),
+        ({"architectures": [_WRAPPER], "max_position_embeddings": 4096, "llm_config": None}, 4096),
+    ],
+    ids=[
+        "llm-config-only",
+        "llm-config-before-wrapper",
+        "text-config-before-wrapper",
+        "registered-wrapper-with-both-keys",
+        "llm-config-without-a-limit",
+        "null-llm-config",
+    ],
+)
+def test_context_length_max_reads_the_decoder_that_fpm_intake_reads(tmp_path, document, expected):
+    (tmp_path / "config.json").write_text(json.dumps(document))
+    assert aic.resolve_model_context_length(str(tmp_path)) == expected
+
+
+@pytest.mark.parametrize(
+    "document,problem",
+    [
+        (
+            {"architectures": ["NemotronH_Omni_Reasoning_V3"], "max_position_embeddings": 4096, "llm_config": None},
+            "llm_config must be a nonempty object describing one text decoder",
+        ),
+        (
+            {"architectures": [_WRAPPER], "max_position_embeddings": 4096, "text_config": None},
+            "text_config must be a nonempty object describing one text decoder",
+        ),
+        (
+            {
+                "architectures": [_WRAPPER],
+                "max_position_embeddings": 4096,
+                "text_config": {"max_position_embeddings": 32768, "llm_config": {"max_position_embeddings": 8192}},
+            },
+            "ambiguous nested llm_config in text_config",
+        ),
+    ],
+    ids=["null-llm-config-of-a-registered-wrapper", "null-text-config", "text-config-nesting-llm-config"],
+)
+def test_context_length_max_refuses_a_malformed_or_nested_decoder(tmp_path, document, problem):
+    (tmp_path / "config.json").write_text(json.dumps(document))
+    with pytest.raises(ValueError, match=re.escape(f"Hugging Face config for {str(tmp_path)!r}: {problem}")):
+        aic.resolve_model_context_length(str(tmp_path))
