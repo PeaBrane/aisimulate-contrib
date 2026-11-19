@@ -53,7 +53,7 @@ impl MemoField {
 /// Mirrors Python's `**kwargs` payload to `op.query(database, ...)`. Each
 /// op variant extracts the fields it needs; non-applicable fields are
 /// safely ignored.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RuntimeContext {
     /// Per-rank batch size for attention queries (context: prefill batch;
     /// generation: decode batch).

@@ -580,6 +580,14 @@ impl MixStepPlan {
     }
 }
 
+/// The ops a DSv4.1 staged walk runs: each stage's children in its place.
+fn stage_children(ops: &[Op]) -> impl Iterator<Item = &Op> {
+    ops.iter().flat_map(|op| match op {
+        Op::Dsv41Stage(stage) => stage.children.as_slice(),
+        _ => std::slice::from_ref(op),
+    })
+}
+
 /// Name slots of a DSv4.1 staged rank walk ([`Engine::dsv41_mixed_workload`]),
 /// which runs each stage's children in its place. Each walk's names are
 /// numbered in visit order, so slots arrive in first-encounter order like a
@@ -607,12 +615,6 @@ impl StageWalkPlan {
     /// tokens: its children then run in no prefill pass, so the names a walk
     /// first encounters depend on its workload and fold by name.
     fn new(context: &[Op], generation: &[Op]) -> Option<Self> {
-        fn children(ops: &[Op]) -> impl Iterator<Item = &Op> {
-            ops.iter().flat_map(|op| match op {
-                Op::Dsv41Stage(stage) => stage.children.as_slice(),
-                _ => std::slice::from_ref(op),
-            })
-        }
         fn slot_of<'a>(
             slots: &mut HashMap<&'a str, usize>,
             names: &mut Vec<String>,
@@ -635,16 +637,16 @@ impl StageWalkPlan {
             return None;
         }
         let (mut slots, mut names) = (HashMap::new(), Vec::new());
-        let generation_slot = children(generation)
+        let generation_slot = stage_children(generation)
             .map(|op| slot_of(&mut slots, &mut names, op))
             .collect();
         let generation_names = names.into();
         let (mut slots, mut names) = (HashMap::new(), Vec::new());
-        let context_slot = children(context)
+        let context_slot = stage_children(context)
             .map(|op| slot_of(&mut slots, &mut names, op))
             .collect();
         let context_names = names.as_slice().into();
-        let decode_attention_slot = children(generation)
+        let decode_attention_slot = stage_children(generation)
             .filter(|op| op.is_generation_attention())
             .map(|op| slot_of(&mut slots, &mut names, op))
             .collect();
@@ -675,6 +677,85 @@ impl StageWalkPlan {
             (true, _) => &self.context_slot,
         };
         slots.get(child).copied()
+    }
+}
+
+/// Query slots of the children one DSv4.1 staged walk pass runs, in visit
+/// order: `==` ops share a slot. A model repeats a few distinct children
+/// across its layers, and equal ops price alike at an equal runtime context.
+#[derive(Debug)]
+struct ChildQuerySlots {
+    of_child: Vec<usize>,
+    count: usize,
+}
+
+impl ChildQuerySlots {
+    fn new<'a>(children: impl Iterator<Item = &'a Op>) -> Self {
+        let mut distinct = Vec::<&Op>::new();
+        let of_child = children
+            .map(|op| {
+                distinct
+                    .iter()
+                    .position(|seen| *seen == op)
+                    .unwrap_or_else(|| {
+                        distinct.push(op);
+                        distinct.len() - 1
+                    })
+            })
+            .collect();
+        Self {
+            of_child,
+            count: distinct.len(),
+        }
+    }
+}
+
+/// Results of one staged walk pass by [`ChildQuerySlots`] slot. A
+/// context-attention child has one entry per prefill scope (`lane`). Each
+/// entry keeps the runtime context it was priced at and is lent only at an
+/// equal one, so a stage that scopes its prefills differently prices anew.
+struct StageQueryMemo<'p> {
+    slots: &'p ChildQuerySlots,
+    lanes: usize,
+    results: Vec<Option<(RuntimeContext, PerformanceResult)>>,
+}
+
+impl<'p> StageQueryMemo<'p> {
+    fn new(slots: &'p ChildQuerySlots, lanes: usize) -> Self {
+        Self {
+            slots,
+            lanes,
+            results: vec![None; slots.count * lanes],
+        }
+    }
+
+    /// `query`'s result for the `child` at `runtime`.
+    fn query(
+        &mut self,
+        child: usize,
+        lane: usize,
+        runtime: &RuntimeContext,
+        query: impl FnOnce() -> Result<PerformanceResult, AicError>,
+    ) -> Result<&PerformanceResult, AicError> {
+        let slot = self.slots.of_child[child];
+        let entry = &mut self.results[slot * self.lanes + lane];
+        entry.take_if(|(priced_at, _)| priced_at != runtime);
+        let (_, result) = match entry {
+            Some(lent) => {
+                #[cfg(debug_assertions)]
+                {
+                    let repriced = query();
+                    assert!(
+                        repriced.as_ref().is_ok_and(|repriced| repriced == &lent.1),
+                        "child {child} shares query slot {slot} but prices as {repriced:?}, not {:?}",
+                        lent.1
+                    );
+                }
+                &*lent
+            }
+            empty => &*empty.insert((*runtime, query()?)),
+        };
+        Ok(result)
     }
 }
 
@@ -984,6 +1065,9 @@ pub struct Engine {
     mix_plan: MixStepPlan,
     /// Name slots of a DSv4.1 staged rank walk, when its names are fixed.
     stage_plan: Option<StageWalkPlan>,
+    /// Query slots of a DSv4.1 staged walk's three passes; built on first
+    /// use. See [`Self::dsv41_mixed_workload`].
+    stage_queries: OnceLock<[ChildQuerySlots; 3]>,
     /// Ranks priced without diagnostics or lookup coverage, by workload;
     /// allocated on first use. See [`Self::rank_pricing`].
     rank_memo: OnceLock<Memo<RankKey, Arc<RankPricing>>>,
@@ -1163,6 +1247,7 @@ impl Engine {
             spec_sha256,
             mix_plan: MixStepPlan::new(&spec.context_ops, &spec.generation_ops),
             stage_plan: StageWalkPlan::new(&spec.context_ops, &spec.generation_ops),
+            stage_queries: OnceLock::new(),
             rank_memo: OnceLock::new(),
             op_memo: OnceLock::new(),
             shared_names: Mutex::default(),
@@ -2427,7 +2512,7 @@ impl Engine {
                 isl.saturating_add(osl / 2).saturating_add(1),
                 seq_imbalance_correction_scale,
                 gen_seq_imbalance_correction_scale,
-                |pass, _, op, _, result| on_op(pass, op, result),
+                |pass, _, op, _, result| on_op(pass, op, result.clone()),
             );
         }
         // Python divides by `isl` (`floor(ctx/isl)`, `ceil(ctx/isl)`) without
@@ -2564,7 +2649,9 @@ impl Engine {
     /// decode tokens and other requests' tails. The tuple is (batch, new, prefix).
     /// `on_op` takes each executed child with its position in its op list,
     /// each stage counting as its children; decode attention after a prefill
-    /// counts only attention children.
+    /// counts only attention children. Each pass prices equal children once
+    /// per runtime context ([`StageQueryMemo`]); every child still reports
+    /// and adds its own value in op order.
     #[allow(clippy::too_many_arguments)]
     fn dsv41_mixed_workload(
         &self,
@@ -2573,13 +2660,24 @@ impl Engine {
         decode_kv: u32,
         context_scale: f64,
         generation_scale: f64,
-        mut on_op: impl FnMut(MixedPass, usize, &Op, &RuntimeContext, PerformanceResult),
+        mut on_op: impl FnMut(MixedPass, usize, &Op, &RuntimeContext, &PerformanceResult),
     ) -> Result<[f64; 4], AicError> {
+        // Query slots of each pass's children: decode-only, prefill, decode
+        // attention after a prefill.
+        let [generation, context, decode_attention] = self.stage_queries.get_or_init(|| {
+            let generation = || stage_children(&self.generation_ops);
+            [
+                ChildQuerySlots::new(generation()),
+                ChildQuerySlots::new(stage_children(&self.context_ops)),
+                ChildQuerySlots::new(generation().filter(|op| op.is_generation_attention())),
+            ]
+        });
         let mut totals = [0.0; 4];
         if prefills.is_empty() {
             if decode_batch > 0 {
                 // Generation can fuse or overlap children differently from
                 // prefill. Preserve that graph when no prefill is scheduled.
+                let mut memo = StageQueryMemo::new(generation, 1);
                 let mut index = 0;
                 for outer in &self.generation_ops {
                     let children: &[Op] = match outer {
@@ -2595,7 +2693,8 @@ impl Engine {
                             0,
                             None,
                         );
-                        let result = child.query(&self.db, &runtime)?;
+                        let result =
+                            memo.query(index, 0, &runtime, || child.query(&self.db, &runtime))?;
                         let (bucket, pass) = if child.is_generation_attention() {
                             (3, MixedPass::DecodeAttention)
                         } else {
@@ -2611,6 +2710,7 @@ impl Engine {
             return Ok(totals);
         }
         let prefill_requests: u32 = prefills.iter().map(|(batch, _, _)| batch).sum();
+        let mut memo = StageQueryMemo::new(context, prefills.len());
         let mut index = 0;
         for outer in &self.context_ops {
             let (stage, children): (_, &[Op]) = match outer {
@@ -2636,13 +2736,14 @@ impl Engine {
                 })?;
             for child in children {
                 if child.is_context_attention() {
-                    for &(batch, s, prefix) in &scopes {
+                    for (lane, &(batch, s, prefix)) in scopes.iter().enumerate() {
                         if batch == 0 || s == 0 {
                             continue;
                         }
                         let runtime =
                             context_op_runtime(child, batch, s, prefix, context_scale, None);
-                        let result = child.query(&self.db, &runtime)?;
+                        let result =
+                            memo.query(index, lane, &runtime, || child.query(&self.db, &runtime))?;
                         totals[2] += result.latency_ms;
                         on_op(MixedPass::ContextAttention, index, child, &runtime, result);
                     }
@@ -2653,7 +2754,8 @@ impl Engine {
                         tokens
                     };
                     let runtime = context_op_runtime(child, 1, tokens, 0, context_scale, Some(x));
-                    let result = child.query(&self.db, &runtime)?;
+                    let result =
+                        memo.query(index, 0, &runtime, || child.query(&self.db, &runtime))?;
                     totals[1] += result.latency_ms;
                     on_op(
                         MixedPass::SharedNonAttention,
@@ -2667,6 +2769,7 @@ impl Engine {
             }
         }
         if decode_batch > 0 {
+            let mut memo = StageQueryMemo::new(decode_attention, 1);
             let mut index = 0;
             for outer in &self.generation_ops {
                 let children: &[Op] = match outer {
@@ -2682,7 +2785,8 @@ impl Engine {
                         0,
                         None,
                     );
-                    let result = child.query(&self.db, &runtime)?;
+                    let result =
+                        memo.query(index, 0, &runtime, || child.query(&self.db, &runtime))?;
                     totals[3] += result.latency_ms;
                     on_op(MixedPass::DecodeAttention, index, child, &runtime, result);
                     index += 1;
@@ -4022,7 +4126,8 @@ impl Engine {
                             "generation"
                         };
                         let slot = plan.and_then(|plan| plan.slot(has_prefill, pass, child));
-                        operations.add(phase, slot, op, result, 1.0, || *runtime);
+                        let result = Cow::Borrowed(result);
+                        operations.add_lent(phase, slot, op, result, 1.0, || *runtime);
                     },
                 )
                 .map(|parts| parts[0]);
