@@ -14,6 +14,7 @@ from __future__ import annotations
 import pytest
 
 from aisimulate_core.sdk import common, config
+from aisimulate_core.sdk.afd_partition import build_afd_ops_partition
 from aisimulate_core.sdk.models import get_model
 
 pytestmark = pytest.mark.unit
@@ -111,3 +112,43 @@ def test_moe_prefill_projects_to_the_decode_vocab_shard(model_path, backend, par
     # per prefill forward pass (not per layer).
     assert context_shape == generation_shape
     assert context_scale == 1.0
+    context_logits = next(op for op in model.context_ops if op._name == "context_logits_gemm")
+    generation_logits = next(op for op in model.generation_ops if op._name == "generation_logits_gemm")
+    assert context_logits._seq_split == parallel.get("cp_size", 1)
+    assert generation_logits._seq_split == 1
+
+
+@pytest.mark.parametrize("backend", ["trtllm", "vllm", "sglang"])
+def test_moe_resident_weights_include_the_bf16_lm_head_shard(backend):
+    model = get_model(
+        "Qwen/Qwen3-235B-A22B",
+        config.ModelConfig(tp_size=2, moe_tp_size=1, moe_ep_size=2, **_BF16),
+        backend,
+    )
+
+    logits = next(op for op in model.context_ops if op._name == "context_logits_gemm")
+    expected_head_bytes = (151936 // 2) * 4096 * 2
+    other_weights = sum(op.get_weights() for op in model.context_ops if op is not logits)
+
+    assert logits.get_weights() == expected_head_bytes
+    # This inventory is the resident-weight input to KV-capacity accounting.
+    assert model.get_resident_weights_bytes() == other_weights + expected_head_bytes
+
+
+@pytest.mark.parametrize("boundary_on_attn", [True, False])
+def test_moe_context_logits_stays_on_the_afd_boundary(boundary_on_attn):
+    model = get_model(
+        "Qwen/Qwen3-30B-A3B",
+        config.ModelConfig(tp_size=2, moe_tp_size=1, moe_ep_size=2, **_BF16),
+        "sglang",
+    )
+    logits = next(op for op in model.context_ops if op._name == "context_logits_gemm")
+
+    partition = build_afd_ops_partition(model, phase="context", boundary_on_attn=boundary_on_attn)
+
+    assert logits in partition.boundary_ops
+    selected_ops = partition.attn_ops if boundary_on_attn else partition.ffn_ops
+    other_ops = partition.ffn_ops if boundary_on_attn else partition.attn_ops
+    assert sum(op is logits for op in selected_ops) == 1
+    assert logits not in other_ops
+    assert logits not in partition.skipped_ops
