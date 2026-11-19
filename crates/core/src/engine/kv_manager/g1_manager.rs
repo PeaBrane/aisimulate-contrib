@@ -22,6 +22,7 @@ use crate::engine::belady::BeladyOracle;
 use crate::engine::common::protocols::{KvEventPublishers, PrefillCost};
 use crate::engine::common::sequence::RequestSequence;
 
+use super::grouped_prefix::{AdmissionLimits, GroupedPrefixRules};
 use super::vllm_backend::{
     BlockRequestLease, DecodeBlockReservation as VllmDecodeBlockReservation,
     DestinationReservation as VllmDestinationReservation,
@@ -90,6 +91,24 @@ impl G1Manager {
         self.inner.grouped()
     }
 
+    pub(crate) fn set_grouped_prefix_rules(
+        &mut self,
+        rules: GroupedPrefixRules,
+        limits: AdmissionLimits,
+    ) {
+        self.inner.set_grouped_prefix_rules(rules, limits);
+    }
+
+    /// The rule table of a grouped cache with prefix caching on.
+    pub(crate) fn grouped_prefix_rules(&self) -> Option<&GroupedPrefixRules> {
+        self.inner.grouped_prefix_rules()
+    }
+
+    /// The whole-prompt blocks of `known_tokens` without a prefix hit.
+    pub(crate) fn grouped_cold_admission_blocks(&self, known_tokens: usize) -> usize {
+        self.inner.grouped_cold_admission_blocks(known_tokens)
+    }
+
     pub(crate) fn set_belady_oracle(&mut self, oracle: BeladyOracle) {
         self.inner.set_belady_oracle(oracle);
     }
@@ -154,6 +173,10 @@ impl G1Manager {
 
     pub(crate) fn begin_step(&mut self) {
         self.inner.begin_step();
+    }
+
+    pub(crate) fn release_grouped_copy_sources(&mut self) {
+        self.inner.release_grouped_copy_sources();
     }
 
     pub(crate) fn accepts_sequence_length(&self, tokens: usize) -> bool {
@@ -313,6 +336,17 @@ impl G1Manager {
 
     pub(crate) fn finish_native(&mut self, owner: Uuid, lease: BlockRequestLease) {
         self.inner.finish_lease(owner, lease);
+    }
+
+    /// The prefill cost of a request that `schedule_request` prices itself. A
+    /// grouped prefix cache keeps the hit on the lease for the allocation, so
+    /// it is searched once.
+    pub(crate) fn lookup_native_prefill_cost(
+        &self,
+        sequence: &RequestSequence,
+        lease: &mut BlockRequestLease,
+    ) -> PrefillCost {
+        self.inner.lookup_lease_prefill_cost(sequence, lease)
     }
 
     pub(crate) fn get_native_prefill_cost(

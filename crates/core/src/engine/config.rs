@@ -6,18 +6,23 @@
 // Modified native port of heterogeneous AFD/fabric behavior; source revision and
 // original paths: root THIRD_PARTY_NOTICES.md (AISimulate heterogeneous AFD).
 // Source: https://github.com/LPhgh/aisimulate/tree/af56328c4ba7ffa1b8c42c8375244568c2e7bb8c
+// Copyright contributors to the vLLM project.
+// Modified Rust simulation of the vLLM v0.31.0
+// (db9527a46873454610df6dbedf79a36d6bf1a7f6) and v0.32.0
+// (5df63a7203cdb9328d824a27b682e77c7b9928be) grouped KV rules.
+// Immutable sources and license: THIRD_PARTY_NOTICES.md.
 
 //! Serializable engine configuration.
 
 use std::sync::Arc;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::engine::common::speculative::normalize_conditional_accept_rates;
 use crate::engine::handoff::TransferTimingMode;
 use crate::engine::host_offload::HostPolicy;
-use crate::engine::kv_manager::SourceReleaseOrder;
+use crate::engine::kv_manager::{GroupedPrefixRules, SourceReleaseOrder, VllmRuleVersion};
 use crate::engine::timing::{TimingModel, TimingModelConfig, built_in_timing_model};
 use crate::perfmodel::FpmCacheGroup;
 
@@ -1162,6 +1167,11 @@ pub struct EngineConfig {
     /// Shared physical budget for `kv_cache_groups`, including page padding.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kv_cache_capacity_bytes: Option<u64>,
+    /// vLLM release whose grouped-cache rules this rank follows. A rank with
+    /// `kv_cache_groups` and `enable_prefix_caching` must set it to `0.31.0`
+    /// or `0.32.0`. A grouped rank with prefix caching off does not read it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vllm_version: Option<String>,
     /// Optional framework-native host-offload simulation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub native_host_offload: Option<NativeHostOffloadConfig>,
@@ -1271,6 +1281,8 @@ struct EngineConfigWire {
     #[serde(default)]
     kv_cache_capacity_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    vllm_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     native_host_offload: Option<NativeHostOffloadConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     state_cache: Option<StateCacheConfig>,
@@ -1345,6 +1357,7 @@ impl<'de> Deserialize<'de> for EngineConfig {
             kv_cache_bytes_per_token: wire.kv_cache_bytes_per_token,
             kv_cache_groups: wire.kv_cache_groups,
             kv_cache_capacity_bytes: wire.kv_cache_capacity_bytes,
+            vllm_version: wire.vllm_version,
             native_host_offload: wire.native_host_offload,
             g3_offload: wire.g3_offload,
             kvcr: wire.kvcr,
@@ -1396,6 +1409,7 @@ impl Default for EngineConfig {
             kv_cache_bytes_per_token: None,
             kv_cache_groups: Vec::new(),
             kv_cache_capacity_bytes: None,
+            vllm_version: None,
             native_host_offload: None,
             g3_offload: None,
             kvcr: None,
@@ -1522,15 +1536,87 @@ impl EngineConfig {
         }
     }
 
+    /// The grouped prefix-caching gate. Every group declares whether it
+    /// caches, the pool has one page size, the hash unit and the vLLM
+    /// version are set, the rule table accepts the groups, and the pool
+    /// holds the full prompt of `max_model_len` plus the state blocks of one
+    /// request, summed per group as vLLM's startup check does (v0.31
+    /// `kv_cache_utils.py:938-942`, v0.32 `:1043-1047`). The preemption order
+    /// is vLLM's: under the `fcfs` policy the victim is the last running
+    /// request (v0.31 `scheduler.py:771`, `:803`, v0.32 `:802`, `:834`), and
+    /// no vLLM policy takes the first running request by position.
+    fn validate_grouped_prefix_caching(&self) -> Result<()> {
+        ensure!(
+            self.preemption_mode == PreemptionMode::Lifo,
+            "kv_cache_groups with enable_prefix_caching=true follow vLLM's preemption order, which preempts the last running request; set preemption_mode=lifo"
+        );
+        let groups = &self.kv_cache_groups;
+        ensure!(
+            groups.iter().all(|group| group.prefix_cacheable.is_some()),
+            "kv_cache_groups with enable_prefix_caching=true require every group to declare prefix_cacheable"
+        );
+        ensure!(
+            groups
+                .iter()
+                .any(|group| group.prefix_cacheable == Some(true)),
+            "kv_cache_groups with enable_prefix_caching=true require at least one prefix_cacheable group"
+        );
+        let page_size_bytes = groups[0].page_size_bytes;
+        ensure!(
+            groups
+                .iter()
+                .all(|group| group.page_size_bytes == page_size_bytes),
+            "kv_cache_groups with enable_prefix_caching=true require equal page_size_bytes across groups"
+        );
+        let Some(unit) = self.prefix_match_unit else {
+            bail!("kv_cache_groups with enable_prefix_caching=true require prefix_match_unit");
+        };
+        let Some(version) = self
+            .vllm_version
+            .as_deref()
+            .and_then(VllmRuleVersion::parse)
+        else {
+            bail!(
+                "kv_cache_groups with enable_prefix_caching=true require vllm_version 0.31.0 or 0.32.0"
+            );
+        };
+        let rules = GroupedPrefixRules::new(groups, unit, version)?;
+        // vLLM always sizes the pool with a model length.
+        let Some(max_model_len) = self.max_model_len else {
+            bail!("kv_cache_groups with enable_prefix_caching=true require max_model_len");
+        };
+        let capacity_blocks = self
+            .kv_cache_capacity_bytes
+            .expect("validated grouped cache capacity")
+            / page_size_bytes;
+        let max_in_flight_tokens = self
+            .max_concurrent_batches()
+            .saturating_mul(self.max_num_batched_tokens);
+        ensure!(
+            capacity_blocks >= rules.startup_blocks(max_model_len, max_in_flight_tokens) as u64,
+            "kv_cache_groups with enable_prefix_caching=true need capacity for the full prompt of max_model_len plus the state blocks of one request"
+        );
+        Ok(())
+    }
+
     fn validate_state_cache(&self) -> Result<()> {
         if let Some(unit) = self.prefix_match_unit {
+            // A grouped cache hashes at the unit itself. The grouped gate
+            // checks it against the group blocks.
             ensure!(
-                unit > 0 && self.block_size > 0 && self.block_size.is_multiple_of(unit),
+                unit > 0
+                    && (!self.kv_cache_groups.is_empty()
+                        || (self.block_size > 0 && self.block_size.is_multiple_of(unit))),
                 "prefix_match_unit must be a positive divisor of block_size"
             );
             ensure!(
-                self.state_cache.is_some(),
-                "prefix_match_unit currently requires state_cache"
+                self.state_cache.is_some() || !self.kv_cache_groups.is_empty(),
+                "prefix_match_unit currently requires state_cache or kv_cache_groups"
+            );
+            // Only grouped prefix caching reads the unit, as in Python.
+            ensure!(
+                self.kv_cache_groups.is_empty() || self.enable_prefix_caching,
+                "prefix_match_unit on kv_cache_groups requires enable_prefix_caching=true"
             );
             ensure!(
                 !self.emit_kv_events,
@@ -1833,14 +1919,14 @@ impl EngineConfig {
                 self.kv_cache_capacity_bytes.is_none(),
                 "kv_cache_capacity_bytes requires kv_cache_groups"
             );
+            ensure!(
+                self.vllm_version.is_none(),
+                "vllm_version requires kv_cache_groups"
+            );
         } else {
             ensure!(
                 self.backend == Backend::Vllm && self.worker_type == WorkerType::Aggregated,
                 "kv_cache_groups currently require backend=vllm and worker_type=aggregated"
-            );
-            ensure!(
-                !self.enable_prefix_caching,
-                "kv_cache_groups currently require enable_prefix_caching=false"
             );
             ensure!(
                 self.native_host_offload.is_none() && self.g3_offload.is_none(),
@@ -1869,6 +1955,9 @@ impl EngineConfig {
             for group in &self.kv_cache_groups {
                 group.validate()?;
                 ensure!(names.insert(&group.name), "duplicate KV cache group name");
+            }
+            if self.enable_prefix_caching {
+                self.validate_grouped_prefix_caching()?;
             }
         }
         if let Some(g3) = &self.g3_offload {
@@ -2676,7 +2765,7 @@ mod tests {
             (
                 "enable_prefix_caching",
                 serde_json::json!(true),
-                "enable_prefix_caching=false",
+                "declare prefix_cacheable",
             ),
             ("aic_nextn", serde_json::json!(1), "speculative"),
             ("emit_kv_events", serde_json::json!(true), "KV event"),
@@ -2790,6 +2879,362 @@ mod tests {
             mutate(&mut config);
             let error = config.validate().unwrap_err().to_string();
             assert!(error.contains(expected), "{expected}: {error}");
+        }
+    }
+
+    const GLM_PAGE: u64 = 13_045_120;
+
+    /// Six GLM-5.3-Flash TP 4 cache groups as a hand-made profile of vLLM
+    /// 0.31.0 or 0.32.0, the versions that the rule table holds. Their kinds
+    /// and blocks are those that the vLLM 0.33.0 runtime probe records
+    /// (fixture `glm53flash_vllm_0330_probe`): MLA attention and four KDA
+    /// `MambaSpec` states with 2,176-token blocks, and a 4-token
+    /// `CircularBufferSpec` ring. The layer counts and the one page size are
+    /// hand-made. `checkpoint` is the `prefill_checkpoint_blocks` of G2 to
+    /// G5, with alignment 16 for 1.
+    /// The page is the sum of the pages of the attention layers, 13,045,120 bytes,
+    /// the block row of vLLM 0.31.0. vLLM 0.32.0 rounds the row up to the least
+    /// common multiple of the block-stride alignments of all layers (v0.32.0
+    /// `vllm/v1/core/kv_cache_utils.py:1533-1551`): 13,516,800 bytes for this
+    /// model at TP 4 on GB300, 25 times the least common multiple of the
+    /// 16,384-byte alignment of the MLA layers and the 4,224-byte alignment of the
+    /// indexer layers. The fixture keeps the page of the attention layers. The
+    /// tests count blocks and tokens, which do not depend on the page, and their
+    /// pool byte values are multiples of this page, not the pool of a vLLM 0.32.0
+    /// deployment.
+    fn glm_groups_wire(checkpoint: Option<u32>) -> serde_json::Value {
+        let mut groups = vec![
+            serde_json::json!({
+                "name": "mla", "kind": "attention", "num_layers": 22,
+                "block_size_tokens": 2176, "page_size_bytes": GLM_PAGE,
+                "prefix_cacheable": true
+            }),
+            serde_json::json!({
+                "name": "kpool_tail", "kind": "state", "num_layers": 11,
+                "block_size_tokens": 4, "page_size_bytes": GLM_PAGE,
+                "blocks_per_request": 1, "prefix_cacheable": false
+            }),
+        ];
+        for i in 0..4 {
+            let mut group = serde_json::json!({
+                "name": format!("kda_{i}"), "kind": "state", "num_layers": 4,
+                "block_size_tokens": 2176, "page_size_bytes": GLM_PAGE,
+                "blocks_per_request": 1, "prefix_cacheable": true
+            });
+            if let Some(blocks) = checkpoint {
+                group["prefill_checkpoint_blocks"] = blocks.into();
+                if blocks == 1 {
+                    group["prefill_checkpoint_alignment"] = 16.into();
+                }
+            }
+            groups.push(group);
+        }
+        serde_json::Value::Array(groups)
+    }
+
+    fn glm_prefix_wire(version: Option<&str>, checkpoint: Option<u32>) -> serde_json::Value {
+        let mut wire = serde_json::json!({
+            "backend": "vllm",
+            "enable_prefix_caching": true,
+            "prefix_match_unit": 2176,
+            "max_model_len": 131_072,
+            "kv_cache_capacity_bytes": 74 * GLM_PAGE,
+            "kv_cache_groups": glm_groups_wire(checkpoint),
+        });
+        if let Some(version) = version {
+            wire["vllm_version"] = version.into();
+        }
+        wire
+    }
+
+    fn validation_error(wire: serde_json::Value) -> String {
+        let config: EngineConfig = serde_json::from_value(wire).unwrap();
+        config.validate().unwrap_err().to_string()
+    }
+
+    fn validates(wire: serde_json::Value) {
+        let config: EngineConfig = serde_json::from_value(wire).unwrap();
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn grouped_prefix_caching_validates_its_geometry() {
+        validates(glm_prefix_wire(Some("0.31.0"), None));
+        validates(glm_prefix_wire(Some("0.31.0"), Some(0)));
+        let round_trip: EngineConfig =
+            serde_json::from_value(glm_prefix_wire(Some("0.31.0"), None)).unwrap();
+        assert_eq!(round_trip.vllm_version.as_deref(), Some("0.31.0"));
+        let encoded = serde_json::to_value(&round_trip).unwrap();
+        assert_eq!(encoded["vllm_version"], "0.31.0");
+        assert_eq!(
+            serde_json::from_value::<EngineConfig>(encoded).unwrap(),
+            round_trip
+        );
+
+        // The version rules.
+        assert!(
+            validation_error(glm_prefix_wire(None, None))
+                .contains("require vllm_version 0.31.0 or 0.32.0")
+        );
+        assert!(
+            validation_error(glm_prefix_wire(Some("0.30.0"), None))
+                .contains("require vllm_version 0.31.0 or 0.32.0")
+        );
+        // The rule table models no vLLM 0.33.0 profile.
+        assert!(
+            validation_error(glm_prefix_wire(Some("0.33.0"), None))
+                .contains("require vllm_version 0.31.0 or 0.32.0")
+        );
+        validates(glm_prefix_wire(Some("0.32.0"), Some(0)));
+        assert!(
+            validation_error(glm_prefix_wire(Some("0.32.0"), None))
+                .contains("set the field (0 or 1) on each such group")
+        );
+        validates(glm_prefix_wire(Some("0.32.0"), Some(1)));
+        assert!(
+            validation_error(glm_prefix_wire(Some("0.31.0"), Some(1))).contains("do not model")
+        );
+
+        // The capacity rule: cdiv(131072, 2176) + (2 + checkpoint) * 4 + 1.
+        for (version, checkpoint, bound) in [("0.31.0", Some(0), 70), ("0.32.0", Some(1), 74)] {
+            let mut wire = glm_prefix_wire(Some(version), checkpoint);
+            wire["kv_cache_capacity_bytes"] = ((bound - 1) * GLM_PAGE).into();
+            assert!(
+                validation_error(wire.clone()).contains("need capacity for the full prompt"),
+                "{version} at {} blocks",
+                bound - 1
+            );
+            wire["kv_cache_capacity_bytes"] = (bound * GLM_PAGE).into();
+            validates(wire);
+        }
+        let mut small = glm_prefix_wire(Some("0.31.0"), None);
+        small["kv_cache_capacity_bytes"] = (10 * GLM_PAGE).into();
+        assert!(validation_error(small).contains("need capacity for the full prompt"));
+        let mut unbounded = glm_prefix_wire(Some("0.31.0"), None);
+        unbounded.as_object_mut().unwrap().remove("max_model_len");
+        assert!(validation_error(unbounded).contains("require max_model_len"));
+
+        // The geometry rules, in gate order.
+        let mut undeclared = glm_prefix_wire(Some("0.31.0"), None);
+        undeclared["kv_cache_groups"][3]
+            .as_object_mut()
+            .unwrap()
+            .remove("prefix_cacheable");
+        assert!(validation_error(undeclared).contains("declare prefix_cacheable"));
+        let mut none_cacheable = glm_prefix_wire(Some("0.31.0"), None);
+        for group in none_cacheable["kv_cache_groups"].as_array_mut().unwrap() {
+            group["prefix_cacheable"] = false.into();
+        }
+        assert!(validation_error(none_cacheable).contains("at least one prefix_cacheable group"));
+        let mut unequal = glm_prefix_wire(Some("0.31.0"), None);
+        unequal["kv_cache_groups"][1]["page_size_bytes"] = (GLM_PAGE - 1).into();
+        assert!(validation_error(unequal).contains("equal page_size_bytes"));
+        let mut no_unit = glm_prefix_wire(Some("0.31.0"), None);
+        no_unit.as_object_mut().unwrap().remove("prefix_match_unit");
+        assert!(validation_error(no_unit).contains("require prefix_match_unit"));
+        let mut bad_unit = glm_prefix_wire(Some("0.31.0"), None);
+        bad_unit["prefix_match_unit"] = 100.into();
+        assert!(
+            validation_error(bad_unit)
+                .contains("prefix_match_unit must divide the block_size_tokens")
+        );
+        let mut with_state_cache = glm_prefix_wire(Some("0.31.0"), None);
+        with_state_cache["state_cache"] = serde_json::json!({"bytes_per_request": 64});
+        with_state_cache["num_gpu_blocks"] = 64.into();
+        with_state_cache["block_size"] = 4.into();
+        with_state_cache["kv_cache_bytes_per_token"] = 16.into();
+        assert!(
+            validation_error(with_state_cache)
+                .contains("cannot use linear cache or KV transfer byte geometry")
+        );
+
+        // Host offload stays refused with prefix caching on, under every
+        // connector name and pool scope. Only a sliding-window state_cache
+        // of a linear pool offloads its checkpoints.
+        for version in ["0.31.0", "0.32.0"] {
+            for host in [
+                serde_json::json!({"num_host_blocks": 64}),
+                serde_json::json!({"num_host_blocks": 64, "connector": "offloading_v0_32"}),
+                serde_json::json!({"num_host_blocks": 64, "connector": "simple_cpu_v0_32"}),
+                serde_json::json!({
+                    "num_host_blocks": 64, "scope": "cluster_shared", "kv_layout_id": "tp4"
+                }),
+            ] {
+                let mut offloaded = glm_prefix_wire(Some(version), Some(0));
+                offloaded["native_host_offload"] = host;
+                assert!(
+                    validation_error(offloaded).contains("only HBM without host or G3 offload"),
+                    "{version}"
+                );
+            }
+        }
+
+        // Prefix caching off keeps the byte mode, with or without the version.
+        // Only prefix caching reads the unit, so a rank with the unit and
+        // without prefix caching is refused.
+        let mut off = glm_prefix_wire(Some("0.31.0"), None);
+        off["enable_prefix_caching"] = false.into();
+        assert!(
+            serde_json::from_value::<EngineConfig>(off.clone())
+                .unwrap_err()
+                .to_string()
+                .contains(
+                    "prefix_match_unit on kv_cache_groups requires enable_prefix_caching=true"
+                )
+        );
+        off.as_object_mut().unwrap().remove("prefix_match_unit");
+        validates(off.clone());
+        off.as_object_mut().unwrap().remove("vllm_version");
+        validates(off);
+        // A linear rank has no grouped-cache rules to follow.
+        let linear: EngineConfig = serde_json::from_value(serde_json::json!({
+            "backend": "vllm", "vllm_version": "0.31.0"
+        }))
+        .unwrap();
+        assert!(
+            linear
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("vllm_version requires kv_cache_groups")
+        );
+        assert!(
+            serde_json::to_value(EngineConfig::default())
+                .unwrap()
+                .get("vllm_version")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn grouped_prefix_caching_refuses_a_startup_count_above_usize() {
+        // Two full-attention groups of two-token blocks need 2^63 blocks each
+        // for a max_model_len of u64::MAX. vLLM sums Python integers, which
+        // cannot overflow, and refuses the pool.
+        let mut wire = glm_prefix_wire(Some("0.31.0"), None);
+        wire["prefix_match_unit"] = 2.into();
+        wire["max_model_len"] = u64::MAX.into();
+        wire["kv_cache_groups"] = serde_json::json!([
+            {"name": "a", "kind": "attention", "num_layers": 1, "block_size_tokens": 2, "page_size_bytes": GLM_PAGE, "prefix_cacheable": true},
+            {"name": "b", "kind": "attention", "num_layers": 1, "block_size_tokens": 2, "page_size_bytes": GLM_PAGE, "prefix_cacheable": true},
+        ]);
+        assert!(validation_error(wire).contains("need capacity for the full prompt"));
+    }
+
+    #[test]
+    fn grouped_prefix_caching_refuses_a_window_admission_count_above_usize() {
+        // A sliding-window group of one-token blocks with max_model_len and
+        // max_num_batched_tokens of u64::MAX caps its admission at usize::MAX
+        // blocks, and the last block of the cap goes above usize.
+        let mut wire = glm_prefix_wire(Some("0.31.0"), None);
+        wire["prefix_match_unit"] = 1.into();
+        wire["max_model_len"] = u64::MAX.into();
+        wire["max_num_batched_tokens"] = u64::MAX.into();
+        wire["kv_cache_groups"] = serde_json::json!([
+            {"name": "w", "kind": "attention", "num_layers": 1, "block_size_tokens": 1, "page_size_bytes": GLM_PAGE, "sliding_window": 2, "prefix_cacheable": true},
+        ]);
+        assert!(validation_error(wire).contains("need capacity for the full prompt"));
+    }
+
+    #[test]
+    fn grouped_prefix_caching_refuses_fifo_preemption() {
+        // Only grouped prefix caching follows vLLM's preemption order. A
+        // grouped rank without prefix caching and a linear rank keep `fifo`.
+        for version in ["0.31.0", "0.32.0"] {
+            let mut fifo = glm_prefix_wire(Some(version), Some(0));
+            fifo["preemption_mode"] = "fifo".into();
+            assert_eq!(
+                validation_error(fifo),
+                "kv_cache_groups with enable_prefix_caching=true follow vLLM's preemption order, which preempts the last running request; set preemption_mode=lifo",
+                "{version}"
+            );
+            let mut lifo = glm_prefix_wire(Some(version), Some(0));
+            lifo["preemption_mode"] = "lifo".into();
+            validates(lifo);
+        }
+        let mut byte_mode = glm_prefix_wire(Some("0.31.0"), None);
+        byte_mode["enable_prefix_caching"] = false.into();
+        byte_mode
+            .as_object_mut()
+            .unwrap()
+            .remove("prefix_match_unit");
+        byte_mode["preemption_mode"] = "fifo".into();
+        validates(byte_mode);
+        validates(serde_json::json!({
+            "backend": "vllm", "enable_prefix_caching": true, "preemption_mode": "fifo"
+        }));
+    }
+
+    #[test]
+    fn grouped_prefix_caching_refuses_convolution_groups() {
+        // The grouped rule table has no rule for a convolution group, so the
+        // gate refuses it with prefix caching on, whatever the capacity. Cold
+        // replay keeps the group.
+        let wire = |prefix_caching: bool, version: &str, pages: u64| {
+            let mut wire = serde_json::json!({
+                "backend": "vllm",
+                "enable_prefix_caching": prefix_caching,
+                "max_model_len": 128,
+                "max_num_batched_tokens": 8,
+                "kv_cache_capacity_bytes": pages * 64,
+                "kv_cache_groups": [{
+                    "name": "convolution", "kind": "convolution", "num_layers": 1,
+                    "block_size_tokens": 4, "page_size_bytes": 64, "sliding_window": 4,
+                    "prefix_cacheable": true
+                }],
+            });
+            if prefix_caching {
+                wire["prefix_match_unit"] = 4.into();
+                wire["vllm_version"] = version.into();
+            }
+            wire
+        };
+        for version in ["0.31.0", "0.32.0"] {
+            for pages in [8, 32] {
+                assert_eq!(
+                    validation_error(wire(true, version, pages)),
+                    "grouped prefix caching does not support convolution cache groups; turn prefix caching off to replay them cold",
+                    "{version} at {pages} pages"
+                );
+            }
+        }
+        validates(wire(false, "", 8));
+    }
+
+    #[test]
+    fn grouped_prefix_caching_refuses_a_non_cacheable_sliding_window_group() {
+        // The rule table models no sliding-window attention group that opts
+        // out of prefix caching, so the native gate refuses it with the text
+        // of the rule table. A non-cacheable full-attention group is accepted.
+        let wire = |version: &str, window: Option<u32>| {
+            let mut other = serde_json::json!({
+                "name": "other", "kind": "attention", "num_layers": 1,
+                "block_size_tokens": 16, "page_size_bytes": 64, "prefix_cacheable": false
+            });
+            if let Some(window) = window {
+                other["sliding_window"] = window.into();
+            }
+            serde_json::json!({
+                "backend": "vllm",
+                "enable_prefix_caching": true,
+                "prefix_match_unit": 16,
+                "vllm_version": version,
+                "max_model_len": 128,
+                "max_num_batched_tokens": 16,
+                "kv_cache_capacity_bytes": 64 * 64,
+                "kv_cache_groups": [{
+                    "name": "full", "kind": "attention", "num_layers": 1,
+                    "block_size_tokens": 16, "page_size_bytes": 64, "prefix_cacheable": true
+                }, other],
+            })
+        };
+        for version in ["0.31.0", "0.32.0"] {
+            assert_eq!(
+                validation_error(wire(version, Some(17))),
+                "kv_cache_groups with enable_prefix_caching=true do not model a sliding-window attention group with prefix_cacheable=false; describe a ring buffer as a state group with blocks_per_request: 1 and prefix_cacheable: false, and turn prefix caching off for a bounded replay window, which replay does not model",
+                "{version}"
+            );
+            validates(wire(version, None));
         }
     }
 

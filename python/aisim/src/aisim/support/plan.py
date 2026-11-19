@@ -22,6 +22,7 @@ from typing import Any
 import yaml
 
 from aisim.config import CorePredictionConfig, CoreRecommendationConfig
+from aisim.config.engine import GROUPED_PREFIX_CACHING_VERSIONS, grouped_prefix_caching_requirements
 
 from .config_profile import _cache_group_shapes, linear_block_size, linear_runtime_resources
 from .fpm import fpm_cli_args
@@ -135,7 +136,7 @@ def _probe_observed_resources(request: SupportRequest) -> dict[str, Any] | None:
 
 
 def _configs(
-    request: SupportRequest, root: Path
+    request: SupportRequest, root: Path, *, grouped_cold: bool = False
 ) -> tuple[dict[str, Any], dict[str, dict[str, Any]], list[dict[str, int]]]:
     preset = request.parallelism()
     workload = request.workload
@@ -170,8 +171,26 @@ def _configs(
     if request.fpm_profile is not None:
         engine["fpm_profile"] = request.fpm_profile.model_dump(mode="json")
         worker["timing"]["estimator_config"] = {"fpm_interpolation": {"method": "direct"}}
-        if request.profile_deployment().resources.cache_layout == "grouped":
-            worker.setdefault("kv_cache", {})["prefix_caching"] = False
+        deployment = request.profile_deployment()
+        resources = deployment.resources
+        if resources.cache_layout == "grouped":
+            # Replay reuses prefixes only when the deployment passes the grouped prefix-caching requirements that the
+            # prediction checks. Replay takes the grouped rules from the label, so the vLLM version of the evidence
+            # must also be the label. Otherwise the plan keeps the cold replay.
+            try:
+                grouped_prefix_caching_requirements(
+                    deployment,
+                    backend_version=deployment.backend_version,
+                    architecture=request.fpm_profile.architecture,
+                    prefix_match_unit=None,
+                    max_batched_tokens=worker["scheduler"]["max_batched_tokens"],
+                )
+                prefix_caching = (
+                    not grouped_cold and _evidence_version(request, deployment) == deployment.backend_version
+                )
+            except ValueError:
+                prefix_caching = False
+            worker.setdefault("kv_cache", {})["prefix_caching"] = prefix_caching
         else:
             # Replay of a linear profile with runtime probe evidence uses the measured block size.
             observed = _probe_observed_resources(request)
@@ -215,6 +234,45 @@ def _configs(
     }
     CoreRecommendationConfig.model_validate(recommendation)
     return prediction, {"pilot": recommendation}, [preset]
+
+
+def _evidence_version(request: SupportRequest, deployment) -> str:
+    """The vLLM version of a profile's evidence.
+
+    The import records it in the runtime memory of the profile. A profile imported before that field existed takes the
+    version that `onboard probe-runtime` records as runtime_framework_version of the request when it differs from an
+    explicit dataset label. Without either, the label is the version.
+    """
+    memory = deployment.resources.runtime_memory
+    recorded = None if memory is None else memory.runtime_framework_version
+    return recorded or request.identity.runtime_framework_version or deployment.backend_version
+
+
+def prefix_caching_note(request: SupportRequest) -> str | None:
+    """A note for a grouped profile whose runtime memory records prefix caching on, from evidence that replay cannot
+    follow: a vLLM version without rules, or a version with rules other than the label.
+
+    The plan files do not hold it, so plans saved before it keep their bytes.
+    """
+    if request.fpm_profile is None or request.identity.framework_version is None:
+        return None
+    deployment = request.profile_deployment()
+    memory = deployment.resources.runtime_memory
+    if deployment.resources.cache_layout != "grouped" or memory is None or memory.enable_prefix_caching is not True:
+        return None
+    version = _evidence_version(request, deployment)
+    if version not in GROUPED_PREFIX_CACHING_VERSIONS:
+        return (
+            f"Grouped prefix caching is not modeled for vLLM {version}, so the plan of this profile runs without "
+            "prefix caching, although its runtime memory records prefix caching on."
+        )
+    if version != deployment.backend_version:
+        return (
+            f"The evidence of this profile comes from vLLM {version}, but its label is {deployment.backend_version}, "
+            "and replay takes the grouped prefix-caching rules from the label, so the plan of this profile runs "
+            "without prefix caching, although its runtime memory records prefix caching on."
+        )
+    return None
 
 
 def _commands(
@@ -287,7 +345,7 @@ def _commands(
 
 
 def _plan_documents(
-    request: SupportRequest, root: Path, *, legacy_cli: bool = False
+    request: SupportRequest, root: Path, *, legacy_cli: bool = False, grouped_cold: bool = False
 ) -> tuple[dict[str, Any], dict[Path, bytes]]:
     package_spec = find_spec("aisim_core")
     if package_spec is None:
@@ -301,7 +359,7 @@ def _plan_documents(
         )
     if request.identity.framework_version is None:
         return _pending_version_documents(request, root, legacy_cli=legacy_cli)
-    prediction, recommendations, presets = _configs(request, root)
+    prediction, recommendations, presets = _configs(request, root, grouped_cold=grouped_cold)
     commands = _commands(request, root, list(recommendations), legacy_cli=legacy_cli)
     runtime_prerequisite = (
         "Prepare and verify the declared model/tokenizer snapshots, visible GPUs, model access and compatible "
@@ -695,12 +753,16 @@ def check_plan(request: SupportRequest, root: Path, *, allow_missing: bool = Fal
     if prior != expected:
         # Validate the entire original presentation, including its generated-file
         # hashes. Do not rewrite saved commands/evidence or ignore differing fields.
-        legacy_expected, legacy_documents = _plan_documents(saved, root, legacy_cli=True)
-        if prior != legacy_expected:
+        # A plan saved before replay modeled grouped prefix caching keeps its
+        # grouped replay cold until `onboard plan --overwrite` writes it again.
+        for legacy_cli, grouped_cold in ((True, False), (False, True), (True, True)):
+            expected, documents = _plan_documents(saved, root, legacy_cli=legacy_cli, grouped_cold=grouped_cold)
+            if prior == expected:
+                break
+        else:
             raise ValueError(
                 f"generated plan input {root / 'support-plan.json'} was modified; choose a new output directory"
             )
-        documents = legacy_documents
     # Recompute the manifest rather than trusting hashes in an edited plan. An
     # evaluation-only refresh must never bless modified collector inputs.
     for relative, content in documents.items():
