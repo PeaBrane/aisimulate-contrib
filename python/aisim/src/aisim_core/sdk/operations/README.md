@@ -100,10 +100,8 @@ loop — not a public per-call query API.)
 
 ### Idempotency
 
-`load_data` must be safe to call repeatedly. The cache-key check at the
-top is the contract: same `(systems_root, system, backend, version,
-enable_shared_layer)` → same result, regardless of how many times it
-fires.
+`load_data` must be safe to call repeatedly. Table-backed operations use
+the inherited `cls._cache_key(database)` for each of their caches.
 
 ### Instance attribute bind gating
 

@@ -1,29 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""
-Base class and shared infrastructure for the operations package.
-
-This module defines the ``Operation`` ABC plus two pieces of shared
-infrastructure that future op classes will rely on:
-
-- **Class-level ``_data_cache``** — each Operation subclass that owns CSV data
-  overrides this in its own class. Keyed by ``(system_path, db_mode)`` so the
-  same op type can serve multiple databases in one process.
-- **``_load_data_call_count`` instrumentation** — used by tests to assert
-  which op classes actually loaded data during a model run. The expected set
-  for Minimax M2.5 NVFP4 is the canonical lazy-load success assertion
-  (see ``~/forks/sdk-refactor-regression/tests/test_load_data_counts.py``).
-- **``supported_quant_modes`` classmethod** — placeholder API used by
-  ``inference_session`` post-Phase-4 to build the support-matrix warning.
-  Default returns the empty set; ops with quant-mode-keyed CSVs override.
-
-``clear_all_op_caches()`` is a module-level utility that walks every
-``Operation`` subclass and clears both its data cache and any LRU on
-``query``. Exported from the ``aisim_core.sdk.operations`` package — same
-function powers a pytest ``autouse`` fixture and serves as a manual eviction
-lever for long-running webapps.
-"""
+"""Python operation shells, performance-table discovery, and cache management."""
 
 from __future__ import annotations
 
@@ -276,13 +254,19 @@ class OpShellKit:
         raise ValueError(f"{type(self).__name__}.query cannot infer the evaluation phase; pass is_context=True/False.")
 
     @classmethod
-    def load_data(cls, database: PerfDatabase) -> None:
-        """Idempotent. Subclasses with CSV data override; default no-op for
-        ops like ``ElementWise`` that compute analytically from system spec.
+    def _cache_key(cls, database: PerfDatabase) -> tuple:
+        """Separate tables loaded from different roots or with different sibling-version reuse settings."""
+        return (
+            database.systems_root,
+            database.system,
+            database.backend,
+            database.version,
+            database.enable_shared_layer,
+        )
 
-        The full ``database`` is passed (not just ``system_path``/``system_spec``)
-        so subclasses can derive their own cache key plus reuse PerfDatabase
-        helpers like ``_build_op_sources`` for HYBRID-mode source discovery."""
+    @classmethod
+    def load_data(cls, database: PerfDatabase) -> None:
+        """Bind the operation's tables to the database. Operations without tables need no setup."""
         return None
 
     @classmethod

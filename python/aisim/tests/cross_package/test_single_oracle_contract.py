@@ -72,16 +72,12 @@ OPERATIONS_DEF_INVENTORY = {
     "__init__.py": frozenset(),
     "attention.py": frozenset(
         {
-            "ContextAttention._cache_key",
             "ContextAttention.clear_cache",
             "ContextAttention.load_data",
-            "EncoderAttention._cache_key",
             "EncoderAttention.clear_cache",
             "EncoderAttention.load_data",
-            "GenerationAttention._cache_key",
             "GenerationAttention.clear_cache",
             "GenerationAttention.load_data",
-            "_cache_key",
             # AIC-1715/1716: attention kernel-lane PRECEDENCE resolution — which
             # kernel_source lane a query should prefer, not a per-op VALUE. Reads
             # a YAML map (attention_lanes.resolve_attention_lane_order) and ranks
@@ -103,6 +99,7 @@ OPERATIONS_DEF_INVENTORY = {
     ),
     "base.py": frozenset(
         {
+            "OpShellKit._cache_key",
             "OpShellKit._engine_query",
             "OpShellKit._engine_query_is_context",
             "OpShellKit._engine_query_plan",
@@ -123,44 +120,33 @@ OPERATIONS_DEF_INVENTORY = {
     ),
     "communication.py": frozenset(
         {
-            "CustomAllReduce._cache_key",
             "CustomAllReduce.clear_cache",
             "CustomAllReduce.load_data",
-            "NCCL._cache_key",
             "NCCL.clear_cache",
             "NCCL.load_data",
-            "_cache_key",
         }
     ),
     "dsa.py": frozenset(
         {
-            "ContextDSAModule._cache_key",
             "ContextDSAModule.clear_cache",
             "ContextDSAModule.load_data",
-            "GenerationDSAModule._cache_key",
             "GenerationDSAModule.clear_cache",
             "GenerationDSAModule.load_data",
-            "_cache_key",
             "_normalize_projection_quant_modes",
         }
     ),
     "dsv4.py": frozenset(
         {
-            "ContextDeepSeekV4AttentionModule._cache_key",
             "ContextDeepSeekV4AttentionModule.clear_cache",
             "ContextDeepSeekV4AttentionModule.load_data",
             "ContextDeepSeekV4AttentionModule.load_data._load_sparse",
             "ContextDeepSeekV4AttentionModule.load_data._primary",
-            "DeepSeekV4MHCModule._cache_key",
             "DeepSeekV4MHCModule.clear_cache",
             "DeepSeekV4MHCModule.load_data",
-            "DeepSeekV4MegaMoEModule._cache_key",
             "DeepSeekV4MegaMoEModule.clear_cache",
             "DeepSeekV4MegaMoEModule.load_data",
-            "GenerationDeepSeekV4AttentionModule._cache_key",
             "GenerationDeepSeekV4AttentionModule.clear_cache",
             "GenerationDeepSeekV4AttentionModule.load_data",
-            "_cache_key",
         }
     ),
     "elementwise.py": frozenset(),
@@ -175,7 +161,6 @@ OPERATIONS_DEF_INVENTORY = {
     ),
     "gemm.py": frozenset(
         {
-            "GEMM._cache_key",
             "GEMM.clear_cache",
             "GEMM.load_data",
             "GEMM.supported_quant_modes",
@@ -184,69 +169,52 @@ OPERATIONS_DEF_INVENTORY = {
     ),
     "mamba.py": frozenset(
         {
-            "GDNKernel._cache_key",
             "GDNKernel.clear_cache",
             "GDNKernel.load_data",
-            "KDAKernel._cache_key",
             "KDAKernel.load_data",
-            "Mamba2Kernel._cache_key",
             "Mamba2Kernel.clear_cache",
             "Mamba2Kernel.load_data",
-            "_cache_key",
         }
     ),
     "mla.py": frozenset(
         {
-            "ContextMLA._cache_key",
             "ContextMLA.clear_cache",
             "ContextMLA.load_data",
-            "GenerationMLA._cache_key",
             "GenerationMLA.clear_cache",
             "GenerationMLA.load_data",
-            "MLABmm._cache_key",
             "MLABmm._engine_query_plan",
             "MLABmm.clear_cache",
             "MLABmm.load_data",
-            "MLAModule._cache_key",
             "MLAModule.clear_cache",
             "MLAModule.load_data",
-            "WideEPContextMLA._cache_key",
             "WideEPContextMLA.clear_cache",
             "WideEPContextMLA.load_data",
-            "WideEPGenerationMLA._cache_key",
             "WideEPGenerationMLA.clear_cache",
             "WideEPGenerationMLA.load_data",
-            "_cache_key",
         }
     ),
     "moe.py": frozenset(
         {
-            "MoE._cache_key",
             "MoE._seq_split",
             "MoE._seq_split.setter",
             "MoE.clear_cache",
             "MoE.load_data",
             "MoEDispatch.__init__",
-            "MoEDispatch._cache_key",
             "MoEDispatch._quant_mode",
             "MoEDispatch.clear_cache",
             "MoEDispatch.load_data",
-            "_cache_key",
             "xprofile_util_level_known",
         }
     ),
     "moe_comm.py": frozenset(
         {
             "MoEAllToAll.__init__",
-            "MoEAllToAll._cache_key",
             "MoEAllToAll.clear_cache",
             "MoEAllToAll.load_data",
             "MoECommBackendSpec.feasible",
             "MoEExpertCompute.__init__",
-            "MoEExpertCompute._cache_key",
             "MoEExpertCompute.clear_cache",
             "MoEExpertCompute.load_data",
-            "_cache_key",
             "communication_dtype_for",
             "_validate_a2a_request",
             "_validate_ep_phase",

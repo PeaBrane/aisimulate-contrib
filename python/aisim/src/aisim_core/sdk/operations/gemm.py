@@ -80,8 +80,6 @@ class GEMM(_core.GEMM, OpShellKit):
     - ``_compute_scale_cache``: compute_scale latency/energy keyed by ``quant_mode -> m -> k``
     - ``_scale_matrix_cache``: scale_matrix latency/energy keyed by ``quant_mode -> m -> k``
 
-    All three are class-level dicts keyed by
-    ``(systems_root, system, backend, version, enable_shared_layer)``.
     """
 
     _data_cache: ClassVar[dict] = {}
@@ -91,24 +89,6 @@ class GEMM(_core.GEMM, OpShellKit):
     # ------------------------------------------------------------------
     # Data ownership: load + cache + clear
     # ------------------------------------------------------------------
-
-    @classmethod
-    def _cache_key(cls, database: PerfDatabase) -> tuple:
-        """Cache key uniquely identifying the loaded data set.
-
-        ``systems_root`` is included so test fixtures that swap to a fresh
-        ``tmp_path`` between tests get distinct entries (otherwise the
-        shared-layer test suite collides). ``enable_shared_layer`` is also
-        part of the key because HYBRID unions sibling-row inheritance, so
-        a SILICON-only load and a HYBRID load produce different dicts.
-        """
-        return (
-            database.systems_root,
-            database.system,
-            database.backend,
-            database.version,
-            database.enable_shared_layer,
-        )
 
     @classmethod
     def load_data(cls, database: PerfDatabase) -> None:
@@ -176,10 +156,6 @@ class GEMM(_core.GEMM, OpShellKit):
         return set(gemm_data.keys())
 
     # ------------------------------------------------------------------
-    # Static helpers (shared with perf_database.py callers)
-    # ------------------------------------------------------------------
-
-    # ------------------------------------------------------------------
     # SOL correction (formerly in PerfDatabase._correct_data)
     # ------------------------------------------------------------------
 
@@ -188,11 +164,3 @@ class GEMM(_core.GEMM, OpShellKit):
     # plane (enumeration/charts); the compiled engine applies the same clamp
     # to its own load (see perf_database/gemm.rs), so QUERY values stay
     # SOL-floored via the single oracle.
-
-    # ------------------------------------------------------------------
-    # Table query classmethods (formerly PerfDatabase.query_*)
-    # ------------------------------------------------------------------
-
-    # ------------------------------------------------------------------
-    # Op contract: query() + get_weights()
-    # ------------------------------------------------------------------
