@@ -4,7 +4,7 @@
 //! Request-boundary snapshots, not physical engine checkpoints.
 //! The behavioral reference is AIPerf's trajectory_source.py at
 //! https://github.com/ai-dynamo/aiperf/tree/7db2ba37a62aa80c882bc90eaf61cc8073e2387b.
-//! Sampling and token allocation below are AISimulate-owned algorithms.
+//! Sampling and token allocation below are AISim-owned algorithms.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -16,6 +16,7 @@ use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use super::driver::waits_on_live_work;
 use super::{
     AgenticDependencyRelation, AgenticDependencyTrigger, AgenticGraphIdentity, AgenticNode,
     SYNTHETIC_OUTPUT_SEED, ValidatedAgenticGraph, planned_output_token_ids,
@@ -503,7 +504,8 @@ impl AgenticReplayContext {
             } else {
                 live_conversations.insert(node.session_id.as_str());
             }
-            // Recorded starts classify history, but do not add execution gates.
+            // Recorded starts classify history, but do not add execution gates,
+            // except for the flagged requests below.
             // Retain authored gates; live dependencies still release relative
             // to actual dispatch/completion, while historical edges become timers.
             let mut delay = (node.not_before_ms - t_star_ms).max(0.0);
@@ -528,6 +530,17 @@ impl AgenticReplayContext {
                     } else {
                         pending.push(snapshot.instance_request_id(&edge.request_id));
                     }
+                }
+                // The AgentX client resumes a request whose causal predecessor
+                // is history at its recorded offset from the cut; historical
+                // edges alone would release it sooner.
+                if node.recorded_start_gates_frontier
+                    && !waits_on_live_work(&node.dependencies, |edge| {
+                        let source = index_by_id[edge.request_id.as_str()];
+                        self.recorded_intervals[source].0 >= t_star_ms
+                    })
+                {
+                    delay = delay.max(recorded_start - t_star_ms);
                 }
             }
             snapshot.evidence.requests.push(AgenticSnapshotRequest {
@@ -597,6 +610,17 @@ impl AgenticPlaySnapshot {
                 .then(|| self.instance_request_id(&graph.nodes[play.root_nodes[0]].request_id)),
             parent_id: parent.map(|e| self.instance_request_id(&e.request_id)),
             cache_id: Some(self.evidence.cache_id.clone()),
+            lineage: graph.conversation_lineage[index].as_ref().map(|lineage| {
+                crate::replay::AgenticConversationLineage {
+                    schema: lineage.schema.clone(),
+                    root_conversation_id: self
+                        .instance_conversation_id(&lineage.root_conversation_id),
+                    parent_conversation_id: lineage
+                        .parent_conversation_id
+                        .as_ref()
+                        .map(|parent| self.instance_conversation_id(parent)),
+                }
+            }),
         }
     }
     pub(super) fn token_ids(&self, index: usize) -> Vec<u32> {

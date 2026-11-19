@@ -1,0 +1,20 @@
+{
+  "command": [
+    "/tmp/pr937-release-validation-m_jcw8cc/venv/bin/maturin",
+    "build",
+    "--release",
+    "--locked",
+    "--auditwheel",
+    "skip",
+    "--out",
+    "/tmp/pr937-release-validation-m_jcw8cc/dist",
+    "--interpreter",
+    "/tmp/pr937-release-validation-m_jcw8cc/venv/bin/python"
+  ],
+  "exit": 0,
+  "seconds": 253.26,
+  "sourceCommit": "77d82652b2f83fd67afefc3141d69a5f06e630be",
+  "wheels": [
+    "/tmp/pr937-release-validation-m_jcw8cc/dist/aisim-0.14.0-cp311-abi3-linux_x86_64.whl"
+  ]
+}

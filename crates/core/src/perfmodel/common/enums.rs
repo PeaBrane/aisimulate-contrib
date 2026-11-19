@@ -3,7 +3,7 @@
 
 //! Backend, database-mode, quant-mode, model-family, and perf-data-filename
 //! enums plus the `QuantMapping` payload shared by the quant-mode enums.
-//! Mirrors the enum surface of `src/aisimulate/sdk/common.py`.
+//! Mirrors the enum surface of `src/aisim/sdk/common.py`.
 //!
 //! HF-architecture-to-family routing lives in `models/registry.rs`, not
 //! here, because it carries AIC-specific lookup tables that depend on
@@ -122,7 +122,7 @@ pub enum TransferKind {
 /// (`off`/`conservative`/`balanced`/`aggressive`) before serialising, so the
 /// wire form is always an explicit list of kind tokens; `None` on the wire
 /// means the default ALL-transfers policy.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TransferPolicy {
     pub xshape: bool,
     pub xquant: bool,
@@ -479,6 +479,9 @@ pub enum KvCacheQuantMode {
     Bfloat16,
     Int8,
     Fp8,
+    /// 4-bit values plus one FP8 scale per 16: 9/16 byte per element. Appended
+    /// so existing bincode discriminants stay stable.
+    Nvfp4,
 }
 
 impl KvCacheQuantMode {
@@ -500,6 +503,12 @@ impl KvCacheQuantMode {
                 memory: 1.0,
                 compute: 0.0,
                 name: "fp8",
+                compute_dtype: None,
+            },
+            Self::Nvfp4 => QuantMapping {
+                memory: 9.0 / 16.0,
+                compute: 0.0,
+                name: "nvfp4",
                 compute_dtype: None,
             },
         }
@@ -641,8 +650,6 @@ pub enum PerfDataFilename {
     Dsv4CsaGenerationModule,
     Dsv4HcaGenerationModule,
     Dsv4PagedMqaLogitsModule,
-    Dsv4HcaAttnModule,
-    Dsv4CsaAttnModule,
     Dsv4CsaTopkCalib,
     Dsv4MegamoeModule,
     MoeA2a,
@@ -682,8 +689,6 @@ impl PerfDataFilename {
             Self::Dsv4CsaGenerationModule => "dsv4_csa_generation_module_perf.parquet",
             Self::Dsv4HcaGenerationModule => "dsv4_hca_generation_module_perf.parquet",
             Self::Dsv4PagedMqaLogitsModule => "dsv4_paged_mqa_logits_module_perf.parquet",
-            Self::Dsv4HcaAttnModule => "dsv4_hca_attn_module_perf.parquet",
-            Self::Dsv4CsaAttnModule => "dsv4_csa_attn_module_perf.parquet",
             Self::Dsv4CsaTopkCalib => "dsv4_csa_topk_calib_perf.parquet",
             Self::Dsv4MegamoeModule => "dsv4_megamoe_module_perf.parquet",
             Self::MoeA2a => "moe_a2a_perf.parquet",
@@ -791,9 +796,17 @@ mod tests {
             KvCacheQuantMode::Bfloat16,
             KvCacheQuantMode::Int8,
             KvCacheQuantMode::Fp8,
+            KvCacheQuantMode::Nvfp4,
         ] {
             assert_eq!(mode.mapping().compute, 0.0);
         }
+    }
+
+    #[test]
+    fn nvfp4_kv_cache_is_appended() {
+        let mode: KvCacheQuantMode = serde_json::from_str("\"nvfp4\"").unwrap();
+        assert_eq!(mode, KvCacheQuantMode::Nvfp4);
+        assert_eq!(bincode::serialize(&mode).unwrap(), 3_u32.to_le_bytes());
     }
 
     #[test]

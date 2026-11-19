@@ -13,25 +13,29 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from aisimulate.capacity import materialize_aic_num_gpu_blocks
-from aisimulate.compiler import prediction_to_replay_spec
-from aisimulate.config import CorePredictionConfig, CoreRecommendationConfig
-from aisimulate.config.common import ENGINE_MODEL_CONTROL_FIELDS
-from aisimulate.recommend import _candidate_prediction, recommendation_to_sweeper
-from aisimulate.support.fpm import fpm_cli_args
-from aisimulate.support.plan import check_plan, create_plan
-from aisimulate.support.schema import SupportRequest
-from aisimulate.sweeper.config import SearchSpace
-from aisimulate.sweeper.deploy import build_backend_deployment
-from aisimulate.sweeper.forward_pass_estimator import (
+from aisim.capacity import materialize_aic_num_gpu_blocks
+from aisim.compiler import prediction_to_replay_spec
+from aisim.config import CorePredictionConfig, CoreRecommendationConfig
+from aisim.config.common import ENGINE_MODEL_CONTROL_FIELDS
+from aisim.recommend import _candidate_prediction, recommendation_to_sweeper
+from aisim.support.fpm import fpm_cli_args
+from aisim.support.plan import check_plan, create_plan
+from aisim.support.schema import SupportRequest
+from aisim.sweeper.config import SearchSpace
+from aisim.sweeper.deploy import build_backend_deployment
+from aisim.sweeper.forward_pass_estimator import (
     ForwardPassEstimatorResolutionError,
     ForwardPassEstimatorResolver,
 )
-from aisimulate.sweeper.model_hw import parallel_configs_for
-from aisimulate.sweeper.replay import ReplaySpec
-from aisimulate.sweeper.sample import unroll_sample
+from aisim.sweeper.model_hw import parallel_configs_for
+from aisim.sweeper.replay import ReplaySpec
+from aisim.sweeper.sample import unroll_sample
+from aisim_core.ais_perf_model import AisPerfModelDeprecationWarning
 
 pytestmark = pytest.mark.unit
+
+# AISim still writes the old estimator fields into the configs it saves, so reading one back warns.
+reads_saved_config = pytest.mark.filterwarnings("ignore::aisim_core.ais_perf_model.AisPerfModelDeprecationWarning")
 
 
 @pytest.fixture
@@ -85,9 +89,9 @@ def profile(tmp_path_factory):
 
 @pytest.fixture(autouse=True)
 def forbid_registered_model(monkeypatch):
-    from aisimulate import capacity, compiler, recommend
-    from aisimulate.sweeper import model_hw
-    from aisimulate_core.sdk import engine, memory
+    from aisim import capacity, compiler, recommend
+    from aisim.sweeper import model_hw
+    from aisim_core.sdk import engine, memory
 
     def fail(*args, **kwargs):
         pytest.fail("class-independent workflow reached model/config construction")
@@ -108,12 +112,12 @@ def timing_systems(profile, tmp_path, monkeypatch):
     import pyarrow as pa
     import pyarrow.parquet as pq
 
-    import aisimulate_core
-    from aisimulate_core.sdk.fpm_profile import load_fpm_profile
+    import aisim_core
+    from aisim_core.sdk.fpm_profile import load_fpm_profile
 
     root = tmp_path / "systems"
     root.mkdir()
-    packaged = Path(aisimulate_core.__file__).parent / "systems"
+    packaged = Path(aisim_core.__file__).parent / "systems"
     (root / "h200_sxm.yaml").write_bytes((packaged / "h200_sxm.yaml").read_bytes())
     rows = []
     for index, deployment in enumerate(load_fpm_profile(profile).deployments):
@@ -206,44 +210,121 @@ def test_prediction_materializes_rank_local_capacity_without_a_model(profile, ti
     assert reserved["num_gpu_blocks"] < lowered["num_gpu_blocks"]
 
 
-def test_speculative_round_prediction_preserves_progress_identity_and_observed_capacity(profile, timing_systems):
+@pytest.mark.parametrize(
+    "policy",
+    ["vllm_native_ar_model_step_cuda_v1", "vllm_native_fpm_model_step_cuda_v1"],
+)
+def test_ar_native_cuda_policy_keeps_ar_and_speculative_measurements_separate(profile, timing_systems, policy):
     import pyarrow as pa
     import pyarrow.parquet as pq
 
-    from aisimulate import _runtime
-    from aisimulate.runner import EngineReplayRunnerFactory
-    from aisimulate.sweeper import ReplayOutputRequirements
-    from aisimulate_core.sdk.fpm_identity import EXECUTION_COLUMNS
-    from aisimulate_core.sdk.fpm_profile import load_fpm_profile
+    from aisim_core.sdk import RustForwardPassPerfModel
+    from aisim_core.sdk.fpm_identity import EXECUTION_COLUMNS, LEGACY_EXECUTION_IDENTITY
 
-    profile["model_revision"] = "1" * 40
-    profile["deployments"] = profile["deployments"][:1]
-    _observed_profile(profile, context=4096)
-    execution = {
-        "kind": "speculative_round",
-        "method": "eagle3",
-        "num_draft_tokens": 3,
-        "draft_model": "test/draft",
-        "draft_revision": "2" * 40,
-        "timing_scope": "model_step_cuda",
-    }
-    profile["deployments"][0]["execution_profile"] = execution
-    deployment = load_fpm_profile(profile).deployments[0]
-    execution_identity = dict(
-        zip(EXECUTION_COLUMNS, deployment.execution_identity(profile["model_revision"]), strict=True)
-    )
     path = Path(timing_systems) / "data/h200_sxm/vllm/0.25.1/fpm_forward_perf.parquet"
-    rows = [row for row in pq.read_table(path).to_pylist() if row["dp"] == 1]
+    rows = pq.read_table(path).to_pylist()
     for row in rows:
         row.update(
-            **execution_identity,
-            measurement_policy="vllm_native_fpm_model_step_cuda_v1",
+            **dict(zip(EXECUTION_COLUMNS, LEGACY_EXECUTION_IDENTITY, strict=True)),
+            measurement_policy=policy,
             timing_scope="model_step_cuda",
             measurement_reduction="single_sample",
             source_sample_count=1,
-            # Deliberately synthetic per-round times, not an analytical estimate.
-            latency_ms=7.0 if row["workload_kind"] == "prefill" else 11.0,
         )
+    pq.write_table(pa.Table.from_pylist(rows), path)
+    metadata = json.loads(path.with_suffix(".metadata.json").read_text())
+    metadata.update(
+        schema_version=7,
+        measurement_policy=policy,
+        timing_scope="model_step_cuda",
+        parquet_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+    )
+    path.with_suffix(".metadata.json").write_text(json.dumps(metadata))
+    config = dict(
+        model=profile["model"],
+        fpm_profile=profile,
+        system="h200_sxm",
+        backend="vllm",
+        backend_version="0.25.1",
+        worker_type="aggregated",
+        tp=2,
+        moe_tp_size=2,
+        moe_ep_size=1,
+        systems_paths=[timing_systems],
+        estimation_mode="fpm_interpolation",
+        fallback_policy="deny",
+        estimator_config={"fpm_interpolation": {"method": "direct"}},
+    )
+    if policy == "vllm_native_fpm_model_step_cuda_v1":
+        with pytest.raises((ValueError, RuntimeError), match="speculative-round identity"):
+            RustForwardPassPerfModel.best_available(config)
+    else:
+        model = RustForwardPassPerfModel.best_available(config)
+        # The AR fixture declares 1 ms at every measured decode coordinate.
+        assert model.estimate_forward_pass_time_ms(
+            {
+                "scheduled_requests": {
+                    "num_decode_requests": 1,
+                    "sum_decode_kv_tokens": 1,
+                }
+            }
+        ) == pytest.approx(1.0)
+
+
+def _speculative_execution(method, *, canonical_target=None):
+    """Descriptor with a separate test draft, or the documented canonical MTP draft equal to the target."""
+    draft = (
+        (canonical_target["model"], canonical_target["model_revision"])
+        if canonical_target
+        else ("test/draft", "2" * 40)
+    )
+    return {
+        "kind": "speculative_round",
+        "method": method,
+        "num_draft_tokens": 3,
+        "draft_model": draft[0],
+        "draft_revision": draft[1],
+        "timing_scope": "model_step_cuda",
+    }
+
+
+def _install_speculative_rows(profile, timing_systems, timings, *, canonical_target=None):
+    """Write dp=1 rows for each method at identical coordinates with distinct (prefill, decode) ms."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from aisim_core.sdk.fpm_identity import EXECUTION_COLUMNS
+    from aisim_core.sdk.fpm_profile import load_fpm_profile
+
+    path = Path(timing_systems) / "data/h200_sxm/vllm/0.25.1/fpm_forward_perf.parquet"
+    base = [row for row in pq.read_table(path).to_pylist() if row["dp"] == 1]
+    rows = []
+    for method, (prefill_ms, decode_ms) in timings.items():
+        deployment = load_fpm_profile(
+            {
+                **profile,
+                "deployments": [
+                    {
+                        **profile["deployments"][0],
+                        "execution_profile": _speculative_execution(method, canonical_target=canonical_target),
+                    }
+                ],
+            }
+        ).deployments[0]
+        identity = dict(zip(EXECUTION_COLUMNS, deployment.execution_identity(profile["model_revision"]), strict=True))
+        for row in base:
+            rows.append(
+                row
+                | identity
+                | dict(
+                    measurement_policy="vllm_native_fpm_model_step_cuda_v1",
+                    timing_scope="model_step_cuda",
+                    measurement_reduction="single_sample",
+                    source_sample_count=1,
+                    # Deliberately synthetic per-round times, not an analytical estimate.
+                    latency_ms=prefill_ms if row["workload_kind"] == "prefill" else decode_ms,
+                )
+            )
     pq.write_table(pa.Table.from_pylist(rows), path)
     metadata = json.loads(path.with_suffix(".metadata.json").read_text())
     metadata.update(
@@ -254,10 +335,16 @@ def test_speculative_round_prediction_preserves_progress_identity_and_observed_c
         parquet_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
     )
     path.with_suffix(".metadata.json").write_text(json.dumps(metadata))
-    public = CorePredictionConfig.model_validate(
+
+
+def _speculative_public(profile, timing_systems, kv_cache=None):
+    engine = _engine(profile)
+    if kv_cache is not None:
+        engine["workers"]["aggregated"]["kv_cache"] = kv_cache
+    return CorePredictionConfig.model_validate(
         {
             "engine": {
-                **_engine(profile),
+                **engine,
                 "systems_paths": [timing_systems],
                 "context_length": 4096,
                 "nextn": 3,
@@ -270,6 +357,128 @@ def test_speculative_round_prediction_preserves_progress_identity_and_observed_c
             },
         }
     )
+
+
+def _requested_method_profile(profile, method, *, canonical=False):
+    profile["model_revision"] = "1" * 40
+    profile["deployments"] = profile["deployments"][:1]
+    _observed_profile(profile, context=4096)
+    profile["deployments"][0]["execution_profile"] = _speculative_execution(
+        method, canonical_target=profile if canonical else None
+    )
+
+
+@pytest.mark.parametrize("method,other", [("eagle3", "mtp"), ("mtp", "eagle3")])
+def test_speculative_method_never_borrows_the_other_methods_rows(profile, timing_systems, method, other):
+    from aisim.runner import EngineReplayRunnerFactory
+
+    _requested_method_profile(profile, method)
+    _install_speculative_rows(profile, timing_systems, {other: (70.0, 110.0)})
+    spec = prediction_to_replay_spec(_speculative_public(profile, timing_systems))
+    with pytest.raises(Exception, match="No FPM cell matches"):
+        EngineReplayRunnerFactory().create(0).run(spec)
+
+
+@pytest.mark.parametrize(
+    "method,other,canonical,cache_layout",
+    [
+        ("eagle3", "mtp", False, "linear"),
+        ("mtp", "eagle3", False, "linear"),
+        ("mtp", "eagle3", True, "linear"),
+        ("eagle3", "mtp", False, "unmodeled"),
+        ("eagle3", "mtp", False, "mamba_align"),
+    ],
+    ids=["eagle3", "mtp", "mtp-canonical-target-draft", "eagle3-unmodeled", "eagle3-mamba-align"],
+)
+def test_speculative_round_prediction_preserves_progress_identity_and_observed_capacity(
+    profile, timing_systems, method, other, canonical, cache_layout
+):
+    from aisim import _runtime
+    from aisim.runner import EngineReplayRunnerFactory
+    from aisim.sweeper import ReplayOutputRequirements
+
+    _requested_method_profile(profile, method, canonical=canonical)
+    execution = profile["deployments"][0]["execution_profile"]
+    if canonical:
+        assert (execution["draft_model"], execution["draft_revision"]) == (profile["model"], profile["model_revision"])
+    # The other method's rows share every coordinate but carry 10x timings.
+    _install_speculative_rows(
+        profile,
+        timing_systems,
+        {method: (7.0, 11.0), other: (70.0, 110.0)},
+        canonical_target=profile if canonical else None,
+    )
+    if cache_layout == "unmodeled":
+        from aisim_core.sdk import RustForwardPassPerfModel
+        from aisim_core.sdk.fpm_profile import load_fpm_profile
+
+        resources = profile["deployments"][0]["resources"]
+        resources["cache_layout"] = "unmodeled"
+        resources.pop("kv_bytes_per_token")
+        restored = load_fpm_profile(profile)
+        assert not restored.deployments[0].resources.memory_ready
+        config = dict(
+            model=profile["model"],
+            fpm_profile=profile,
+            system="h200_sxm",
+            backend="vllm",
+            backend_version="0.25.1",
+            worker_type="aggregated",
+            tp=2,
+            moe_tp_size=2,
+            moe_ep_size=1,
+            nextn=3,
+            systems_paths=[timing_systems],
+            estimation_mode="fpm_interpolation",
+            fallback_policy="deny",
+            estimator_config={"fpm_interpolation": {"method": "direct"}},
+        )
+        model = RustForwardPassPerfModel.best_available(config)
+        # The fixture declares every complete decode round as exactly 11 ms.
+        assert model.estimate_forward_pass_time_ms(
+            {
+                "scheduled_requests": {
+                    "num_decode_requests": 1,
+                    "sum_decode_kv_tokens": 1,
+                }
+            }
+        ) == pytest.approx(11.0)
+        with pytest.raises(ValueError, match="unmodeled FPM cache"):
+            restored.deployments[0].resources.require_memory()
+        with pytest.raises((ValueError, RuntimeError), match="unmodeled FPM cache"):
+            RustForwardPassPerfModel.estimate_cache_budget(
+                config,
+                dict(
+                    total_gpu_capacity_bytes=80 * 1024**3,
+                    memory_fraction_kind="of_total",
+                    memory_fraction_value=0.9,
+                    max_num_tokens=8192,
+                    max_batch_size=8,
+                ),
+            )
+        spec = prediction_to_replay_spec(_speculative_public(profile, timing_systems))
+        with pytest.raises(ValueError, match="unmodeled FPM cache"):
+            materialize_aic_num_gpu_blocks(spec.backend_deployment.agg_engine_args)
+        with pytest.raises((ValueError, RuntimeError), match="unmodeled FPM cache"):
+            EngineReplayRunnerFactory(runtime=_runtime).create(0).run(spec)
+        return
+    if cache_layout == "mamba_align":
+        resources = profile["deployments"][0]["resources"]
+        resources.pop("kv_bytes_per_token")
+        resources.update(
+            cache_layout="mamba_align",
+            mamba_cache={
+                "state_storage": "full_state",
+                "block_size_tokens": 64,
+                "page_size_bytes": 32768,
+                "state_groups": 2,
+                "prefix_match_unit": 16,
+                "num_speculative_states": 3,
+            },
+        )
+    expected_blocks = 32767 if cache_layout == "mamba_align" else 32768
+    kv_cache = {"block_size": 64} if cache_layout == "mamba_align" else None
+    public = _speculative_public(profile, timing_systems, kv_cache)
     restored = CorePredictionConfig.model_validate_json(public.model_dump_json())
     spec = prediction_to_replay_spec(restored)
     diagnostics = {}
@@ -277,12 +486,12 @@ def test_speculative_round_prediction_preserves_progress_identity_and_observed_c
         spec.backend_deployment.agg_engine_args, memory_diagnostics=diagnostics
     )
     # Observed 1 GiB / 512 bytes per token / 64 tokens per block; no draft or graph charge is added.
-    assert materialized["num_gpu_blocks"] == 32768
+    assert materialized["num_gpu_blocks"] == expected_blocks
     assert diagnostics["total_kv_size_bytes"] == 1024**3
     assert diagnostics["memory_breakdown"] is None
     canonical_only = deepcopy(spec.backend_deployment.agg_engine_args)
     canonical_only.pop("aic_nextn")
-    assert materialize_aic_num_gpu_blocks(canonical_only)["num_gpu_blocks"] == 32768
+    assert materialize_aic_num_gpu_blocks(canonical_only)["num_gpu_blocks"] == expected_blocks
     for legacy_name in ("aic_nextn", "nextn"):
         conflicting_depth = deepcopy(canonical_only)
         conflicting_depth[legacy_name] = 2
@@ -301,14 +510,20 @@ def test_speculative_round_prediction_preserves_progress_identity_and_observed_c
         .run(spec, output_requirements=ReplayOutputRequirements(include_raw_report=True, capture_per_request=True))
     )
     rank = seen[0]["spec"]["engine"]["rank"]
+    if cache_layout == "mamba_align":
+        assert rank["state_cache"] == {"bytes_per_request": 65536, "num_speculative_states": 3}
+        assert rank["prefix_match_unit"] == 16
     assert rank["aic_nextn"] == 3
     # 1.78 accepted drafts plus the mandatory base token means 2.78 output tokens per round.
     assert [float(rate) for rate in rank["aic_nextn_accept_rates"].split(",")] == [1.0, 0.78, 0.0]
-    assert rank["num_gpu_blocks"] == 32768
+    assert rank["num_gpu_blocks"] == expected_blocks
     assert rank["timing_model"]["config"]["fpm_profile"]["deployments"][0]["execution_profile"] == execution
     assert report.metrics["completed_requests"] == 2
     assert report.metrics["mean_ttft_ms"] == pytest.approx(7.0)
-    records = report.metadata["native_report"]["per_request"]
+    native = report.metadata["native_report"]
+    assert native["power_w"] is None
+    assert native["power_coverage"] is None
+    records = native["per_request"]
     assert len(records) == 2
     for record in records:
         assert record["output_length"] == 7
@@ -341,8 +556,8 @@ def test_profile_memory_cannot_be_bypassed_by_explicit_blocks(profile, timing_sy
 
 @pytest.mark.parametrize("memory_state,missing_timings", [("pending", False), ("runtime", False), ("pending", True)])
 def test_native_profile_memory_rejects_explicit_capacity_bypass(profile, timing_systems, memory_state, missing_timings):
-    from aisimulate import _runtime
-    from aisimulate.runner import EngineReplayRunnerFactory
+    from aisim import _runtime
+    from aisim.runner import EngineReplayRunnerFactory
 
     config = CorePredictionConfig.model_validate(
         {
@@ -444,16 +659,16 @@ def test_runtime_recommendation_propagates_selected_context(profile):
 
 @pytest.mark.parametrize("command", ["predict", "recommend"])
 def test_public_commands_report_pending_memory_before_missing_timings(profile, tmp_path, monkeypatch, capsys, command):
-    import aisimulate.main as cli
-    import aisimulate_core
-    from aisimulate.recommend import _run_recommendation
+    import aisim.main as cli
+    import aisim_core
+    from aisim.recommend import _run_recommendation
 
     for deployment in profile["deployments"]:
         for field in ("weights_bytes", "activations_bytes", "runtime_overhead_bytes", "comm_overhead_bytes"):
             deployment["resources"].pop(field)
     root = tmp_path / "empty-systems"
     root.mkdir()
-    packaged = Path(aisimulate_core.__file__).parent / "systems/h200_sxm.yaml"
+    packaged = Path(aisim_core.__file__).parent / "systems/h200_sxm.yaml"
     (root / packaged.name).write_bytes(packaged.read_bytes())
     engine = {**_engine(profile), "mode": "aggregated", "systems_paths": [str(root)]}
     raw = {
@@ -468,7 +683,7 @@ def test_public_commands_report_pending_memory_before_missing_timings(profile, t
         engine["workers"]["aggregated"]["parallelism"] = {"preset": "default"}
         raw["optimization"] = {"constraints": {"max_candidate_gpus": 2}}
         raw["optimizer"] = {"algorithm": "random", "max_trials": 1, "parallelism": 1}
-        monkeypatch.setattr("aisimulate.recommend.run_recommendation", _run_recommendation)
+        monkeypatch.setattr("aisim.recommend.run_recommendation", _run_recommendation)
         CoreRecommendationConfig.model_validate(raw)  # Pending templates remain schema-valid.
     else:
         CorePredictionConfig.model_validate(raw)
@@ -567,8 +782,8 @@ def test_disaggregated_profile_candidates_do_not_swap_roles(profile):
 
 
 def test_native_disaggregated_capacity_keeps_canonical_worker_role(profile, timing_systems, monkeypatch):
-    from aisimulate.runner import EngineReplayRunnerFactory
-    from aisimulate_core.sdk import memory
+    from aisim.runner import EngineReplayRunnerFactory
+    from aisim_core.sdk import memory
 
     prefill = deepcopy(profile["deployments"][0])
     decode = deepcopy(prefill)
@@ -616,7 +831,7 @@ def test_native_disaggregated_capacity_keeps_canonical_worker_role(profile, timi
 
 @pytest.mark.parametrize("mode,budget,expected", [("agg", 2, 2), ("disagg", 4, 4)])
 def test_profile_candidates_use_only_declared_topologies(profile, mode, budget, expected, monkeypatch):
-    from aisimulate_core.sdk import RustForwardPassPerfModel
+    from aisim_core.sdk import RustForwardPassPerfModel
 
     def no_timing(*args, **kwargs):
         pytest.fail("candidate enumeration constructed a timing estimator before collection")
@@ -660,9 +875,9 @@ def test_dense_profile_preserves_unsharded_moe_dimensions(profile):
 
 @pytest.mark.parametrize("source", ["sample", "resolved"])
 def test_profile_kv_load_cache_keeps_resource_identity_without_model_construction(profile, monkeypatch, source):
-    from aisimulate.sweeper import kv_load
-    from aisimulate.sweeper.config import Workload
-    from aisimulate.sweeper.parallel_enum import ParallelShape, ReplicaParallelConfig
+    from aisim.sweeper import kv_load
+    from aisim.sweeper.config import Workload
+    from aisim.sweeper.parallel_enum import ParallelShape, ReplicaParallelConfig
 
     sample = {
         "deployment_mode": "agg",
@@ -708,12 +923,60 @@ def test_profile_kv_load_cache_keeps_resource_identity_without_model_constructio
         kv_load._per_rank_capacity_tokens.cache_clear()
 
 
+@pytest.mark.parametrize("decode_context", [1024, 512])
+def test_linear_pd_kv_load_sizes_each_role_with_its_own_context_length(profile, decode_context):
+    from aisim.sweeper import kv_load
+    from aisim.sweeper.config import Workload
+    from aisim.sweeper.parallel_enum import DisaggParallelConfig, ParallelShape, ReplicaParallelConfig
+
+    prefill = deepcopy(profile["deployments"][0])
+    decode = deepcopy(prefill)
+    prefill["worker_type"] = "prefill"
+    decode["worker_type"] = "decode"
+    profile["deployments"] = [prefill, decode]
+    _observed_profile(profile, context=1024)
+    sample = {
+        "deployment_mode": "disagg",
+        "model_name": profile["model"],
+        "hardware_sku": "h200_sxm",
+        "backend": "vllm",
+        "fpm_profile": profile,
+        "context_length": 2048,
+        "prefill_context_length": 1024,
+        "decode_context_length": decode_context,
+    }
+    for role in ("prefill", "decode"):
+        sample.update(
+            {
+                f"{role}_block_size": 64,
+                f"{role}_max_num_batched_tokens": 1024,
+                f"{role}_max_num_seqs": 4,
+                f"{role}_gpu_memory_utilization": 0.9,
+            }
+        )
+    role = ReplicaParallelConfig(ParallelShape(tp=2, dp=1, moe_tp=2, moe_ep=1), replicas=1)
+    kv_load._per_rank_capacity_tokens.cache_clear()
+    try:
+        result = kv_load.resolve_kv_load(
+            sample,
+            workload=Workload(isl=256, osl=4, kv_load_ratio=1.0, request_count=1),
+            parallel_config=DisaggParallelConfig(prefill=role, decode=role),
+            ratio=1.0,
+            backend_version="0.25.1",
+        )
+    finally:
+        kv_load._per_rank_capacity_tokens.cache_clear()
+
+    assert result.role_capacity_tokens["prefill"] > 0
+    assert result.role_capacity_tokens["decode"] > 0
+
+
 @pytest.mark.parametrize("method", ["auto", "direct"])
 @pytest.mark.parametrize("backend_version", ["0.25.1", {"vllm": " 0.25.1 "}])
 def test_recommendation_preserves_profile_in_exported_prediction(
     profile, monkeypatch, method, timing_systems, backend_version
 ):
-    from aisimulate_core.sdk import RustForwardPassPerfModel
+    from aisim_core.sdk import RustForwardPassPerfModel
 
     engine = _engine(profile)
     engine["backend_version"] = backend_version
@@ -766,7 +1029,7 @@ def test_recommendation_preserves_profile_in_exported_prediction(
     }
     assert {name: resolved[name] for name in ENGINE_MODEL_CONTROL_FIELDS} == controls
     assert resolved["systems_paths"] == [timing_systems]
-    from aisimulate_core.sdk.models.base import _MODEL_REGISTRY
+    from aisim_core.sdk.models.base import _MODEL_REGISTRY
 
     # A fresh environment may now have an analytical class for the same model.
     # Export must retain the method actually selected for the evaluated sample.
@@ -823,7 +1086,7 @@ def test_profile_resolver_normalizes_cache_identity_and_rejects_conflicting_over
 ):
     from dataclasses import replace
 
-    from aisimulate_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
+    from aisim_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
 
     resolver = ForwardPassEstimatorResolver(SearchSpace(model_name=profile["model"], hardware_sku="h200_sxm"))
     request = ForwardPassPerfModelConfig(
@@ -855,7 +1118,7 @@ def test_profile_resolver_normalizes_cache_identity_and_rejects_conflicting_over
 
 @pytest.mark.parametrize("field", [*ENGINE_MODEL_CONTROL_FIELDS, "worker_type", "tp"])
 def test_profile_resolver_rejects_changed_resolved_identity(profile, timing_systems, monkeypatch, field):
-    from aisimulate_core.sdk import RustForwardPassPerfModel
+    from aisim_core.sdk import RustForwardPassPerfModel
 
     engine = _engine(profile)
     engine.update(mode="aggregated", systems_paths=[timing_systems])
@@ -900,21 +1163,31 @@ def test_profile_search_space_rejects_custom_timing(profile, role, timing):
 @pytest.mark.parametrize(
     "updates",
     [
-        {"deployment_mode": ["afd"]},
-        {"deployment_mode": ["afd+pd"]},
+        {
+            "deployment_mode": ["agg"],
+            "backend": ["sglang"],
+            "afd_roles": {"aggregated": {"type": "afd", "afd": {"a_batch_size": 16}}},
+        },
+        {
+            "deployment_mode": ["disagg"],
+            "backend": ["sglang"],
+            "afd_roles": {"decode": {"type": "afd", "afd": {"a_batch_size": 16}}},
+        },
         {"encoder": {"hardware_sku": "h200_sxm"}},
         {"backend": ["sglang"]},
     ],
 )
 def test_profile_search_space_rejects_unsupported_providers(profile, updates):
+    options = {
+        "model_name": profile["model"],
+        "hardware_sku": "h200_sxm",
+        "backend_version": "0.25.1",
+        **updates,
+    }
+    if "afd_roles" in updates:
+        SearchSpace(**options)
     with pytest.raises(ValidationError, match="FPM profiles support vLLM aggregated/disaggregated"):
-        SearchSpace(
-            model_name=profile["model"],
-            hardware_sku="h200_sxm",
-            backend_version="0.25.1",
-            fpm_profile=profile,
-            **updates,
-        )
+        SearchSpace(fpm_profile=profile, **options)
 
 
 @pytest.mark.parametrize(
@@ -931,7 +1204,7 @@ def test_profile_search_space_rejects_unsupported_providers(profile, updates):
     ],
 )
 def test_profile_recommendation_cli_reports_invalid_version_mapping(profile, tmp_path, capsys, backend_version, error):
-    import aisimulate.main as cli
+    import aisim.main as cli
 
     engine = _engine(profile)
     engine.update(mode="aggregated", backend_version=backend_version)
@@ -952,10 +1225,10 @@ def test_profile_recommendation_cli_accepts_version_mapping_and_exports_literal(
 ):
     import yaml
 
-    import aisimulate.main as cli
-    from aisimulate.recommend import _run_recommendation
+    import aisim.main as cli
+    from aisim.recommend import _run_recommendation
 
-    monkeypatch.setattr("aisimulate.recommend.run_recommendation", _run_recommendation)
+    monkeypatch.setattr("aisim.recommend.run_recommendation", _run_recommendation)
     engine = _engine(profile)
     engine.update(mode="aggregated", backend_version={"vllm": "0.25.1"}, systems_paths=[timing_systems])
     engine["workers"]["aggregated"]["parallelism"] = {"preset": "default"}
@@ -993,8 +1266,8 @@ def _observed_profile(profile, *, context=2048, fraction=0.9):
 
 
 def test_public_linear_runtime_kv_load_preserves_selected_context(profile, timing_systems, tmp_path, monkeypatch):
-    import aisimulate.main as cli
-    from aisimulate.recommend import _run_recommendation
+    import aisim.main as cli
+    from aisim.recommend import _run_recommendation
 
     _observed_profile(profile)
     for deployment in profile["deployments"]:
@@ -1022,16 +1295,17 @@ def test_public_linear_runtime_kv_load_preserves_selected_context(profile, timin
             }
         )
     )
-    monkeypatch.setattr("aisimulate.recommend.run_recommendation", _run_recommendation)
+    monkeypatch.setattr("aisim.recommend.run_recommendation", _run_recommendation)
     output = tmp_path / "recommendation"
     assert cli.main(["recommend", "--config", str(path), "--output-dir", str(output)]) == 0
-    exported = CorePredictionConfig.from_yaml(output / "recommendations/0001.yaml")
+    with pytest.warns(AisPerfModelDeprecationWarning):
+        exported = CorePredictionConfig.from_yaml(output / "recommendations/0001.yaml")
     assert exported.engine.context_length == 1024
     assert all(item.resources.runtime_memory.max_model_len == 2048 for item in exported.engine.fpm_profile.deployments)
 
 
 def test_observed_linear_pool_exposes_missing_batch_timing(profile, timing_systems):
-    from aisimulate.runner import EngineReplayRunnerFactory
+    from aisim.runner import EngineReplayRunnerFactory
 
     _observed_profile(profile, context=4096)
     engine = {**_engine(profile), "systems_paths": [timing_systems]}
@@ -1057,7 +1331,7 @@ def test_observed_linear_pool_exposes_missing_batch_timing(profile, timing_syste
 
 @pytest.mark.parametrize("override", [(), ("--context-length", "256"), ("--gpu-memory-utilization", "0.9")])
 def test_runtime_profile_reinitialization_reuses_observed_defaults(profile, tmp_path, override):
-    import aisimulate.main as cli
+    import aisim.main as cli
 
     _observed_profile(profile, context=128, fraction=0.8)
     source, target = tmp_path / "profile.json", tmp_path / "request.yaml"
@@ -1121,8 +1395,9 @@ def test_invalid_profile_predictions_fail_before_runtime(profile, update, error)
         CorePredictionConfig.model_validate({"engine": {**_engine(profile), **update}})
 
 
+@reads_saved_config
 def test_onboard_dep_keeps_full_identity_and_checks_resources_before_collection(profile, tmp_path, monkeypatch):
-    from aisimulate_core.sdk import RustForwardPassPerfModel
+    from aisim_core.sdk import RustForwardPassPerfModel
 
     def no_timing(*args, **kwargs):
         pytest.fail("planning constructed a timing estimator before collection")
@@ -1173,6 +1448,7 @@ def test_onboard_dep_keeps_full_identity_and_checks_resources_before_collection(
     assert {p.relative_to(tmp_path): p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()} == before
 
 
+@reads_saved_config
 @pytest.mark.parametrize(
     "preset,max_tokens,max_sequences,moe_backend",
     [
@@ -1296,11 +1572,12 @@ def test_onboard_rejects_profile_below_collector_minimum_token_axis(profile, tmp
     assert not output.exists()
 
 
+@reads_saved_config
 @pytest.mark.parametrize(
     "tp,dp,moe_tp,moe_ep,preset", [(2, 1, 2, 1, "pure_tp"), (1, 2, 1, 2, "dep"), (2, 1, 1, 2, "tep")]
 )
 def test_onboard_cli_embeds_profile_and_preserves_topology(profile, tmp_path, tp, dp, moe_tp, moe_ep, preset):
-    import aisimulate.main as cli
+    import aisim.main as cli
 
     profile["deployments"].append({**deepcopy(profile["deployments"][0]), "moe_tp": 1, "moe_ep": 2})
     source = tmp_path / "model-profile.json"
@@ -1367,7 +1644,7 @@ def test_direct_profile_uses_external_pair_and_preserves_fmha_arithmetic(
     import pyarrow as pa
     import pyarrow.parquet as pq
 
-    from aisimulate_core.sdk import RustForwardPassPerfModel
+    from aisim_core.sdk import RustForwardPassPerfModel
 
     # Move the only measured pair outside the systems tree, so silently losing
     # the external path cannot succeed through packaged-data fallback.
@@ -1412,8 +1689,8 @@ def test_direct_profile_uses_external_pair_and_preserves_fmha_arithmetic(
 
 
 def test_recommendation_names_profile_context_budget(profile, timing_systems, monkeypatch, caplog):
-    from aisimulate.recommend import _run_recommendation
-    from aisimulate.sweeper.search import Sweeper
+    from aisim.recommend import _run_recommendation
+    from aisim.sweeper.search import Sweeper
 
     engine = {**_engine(profile), "mode": "aggregated", "systems_paths": [timing_systems]}
     engine["workers"]["aggregated"]["parallelism"] = {"preset": "default"}
@@ -1421,9 +1698,151 @@ def test_recommendation_names_profile_context_budget(profile, timing_systems, mo
         {"engine": engine, "optimization": {"constraints": {"max_candidate_gpus": 2}}}
     )
     monkeypatch.setattr(Sweeper, "run", lambda self, smart, **kwargs: smart)
-    caplog.set_level("WARNING", logger="aisimulate.recommend")
+    caplog.set_level("WARNING", logger="aisim.recommend")
 
     _run_recommendation(config, stack="engine", runner_factory=None, show_progress=False)
 
     assert "engine.context_length is 'max'; using the FPM profile context length of 4096 tokens" in caplog.text
     assert "model maximum" not in caplog.text
+
+
+def test_observed_mamba_pool_reaches_native_replay(profile, timing_systems):
+    from aisim.runner import EngineReplayRunnerFactory
+
+    profile["deployments"] = profile["deployments"][:1]
+    profile["deployments"][0]["resources"] = {
+        "cache_layout": "mamba_align",
+        "mamba_cache": {
+            "state_storage": "full_state",
+            "block_size_tokens": 8,
+            "page_size_bytes": 64,
+            "state_groups": 5,
+            "prefix_match_unit": 2,
+            "num_speculative_states": 0,
+        },
+        "runtime_memory": {
+            "kv_cache_bytes": 6400,
+            "gpu_memory_utilization": 0.9,
+            "max_model_len": 4096,
+            "provenance": "synthetic shared pool",
+        },
+        "max_num_tokens": 1024,
+        "max_batch_size": 4,
+        "provenance": "synthetic shared pool",
+    }
+    worker = _worker()
+    worker["kv_cache"] = {"block_size": 8}
+    config = CorePredictionConfig.model_validate(
+        {
+            "engine": {
+                **_engine(profile),
+                "systems_paths": [timing_systems],
+                "workers": {"aggregated": worker},
+            },
+            "traffic": {
+                "source": {"type": "synthetic", "input_tokens": 1, "output_tokens": 2},
+                "load": {"type": "concurrency", "concurrency": 1},
+                "stop": {"requests": 1},
+            },
+        }
+    )
+    spec = prediction_to_replay_spec(config)
+    lowered = materialize_aic_num_gpu_blocks(spec.backend_deployment.agg_engine_args)
+    assert lowered["num_gpu_blocks"] == 99
+    assert lowered["state_cache"] == {"bytes_per_request": 320}
+    assert lowered["kv_cache_bytes_per_token"] == 8
+    assert lowered["prefix_match_unit"] == 2
+    host = {"num_host_blocks": 4, "connector": "simple_cpu_v0_32"}
+    with pytest.raises(ValueError, match="Mamba FPM cache supports HBM replay only"):
+        materialize_aic_num_gpu_blocks({**spec.backend_deployment.agg_engine_args, "native_host_offload": host})
+    result = EngineReplayRunnerFactory().create(0).run(spec)
+    assert result.metrics["completed_requests"] == 1
+    recommendation = {**_engine(profile), "mode": "aggregated"}
+    recommendation["workers"]["aggregated"]["parallelism"] = {"preset": "default"}
+    with pytest.raises(ValidationError, match="recommendation search is unsupported"):
+        CoreRecommendationConfig.model_validate({"engine": recommendation, "optimization": {}})
+
+
+@pytest.mark.parametrize("layout", ["mamba_align", "unmodeled"])
+def test_onboarding_rejects_observed_pools_it_cannot_plan(profile, layout):
+    resources = {
+        "cache_layout": layout,
+        "runtime_memory": {
+            "kv_cache_bytes": 6400,
+            "gpu_memory_utilization": 0.9,
+            "max_model_len": 4096,
+            "provenance": "synthetic shared pool",
+        },
+        "max_num_tokens": 1024,
+        "max_batch_size": 4,
+        "provenance": "synthetic shared pool",
+    }
+    if layout == "mamba_align":
+        resources["mamba_cache"] = {
+            "state_storage": "full_state",
+            "block_size_tokens": 8,
+            "page_size_bytes": 64,
+            "state_groups": 5,
+            "prefix_match_unit": 2,
+            "num_speculative_states": 0,
+        }
+    profile["deployments"] = profile["deployments"][:1]
+    profile["deployments"][0]["resources"] = resources
+    request = {
+        "identity": {
+            "model": profile["model"],
+            "model_revision": profile["model_revision"],
+            "model_kind": "moe",
+            "framework_version": "0.25.1",
+            "gpu": "h200_sxm",
+            "interconnect": "NVLink",
+        },
+        "search": {
+            "tensor_parallel": 2,
+            "attention_data_parallel": 1,
+            "moe_tensor_parallel": 2,
+            "moe_expert_parallel": 1,
+            "context_length": 4096,
+        },
+        "fpm_profile": profile,
+    }
+    with pytest.raises(ValidationError, match=f"onboarding does not support {layout} FPM caches"):
+        SupportRequest.model_validate(request)
+
+
+@pytest.mark.parametrize(
+    "geometry, message",
+    [
+        ({"state_storage": "replayssm"}, "full_state"),
+        ({"prefix_match_unit": 3}, "prefix_match_unit must divide block_size_tokens"),
+        ({"page_size_bytes": 65}, "page_size_bytes must be a positive multiple of block_size_tokens"),
+    ],
+)
+def test_mamba_profile_rejects_inconsistent_physical_geometry(profile, geometry, message):
+    from aisim_core.fpm_profile import FpmModelProfile
+
+    resources = profile["deployments"][0]["resources"]
+    resources.clear()
+    resources.update(
+        cache_layout="mamba_align",
+        mamba_cache={
+            "state_storage": "full_state",
+            "block_size_tokens": 8,
+            "page_size_bytes": 64,
+            "state_groups": 5,
+            "prefix_match_unit": 2,
+            "num_speculative_states": 0,
+            **geometry,
+        },
+        runtime_memory={
+            "kv_cache_bytes": 6400,
+            "gpu_memory_utilization": 0.9,
+            "max_model_len": 4096,
+            "provenance": "synthetic shared pool",
+        },
+        max_num_tokens=1024,
+        max_batch_size=4,
+        provenance="synthetic shared pool",
+    )
+    with pytest.raises(ValidationError, match=message):
+        FpmModelProfile.model_validate(profile)

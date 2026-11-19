@@ -18,6 +18,7 @@ from scripts.fpm_accuracy.models.aic_config import map_worker_config_to_aic
 from scripts.fpm_accuracy.models.aic_fpm_database import PreparedAicFpmDatabase, prepare_aic_fpm_database
 from scripts.fpm_accuracy.models.fpt_predictor import ForwardPassTimePredictor, Prediction, PredictorContext
 from scripts.fpm_accuracy.types.forward_pass import ForwardPassInput, ForwardPassIteration
+from scripts.release.package_identity import runtime_module
 
 AicMode = Literal["fpm", "regression"]
 
@@ -221,16 +222,20 @@ def _import_aisim_forward_pass_perf_model() -> Any:
     """Import AISim only when a concrete predictor is constructed."""
 
     try:
-        from aisimulate_core.sdk import RustForwardPassPerfModel
+        sdk = runtime_module("aisim_core.sdk")
     except ImportError as exc:
         raise DependencyError(
-            "AISim predictors require aisimulate. Install the sibling AISim checkout in this environment."
+            "AISim predictors require aisim. Install the sibling AISim checkout in this environment."
         ) from exc
-    return RustForwardPassPerfModel
+    try:
+        perf_model_type = sdk.RustForwardPassPerfModel
+    except (AttributeError, ImportError) as exc:
+        raise DependencyError("This AISim revision does not export RustForwardPassPerfModel.") from exc
+    return perf_model_type
 
 
 def _canonical_config_type() -> Any:
-    from aisimulate_core import sdk
+    sdk = runtime_module("aisim_core.sdk")
 
     return getattr(sdk, "ForwardPassPerfModelConfig", None)
 

@@ -1,5 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-FileCopyrightText: Copyright 2023-2026 SGLang Team
 // SPDX-License-Identifier: Apache-2.0
+// Merged backup submission adapts SGLang v0.5.22; see THIRD_PARTY_NOTICES.md.
+// Source: https://github.com/sgl-project/sglang/tree/baa9befa381511cd4d56f83980951e5a45fffc6d
 
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, VecDeque};
@@ -7,9 +10,9 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use super::{HostOffloadObservation, HostOffloadObservationData, HostOffloadObserver};
-use crate::engine::common::hashing::SequenceHash;
+use crate::engine::common::hashing::{SequenceHash, compute_next_sequence_hash};
 use crate::engine::offload_lru::Lru;
-use crate::engine::offload_transfer::{self, Direction, FairTransfers};
+use crate::engine::offload_transfer::{self, Direction, FairTransfers, Link};
 use crate::engine::{KvBlock, KvEventData, StoredBlocks};
 use anyhow::{Result, bail, ensure};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -27,6 +30,17 @@ impl HostBlockKey {
 
     pub(crate) const fn sequence_hash(self) -> SequenceHash {
         self.0
+    }
+
+    /// A state at the block boundary whose sequence hash is `prefix`, chained
+    /// like a child block of that prefix so it cannot collide with a token
+    /// block. A recurrent state has one key per `slot` (one per Mamba KV cache
+    /// group). A sliding-window checkpoint has one key, for which `slot` is
+    /// its row count, so ranks whose states differ in size never read each
+    /// other's checkpoints from a shared pool.
+    pub(crate) fn state(prefix: SequenceHash, slot: usize) -> Self {
+        const STATE_TAG: u64 = 0x5354_4154_455f_4b45; // "STATE_KE"
+        Self(compute_next_sequence_hash(prefix, STATE_TAG + slot as u64))
     }
 }
 
@@ -53,6 +67,32 @@ pub(crate) struct HostTierConfig {
     /// Aggregate `(D2H, H2D)` caps of a cluster-shared pool in decimal GB/s.
     /// `None` selects one private owner with FIFO lanes.
     pub(crate) shared_gbps: Option<(f64, f64)>,
+    pub(crate) policy: HostPolicy,
+    pub(crate) eviction: HostEviction,
+}
+
+/// Who chooses which resident blocks may be reclaimed for admission.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HostEviction {
+    TierLru,
+    /// Admission uses empty slots only; the caller explicitly evicts eligible blocks.
+    Caller,
+}
+
+/// Where a block enters the eviction order.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HostPolicy {
+    /// Blocks that become evictable together, by a completed store or a
+    /// released pin, become the newest in key order.
+    CohortLru,
+    /// Blocks become the newest when their last pin drops, in the order they
+    /// are released: a CPU block pool's free queue.
+    FreeQueue,
+    /// A block is ranked when its store is admitted and keeps its rank while
+    /// pending or pinned; only [`HostTier::touch`] re-ranks it. Victims are the
+    /// lowest-ranked resident, unpinned blocks. External reservations (G3,
+    /// KVCR) are not planned on such a tier.
+    Ranked,
 }
 
 /// One owner's access link. Zero bandwidth is instantaneous.
@@ -66,9 +106,10 @@ pub(crate) struct HostLink {
 /// Router-facing identity and store attribution, retained when publishing residency.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct HostBlockMeta {
+    pub(crate) cache_salt: Option<Arc<str>>,
     pub(crate) parent: Option<SequenceHash>,
     pub(crate) tokens_hash: u64,
-    /// Absolute zero-based block index within its prompt.
+    /// Absolute zero-based block index within its request.
     pub(crate) position: usize,
     /// Session that triggered this residency; retained for subscriber snapshots.
     pub(crate) session_id: Option<Arc<str>>,
@@ -87,6 +128,7 @@ pub(crate) enum Lookup {
 pub(crate) enum StoreOutcome {
     Prepared {
         transfer_id: TransferId,
+        /// Unit blocks the cohort stores; its weighted entries are not counted.
         stored_blocks: usize,
     },
     AlreadyPresent,
@@ -138,6 +180,41 @@ pub(crate) enum CompletedTransfer {
     },
 }
 
+/// A caller's last [`HostTier::touch_reversed`] of one key list. The next
+/// call skips what cannot have changed since.
+pub(crate) struct ReversedTouch {
+    /// [`Lru::touches`] after the call. While it stands, the keys' blocks
+    /// are still the newest, in order, and the next call does nothing.
+    lru_touches: u64,
+    /// `admitted_blocks` when the tier held none of the keys from
+    /// `absent_from` on. While it stands, those keys need no lookup.
+    admitted: u64,
+    absent_from: usize,
+    /// The [`Lru`] run the keys' blocks join as they move.
+    run: u32,
+    /// The blocks the call left newest, if the first key had one. While
+    /// `run` is whole they move again as one, without lookups.
+    leading: Option<Leading>,
+}
+
+impl ReversedTouch {
+    /// The caller's own store admitted `blocks` of its keys, all before
+    /// index `end`.
+    pub(crate) fn stored(&mut self, blocks: usize, end: usize) {
+        self.admitted += blocks as u64;
+        self.absent_from = self.absent_from.max(end);
+    }
+}
+
+/// The adjacent blocks of a caller's first `len` keys: `oldest` holds key
+/// `len - 1`, `newest` key 0.
+#[derive(Clone, Copy)]
+struct Leading {
+    len: usize,
+    oldest: NonZeroU32,
+    newest: NonZeroU32,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum EntryState {
     PendingStore { transfer_id: TransferId },
@@ -149,10 +226,15 @@ enum EntryState {
 struct Entry {
     state: EntryState,
     load_pins: u32,
-    /// This block's [`Lru`] node while it is resident and unpinned.
+    /// This block's [`Lru`] node while it is resident and unpinned, or while
+    /// it is present in a [`HostPolicy::Ranked`] tier.
     lru_slot: Option<NonZeroU32>,
     /// Filled by a KVCR peer fetch rather than a local store.
     kvcr_origin: bool,
+    /// Pool blocks the entry occupies: one, or a state checkpoint's rows.
+    /// External reservations and [`HostTier::free_blocks`] count entries;
+    /// they never share a pool with a weighted entry.
+    weight: u32,
 }
 
 /// Declaration order is the same-timestamp completion order.
@@ -169,6 +251,8 @@ struct Transfer {
     client: u64,
     request_id: Uuid,
     blocks: Vec<HostBlockKey>,
+    /// Pool blocks the transfer moves: the weights of `blocks`.
+    weight: usize,
     /// Fixed completion time of a submitted private-lane transfer.
     deadline: Option<f64>,
 }
@@ -236,7 +320,7 @@ enum Transport {
         h2d: FifoLane,
         deadlines: BTreeSet<Deadline>,
     },
-    /// Shared pool: equal-share service under access and pool caps.
+    /// Shared pool: max-min fair service under access and pool caps.
     Fair {
         transfers: FairTransfers,
         /// Bytes per millisecond, indexed by [`Direction`].
@@ -254,6 +338,8 @@ fn direction(kind: Kind) -> Direction {
 struct Client {
     link: HostLink,
     prepared_stores: VecDeque<TransferId>,
+    /// This client's entries in [`HostTier::transfers`].
+    pending_transfers: usize,
     /// Physically complete transfers the owner has not consumed yet.
     done: VecDeque<(f64, CompletedTransfer)>,
     seen_epoch: u64,
@@ -270,9 +356,18 @@ struct Client {
 pub(crate) struct HostTier {
     config: HostTierConfig,
     entries: FxHashMap<HostBlockKey, Entry>,
-    /// Resident, currently unpinned blocks. Blocks a framework operation makes
-    /// evictable together are one cohort because vLLM exposes no stable policy
-    /// order within its Python-set completion cohort.
+    /// Includes pinned residents; pending destinations count only in `used_blocks`.
+    resident_blocks: usize,
+    /// Unit blocks ever admitted, by a store or an external reservation. A
+    /// prompt key the tier lacked is still absent while this count stands.
+    admitted_blocks: u64,
+    /// Pool blocks that resident and pending entries occupy.
+    used_blocks: usize,
+    /// Resident, currently unpinned blocks, or every present block of a
+    /// [`HostPolicy::Ranked`] tier. Under [`HostPolicy::CohortLru`], blocks a
+    /// framework operation makes evictable together are one cohort because
+    /// vLLM exposes no stable policy order within its Python-set completion
+    /// cohort.
     lru: Lru,
     transfers: FxHashMap<TransferId, Transfer>,
     transport: Transport,
@@ -280,6 +375,11 @@ pub(crate) struct HostTier {
     /// Router identity of each block, retained while residency is published.
     meta: FxHashMap<HostBlockKey, HostBlockMeta>,
     completion_epoch: u64,
+    /// See [`Self::lookup_epoch`].
+    lookup_epoch: u64,
+    /// Loads that released their pins. With [`Self::lookup_epoch`] this covers
+    /// every change that can make room for a store.
+    pin_releases: u64,
     next_transfer_id: u64,
     current_time_ms: f64,
     warned_structurally_unfittable: bool,
@@ -290,6 +390,10 @@ pub(crate) struct HostTier {
 
 impl HostTier {
     pub(crate) fn new(config: HostTierConfig) -> Result<Self> {
+        ensure!(
+            config.eviction != HostEviction::Caller || config.shared_gbps.is_none(),
+            "caller-controlled host eviction requires a private pool"
+        );
         ensure!(config.capacity_blocks > 0, "host capacity must be positive");
         ensure!(config.block_bytes > 0, "host block size must be positive");
         let max_bytes = config
@@ -317,12 +421,17 @@ impl HostTier {
         Ok(Self {
             config,
             entries: FxHashMap::default(),
+            resident_blocks: 0,
+            admitted_blocks: 0,
+            used_blocks: 0,
             lru: Lru::default(),
             transfers: FxHashMap::default(),
             transport,
             clients: FxHashMap::default(),
             meta: FxHashMap::default(),
             completion_epoch: 0,
+            lookup_epoch: 0,
+            pin_releases: 0,
             next_transfer_id: 0,
             current_time_ms: 0.0,
             warned_structurally_unfittable: false,
@@ -356,6 +465,7 @@ impl HostTier {
             Client {
                 link,
                 prepared_stores: VecDeque::new(),
+                pending_transfers: 0,
                 done: VecDeque::new(),
                 seen_epoch: self.completion_epoch,
                 holds_completed_sources: false,
@@ -412,7 +522,7 @@ impl HostTier {
             match self.transfers[&id].kind {
                 Kind::Load => {
                     self.remove_queued(id);
-                    let transfer = self.transfers.remove(&id).expect("owned load disappeared");
+                    let transfer = self.remove_transfer(id).expect("owned load disappeared");
                     self.release_load_pins(&transfer.blocks);
                 }
                 Kind::Store if self.is_submitted(id) => {}
@@ -442,17 +552,40 @@ impl HostTier {
         meta: Option<&[HostBlockMeta]>,
         now_ms: f64,
     ) -> StoreOutcome {
-        self.reserve_store(client, request_id, blocks, meta, now_ms, Kind::Store)
+        self.prepare_cohort(client, request_id, blocks, meta, &[], 1, now_ms)
+    }
+
+    /// [`Self::prepare_store`] with `weighted` entries in the same cohort.
+    /// Each occupies `weight` pool blocks and carries no router identity,
+    /// such as a state checkpoint. The cohort is admitted whole or not at all.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prepare_cohort(
+        &mut self,
+        client: u64,
+        request_id: Uuid,
+        blocks: &[HostBlockKey],
+        meta: Option<&[HostBlockMeta]>,
+        weighted: &[HostBlockKey],
+        weight: usize,
+        now_ms: f64,
+    ) -> StoreOutcome {
+        let kind = Kind::Store;
+        self.reserve_store(
+            client, request_id, blocks, meta, weighted, weight, now_ms, kind,
+        )
     }
 
     /// Both sources mutate the same physical capacity. Only a GPU source
     /// prepares a native D2H; eviction and capacity observations apply to both.
+    #[allow(clippy::too_many_arguments)]
     fn reserve_store(
         &mut self,
         client: u64,
         request_id: Uuid,
         blocks: &[HostBlockKey],
         meta: Option<&[HostBlockMeta]>,
+        weighted: &[HostBlockKey],
+        weight: usize,
         now_ms: f64,
         kind: Kind,
     ) -> StoreOutcome {
@@ -464,29 +597,64 @@ impl HostTier {
                 missing.push((key, meta.map(|meta| meta[index].clone())));
             }
         }
-        let (missing, missing_meta): (Vec<_>, Vec<_>) = missing.into_iter().unzip();
+        let (mut missing, mut missing_meta): (Vec<_>, Vec<_>) = missing.into_iter().unzip();
+        // Unit blocks first, then the weighted entries.
+        let (stored_blocks, offered_blocks) = (missing.len(), protected.len());
+        for key in weighted.iter().copied() {
+            if protected.insert(key) && !self.entries.contains_key(&key) {
+                missing.push(key);
+                missing_meta.push(None);
+            }
+        }
         if missing.is_empty() {
             return StoreOutcome::AlreadyPresent;
         }
 
-        let free = self.config.capacity_blocks - self.entries.len();
-        let needed_victims = missing.len().saturating_sub(free);
+        let free = self.config.capacity_blocks - self.used_blocks;
+        let missing_blocks = stored_blocks + (missing.len() - stored_blocks) * weight;
+        let needed = missing_blocks.saturating_sub(free);
+        // A cohort larger than the pool never fits, whatever is evicted.
+        let cohort_blocks = offered_blocks + (protected.len() - offered_blocks) * weight;
+        let structurally_unfittable = cohort_blocks > self.config.capacity_blocks;
         let entries = &self.entries;
-        let victims = self.lru.victims(needed_victims, |key| {
-            !protected.contains(&key)
-                && entries.get(&key).is_some_and(|entry| {
-                    entry.state == EntryState::Resident && entry.load_pins == 0
-                })
-        });
-        if victims.len() != needed_victims {
-            let structurally_unfittable = protected.len() > self.config.capacity_blocks;
+        // Victims are resident entries, so a need above the resident blocks
+        // fails without the walk, which in a ranked order also passes every
+        // pending and pinned entry.
+        let (victims, covered) = if structurally_unfittable
+            || self.config.eviction == HostEviction::Caller
+            || needed > self.resident_blocks
+        {
+            (Vec::new(), 0)
+        } else {
+            self.lru.victims_covering(needed, |key| {
+                entries
+                    .get(&key)
+                    .filter(|entry| {
+                        !protected.contains(&key)
+                            && entry.state == EntryState::Resident
+                            && entry.load_pins == 0
+                    })
+                    .map(|entry| entry.weight as usize)
+            })
+        };
+        if covered < needed {
             if structurally_unfittable && !self.warned_structurally_unfittable {
-                tracing::warn!(
-                    cohort_blocks = protected.len(),
-                    missing_blocks = missing.len(),
-                    host_capacity_blocks = self.config.capacity_blocks,
-                    "native host-offload store cohort cannot fit; retrying without advancing the store cursor"
-                );
+                let host_capacity_blocks = self.config.capacity_blocks;
+                if weighted.is_empty() {
+                    tracing::warn!(
+                        cohort_blocks,
+                        missing_blocks,
+                        host_capacity_blocks,
+                        "native host-offload store cohort cannot fit; retrying without advancing the store cursor"
+                    );
+                } else {
+                    tracing::warn!(
+                        cohort_blocks,
+                        host_capacity_blocks,
+                        "state checkpoints make a store cohort larger than host_offload.num_host_blocks, \
+                         so it is not stored; set state_cache.retention_interval or raise num_host_blocks"
+                    );
+                }
                 self.warned_structurally_unfittable = true;
             }
             self.observe(HostOffloadObservation {
@@ -501,13 +669,14 @@ impl HostTier {
                 structurally_unfittable,
             };
         }
-        let stored_blocks = missing.len();
+        let weights = (stored_blocks, weight);
         let transfer_id = self.admit(
             client,
             request_id,
             &victims,
             missing,
             missing_meta,
+            weights,
             now_ms,
             kind,
         );
@@ -517,7 +686,8 @@ impl HostTier {
         }
     }
 
-    /// Evict `victims`, then admit `missing` as one pending transfer.
+    /// Evict `victims`, then admit `missing` as one pending transfer. Its
+    /// first `units` entries occupy one pool block each and the rest `weight`.
     #[allow(clippy::too_many_arguments)]
     fn admit(
         &mut self,
@@ -526,34 +696,12 @@ impl HostTier {
         victims: &[HostBlockKey],
         missing: Vec<HostBlockKey>,
         missing_meta: Vec<Option<HostBlockMeta>>,
+        (units, weight): (usize, usize),
         now_ms: f64,
         kind: Kind,
     ) -> TransferId {
-        for victim in victims {
-            let mut entry = self
-                .entries
-                .remove(victim)
-                .expect("selected host victim disappeared");
-            assert_eq!(entry.state, EntryState::Resident);
-            assert_eq!(entry.load_pins, 0);
-            self.lru.remove(&mut entry.lru_slot);
-            self.observe(HostOffloadObservation {
-                request_id,
-                event: HostOffloadObservationData::Evicted {
-                    at_ms: now_ms,
-                    block: *victim,
-                },
-            });
-        }
+        self.remove_residents(request_id, victims, now_ms);
         if self.meta_retained() {
-            for victim in victims {
-                self.meta.remove(victim);
-            }
-            if !victims.is_empty() {
-                self.publish(|| KvEventData::Removed {
-                    block_hashes: victims.iter().map(|key| key.sequence_hash()).collect(),
-                });
-            }
             for (key, meta) in missing.iter().zip(missing_meta) {
                 if let Some(meta) = meta {
                     self.meta.insert(*key, meta);
@@ -562,20 +710,23 @@ impl HostTier {
         }
 
         let transfer_id = self.allocate_transfer_id();
-        for key in &missing {
-            assert!(
-                self.entries
-                    .insert(
-                        *key,
-                        Entry {
-                            state: EntryState::PendingStore { transfer_id },
-                            load_pins: 0,
-                            lru_slot: None,
-                            kvcr_origin: false,
-                        },
-                    )
-                    .is_none()
-            );
+        // A weighted entry is no key of a prompt, so the prompt-touch memo
+        // does not count it.
+        self.admitted_blocks += units as u64;
+        self.lookup_epoch += 1;
+        let weight = u32::try_from(weight).expect("host entry weight overflow");
+        for (index, key) in missing.iter().enumerate() {
+            let mut entry = Entry {
+                state: EntryState::PendingStore { transfer_id },
+                load_pins: 0,
+                lru_slot: None,
+                kvcr_origin: false,
+                weight: if index < units { 1 } else { weight },
+            };
+            if self.config.policy == HostPolicy::Ranked {
+                self.lru.touch(&mut entry.lru_slot, *key);
+            }
+            assert!(self.entries.insert(*key, entry).is_none());
         }
         if kind == Kind::Store {
             self.observe(HostOffloadObservation {
@@ -588,17 +739,87 @@ impl HostTier {
             });
             self.client(client).prepared_stores.push_back(transfer_id);
         }
-        self.transfers.insert(
+        let weight = units + (missing.len() - units) * weight as usize;
+        self.used_blocks += weight;
+        self.insert_transfer(
             transfer_id,
             Transfer {
                 kind,
                 client,
                 request_id,
                 blocks: missing,
+                weight,
                 deadline: None,
             },
         );
         transfer_id
+    }
+
+    /// Remove an unpinned resident in a caller-managed pool, publishing the same eviction effects
+    /// as tier-managed admission. Pending transfers and pinned load sources cannot be removed.
+    pub(crate) fn evict_resident(
+        &mut self,
+        request_id: Uuid,
+        key: HostBlockKey,
+        now_ms: f64,
+    ) -> bool {
+        assert_eq!(self.config.eviction, HostEviction::Caller);
+        let now_ms = self.prepare_mutation(now_ms);
+        if !self
+            .entries
+            .get(&key)
+            .is_some_and(|entry| entry.state == EntryState::Resident && entry.load_pins == 0)
+        {
+            return false;
+        }
+        self.remove_residents(request_id, &[key], now_ms);
+        true
+    }
+
+    fn remove_residents(&mut self, request_id: Uuid, victims: &[HostBlockKey], now_ms: f64) {
+        self.lookup_epoch += 1;
+        for victim in victims {
+            let mut entry = self
+                .entries
+                .remove(victim)
+                .expect("selected host victim disappeared");
+            assert_eq!(entry.state, EntryState::Resident);
+            assert_eq!(entry.load_pins, 0);
+            self.resident_blocks -= entry.weight as usize;
+            self.used_blocks -= entry.weight as usize;
+            self.lru.remove(&mut entry.lru_slot);
+            self.observe(HostOffloadObservation {
+                request_id,
+                event: HostOffloadObservationData::Evicted {
+                    at_ms: now_ms,
+                    block: *victim,
+                },
+            });
+        }
+        if self.meta_retained() && !victims.is_empty() {
+            // A block without router identity (a state row) published no
+            // `Stored` event, so it publishes no `Removed` one either.
+            let subscribers = self.clients.values().filter(|c| c.events.is_some());
+            let mut left = subscribers.count();
+            let mut removed = Vec::with_capacity(if left > 0 { victims.len() } else { 0 });
+            for victim in victims {
+                if self.meta.remove(victim).is_some() && left > 0 {
+                    removed.push(victim.sequence_hash());
+                }
+            }
+            if !removed.is_empty() {
+                // One list per subscriber: the last one takes this one.
+                for events in self.clients.values_mut().filter_map(|c| c.events.as_mut()) {
+                    left -= 1;
+                    let block_hashes = if left == 0 {
+                        std::mem::take(&mut removed)
+                    } else {
+                        removed.clone()
+                    };
+                    events.push(KvEventData::Removed { block_hashes });
+                }
+            }
+        }
     }
 
     /// Pure feasibility check: no LRU touch, allocation, eviction or observation.
@@ -608,8 +829,11 @@ impl HostTier {
             .iter()
             .filter(|key| !self.entries.contains_key(key))
             .count();
-        let free = self.config.capacity_blocks - self.entries.len();
+        let free = self.config.capacity_blocks - self.used_blocks;
         let needed = missing.saturating_sub(free);
+        if self.config.eviction == HostEviction::Caller {
+            return needed == 0;
+        }
         self.lru
             .victims(needed, |key| {
                 !protected.contains(&key)
@@ -626,7 +850,7 @@ impl HostTier {
     pub(crate) fn plan_external(&mut self, protected: &[HostBlockKey], now: f64) -> ExternalPlan {
         self.prepare_mutation(now);
         ExternalPlan {
-            free: self.config.capacity_blocks - self.entries.len(),
+            free: self.config.capacity_blocks - self.used_blocks,
             protected: protected.iter().copied().collect(),
             cursor: None,
             victims: Vec::new(),
@@ -651,9 +875,12 @@ impl HostTier {
         if let Some(free) = plan.free.checked_sub(1) {
             plan.free = free;
         } else {
-            // The LRU holds exactly the resident, unpinned blocks, so each
-            // block past the cursor is a candidate; earlier ones are victims
-            // or protected.
+            if self.config.eviction == HostEviction::Caller {
+                return false;
+            }
+            // Outside a ranked tier, which is never planned on, the LRU holds
+            // exactly the resident, unpinned blocks, so each block past the
+            // cursor is a candidate; earlier ones are victims or protected.
             // Planning borrows the tier immutably, so the cursor node stays
             // linked until the plan is applied.
             let Some((node, victim)) = self
@@ -692,6 +919,9 @@ impl HostTier {
             })
             .count();
         let needed = missing.saturating_sub(plan.free);
+        if self.config.eviction == HostEviction::Caller {
+            return needed == 0;
+        }
         self.lru
             .victims(needed, |key| {
                 !protected.contains(&key)
@@ -724,12 +954,14 @@ impl HostTier {
             None => vec![None; plan.reserved.len()],
         };
         assert_eq!(meta.len(), plan.reserved.len());
+        let units = (plan.reserved.len(), 1);
         self.admit(
             client,
             owner,
             &plan.victims,
             plan.reserved,
             meta,
+            units,
             now_ms,
             Kind::External,
         )
@@ -758,7 +990,7 @@ impl HostTier {
         meta: Option<&[HostBlockMeta]>,
         now: f64,
     ) -> StoreOutcome {
-        self.reserve_store(client, owner, keys, meta, now, Kind::External)
+        self.reserve_store(client, owner, keys, meta, &[], 1, now, Kind::External)
     }
 
     pub(crate) fn complete_external(&mut self, id: TransferId) {
@@ -772,10 +1004,10 @@ impl HostTier {
 
     fn complete_external_with(&mut self, id: TransferId, kvcr_origin: bool) {
         let transfer = self
-            .transfers
-            .remove(&id)
+            .remove_transfer(id)
             .filter(|transfer| transfer.kind == Kind::External)
             .expect("external G2 reservation missing");
+        self.lookup_epoch += 1;
         for key in &transfer.blocks {
             let entry = self.entries.get_mut(key).unwrap();
             assert_eq!(entry.state, EntryState::PendingStore { transfer_id: id });
@@ -785,6 +1017,7 @@ impl HostTier {
                 self.lru.touch(&mut entry.lru_slot, *key);
             }
         }
+        self.resident_blocks += transfer.weight;
         self.mark_resident(&transfer.blocks);
         self.notify_peers(transfer.client);
     }
@@ -812,10 +1045,13 @@ impl HostTier {
                 && !self.is_submitted(id),
             "external G2 reservation missing"
         );
-        let transfer = self.transfers.remove(&id).unwrap();
+        let transfer = self.remove_transfer(id).unwrap();
+        self.lookup_epoch += 1;
         for key in transfer.blocks {
-            let entry = self.entries.remove(&key).unwrap();
+            let mut entry = self.entries.remove(&key).unwrap();
             assert_eq!(entry.load_pins, 0);
+            self.used_blocks -= entry.weight as usize;
+            self.lru.remove(&mut entry.lru_slot);
             self.meta.remove(&key);
         }
         if let Some(client) = self.clients.get_mut(&transfer.client) {
@@ -839,7 +1075,7 @@ impl HostTier {
         }
     }
 
-    /// Hold resident `keys` outside the LRU until [`Self::unpin_external`]. The
+    /// Hold resident `keys` out of eviction until [`Self::unpin_external`]. The
     /// caller must have just seen each one report [`Lookup::Hit`].
     pub(crate) fn pin_external(&mut self, keys: &[HostBlockKey]) {
         for key in keys {
@@ -852,7 +1088,9 @@ impl HostTier {
                 .load_pins
                 .checked_add(1)
                 .expect("host pin count overflow");
-            self.lru.remove(&mut entry.lru_slot);
+            if self.config.policy != HostPolicy::Ranked {
+                self.lru.remove(&mut entry.lru_slot);
+            }
         }
     }
 
@@ -887,11 +1125,50 @@ impl HostTier {
         prepared.len()
     }
 
+    /// One private D2H operation for the step, with one completion boundary for every cohort.
+    /// SGLang retains every participating device node until the merged backup is acknowledged.
+    pub(crate) fn submit_prepared_stores_merged(&mut self, client: u64, now_ms: f64) -> usize {
+        assert_eq!(self.config.eviction, HostEviction::Caller);
+        let now_ms = self.prepare_mutation(now_ms);
+        let prepared = std::mem::take(&mut self.client(client).prepared_stores);
+        if prepared.is_empty() {
+            return 0;
+        }
+        let blocks = prepared.iter().map(|id| self.transfers[id].weight).sum();
+        let bytes = self.transfer_bytes(blocks);
+        let ready = now_ms + self.clients[&client].link.latency_to_first_byte_ms;
+        let Transport::Fifo { d2h, deadlines, .. } = &mut self.transport else {
+            unreachable!("caller-managed pools are private")
+        };
+        let completes_at_ms = d2h.submit(ready, bytes);
+        for &transfer_id in &prepared {
+            assert!(deadlines.insert(Deadline {
+                at_ms: completes_at_ms,
+                kind: Kind::Store,
+                transfer_id,
+            }));
+            let transfer = self.transfers.get_mut(&transfer_id).unwrap();
+            transfer.deadline = Some(completes_at_ms);
+            if let Some(observer) = &self.observer {
+                observer.record(HostOffloadObservation {
+                    request_id: transfer.request_id,
+                    event: HostOffloadObservationData::StoreSubmitted {
+                        at_ms: now_ms,
+                        completes_at_ms,
+                        transfer_id,
+                        blocks: &transfer.blocks,
+                    },
+                });
+            }
+        }
+        prepared.len()
+    }
+
     /// Start one transfer. Private lanes return their fixed completion time.
     fn submit(&mut self, id: TransferId, now_ms: f64, not_before_ms: f64) -> Option<f64> {
         let transfer = &self.transfers[&id];
         let (kind, link) = (transfer.kind, self.clients[&transfer.client].link);
-        let bytes = self.transfer_bytes(transfer.blocks.len());
+        let bytes = self.transfer_bytes(transfer.weight);
         let ready = not_before_ms + link.latency_to_first_byte_ms;
         match &mut self.transport {
             Transport::Fifo {
@@ -917,12 +1194,19 @@ impl HostTier {
                 };
                 transfers.submit(offload_transfer::Job {
                     id: id.get(),
-                    client: self.transfers[&id].client,
                     direction,
                     ready: ready.max(now_ms),
                     bytes: bytes as f64,
-                    client_rate: offload_transfer::bytes_per_ms(client_gbps),
-                    shared_rate: shared[direction as usize],
+                    links: [
+                        Link {
+                            id: self.transfers[&id].client,
+                            rate: offload_transfer::bytes_per_ms(client_gbps),
+                        },
+                        Link {
+                            id: 0,
+                            rate: shared[direction as usize],
+                        },
+                    ],
                 });
                 None
             }
@@ -974,20 +1258,98 @@ impl HostTier {
         }
     }
 
+    /// Moves whenever an entry appears, disappears or becomes resident, the
+    /// only changes to a [`Self::lookup`] answer, so answers read at one
+    /// epoch hold until it moves.
+    pub(crate) fn lookup_epoch(&self) -> u64 {
+        self.lookup_epoch
+    }
+
     /// Apply framework-defined recency order. Not-ready or pinned blocks are
-    /// outside vLLM's evictable LRU and ignore ordinary touches.
+    /// outside vLLM's evictable LRU and ignore ordinary touches, except in a
+    /// ranked tier, which re-ranks every present block.
     pub(crate) fn touch(&mut self, key: HostBlockKey) {
         if let Some(entry) = self.entries.get_mut(&key)
-            && entry.state == EntryState::Resident
-            && entry.load_pins == 0
+            && (self.config.policy == HostPolicy::Ranked
+                || entry.state == EntryState::Resident && entry.load_pins == 0)
         {
             self.lru.touch(&mut entry.lru_slot, key);
         }
     }
 
-    /// Make blocks that became evictable together the newest, in key order.
+    /// [`Self::touch`] each of `keys` from the last to the first, so the
+    /// first ends up the newest. `last` is the caller's from its previous
+    /// call with the same `keys`, `None` before the first.
+    pub(crate) fn touch_reversed(
+        &mut self,
+        keys: &[HostBlockKey],
+        last: &mut Option<ReversedTouch>,
+    ) {
+        let (run, end, kept) = match last {
+            None => (self.lru.new_run(), keys.len(), None),
+            Some(last) if last.lru_touches == self.lru.touches() => return,
+            Some(last) => {
+                let whole = self.lru.resume_run(last.run);
+                let end = if last.admitted == self.admitted_blocks {
+                    last.absent_from.min(keys.len())
+                } else {
+                    keys.len()
+                };
+                (last.run, end, last.leading.filter(|_| whole))
+            }
+        };
+        let kept_len = kept.map_or(0, |kept| kept.len);
+        debug_assert!(kept_len <= end);
+        let mut leading: Option<Leading> = None;
+        let mut absent_from = kept_len;
+        let mut index = end;
+        while index > kept_len {
+            index -= 1;
+            let Some(entry) = self.entries.get(&keys[index]) else {
+                leading = None;
+                continue;
+            };
+            absent_from = absent_from.max(index + 1);
+            // The linked blocks are the ones a touch moves.
+            let Some(oldest) = entry.lru_slot else {
+                leading = None;
+                continue;
+            };
+            let len = index + 1;
+            let (newest, matched) =
+                self.lru
+                    .touch_matching_span(run, oldest, &keys[kept_len..index]);
+            index -= matched;
+            leading
+                .get_or_insert(Leading {
+                    len,
+                    oldest,
+                    newest,
+                })
+                .newest = newest;
+        }
+        // The kept blocks are the first keys', so they move last, as one.
+        if let Some(kept) = kept {
+            self.lru.touch_span(kept.oldest, kept.newest);
+            leading.get_or_insert(kept).newest = kept.newest;
+        }
+        *last = Some(ReversedTouch {
+            lru_touches: self.lru.touches(),
+            admitted: self.admitted_blocks,
+            absent_from,
+            run,
+            leading,
+        });
+    }
+
+    /// Make blocks that became evictable together the newest: in key order,
+    /// or in release order for a free queue. A ranked tier keeps their ranks.
     fn touch_cohort(&mut self, keys: &mut [HostBlockKey]) {
-        keys.sort_unstable();
+        match self.config.policy {
+            HostPolicy::CohortLru => keys.sort_unstable(),
+            HostPolicy::FreeQueue => {}
+            HostPolicy::Ranked => return,
+        }
         for key in keys {
             let entry = self
                 .entries
@@ -1022,12 +1384,14 @@ impl HostTier {
             return LoadOutcome::Miss;
         }
 
+        let mut weight = 0;
         for key in blocks {
             let entry = self
                 .entries
                 .get_mut(key)
                 .expect("validated host load source disappeared");
-            if entry.load_pins == 0 {
+            weight += entry.weight as usize;
+            if entry.load_pins == 0 && self.config.policy != HostPolicy::Ranked {
                 self.lru.remove(&mut entry.lru_slot);
             }
             entry.load_pins = entry
@@ -1037,13 +1401,14 @@ impl HostTier {
         }
 
         let transfer_id = self.allocate_transfer_id();
-        self.transfers.insert(
+        self.insert_transfer(
             transfer_id,
             Transfer {
                 kind: Kind::Load,
                 client,
                 request_id,
                 blocks: blocks.to_vec(),
+                weight,
                 deadline: None,
             },
         );
@@ -1097,7 +1462,7 @@ impl HostTier {
             return done.len() != before;
         }
         self.remove_queued(transfer_id);
-        let transfer = self.transfers.remove(&transfer_id).unwrap();
+        let transfer = self.remove_transfer(transfer_id).unwrap();
         self.release_load_pins(&transfer.blocks);
         self.observe(HostOffloadObservation {
             request_id: transfer.request_id,
@@ -1172,10 +1537,10 @@ impl HostTier {
             client,
             request_id,
             blocks,
+            weight,
             deadline,
         } = self
-            .transfers
-            .remove(&transfer_id)
+            .remove_transfer(transfer_id)
             .expect("due host transfer disappeared");
         assert!(deadline.is_none_or(|deadline| deadline == at_ms));
         self.completion_epoch += 1;
@@ -1184,6 +1549,7 @@ impl HostTier {
                 .clients
                 .get(&client)
                 .is_some_and(|client| client.holds_completed_sources);
+            self.lookup_epoch += 1;
             for key in &blocks {
                 let entry = self
                     .entries
@@ -1193,6 +1559,7 @@ impl HostTier {
                 entry.state = EntryState::Resident;
                 entry.load_pins += u32::from(hold);
             }
+            self.resident_blocks += weight;
             if !hold {
                 self.touch_cohort(&mut blocks.clone());
             }
@@ -1273,41 +1640,112 @@ impl HostTier {
         self.transfers.get(&transfer_id)?.deadline
     }
 
+    /// When the last submitted private-lane transfer of `client` completes.
+    pub(crate) fn last_deadline(&self, client: u64) -> Option<f64> {
+        self.transfers
+            .values()
+            .filter(|transfer| transfer.client == client)
+            .filter_map(|transfer| transfer.deadline)
+            .max_by(f64::total_cmp)
+    }
+
     pub(crate) fn has_transfer(&self, transfer_id: TransferId) -> bool {
         self.transfers.contains_key(&transfer_id)
     }
 
+    /// Stores `client` prepared that the next engine boundary submits.
+    pub(crate) fn has_prepared_stores(&self, client: u64) -> bool {
+        !self.clients[&client].prepared_stores.is_empty()
+    }
+
     pub(crate) fn has_pending_work(&self, client: u64) -> bool {
-        !self.clients[&client].done.is_empty()
-            || self.has_queued_events(client)
-            || self
-                .transfers
+        let state = &self.clients[&client];
+        debug_assert_eq!(
+            state.pending_transfers,
+            self.transfers
                 .values()
-                .any(|transfer| transfer.client == client)
+                .filter(|transfer| transfer.client == client)
+                .count()
+        );
+        !state.done.is_empty() || self.has_queued_events(client) || state.pending_transfers > 0
+    }
+
+    /// Moves whenever a store could find room it did not find before: a
+    /// [`Self::lookup`] answer changed or a load released its pins. Read
+    /// after the completions due by `now_ms`, which a store offer applies
+    /// before it looks for room.
+    pub(crate) fn room_epoch(&mut self, now_ms: f64) -> u64 {
+        self.prepare_mutation(now_ms);
+        self.lookup_epoch + self.pin_releases
     }
 
     pub(crate) fn capacity_blocks(&self) -> usize {
         self.config.capacity_blocks
     }
 
+    /// Empty physical slots, excluding all resident and pending blocks.
+    pub(crate) fn empty_blocks(&self) -> usize {
+        self.config.capacity_blocks - self.used_blocks
+    }
+
+    /// Blocks a store can take now: only empty slots under caller eviction;
+    /// otherwise empty slots and resident blocks no pin
+    /// holds, as vLLM's `BlockPool.get_num_free_blocks` counts them. Not for
+    /// a [`HostPolicy::Ranked`] tier, whose order also holds pending and
+    /// pinned blocks, nor for a pool with weighted entries: it counts each
+    /// evictable entry as one block.
+    pub(crate) fn free_blocks(&self) -> usize {
+        if self.config.eviction == HostEviction::Caller {
+            return self.empty_blocks();
+        }
+        debug_assert_ne!(self.config.policy, HostPolicy::Ranked);
+        self.empty_blocks() + self.lru.len()
+    }
+
     pub(crate) fn block_bytes(&self) -> usize {
         self.config.block_bytes
     }
 
+    /// Called by telemetry sampling, never by individual forward passes.
+    pub(crate) fn metrics(&self, scope: crate::engine::G2Scope) -> crate::engine::HostCacheMetrics {
+        let (resident, used) = self.occupancy();
+        let block_bytes = self.block_bytes() as u64;
+        crate::engine::HostCacheMetrics {
+            scope,
+            worker_id: None,
+            dp_rank: None,
+            capacity_blocks: self.capacity_blocks() as u64,
+            resident_blocks: resident as u64,
+            used_blocks: used as u64,
+            capacity_bytes: self.capacity_blocks() as u64 * block_bytes,
+            resident_bytes: resident as u64 * block_bytes,
+            used_bytes: used as u64 * block_bytes,
+        }
+    }
+
     /// `(resident, used)` blocks; used includes pending destinations.
     pub(crate) fn occupancy(&self) -> (usize, usize) {
-        let resident = self
-            .entries
-            .values()
-            .filter(|entry| entry.state == EntryState::Resident)
-            .count();
-        (resident, self.entries.len())
+        (self.resident_blocks, self.used_blocks)
     }
 
     fn client(&mut self, client: u64) -> &mut Client {
         self.clients
             .get_mut(&client)
             .expect("host client is not registered")
+    }
+
+    fn insert_transfer(&mut self, id: TransferId, transfer: Transfer) {
+        self.client(transfer.client).pending_transfers += 1;
+        self.transfers.insert(id, transfer);
+    }
+
+    /// A retired owner's submitted stores outlive its count.
+    fn remove_transfer(&mut self, id: TransferId) -> Option<Transfer> {
+        let transfer = self.transfers.remove(&id)?;
+        if let Some(owner) = self.clients.get_mut(&transfer.client) {
+            owner.pending_transfers -= 1;
+        }
+        Some(transfer)
     }
 
     fn observe(&self, observation: HostOffloadObservation<'_>) {
@@ -1348,11 +1786,13 @@ impl HostTier {
                 Some(KvEventData::Stored(stored))
                     if stored.blocks.last().map(|last: &KvBlock| last.block_hash)
                         == meta.parent
-                        && stored.session_id.as_deref() == meta.session_id.as_deref() =>
+                        && stored.session_id.as_deref() == meta.session_id.as_deref()
+                        && stored.cache_salt.as_deref() == meta.cache_salt.as_deref() =>
                 {
                     stored.blocks.push(block);
                 }
                 _ => events.push(KvEventData::Stored(StoredBlocks {
+                    cache_salt: meta.cache_salt.as_deref().map(str::to_owned),
                     parent_hash: meta.parent,
                     start_position: Some(meta.position),
                     blocks: vec![block],
@@ -1372,6 +1812,7 @@ impl HostTier {
     }
 
     fn release_load_pins(&mut self, blocks: &[HostBlockKey]) {
+        self.pin_releases += 1;
         let mut newly_unpinned = Vec::new();
         for key in blocks {
             let entry = self
@@ -1450,11 +1891,13 @@ pub(crate) mod tests {
 
     pub(crate) const C: u64 = 0;
 
-    pub(crate) fn private(capacity_blocks: usize, d2h: f64, h2d: f64) -> HostTier {
+    pub(crate) fn per_rank(capacity_blocks: usize, d2h: f64, h2d: f64) -> HostTier {
         let mut tier = HostTier::new(HostTierConfig {
             capacity_blocks,
             block_bytes: 1_000_000,
             shared_gbps: None,
+            policy: HostPolicy::CohortLru,
+            eviction: HostEviction::TierLru,
         })
         .unwrap();
         tier.register(
@@ -1496,7 +1939,7 @@ pub(crate) mod tests {
         }
 
         fn used_blocks(&self) -> usize {
-            self.entries.len()
+            self.used_blocks
         }
 
         fn needs_engine_boundary(&self) -> bool {
@@ -1556,6 +1999,101 @@ pub(crate) mod tests {
 
     fn request_id() -> Uuid {
         Uuid::from_u128(1)
+    }
+
+    fn assert_occupancy(tier: &HostTier, resident: usize, used: usize) {
+        assert_eq!(tier.occupancy(), (resident, used));
+        assert_eq!(tier.resident_snapshot().len(), resident);
+        let scope = if tier.is_shared() {
+            crate::engine::G2Scope::ClusterShared
+        } else {
+            crate::engine::G2Scope::DpRankLocal
+        };
+        let metrics = tier.metrics(scope);
+        assert_eq!(metrics.resident_blocks, resident as u64);
+        assert_eq!(metrics.used_blocks, used as u64);
+        assert_eq!(metrics.capacity_blocks, tier.capacity_blocks() as u64);
+        assert_eq!(metrics.resident_bytes, resident as u64 * 1_000_000);
+        assert_eq!(metrics.used_bytes, used as u64 * 1_000_000);
+    }
+
+    #[test]
+    fn occupancy_tracks_native_and_external_residency_without_counting_pins() {
+        for (mut tier, client) in [(per_rank(2, 1.0, 1.0), C), (shared(2, 1.0), A)] {
+            assert_occupancy(&tier, 0, 0);
+            assert!(matches!(
+                tier.prepare_store(client, request_id(), &[key(1), key(1), key(2)], None, 0.0),
+                StoreOutcome::Prepared {
+                    stored_blocks: 2,
+                    ..
+                }
+            ));
+            assert_occupancy(&tier, 0, 2);
+            assert_eq!(
+                tier.prepare_store(client, request_id(), &[key(1)], None, 0.0),
+                StoreOutcome::AlreadyPresent
+            );
+            assert!(matches!(
+                tier.prepare_store(client, request_id(), &[key(3)], None, 0.0),
+                StoreOutcome::RetryCapacity { .. }
+            ));
+            assert_occupancy(&tier, 0, 2);
+            tier.submit_prepared_stores(client, 0.0);
+            let advancing_client = if tier.is_shared() { B } else { client };
+            tier.tick(advancing_client, 2.0);
+            assert_occupancy(&tier, 2, 2);
+            tier.tick(client, 2.0);
+            assert_occupancy(&tier, 2, 2);
+
+            let LoadOutcome::Queued(load) =
+                tier.schedule_load(client, request_id(), &[key(1)], 2.0, 2.0)
+            else {
+                panic!("resident block should load");
+            };
+            assert_occupancy(&tier, 2, 2);
+            let mut plan = tier.plan_external(&[], 2.0);
+            assert!(tier.plan_reserve(&mut plan, key(3)));
+            assert_occupancy(&tier, 2, 2);
+            let reservation = tier.reserve_planned(client, request_id(), plan, None, 2.0);
+            assert_occupancy(&tier, 1, 2);
+            assert_eq!(tier.lookup(key(2)), Lookup::Miss);
+            tier.cancel_external(reservation);
+            assert_occupancy(&tier, 1, 1);
+            assert!(tier.cancel_load(client, load, 2.0, 2.0));
+            assert_occupancy(&tier, 1, 1);
+
+            for (block, kvcr) in [(key(3), true), (key(4), false)] {
+                tier.pin_external(&[key(1)]);
+                let StoreOutcome::Prepared { transfer_id, .. } =
+                    tier.reserve_external(client, request_id(), &[block], None, 2.0)
+                else {
+                    panic!("external reservation should fit");
+                };
+                assert_occupancy(&tier, 1, 2);
+                if kvcr {
+                    tier.complete_external_from_kvcr(transfer_id);
+                } else {
+                    tier.complete_external(transfer_id);
+                }
+                assert_occupancy(&tier, 2, 2);
+                tier.unpin_external(&[key(1)]);
+                assert_occupancy(&tier, 2, 2);
+            }
+
+            assert!(matches!(
+                tier.schedule_load(client, request_id(), &[key(1)], 2.0, 2.0),
+                LoadOutcome::Queued(_)
+            ));
+            tier.tick(client, 4.0);
+            assert_occupancy(&tier, 2, 2);
+            assert!(matches!(
+                tier.prepare_store(client, request_id(), &[key(5)], None, 4.0),
+                StoreOutcome::Prepared { .. }
+            ));
+            assert_occupancy(&tier, 1, 2);
+            tier.retire(client);
+            assert_occupancy(&tier, 1, 1);
+        }
     }
 
     type ExternalReservationEvent = (Uuid, f64, Vec<HostBlockKey>, Option<bool>);
@@ -1632,7 +2170,7 @@ pub(crate) mod tests {
 
     #[test]
     fn kvcr_origin_counts_each_pulled_block_once() {
-        let mut tier = private(2, 0.0, 0.0);
+        let mut tier = per_rank(2, 0.0, 0.0);
         let owner = Uuid::from_u128(1);
         let (a, b, c) = (key(1), key(2), key(3));
         let StoreOutcome::Prepared { transfer_id, .. } =
@@ -1658,7 +2196,7 @@ pub(crate) mod tests {
 
     #[test]
     fn pinned_resident_block_survives_eviction_and_unpins_to_mru() {
-        let mut tier = private(2, 0.0, 0.0);
+        let mut tier = per_rank(2, 0.0, 0.0);
         let owner = Uuid::from_u128(1);
         let (a, b, c) = (key(1), key(2), key(3));
         for (k, t) in [(a, 0.0), (b, 1.0)] {
@@ -1687,7 +2225,7 @@ pub(crate) mod tests {
     }
 
     fn tier(capacity_blocks: usize) -> HostTier {
-        private(capacity_blocks, 1.0, 1.0)
+        per_rank(capacity_blocks, 1.0, 1.0)
     }
 
     fn make_resident(tier: &mut HostTier, blocks: &[HostBlockKey], at_ms: f64) -> f64 {
@@ -1739,7 +2277,7 @@ pub(crate) mod tests {
     fn load_input_order_preserves_pins_and_terminal_lru() {
         for cancel in [false, true] {
             let make = || {
-                let mut tier = private(4, 0.0, 1.0);
+                let mut tier = per_rank(4, 0.0, 1.0);
                 assert!(matches!(
                     tier.prepare_store(
                         C,
@@ -1825,6 +2363,113 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn touch_reversed_skips_pending_blocks_until_they_land() {
+        let mut tier = tier(8);
+        let mut now = 0.0;
+        for block in [1, 2, 3, 9] {
+            now = make_resident(&mut tier, &[key(block)], now);
+        }
+        // Of the prompt, 5 and 6 are pending and 7 is absent; 9 is another
+        // prompt's.
+        let StoreOutcome::Prepared { transfer_id, .. } =
+            tier.prepare_store(C, request_id(), &[key(5), key(6)], None, now)
+        else {
+            panic!("5 and 6 must be absent")
+        };
+        let prompt = [1, 2, 3, 5, 6, 7].map(key);
+        let mut last = None;
+        tier.touch_reversed(&prompt, &mut last);
+        assert_eq!(tier.lru_order(), [9, 3, 2, 1].map(key));
+
+        // 5 and 6 land in key order; the next touch puts them in touch order.
+        assert_eq!(tier.submit_prepared_stores(C, now), 1);
+        let deadline = tier.transfer_deadline(transfer_id).unwrap();
+        tier.tick(C, deadline);
+        tier.touch_reversed(&prompt, &mut last);
+        assert_eq!(tier.lru_order(), [9, 6, 5, 3, 2, 1].map(key));
+    }
+
+    #[test]
+    fn touch_reversed_keeps_its_run_until_one_of_the_blocks_moves() {
+        let mut tier = tier(5);
+        let mut now = 0.0;
+        for block in [1, 2, 3, 9] {
+            now = make_resident(&mut tier, &[key(block)], now);
+        }
+        let prompt = [1, 2, 3, 4].map(key);
+        let mut last = None;
+        tier.touch_reversed(&prompt, &mut last);
+        assert_eq!(tier.lru_order(), [9, 3, 2, 1].map(key));
+
+        // 4 is admitted and lands: the keys the tier lacked are looked up
+        // again, and 4 goes before the kept 3, 2 and 1.
+        now = make_resident(&mut tier, &[key(4)], now);
+        tier.touch(key(9));
+        tier.touch_reversed(&prompt, &mut last);
+        assert_eq!(tier.lru_order(), [9, 4, 3, 2, 1].map(key));
+
+        // A block touched alone leaves the run, which is found by key again.
+        tier.touch(key(2));
+        tier.touch_reversed(&prompt, &mut last);
+        assert_eq!(tier.lru_order(), [9, 4, 3, 2, 1].map(key));
+
+        // So does an evicted block, whose node goes to 7.
+        tier.touch(key(9));
+        make_resident(&mut tier, &[key(7)], now);
+        tier.touch_reversed(&prompt, &mut last);
+        assert_eq!(tier.lru_order(), [9, 7, 3, 2, 1].map(key));
+
+        // And blocks that another caller's touch joins to its own run.
+        tier.touch_reversed(&[1, 2, 9].map(key), &mut None);
+        assert_eq!(tier.lru_order(), [7, 3, 9, 2, 1].map(key));
+        tier.touch_reversed(&prompt, &mut last);
+        assert_eq!(tier.lru_order(), [7, 9, 3, 2, 1].map(key));
+    }
+
+    #[test]
+    fn lookup_epoch_moves_only_when_a_lookup_answer_changes() {
+        let mut tier = tier(4);
+        let mut seen = tier.lookup_epoch();
+        let mut moved = |tier: &HostTier| std::mem::replace(&mut seen, tier.lookup_epoch()) != seen;
+
+        // A store: absent, then pending, then resident.
+        let StoreOutcome::Prepared { transfer_id, .. } =
+            tier.prepare_store(C, request_id(), &[key(1)], None, 0.0)
+        else {
+            panic!("1 must be absent")
+        };
+        assert!(moved(&tier));
+        tier.submit_prepared_stores(C, 0.0);
+        assert!(!moved(&tier));
+        let now = tier.transfer_deadline(transfer_id).unwrap();
+        tier.tick(C, now);
+        assert!(moved(&tier));
+
+        // A touch, a pin and a load change no answer.
+        tier.touch(key(1));
+        tier.pin_external(&[key(1)]);
+        tier.unpin_external(&[key(1)]);
+        let now = load(&mut tier, &[key(1)], now);
+        assert!(!moved(&tier));
+
+        // An external reservation: pending, then resident or rolled back.
+        for (block, lands) in [(2, true), (3, false)] {
+            let StoreOutcome::Prepared { transfer_id, .. } =
+                tier.reserve_external(C, request_id(), &[key(block)], None, now)
+            else {
+                panic!("the block must be absent")
+            };
+            assert!(moved(&tier));
+            if lands {
+                tier.complete_external(transfer_id);
+            } else {
+                tier.cancel_external(transfer_id);
+            }
+            assert!(moved(&tier));
+        }
+    }
+
+    #[test]
     fn older_completion_cohort_is_exhausted_before_newer_cohort() {
         let mut tier = tier(3);
         let mut now = make_resident(&mut tier, &[key(2), key(1)], 0.0);
@@ -1888,6 +2533,100 @@ pub(crate) mod tests {
             }
         );
         assert_eq!(tier.next_transfer_id, 0);
+    }
+
+    #[rstest::rstest]
+    #[case(HostPolicy::CohortLru)]
+    #[case(HostPolicy::Ranked)]
+    fn weighted_entries_occupy_evict_and_transfer_by_weight(#[case] policy: HostPolicy) {
+        // A 1 MB block at 1 GB/s takes 1 ms.
+        let mut tier = policy_tier(8, policy);
+        make_resident(&mut tier, &[key(1), key(2)], 0.0);
+        let store = |tier: &mut HostTier, entry: u64, at_ms: f64| {
+            let outcome = tier.prepare_cohort(C, request_id(), &[], None, &[key(entry)], 4, at_ms);
+            tier.submit_prepared_stores(C, at_ms);
+            outcome
+        };
+        // A four-block entry takes four blocks and four blocks' time.
+        let (room, admitted) = (tier.room_epoch(100.0), tier.admitted_blocks);
+        let StoreOutcome::Prepared { transfer_id, .. } = store(&mut tier, 10, 100.0) else {
+            panic!("the entry fits")
+        };
+        assert_ne!(tier.room_epoch(100.0), room);
+        // It leaves a caller's prompt-touch memo standing.
+        assert_eq!(tier.admitted_blocks, admitted);
+        assert_eq!(tier.occupancy(), (2, 6));
+        assert_eq!(tier.transfer_deadline(transfer_id), Some(104.0));
+        // A second one lacks two blocks. The first is pending and no victim,
+        // so the two token blocks go; then nothing resident is left.
+        assert!(matches!(
+            store(&mut tier, 11, 100.0),
+            StoreOutcome::Prepared { .. }
+        ));
+        assert_eq!(tier.occupancy(), (0, 8));
+        let retry = |structurally_unfittable| StoreOutcome::RetryCapacity {
+            structurally_unfittable,
+        };
+        // A store that finds no room leaves the room epoch; the completion
+        // that makes an entry evictable moves it.
+        let room = tier.room_epoch(100.0);
+        assert_eq!(store(&mut tier, 12, 100.0), retry(false));
+        assert_eq!(tier.room_epoch(100.0), room);
+        tier.tick(C, 108.0);
+        assert_ne!(tier.room_epoch(108.0), room);
+        assert_eq!(tier.occupancy(), (8, 8));
+        // One resident four-block entry covers the next one.
+        assert!(matches!(
+            store(&mut tier, 12, 200.0),
+            StoreOutcome::Prepared { .. }
+        ));
+        assert_eq!(tier.lookup(key(10)), Lookup::Miss);
+        assert_eq!(tier.occupancy(), (4, 8));
+        tier.tick(C, 204.0);
+        // A load moves the entry's four blocks.
+        let LoadOutcome::Queued(load) =
+            tier.schedule_load(C, request_id(), &[key(11)], 300.0, 300.0)
+        else {
+            panic!("the entry is resident")
+        };
+        assert_eq!(tier.transfer_deadline(load), Some(304.0));
+        // Token blocks and entries offered together are stored whole or not
+        // at all, and none of them is a victim of the rest: entry 12 is
+        // offered and entry 11 is loading, so one more block finds no room.
+        // Five blocks and an entry never fit.
+        let keys = |values: &[u64]| values.iter().copied().map(key).collect::<Vec<_>>();
+        let mut cohort = |blocks: &[u64], entries: &[u64]| {
+            tier.prepare_cohort(
+                C,
+                request_id(),
+                &keys(blocks),
+                None,
+                &keys(entries),
+                4,
+                300.0,
+            )
+        };
+        assert_eq!(cohort(&[20], &[12]), retry(false));
+        assert_eq!(cohort(&[20, 21, 22, 23, 24], &[13]), retry(true));
+        // Once the load is done, one block and one entry replace both
+        // residents: five pool blocks, copied in 5 ms.
+        let room = tier.room_epoch(300.0);
+        tier.tick(C, 304.0);
+        assert_ne!(tier.room_epoch(304.0), room);
+        let outcome = tier.prepare_cohort(C, request_id(), &[key(20)], None, &[key(13)], 4, 400.0);
+        let StoreOutcome::Prepared {
+            transfer_id,
+            stored_blocks: 1,
+        } = outcome
+        else {
+            panic!("the cohort fits")
+        };
+        tier.submit_prepared_stores(C, 400.0);
+        assert_eq!(tier.occupancy(), (0, 5));
+        assert_eq!(tier.transfer_deadline(transfer_id), Some(405.0));
+        // The size is part of a checkpoint's key, and no token block shares it.
+        assert_ne!(HostBlockKey::state(7, 2), HostBlockKey::state(7, 4));
+        assert_ne!(HostBlockKey::state(7, 2), key(7));
     }
 
     #[test]
@@ -2019,6 +2758,8 @@ pub(crate) mod tests {
             capacity_blocks,
             block_bytes: 1_000_000,
             shared_gbps: Some((shared_gbps, shared_gbps)),
+            policy: HostPolicy::CohortLru,
+            eviction: HostEviction::TierLru,
         })
         .unwrap();
         for client in [A, B] {
@@ -2121,6 +2862,7 @@ pub(crate) mod tests {
         tier.tick(B, 1.0);
         // Complete but unconsumed: B cannot evict A's G3 write source.
         assert!(tier.is_resident(key(1)) && tier.pins(key(1)) == 1);
+        assert_occupancy(&tier, 1, 1);
         assert!(matches!(
             tier.prepare_store(B, request_id(), &[key(2)], None, 1.0),
             StoreOutcome::RetryCapacity { .. }
@@ -2129,6 +2871,7 @@ pub(crate) mod tests {
         tier.unpin_external(&[key(1)]);
         store(&mut tier, B, &[2], 1.0);
         assert_eq!(tier.lookup(key(1)), Lookup::Miss);
+        assert_occupancy(&tier, 0, 1);
     }
 
     #[test]
@@ -2168,9 +2911,11 @@ pub(crate) mod tests {
         tier.submit_prepared_stores(A, 0.0);
         let peer = store(&mut tier, B, &[2], 0.0);
         tier.retire(A);
+        assert_occupancy(&tier, 0, 2);
         // The accepted D2H keeps its equal share of the 1 GB/s pool cap.
         assert_eq!(tier.next_deadline(B), Some(2.0));
         assert_eq!(delivered(&mut tier, B, 2.0), [(true, peer.get())]);
+        assert_occupancy(&tier, 2, 2);
         // No owner remains to hand the source to G3, so it lands unpinned.
         assert_eq!((tier.lookup(key(1)), tier.pins(key(1))), (Lookup::Hit, 0));
         assert!(tier.transfers.is_empty());
@@ -2179,6 +2924,7 @@ pub(crate) mod tests {
         // The block is routable and remains an ordinary LRU victim.
         store(&mut tier, B, &[3], 2.0);
         assert_eq!(tier.resident_snapshot(), [key(2)]);
+        assert_occupancy(&tier, 1, 2);
         assert_eq!(
             tier.take_events(B),
             [
@@ -2208,7 +2954,9 @@ pub(crate) mod tests {
             else {
                 panic!("free slot")
             };
+            assert!(tier.has_pending_work(A));
             finish(&mut tier, transfer_id);
+            assert!(!tier.has_pending_work(A));
             assert_eq!(tier.next_deadline(A), None);
             assert_eq!(tier.next_deadline(B), Some(0.0));
             assert_eq!(tier.tick(B, 0.0), (vec![], true));
@@ -2217,7 +2965,7 @@ pub(crate) mod tests {
 
     #[test]
     fn cancelling_a_load_does_not_wake_its_owner() {
-        for mut tier in [private(2, 1.0, 1.0), shared(2, 0.0)] {
+        for mut tier in [per_rank(2, 1.0, 1.0), shared(2, 0.0)] {
             let client = if tier.is_shared() { A } else { C };
             store(&mut tier, client, &[1], 0.0);
             tier.tick(client, 1.0);
@@ -2226,6 +2974,7 @@ pub(crate) mod tests {
             else {
                 panic!("resident block must load")
             };
+            assert!(tier.has_pending_work(client));
             assert!(tier.cancel_load(client, load, 1.0, 1.0));
             assert_eq!(tier.next_deadline(client), None);
             assert_eq!(tier.tick(client, 1.0), (vec![], false));
@@ -2235,6 +2984,7 @@ pub(crate) mod tests {
 
     fn meta(parent: Option<u64>, tokens_hash: u64, position: usize) -> HostBlockMeta {
         HostBlockMeta {
+            cache_salt: None,
             parent,
             tokens_hash,
             position,
@@ -2245,6 +2995,7 @@ pub(crate) mod tests {
     /// One `Stored` run of `(block_hash, tokens_hash)` pairs.
     fn stored(parent: Option<u64>, start: usize, blocks: &[(u64, u64)]) -> KvEventData {
         KvEventData::Stored(StoredBlocks {
+            cache_salt: None,
             parent_hash: parent,
             start_position: Some(start),
             blocks: blocks
@@ -2320,12 +3071,30 @@ pub(crate) mod tests {
             Some(&[meta(Some(2), 9, 2)]),
             2.0,
         );
-        assert_eq!(
-            tier.take_events(B),
-            [KvEventData::Removed {
-                block_hashes: vec![1]
-            }]
-        );
+        // Each subscriber gets the whole list.
+        let removed = [KvEventData::Removed {
+            block_hashes: vec![1],
+        }];
+        assert_eq!(tier.take_events(B), removed);
+        assert_eq!(tier.take_events(A), removed);
+    }
+
+    #[test]
+    fn an_evicted_entry_without_router_identity_publishes_no_removal() {
+        // A state row published no `Stored` event either.
+        let mut tier = shared(2, 0.0);
+        tier.subscribe(B);
+        tier.prepare_store(A, request_id(), &[key(1)], Some(&[meta(None, 7, 0)]), 0.0);
+        tier.prepare_store(A, request_id(), &[key(2)], None, 0.0);
+        tier.submit_prepared_stores(A, 0.0);
+        tier.tick(A, 2.0);
+        assert_eq!(tier.take_events(B), [stored(None, 0, &[(1, 7)])]);
+        let blocks = [meta(None, 8, 0), meta(Some(3), 9, 1)];
+        tier.prepare_store(A, request_id(), &[key(3), key(4)], Some(&blocks), 2.0);
+        let removed = [KvEventData::Removed {
+            block_hashes: vec![1],
+        }];
+        assert_eq!(tier.take_events(B), removed);
     }
 
     #[test]
@@ -2382,5 +3151,185 @@ pub(crate) mod tests {
         );
         tier.subscribe(A);
         assert_eq!(tier.take_events(A), [stored(None, 0, &[(2, 7), (1, 8)])]);
+    }
+
+    fn policy_tier(capacity_blocks: usize, policy: HostPolicy) -> HostTier {
+        let mut tier = tier(capacity_blocks);
+        tier.config.policy = policy;
+        tier
+    }
+
+    #[rstest::rstest]
+    #[case(HostPolicy::CohortLru)]
+    #[case(HostPolicy::FreeQueue)]
+    #[case(HostPolicy::Ranked)]
+    fn caller_eviction_controls_store_and_external_admission(#[case] policy: HostPolicy) {
+        let mut tier = policy_tier(2, policy);
+        tier.config.eviction = HostEviction::Caller;
+        let at = make_resident(&mut tier, &[key(1), key(2)], 0.0);
+        assert_eq!(tier.empty_blocks(), 0);
+        assert_eq!(tier.free_blocks(), 0);
+        let order = tier.lru_order();
+        for external in [false, true] {
+            let outcome = if external {
+                tier.reserve_external(C, request_id(), &[key(3)], None, at)
+            } else {
+                tier.prepare_store(C, request_id(), &[key(3)], None, at)
+            };
+            assert_eq!(
+                outcome,
+                StoreOutcome::RetryCapacity {
+                    structurally_unfittable: false
+                }
+            );
+        }
+        assert_eq!(tier.lru_order(), order);
+        assert!(!tier.can_reserve_external_prefix(&[key(3)]));
+        let mut plan = tier.plan_external(&[], at);
+        assert!(!tier.plan_reserve(&mut plan, key(3)));
+        assert!(plan.reserved().is_empty());
+        assert!(!tier.plan_can_reserve_prefix(&plan, &[key(3)]));
+
+        // Choose the newest block rather than the tier's oldest victim.
+        assert!(tier.evict_resident(request_id(), key(2), at));
+        assert_eq!(tier.resident_snapshot(), [key(1)]);
+        assert_eq!(tier.occupancy(), (1, 1));
+        assert_eq!(tier.free_blocks(), 1);
+        assert!(tier.can_reserve_external_prefix(&[key(3)]));
+        let mut plan = tier.plan_external(&[], at);
+        assert!(tier.plan_can_reserve_prefix(&plan, &[key(3)]));
+        assert!(tier.plan_reserve(&mut plan, key(3)));
+        assert!(!tier.plan_can_reserve_prefix(&plan, &[key(4)]));
+        let transfer = tier.reserve_planned(C, request_id(), plan, None, at);
+        assert_eq!(tier.empty_blocks(), 0);
+        tier.complete_external(transfer);
+        assert_eq!(tier.resident_snapshot(), [key(1), key(3)]);
+    }
+
+    #[test]
+    fn explicit_eviction_preserves_pending_and_pinned_blocks_and_publishes_removal() {
+        let mut tier = tier(2);
+        tier.config.eviction = HostEviction::Caller;
+        tier.subscribe(C);
+        let StoreOutcome::Prepared { transfer_id, .. } =
+            tier.prepare_store(C, request_id(), &[key(1)], Some(&[meta(None, 10, 0)]), 0.0)
+        else {
+            panic!("store must fit")
+        };
+        assert!(!tier.evict_resident(request_id(), key(1), 0.0));
+        assert!(!tier.evict_resident(request_id(), key(2), 0.0));
+        assert!(tier.take_events(C).is_empty());
+        tier.submit_prepared_stores(C, 0.0);
+        let at = tier.transfer_deadline(transfer_id).unwrap();
+        tier.tick(C, at);
+        assert_eq!(tier.take_events(C), [stored(None, 0, &[(1, 10)])]);
+        let LoadOutcome::Queued(load) = tier.schedule_load(C, request_id(), &[key(1)], at, at)
+        else {
+            panic!("resident block must load")
+        };
+        assert!(!tier.evict_resident(request_id(), key(1), at));
+        assert_eq!(tier.occupancy(), (1, 1));
+        let loaded_at = tier.transfer_deadline(load).unwrap();
+        tier.tick(C, loaded_at);
+        // The private owner settles transfers at its clock boundary before reclaiming pages.
+        assert!(tier.evict_resident(request_id(), key(1), loaded_at));
+        assert_eq!(tier.occupancy(), (0, 0));
+        assert_eq!(tier.free_blocks(), 2);
+        assert_eq!(
+            tier.take_events(C),
+            [KvEventData::Removed {
+                block_hashes: vec![1]
+            }]
+        );
+        assert!(tier.meta.is_empty());
+        assert!(tier.lru_order().is_empty());
+        assert!(!tier.evict_resident(request_id(), key(1), loaded_at));
+    }
+
+    #[test]
+    fn caller_eviction_rejects_shared_pool_ownership() {
+        let result = HostTier::new(HostTierConfig {
+            capacity_blocks: 2,
+            block_bytes: 1_000_000,
+            shared_gbps: Some((1.0, 1.0)),
+            policy: HostPolicy::CohortLru,
+            eviction: HostEviction::Caller,
+        });
+        assert!(result.err().unwrap().to_string().contains("private pool"));
+    }
+
+    #[test]
+    fn merged_backups_publish_all_cohorts_at_one_ack() {
+        let mut tier = tier(3);
+        tier.config.eviction = HostEviction::Caller;
+        tier.client(C).link.latency_to_first_byte_ms = 2.0;
+        let mut transfers = Vec::new();
+        for keys in [&[key(1)][..], &[key(2), key(3)][..]] {
+            let StoreOutcome::Prepared { transfer_id, .. } =
+                tier.prepare_store(C, request_id(), keys, None, 0.0)
+            else {
+                panic!("store must fit")
+            };
+            transfers.push(transfer_id);
+        }
+        assert_eq!(tier.submit_prepared_stores_merged(C, 0.0), 2);
+        for id in transfers {
+            assert_eq!(tier.transfer_deadline(id), Some(5.0));
+        }
+        assert_eq!(tier.submit_prepared_stores_merged(C, 0.0), 0);
+        assert!(tier.tick(C, 3.0).0.is_empty());
+        assert_eq!(tier.occupancy(), (0, 3));
+        assert_eq!(tier.tick(C, 5.0).0.len(), 2);
+        assert_eq!(tier.resident_snapshot(), [key(1), key(2), key(3)]);
+        assert!(!tier.has_pending_work(C));
+    }
+
+    fn load(tier: &mut HostTier, blocks: &[HostBlockKey], at_ms: f64) -> f64 {
+        let LoadOutcome::Queued(transfer_id) =
+            tier.schedule_load(C, request_id(), blocks, at_ms, at_ms)
+        else {
+            panic!("test host load must hit")
+        };
+        let deadline = tier.transfer_deadline(transfer_id).unwrap();
+        tier.tick(C, deadline);
+        deadline
+    }
+
+    #[test]
+    fn free_queue_frees_blocks_in_release_order() {
+        // SimpleCPU's CPU block pool frees a completed store's blocks, and a
+        // finished load's blocks, in list order at the newest end of its free
+        // queue; the default tier orders each cohort by key.
+        let (a, b, c) = (key(3), key(1), key(2));
+        for (policy, stored, loaded) in [
+            (HostPolicy::FreeQueue, [a, b, c], [b, a, c]),
+            (HostPolicy::CohortLru, [b, c, a], [b, c, a]),
+        ] {
+            let mut tier = policy_tier(4, policy);
+            let now = make_resident(&mut tier, &[a, b, c], 0.0);
+            assert_eq!(tier.lru_order(), stored, "{policy:?}");
+            load(&mut tier, &[a, c], now);
+            assert_eq!(tier.lru_order(), loaded, "{policy:?}");
+        }
+    }
+
+    #[test]
+    fn ranked_tier_keeps_a_rank_across_a_load_until_touched() {
+        // vLLM 0.32 `LRUCachePolicy`: a block is ranked at its store, keeps
+        // the rank while a load pins it, and only a touch re-ranks it.
+        let mut tier = policy_tier(3, HostPolicy::Ranked);
+        let (a, b, c, d) = (key(1), key(2), key(3), key(4));
+        let mut now = 0.0;
+        for block in [a, b, c] {
+            now = make_resident(&mut tier, &[block], now);
+        }
+        now = load(&mut tier, &[a], now);
+        assert_eq!(tier.lru_order(), [a, b, c]);
+        // A request's blocks touched last to first: its first block is newest.
+        tier.touch(c);
+        tier.touch(a);
+        assert_eq!(tier.lru_order(), [b, c, a]);
+        make_resident(&mut tier, &[d], now);
+        assert!(!tier.is_resident(b) && tier.is_resident(a));
     }
 }

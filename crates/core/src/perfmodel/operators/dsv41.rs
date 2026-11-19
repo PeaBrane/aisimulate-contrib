@@ -24,11 +24,67 @@ use crate::operators::op::{Op, RuntimeContext};
 use crate::perf_database::PerfDatabase;
 use crate::perf_database::dsv41::{AttentionRole, MeasuredGeometry};
 
-fn leaf(spec: &SystemSpec, flops: f64, bytes: f64, rate: f64) -> PerformanceResult {
-    PerformanceResult::sol(SolComponents::new(
+/// A SOL leaf or a serial sum of leaves. `scaled` and `plus` match
+/// [`PerformanceResult::scaled`] and [`PerformanceResult::plus`] on SOL
+/// results, without moving a whole result per leaf.
+#[derive(Clone, Copy)]
+struct SolTerm {
+    latency_ms: f64,
+    components: SolComponents,
+}
+
+impl SolTerm {
+    fn leaf(components: SolComponents) -> Self {
+        Self {
+            latency_ms: components.time_ms(),
+            components,
+        }
+    }
+
+    fn scaled(self, factor: f64) -> Self {
+        Self {
+            latency_ms: self.latency_ms * factor,
+            components: SolComponents::new(
+                self.components.math_ms * factor,
+                self.components.mem_ms * factor,
+            ),
+        }
+    }
+
+    fn plus(self, other: Self) -> Self {
+        // SOL leaves carry no energy: a zero latency alone is the identity.
+        let components = if self.latency_ms == 0.0 {
+            other.components
+        } else if other.latency_ms == 0.0 {
+            self.components
+        } else {
+            SolComponents::new(
+                self.components.math_ms + other.components.math_ms,
+                self.components.mem_ms + other.components.mem_ms,
+            )
+        };
+        Self {
+            latency_ms: self.latency_ms + other.latency_ms,
+            components,
+        }
+    }
+}
+
+impl From<SolTerm> for PerformanceResult {
+    fn from(term: SolTerm) -> Self {
+        PerformanceResult::new(term.latency_ms, Source::Sol).with_sol(term.components)
+    }
+}
+
+fn term(spec: &SystemSpec, flops: f64, bytes: f64, rate: f64) -> SolTerm {
+    SolTerm::leaf(SolComponents::new(
         flops / rate * 1e3,
         bytes / spec.gpu.mem_bw * 1e3,
     ))
+}
+
+fn leaf(spec: &SystemSpec, flops: f64, bytes: f64, rate: f64) -> PerformanceResult {
+    term(spec, flops, bytes, rate).into()
 }
 
 fn zero() -> PerformanceResult {
@@ -231,7 +287,7 @@ impl Dsv41AttentionOp {
                 0.0
             };
         let mm = |a: f64, b: f64, nt: f64, weight: f64, rate: f64| {
-            leaf(
+            term(
                 spec,
                 2.0 * nt * a * b,
                 a * b * weight + nt * (a + b) * 2.0,
@@ -241,7 +297,7 @@ impl Dsv41AttentionOp {
         let mut result = mm(h, q, tokens, w8, gemm)
             .plus(mm(q, n * d, tokens, w8, gemm))
             .plus(mm(h, d, tokens, w8, gemm))
-            .plus(leaf(
+            .plus(term(
                 spec,
                 2.0 * tokens * n * d * o,
                 n * d * o * 2.0 + tokens * (n * d + g * o) * 2.0,
@@ -251,7 +307,7 @@ impl Dsv41AttentionOp {
         if self.kv_cache_layout == Dsv41KvCacheLayout::SglangFp8Bf16 {
             // Fused norm/RoPE/store reads the BF16 projection output and writes
             // one physical SWA row. Projection's own BF16 output write is above.
-            result = result.plus(leaf(
+            result = result.plus(term(
                 spec,
                 0.0,
                 tokens * (d * 2.0 + window_entry_bytes),
@@ -278,7 +334,7 @@ impl Dsv41AttentionOp {
             // Main FP4 rounding is temporary: SGLang persists only the 584-byte
             // FlashMLA row, not an additional packed main cache. Index stays FP4.
             let packed = main_entry_bytes + ihd * 0.53125;
-            result = result.plus(leaf(spec, 0.0, batch * produced * (d * 2.0 + packed), bf16));
+            result = result.plus(term(spec, 0.0, batch * produced * (d * 2.0 + packed), bf16));
         }
         if self.role == "full" || self.role == "reindex" {
             let (inh, ihd) = (self.index_n_heads as f64, self.index_head_dim as f64);
@@ -303,7 +359,7 @@ impl Dsv41AttentionOp {
                     0.53125,
                 )
             };
-            result = result.plus(leaf(
+            result = result.plus(term(
                 spec,
                 2.0 * tokens * inh * ihd * index_len,
                 batch * index_len * ihd * 0.53125
@@ -317,7 +373,7 @@ impl Dsv41AttentionOp {
             } else {
                 0.0
             };
-            result = result.plus(leaf(
+            result = result.plus(term(
                 spec,
                 0.0,
                 tokens * (index_len * 4.0 + self.index_topk as f64 * 4.0) + candidate_bytes,
@@ -355,13 +411,13 @@ impl Dsv41AttentionOp {
         } else {
             batch * end.min(self.window_size as f64)
         };
-        result = result.plus(leaf(
+        result = result.plus(term(
             spec,
             4.0 * n * d * (wp + cp),
             (window_rows * window_entry_bytes + cp * main_entry_bytes) + tokens * n * d * 4.0,
             attn,
         ));
-        Ok(result)
+        Ok(result.into())
     }
 
     pub fn query(
@@ -548,6 +604,16 @@ impl Dsv41StageOp {
         db: &PerfDatabase,
         ctx: &RuntimeContext,
     ) -> Result<PerformanceResult, AicError> {
+        self.query_with(ctx, |_, op, child| op.query(db, child))
+    }
+
+    /// [`Self::query`] taking each child's result from `query`, which
+    /// receives the child's index, the child and the context it runs at.
+    pub(crate) fn query_with(
+        &self,
+        ctx: &RuntimeContext,
+        mut query: impl FnMut(usize, &Op, &RuntimeContext) -> Result<PerformanceResult, AicError>,
+    ) -> Result<PerformanceResult, AicError> {
         let (s, prefix) = self.scope(ctx.s as f64, ctx.prefix as f64);
         let mut scoped = *ctx;
         scoped.s = s as u32;
@@ -556,12 +622,12 @@ impl Dsv41StageOp {
             scoped.num_tokens = ctx.batch_size * scoped.s;
         }
         let mut total = None;
-        for op in &self.children {
+        for (index, op) in self.children.iter().enumerate() {
             let mut child = scoped;
             if self.is_context && op.is_logits_gemm() {
                 child.num_tokens = ctx.batch_size;
             }
-            let result = op.query(db, &child)?;
+            let result = query(index, op, &child)?;
             total = Some(match total {
                 None => result,
                 Some(prev) => PerformanceResult::plus(prev, result),
@@ -579,7 +645,7 @@ mod tests {
 
     fn test_db(mode: DatabaseMode) -> PerfDatabase {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../python/aisimulate/src/aisimulate_core/systems");
+            .join("../../python/aisim/src/aisim_core/systems");
         PerfDatabase::load(&root, "gb300", "sglang", "0.5.14")
             .unwrap()
             .with_mode(mode, TransferPolicy::ALL)
@@ -642,6 +708,22 @@ mod tests {
             let op = attention(role, ratio);
             assert_eq!(op.weight_bytes(), weights, "{role}, ratio={ratio}");
             assert_components(op.sol(&unit_spec(), 1.0, 4.0, 0.0).unwrap(), flops, bytes);
+        }
+    }
+
+    #[test]
+    fn sol_terms_compose_like_performance_results() {
+        // The -1 and -2 leaves have zero latency (max(-1, 0) = 0) but nonzero
+        // components: `plus` drops them on either side, and between two of them
+        // keeps the right one's.
+        let leaves = [(-1, 0), (-2, 0), (3, 5), (7, 2), (-1, 0)]
+            .map(|(math, mem)| SolComponents::new(f64::from(math), f64::from(mem)));
+        let mut terms = SolTerm::leaf(leaves[0]);
+        let mut results = PerformanceResult::sol(leaves[0]);
+        for &leaf in &leaves[1..] {
+            terms = terms.plus(SolTerm::leaf(leaf).scaled(2.0));
+            results = results.plus(PerformanceResult::sol(leaf).scaled(2.0));
+            assert_eq!(PerformanceResult::from(terms), results, "after {leaf:?}");
         }
     }
 

@@ -1,0 +1,38 @@
+traffic:
+  source:
+    type: synthetic
+    input_tokens: 1024
+    output_tokens: 128
+  load:
+    type: constant_rate
+    requests_per_second: 1
+  stop:
+    requests: 300
+engine:
+  mode: aggregated
+  model: Qwen/Qwen3.5-35B-A3B
+  hardware: b300_sxm
+  backend:
+    choices:
+    - vllm
+    - sglang
+  context_length: 2048
+  workers:
+    aggregated:
+      parallelism:
+        preset: default
+optimization:
+  target: min_gpus
+  constraints:
+    max_candidate_gpus: 2
+    min_goodput_rps: 0.9
+optimizer:
+  max_trials: 2
+execution:
+  resources:
+    memory_limit_gb: 8
+    cpu_limit: 4
+evaluation:
+  sla:
+    ttft_ms: 500
+    itl_ms: 50

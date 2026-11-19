@@ -1,5 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-FileCopyrightText: Copyright 2023-2026 SGLang Team
 // SPDX-License-Identifier: Apache-2.0
+// Modified behavioral adaptation of SGLang v0.5.22; see THIRD_PARTY_NOTICES.md.
+// Source: https://github.com/sgl-project/sglang/tree/baa9befa381511cd4d56f83980951e5a45fffc6d
 
 use std::collections::BTreeSet;
 use std::marker::PhantomData;
@@ -108,7 +111,7 @@ impl RankMetricsState {
                 .checked_add_assign(ReplaySchedulerIntervalMetrics {
                     cache_hit_tokens: metrics.sglang_cache_hit_tokens,
                     cache_total_tokens: metrics.sglang_cache_total_tokens,
-                    preemptions: 0,
+                    ..ReplaySchedulerIntervalMetrics::default()
                 })?;
         }
         self.latest = metrics.clone();
@@ -166,6 +169,14 @@ where
     /// starve later workers. They are reconsidered on the next coordinator
     /// drive at the same or a later virtual timestamp.
     deferred_ready_workers: BTreeSet<usize>,
+    /// Every worker's earliest release of outputs held past their pass (vLLM
+    /// `launch`), as `(release time bits, worker id)`, so that the driver
+    /// finds the next one without visiting each worker. Release times are
+    /// never negative, so their bits order as the times do. Kept current by
+    /// `refresh_emission`.
+    pending_emissions: BTreeSet<(u64, usize)>,
+    /// The release time bits each worker has in `pending_emissions`, by worker id.
+    indexed_emission_bits: Vec<Option<u64>>,
     pending_removal: BTreeSet<usize>,
     pending_startup: BTreeSet<usize>,
     factory: ReplayRoleFactory,
@@ -210,6 +221,8 @@ where
             total_in_flight: 0,
             ready_workers: BTreeSet::new(),
             deferred_ready_workers: BTreeSet::new(),
+            pending_emissions: BTreeSet::new(),
+            indexed_emission_bits: Vec::new(),
             pending_removal: BTreeSet::new(),
             pending_startup: BTreeSet::new(),
             factory,
@@ -295,6 +308,37 @@ where
             .collect()
     }
 
+    /// Observe each host ownership domain once. A disaggregated deployment
+    /// disables `include_shared` for its second role when the first role
+    /// already sampled the deployment's shared pool.
+    pub(crate) fn host_cache_snapshots(
+        &self,
+        include_shared: bool,
+    ) -> Vec<crate::engine::HostCacheMetrics> {
+        if self.telemetry.is_none() {
+            return Vec::new();
+        }
+        let mut snapshots = Vec::new();
+        if include_shared
+            && let Some(metrics) = self
+                .factory
+                .g2_registry()
+                .and_then(|registry| registry.metrics())
+        {
+            snapshots.push(metrics);
+        }
+        for (worker_id, worker) in self.workers.iter().enumerate() {
+            let Some(worker) = worker else { continue };
+            for rank in worker.engine.ranks() {
+                if let Some(mut metrics) = rank.per_rank_host_cache_metrics() {
+                    metrics.worker_id = Some(worker_id);
+                    snapshots.push(metrics);
+                }
+            }
+        }
+        snapshots
+    }
+
     pub(crate) fn reset_timing_evidence(&self) -> Result<()> {
         self.factory.reset_timing_evidence()
     }
@@ -311,6 +355,16 @@ where
             .get_mut(worker_id)
             .and_then(Option::as_mut)
             .with_context(|| format!("offline replay selected unknown worker {worker_id}"))
+    }
+
+    pub(crate) fn decode_load(&self, scheduler_id: usize) -> Result<(usize, usize)> {
+        let owner = self.scheduler_owner(scheduler_id)?;
+        self.required_worker(owner.worker_id)?
+            .engine
+            .ranks()
+            .nth(owner.dp_rank as usize)
+            .and_then(|rank| rank.decode_load())
+            .context("decode load snapshots require a live SGLang rank")
     }
 
     fn scheduler_owner(&self, scheduler_id: usize) -> Result<SchedulerOwner> {
@@ -334,6 +388,34 @@ where
             self.ready_workers.insert(worker_id);
         } else {
             self.ready_workers.remove(&worker_id);
+        }
+        if self.factory.can_hold_outputs() {
+            self.refresh_emission(worker_id);
+        }
+    }
+
+    /// Index `worker_id`'s earliest held-output release again, after its
+    /// engine may have queued, dropped or released held outputs. Only for
+    /// workers that can hold outputs.
+    fn refresh_emission(&mut self, worker_id: usize) {
+        let next = self
+            .workers
+            .get(worker_id)
+            .and_then(Option::as_ref)
+            .and_then(|worker| worker.engine.next_emission_ms())
+            .map(f64::to_bits);
+        if self.indexed_emission_bits.len() <= worker_id {
+            self.indexed_emission_bits.resize(worker_id + 1, None);
+        }
+        let indexed = std::mem::replace(&mut self.indexed_emission_bits[worker_id], next);
+        if indexed == next {
+            return;
+        }
+        if let Some(bits) = indexed {
+            self.pending_emissions.remove(&(bits, worker_id));
+        }
+        if let Some(bits) = next {
+            self.pending_emissions.insert((bits, worker_id));
         }
     }
 
@@ -906,6 +988,10 @@ where
                 self.refresh_worker(worker_id);
                 continue;
             };
+            if self.factory.can_hold_outputs() {
+                // Forming a pass queues the outputs held from the one before it.
+                self.refresh_emission(worker_id);
+            }
             if let Some(registry) = &self.factory.kvcr {
                 registry
                     .lock()
@@ -923,6 +1009,14 @@ where
 
             let mut effects: EngineEffects<Observation::Batch> = EngineEffects::default();
             for rank in started.by_rank {
+                if let Some(telemetry) = self.required_worker_mut(worker_id)?.telemetry.as_mut() {
+                    telemetry[rank.dp_rank as usize]
+                        .interval
+                        .checked_add_assign(ReplaySchedulerIntervalMetrics {
+                            g1_prefix_cache_lookup: rank.effects.g1_prefix_cache_lookup,
+                            ..ReplaySchedulerIntervalMetrics::default()
+                        })?;
+                }
                 if pending.committed_requests.is_empty() {
                     pending.committed_requests = rank.effects.committed_requests;
                 } else {
@@ -1131,7 +1225,7 @@ where
                 completion.worker_id,
                 scheduler_id,
                 rank.dp_rank,
-                &pending,
+                pending.started_at_ms,
                 self.capture_artifact_kv_events,
                 rank.effects,
             ));
@@ -1142,6 +1236,89 @@ where
 
     pub(crate) fn in_flight(&self) -> usize {
         self.total_in_flight
+    }
+
+    /// Earliest instant at which a worker releases outputs it held past their
+    /// pass (vLLM `launch`). Not masked by a pass in flight.
+    pub(crate) fn next_emission_ms(&self) -> Option<f64> {
+        if !self.factory.can_hold_outputs() {
+            return None;
+        }
+        let next = self
+            .pending_emissions
+            .first()
+            .map(|&(bits, _)| f64::from_bits(bits));
+        debug_assert_eq!(
+            next,
+            self.workers
+                .iter()
+                .filter_map(Option::as_ref)
+                .filter_map(|worker| worker.engine.next_emission_ms())
+                .min_by(f64::total_cmp),
+            "held-output release index is out of date"
+        );
+        next
+    }
+
+    /// Release every worker's outputs due at `now_ms` as completion payloads
+    /// that carry only outputs. Request ownership ends when a completed
+    /// output is released, as at a pass completion.
+    pub(crate) fn take_due_emissions(
+        &mut self,
+        now_ms: f64,
+    ) -> Result<Vec<WorkerCompletionPayload<Observation::Batch>>> {
+        let mut payloads = Vec::new();
+        // Payloads leave in worker order, whatever the release times.
+        let mut due = self
+            .pending_emissions
+            .iter()
+            .take_while(|&&(bits, _)| f64::from_bits(bits) <= now_ms)
+            .map(|&(_, worker_id)| worker_id)
+            .collect::<Vec<_>>();
+        due.sort_unstable();
+        for worker_id in due {
+            let released = self
+                .required_worker_mut(worker_id)?
+                .engine
+                .take_due_emissions(now_ms)
+                .map_err(crate::replay::error::engine_boundary)?;
+            for rank in released.into_by_rank() {
+                let scheduler_id = self
+                    .required_worker(worker_id)?
+                    .scheduler_ids
+                    .get(rank.dp_rank as usize)
+                    .copied()
+                    .context("native emission returned an out-of-range DP rank")?;
+                let completed_request_ids = rank
+                    .effects
+                    .outputs
+                    .iter()
+                    .filter_map(|output| output.completed.then_some(output.request_id))
+                    .collect::<Vec<_>>();
+                self.apply_request_accounting(
+                    SchedulerOwner {
+                        worker_id,
+                        dp_rank: rank.dp_rank,
+                    },
+                    None,
+                    &completed_request_ids,
+                )?;
+                // Returned outputs belong to no pass: no forward-pass sample.
+                let mut payload = lower_completion::<Observation>(
+                    self.stage,
+                    worker_id,
+                    scheduler_id,
+                    rank.dp_rank,
+                    now_ms,
+                    self.capture_artifact_kv_events,
+                    rank.effects,
+                );
+                payload.fpm = None;
+                payloads.push(payload);
+            }
+            self.refresh_worker(worker_id);
+        }
+        Ok(payloads)
     }
 
     /// Earliest independently modeled deadline across every logical worker.
@@ -1274,6 +1451,7 @@ fn native_request(request: DirectRequest, kv_hint: Option<KvHintSource>) -> Resu
             .uuid
             .context("offline replay request must have a UUID before dispatch")?,
         tokens: request.tokens,
+        cache_salt: request.cache_salt,
         max_output_tokens: request.max_output_tokens,
         output_token_ids: request.output_token_ids,
         session_id: request
@@ -1289,7 +1467,7 @@ fn lower_completion<Observation: ReplayEngineObservation>(
     worker_id: usize,
     scheduler_id: usize,
     dp_rank: u32,
-    pass: &PendingPass,
+    pass_started_at_ms: f64,
     capture_artifact_kv_events: bool,
     effects: PassCompletionEffects,
 ) -> WorkerCompletionPayload<Observation::Batch> {
@@ -1332,7 +1510,7 @@ fn lower_completion<Observation: ReplayEngineObservation>(
             .collect(),
         lifecycle_events: effects.lifecycle_events,
         engine_events,
-        pass_started_at_ms: pass.started_at_ms,
+        pass_started_at_ms,
         artifact_pass_end_kv_events,
         progress: EngineProgress {
             made_progress,
@@ -1441,6 +1619,80 @@ mod tests {
             startup_time_ms,
         )
         .unwrap()
+    }
+
+    #[rstest::rstest]
+    #[case(Backend::Vllm)]
+    #[case(Backend::Sglang)]
+    #[case(Backend::Trtllm)]
+    fn passes_start_in_ascending_worker_then_rank_order(#[case] backend: Backend) {
+        const WORKERS: usize = 3;
+        const DP_SIZE: u32 = 2;
+        let config = ReplayEngineConfig {
+            dp_size: DP_SIZE,
+            rank: EngineConfig {
+                backend,
+                num_gpu_blocks: 32,
+                block_size: 4,
+                enable_prefix_caching: false,
+                timing_model: TimingModelConfig::Fixed {
+                    prefill_ms: 10.0,
+                    decode_ms: 1.0,
+                },
+                ..EngineConfig::for_backend(backend)
+            },
+            ..ReplayEngineConfig::default()
+        };
+        let factory = ReplayEngineFactory::new()
+            .role_factory(&config, WorkerStage::Aggregated, false)
+            .unwrap();
+        let mut component: EngineComponent = EngineComponent::new_with_factory(
+            SimulationWorkerStage::Aggregated,
+            EnginePassMode::Visible,
+            factory,
+            WORKERS,
+            None,
+        )
+        .unwrap();
+        // Reverse dispatch separates submission order from worker/rank start order.
+        let schedulers = WORKERS * DP_SIZE as usize;
+        for scheduler_id in (0..schedulers).rev() {
+            component
+                .dispatch(
+                    scheduler_id,
+                    DirectRequest {
+                        tokens: vec![scheduler_id as u32; 8],
+                        max_output_tokens: 2,
+                        uuid: Some(Uuid::from_u128(scheduler_id as u128 + 1)),
+                        ..Default::default()
+                    },
+                    None,
+                    0.0,
+                )
+                .unwrap();
+        }
+        let mut passes = Vec::new();
+        loop {
+            let effects = component.drive_ready(0.0, None).unwrap();
+            if effects.is_empty() {
+                break;
+            }
+            passes.push(
+                effects
+                    .admissions
+                    .iter()
+                    .map(|admission| admission.uuid.as_u128() as usize - 1)
+                    .collect::<Vec<_>>(),
+            );
+        }
+        let expected: Vec<Vec<usize>> = (0..WORKERS)
+            .map(|worker| {
+                (0..DP_SIZE as usize)
+                    .map(|rank| worker * DP_SIZE as usize + rank)
+                    .collect()
+            })
+            .collect();
+        assert_eq!(passes, expected);
     }
 
     #[rstest::rstest]
@@ -1880,6 +2132,139 @@ mod tests {
     }
 
     #[test]
+    fn host_cache_snapshots_follow_pool_ownership_without_shared_duplicates() {
+        for dp_size in [2, 4] {
+            for scope in ["dp_rank_local", "cluster_shared"] {
+                let config = serde_json::from_value(serde_json::json!({
+                    "dp_size": dp_size,
+                    "rank": {
+                        "num_gpu_blocks": 8, "block_size": 4,
+                        "max_num_seqs": 1, "max_num_batched_tokens": 8,
+                        "enable_prefix_caching": true,
+                        "kv_cache_bytes_per_token": 256,
+                        "native_host_offload": {
+                            "scope": scope, "num_host_blocks": 16, "kv_layout_id": "tp1"
+                        },
+                        "timing_model": {"type": "fixed", "prefill_ms": 0.0, "decode_ms": 0.0}
+                    }
+                }))
+                .unwrap();
+                let factory = ReplayEngineFactory::new()
+                    .role_factory(&config, WorkerStage::Aggregated, false)
+                    .unwrap();
+                let mut component: EngineComponent = EngineComponent::new_with_factory(
+                    SimulationWorkerStage::Aggregated,
+                    EnginePassMode::Visible,
+                    factory,
+                    2,
+                    None,
+                )
+                .unwrap();
+                assert!(component.host_cache_snapshots(true).is_empty());
+                component.enable_telemetry();
+                let snapshots = component.host_cache_snapshots(true);
+                let shared = scope == "cluster_shared";
+                assert_eq!(snapshots.len(), if shared { 1 } else { 2 * dp_size });
+                for (index, row) in snapshots.iter().enumerate() {
+                    assert_eq!(row.capacity_blocks, 16);
+                    assert_eq!(row.capacity_bytes, 16 * 4 * 256);
+                    assert_eq!(row.used_blocks, 0);
+                    assert_eq!(row.resident_bytes, 0);
+                    assert_eq!(row.worker_id, (!shared).then_some(index / dp_size));
+                    assert_eq!(row.dp_rank, (!shared).then_some((index % dp_size) as u32));
+                }
+                assert_eq!(
+                    component.host_cache_snapshots(false).len(),
+                    if shared { 0 } else { 2 * dp_size }
+                );
+                component
+                    .dispatch(
+                        0,
+                        DirectRequest {
+                            tokens: vec![1, 2, 3, 4],
+                            max_output_tokens: 0,
+                            uuid: Some(Uuid::from_u128(32)),
+                            ..Default::default()
+                        },
+                        None,
+                        0.0,
+                    )
+                    .unwrap();
+                component.drive_ready(0.0, None).unwrap();
+                let occupied = component.host_cache_snapshots(true);
+                assert_eq!(occupied.iter().map(|row| row.used_blocks).sum::<u64>(), 1);
+                assert_eq!(occupied.iter().map(|row| row.used_bytes).sum::<u64>(), 1024);
+            }
+        }
+    }
+
+    #[test]
+    fn g1_lookup_observations_do_not_make_a_blocked_worker_progress() {
+        for capture in [false, true] {
+            let config = ReplayEngineConfig {
+                rank: EngineConfig {
+                    num_gpu_blocks: 16,
+                    block_size: 4,
+                    max_num_batched_tokens: 4,
+                    max_num_seqs: 1,
+                    enable_prefix_caching: true,
+                    enable_chunked_prefill: false,
+                    timing_model: TimingModelConfig::Fixed {
+                        prefill_ms: 1.0,
+                        decode_ms: 1.0,
+                    },
+                    ..EngineConfig::for_backend(Backend::Vllm)
+                },
+                ..ReplayEngineConfig::default()
+            };
+            let factory = ReplayEngineFactory::new()
+                .role_factory(&config, WorkerStage::Aggregated, false)
+                .unwrap();
+            let mut component: EngineComponent = EngineComponent::new_with_factory(
+                SimulationWorkerStage::Aggregated,
+                EnginePassMode::Visible,
+                factory,
+                1,
+                None,
+            )
+            .unwrap();
+            if capture {
+                component.enable_telemetry();
+            }
+            component
+                .dispatch(
+                    0,
+                    DirectRequest {
+                        tokens: (0..8).collect(),
+                        max_output_tokens: 1,
+                        uuid: Some(Uuid::from_u128(33)),
+                        ..Default::default()
+                    },
+                    None,
+                    0.0,
+                )
+                .unwrap();
+            for _ in 0..2 {
+                let effects = component.drive_ready(0.0, None).unwrap();
+                assert!(effects.is_empty());
+                assert!(!effects.progress.made_progress);
+                assert_eq!(component.in_flight(), 1);
+                let (_, interval) = component.take_telemetry_snapshot().unwrap();
+                assert_eq!(
+                    interval.g1_prefix_cache_lookup,
+                    capture.then_some(crate::engine::PrefixCacheLookupCounts {
+                        query_count: 1,
+                        queried_tokens: 8,
+                        matched_tokens: 0,
+                    })
+                );
+                assert_eq!(interval.cache_hit_tokens, 0);
+                assert_eq!(interval.cache_total_tokens, 0);
+            }
+        }
+    }
+
+    #[test]
     fn scheduler_metrics_follow_command_and_completion_boundaries() {
         let config = ReplayEngineConfig {
             rank: EngineConfig {
@@ -2239,7 +2624,7 @@ mod tests {
     }
 
     #[test]
-    fn sglang_component_consumes_retries_until_internal_state_converges() {
+    fn sglang_component_rejects_an_impossible_prompt_without_retrying() {
         let config = ReplayEngineConfig {
             rank: EngineConfig {
                 backend: Backend::Sglang,
@@ -2282,21 +2667,20 @@ mod tests {
             )
             .unwrap();
 
-        let error = component.drive_ready(37.0, None).unwrap_err();
+        let effects = component.drive_ready(37.0, None).unwrap();
         let retries = component.workers[0]
             .as_ref()
             .unwrap()
             .same_timestamp_retries_total;
 
-        assert!(
-            retries > 1,
-            "the component must not stop after the first pass"
-        );
-        assert!(retries < MAX_CONSECUTIVE_SAME_TIMESTAMP_RETRIES);
-        assert!(
-            error.to_string().contains("effect-free zero-duration pass"),
-            "{error}"
-        );
+        assert_eq!(retries, 0);
+        assert!(effects.admissions.is_empty());
+        assert!(effects.scheduled_completion.is_none());
+        assert_eq!(effects.immediate_completions.len(), 1);
+        let outputs = &effects.immediate_completions[0].output_signals;
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].uuid, Uuid::from_u128(2));
+        assert!(outputs[0].completed && outputs[0].rejected);
     }
 
     #[test]

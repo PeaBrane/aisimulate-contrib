@@ -5,7 +5,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # Rust Replay API
 
-`aisimulate_core::replay` exposes native deterministic token replay. The native
+`aisim_core::replay` exposes native deterministic token replay. The native
 `ReplaySpec` describes topology, engine/provider descriptors, requests and
 report controls; it differs from Python Sweeper's `ReplaySpec`. The crate root
 also re-exports common replay types.
@@ -34,9 +34,39 @@ the Replayer so ownership, virtual time and caches remain within one execution.
 the tokens the batch computes and the cached or earlier-chunk KV its requests
 read. The default reduces these totals to the integer per-request means of
 `predict_prefill_ms`; providers indexed by iteration totals override it.
+A vLLM or TensorRT-LLM pass that computes prefill and decode steps together
+is priced with `TimingModel::predict_mixed_pass_ms(prefill, batch_size, ...)`,
+which takes the pass's `PrefillTotals` and otherwise the arguments of
+`predict_decode_ms`. A provider that prices such a pass as one forward returns
+`MixedPassMs`: the prefill latency and the latency the decode steps add, which
+sum to its estimate of the pass. The default `None` prices the prefill with
+`predict_prefill_totals_ms` and a separate decode pass with
+`predict_decode_ms`. The built-in `ais` provider returns the pass only for
+whole-model FPM interpolation, corrected as one mixed iteration when the model
+is tuned. Any other timing it serves, including operation-level timing,
+measured SD-round profiles and MTP drafts, returns `None`.
+`TimingModel::predict_iteration_ms(&[RankWork])` comes first: it prices one
+attention-DP group pass from every rank's `RankWork`, in DP-rank order with
+idle ranks included, and returns `IterationMs`, the shared duration every rank
+takes from its compute start under the prefill speedup. Schedulers ask only
+while `decode_speedup_ratio` is 1 and some rank computes model work; otherwise,
+and when the provider returns the default `None`, each rank prices its own
+work with the phase methods above. The `ais` provider answers through the
+canonical multi-rank `ForwardPassMetrics` query, so the phase methods serve
+only the passes it declines; see
+[engine replay timing](../../perf-model/configuration.md#engine-replay-timing).
+For an `fpm_regression` or `fpm_learned` estimator, that iteration pricing is
+public as `engine::FittedIterationTiming`, so an embedder that supplies its own
+provider can price passes the same way. Build the model with
+`ForwardPassPerfModel::best_available`, wrap it with
+`FittedIterationTiming::from_model`, and check the engine's attention-DP width
+and decode speedup with `require_replay_role(attention_dp, decode_speedup_ratio)`;
+a width the identity records must match. It prices every pass with model work as
+one iteration, mixed passes and per-request detail included, and rejects phase
+queries and decode passes whose `verify_width` is not the fitted `nextn + 1`.
 `TimingModel::predict_vision_ms(&[VisionShape])`
 prices one vision-encoder batch; the default returns `None`, and a rank with
-image work then rejects it rather than treating the encoder as free. The AIC
+image work then rejects it rather than treating the encoder as free. The `ais`
 provider answers from the `EngineSpec` `vision` section compiled under
 `encoder_parallel`.
 
@@ -112,6 +142,16 @@ them. Latency metrics keep the arrival time, and each per-request record gains
 rejected. See
 [request tokenization](../engine/README.md#tokenization).
 
+`with_detokenization(workers, base_ms, per_output_ms)` detokenizes each pass's
+outputs before the client receives them. Each worker that emits tokens has
+`workers` servers, shared by its attention-DP ranks, and each request belongs
+to one of them. A server takes the outputs of a pass that belong to it as one
+job of `base_ms + per_output_ms × outputs`, after its earlier jobs. Token
+times, latency metrics and request completion use the client's receive time.
+Both costs zero, the default, keep every output at its pass end. Scaling and
+agentic profiles are rejected. See
+[response detokenization](../engine/README.md#detokenization).
+
 `with_capture_options(ReplayCaptureOptions)` controls capture and canonical
 determinism. Canonical comparison uses the exported schema version, seed and
 exclusion definitions rather than arbitrary JSON key order. The default
@@ -124,14 +164,43 @@ and neutral observation contracts.
 interval and returns `ReplayResult<Self>`. The observer receives a baseline,
 settled interval samples, and a final tail when needed. A sample coinciding
 with a scaling tick observes settled pre-scaling state. Grouped cache byte
-occupancy is available here even though the Python JSON runner does not expose
-this observer API. Telemetry neither extends the time cap nor prevents deadlock.
+occupancy is available here. Telemetry neither extends the time cap nor prevents deadlock.
+
+Each observer sample also carries `completion_feedback`, measured outcomes for
+closed-loop scaling policies: the SLA thresholds, cumulative terminal,
+completed and SLA-satisfying request counts, cumulative provisioned
+GPU-seconds, and up to 64 `(TTFT, mean ITL)` pairs from requests completed
+since the previous sample. `latency_population` counts all eligible completions
+represented by those pairs, excluding completions without token timestamps. It
+can exceed 64 even though the returned pairs are capped at 64. Both values in
+each pair are in milliseconds, and mean ITL is `None` for a single-token
+completion. The baseline sample carries the counters but no pairs; pairs from
+earlier completions arrive with the next sample.
+`good_requests_strict_itl` excludes single-token outputs when an ITL threshold
+is set. In the last sample, `gpu_seconds` equals the report's
+`throughput.gpu_hours` multiplied by 3600 and, with an SLA configured,
+`good_requests` equals `goodput.completed_requests`. Telemetry capture does
+not export this block.
+
+Adding `completion_feedback` is source-breaking for downstream
+`ReplayTelemetrySnapshot` struct literals: include `completion_feedback: None`
+when feedback is absent, or preserve the field when rebuilding an observer sample.
+
+`with_telemetry_capture(interval_ms)` retains native telemetry in
+`ReplayReport.telemetry`, including preparation and profiling requests, periodic
+samples, and agentic lifecycle events. It enables internal request capture while
+preserving the caller's original `record_per_request` choice for
+`ReplayReport.per_request`. Capture uses absolute virtual milliseconds and does
+not move profiling/scaling boundaries. The capture and observer APIs are mutually
+exclusive. See the [telemetry contract](../../getting-started/understand-results.md#replay-telemetry).
+Downstream `ReplayReport` struct literals must include `telemetry: None` when
+capture is absent, or preserve the field when rebuilding a captured report.
 
 ## Errors and stability
 
 `ReplayResult<T>` is `Result<T, ReplayError>`. Errors distinguish `InvalidSpec`,
-`Engine`, `Placement`, `Scaling`, `Telemetry`, `Deadlock`, `ResourceLimited`, and
-`Invariant`. Handle typed variants instead of parsing display messages.
+`Engine`, `Placement`, `Scaling`, `Telemetry`, `WorkloadSource`, `Deadlock`,
+`ResourceLimited`, and `Invariant`. Handle typed variants instead of parsing display messages.
 `ResourceLimited` can represent exact-latency spill storage failure; it does
 not produce a successful partial native report.
 
@@ -139,7 +208,60 @@ The authoritative exports are in
 [`replay/mod.rs`](../../../crates/core/src/replay/mod.rs). Several cross-crate
 integration seams are `pub` but marked `#[doc(hidden)]` (runtime input,
 request payloads, engine observations and internal collectors). They are not
-promoted here as stable end-user APIs. In-tree workload import and snapshot
+promoted here as stable end-user APIs.
+
+`ReplayWorkloadSource` and `Replayer::run_with_source(source)` are one such
+seam. They let a reactive workload owned by another crate drive Replay through
+the same admission queue as `WorkloadDriver`, on aggregated and disaggregated
+topologies. Replay owns the clock: the next instant is the earliest of the next
+engine event and the source's `next_wakeup_ms`, a request to be stepped then
+that may produce nothing, so empty steps are legal. A step is one `pop_ready`
+call, and Replay stamps each returned request's arrival as that instant. Each
+instant `t` runs four phases:
+
+1. **Wakeup step**, only if `t` is the source's wakeup or feedback awaits it:
+   the source is stepped once, before engine work at `t` settles. Its
+   submissions are scheduled arrivals, admitted exactly as native arrivals at
+   `t`: Replay holds them and releases them where it releases native arrivals.
+2. **Settle**: engine work due at `t` settles (pass ends, output tokens,
+   terminals), delivered through `on_output_token` (with its instant),
+   `on_causal_terminal` and `on_quiescent`.
+3. **Reaction fixpoint**: the source is stepped again while a step left new
+   feedback at `t`. These submissions are reactions.
+4. **Pass starts**: idle workers start passes one at a time, each start taking
+   the lowest-numbered ready worker (so ascending worker order); a worker's
+   attention-DP ranks start together as its one pass, scheduled in ascending
+   rank order. Native replay starts passes in this order, and so does a run
+   with a source. Feedback from a pass start, such as an admission rejection,
+   is delivered and the source stepped before the next worker starts, so a
+   reaction joins every pass not yet started and none that has. On
+   disaggregated topologies prefill workers start before decode workers.
+
+An instant whose only activity is an empty wakeup step leaves engine state
+untouched, so idle wakeups never change engine timing. Worker removal,
+telemetry and scaling never run at an instant while delivered feedback still
+awaits a step. Feedback that only emerges in a later drain pass at that instant
+(a prefill rejection, say) can still bring a reaction after a telemetry or
+scaling tick already ran at it, exactly where a native arrival known only at
+that point would land; scheduled arrivals keep native tick ordering exactly.
+
+Progress rules: after every step at `t` the next wakeup is `None` or finite and
+strictly later than `t` (before the first step it must be finite and no earlier
+than the first instant); a source not drained, with nothing in flight and no
+wakeup, has stalled. Both fail the run with `WorkloadSource`, as do an error the
+source returns, a reused request `uuid` and a rank out of range (ranks are
+validated like spec ranks when the source submits the request). Steps at one
+instant are bounded by `Replayer::with_max_source_steps_per_instant` (default
+1,000,000); exceeding it, which only a reaction loop such as a rejected request
+resubmitted at once can, fails with `ResourceLimited` naming the budget and the
+instant. The run takes ownership of the source, which need not be `Send`. The
+source owns its concurrency and duration, so `run_with_source` refuses
+spec-authored requests or a second runtime input, `max_in_flight`,
+`max_sim_time_ms`, Belady eviction, detokenization latency and
+`ReplayDeterminism::CanonicalV1` with `InvalidSpec`.
+Cancelling requests from the source is not part of this seam.
+
+In-tree workload import and snapshot
 APIs live under `replay::loadgen`; see [workloads](../workloads.md#agentic-load-controls) and
 [agentic warmup](../agentic/warmup.md#seeded-request-boundary-snapshots) for their semantics. To build snapshots directly, call
 `ValidatedAgenticGraph::prepare_snapshots(lanes, options)` with a positive lane

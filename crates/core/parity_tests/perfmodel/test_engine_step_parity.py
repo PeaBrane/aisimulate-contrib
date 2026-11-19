@@ -27,11 +27,11 @@ from pathlib import Path
 
 import pytest
 
-from aisimulate.legacy_cli.api import cli_estimate
-from aisimulate.sdk import common, config, errors, perf_database, rust_engine_step
-from aisimulate.sdk.backends.factory import get_backend
-from aisimulate.sdk.models import get_model
-from aisimulate.sdk.operations import util_empirical
+from aisim.legacy_cli.api import cli_estimate
+from aisim.sdk import common, config, errors, perf_database, rust_engine_step
+from aisim.sdk.backends.factory import get_backend
+from aisim.sdk.models import get_model
+from aisim.sdk.operations import util_empirical
 
 pytestmark = pytest.mark.integration
 
@@ -1209,12 +1209,12 @@ def _golden_python_metrics(
 
 def _prepare_rust_core(monkeypatch: pytest.MonkeyPatch) -> None:
     # The live path is the compiled-engine ``EngineHandle`` (Python builds the
-    # ``EngineSpec``, the PyO3 ``aisimulate_core`` extension executes it).
+    # ``EngineSpec``, the PyO3 ``aisim_core`` extension executes it).
     # The legacy ctypes dylib is gone, so the only requirement is that the
     # maturin-built extension is importable.
     pytest.importorskip(
-        "aisimulate_core",
-        reason="maturin-built aisimulate_core extension is required "
+        "aisim_core",
+        reason="maturin-built aisim_core extension is required "
         "(`uv run maturin develop -m aic-core/rust/aiconfigurator-core/Cargo.toml`)",
     )
     rust_engine_step._engine_handle_cache_clear()
@@ -1617,6 +1617,12 @@ HYBRID_CASES = [
         EngineStepParityCase(
             model_path="Qwen/Qwen3-32B",
             database_mode="EMPIRICAL",
+            # EMPIRICAL needs the version's OWN comm tables (custom_allreduce
+            # util grid); the 2026-10 campaign did not collect comm, so the
+            # estimator is pinned to the 0.24.0 data (follow-up: comm tables for
+            # the current versions).
+            backend_version="0.24.0",
+            allow_unlisted_version=True,
         ),
         id="qwen3-32b-b200-vllm-empirical",
     ),
@@ -1624,6 +1630,12 @@ HYBRID_CASES = [
         EngineStepParityCase(
             model_path="Qwen/Qwen3-235B-A22B",
             database_mode="EMPIRICAL",
+            # EMPIRICAL needs the version's OWN comm tables (custom_allreduce
+            # util grid); the 2026-10 campaign did not collect comm, so the
+            # estimator is pinned to the 0.24.0 data (follow-up: comm tables for
+            # the current versions).
+            backend_version="0.24.0",
+            allow_unlisted_version=True,
         ),
         id="qwen3-235b-a22b-b200-vllm-empirical",
     ),
@@ -1631,6 +1643,12 @@ HYBRID_CASES = [
         EngineStepParityCase(
             model_path="moonshotai/Kimi-K2.5",
             database_mode="EMPIRICAL",
+            # EMPIRICAL needs the version's OWN comm tables (custom_allreduce
+            # util grid); the 2026-10 campaign did not collect comm, so the
+            # estimator is pinned to the 0.24.0 data (follow-up: comm tables for
+            # the current versions).
+            backend_version="0.24.0",
+            allow_unlisted_version=True,
         ),
         id="kimi-k25-b200-vllm-empirical",
     ),
@@ -1638,6 +1656,12 @@ HYBRID_CASES = [
         EngineStepParityCase(
             model_path="deepseek-ai/DeepSeek-V3.2",
             database_mode="EMPIRICAL",
+            # EMPIRICAL needs the version's OWN comm tables (custom_allreduce
+            # util grid); the 2026-10 campaign did not collect comm, so the
+            # estimator is pinned to the 0.24.0 data (follow-up: comm tables for
+            # the current versions).
+            backend_version="0.24.0",
+            allow_unlisted_version=True,
         ),
         id="deepseek-v32-b200-vllm-empirical",
     ),
@@ -1652,6 +1676,12 @@ HYBRID_CASES = [
             backend_name="sglang",
             isl=1536,
             database_mode="EMPIRICAL",
+            # EMPIRICAL needs the version's OWN comm tables (custom_allreduce
+            # util grid); the 2026-10 campaign did not collect comm, so the
+            # estimator is pinned to the 0.5.14 data (follow-up: comm tables for
+            # the current versions).
+            backend_version="0.5.14",
+            allow_unlisted_version=True,
         ),
         id="glm5-b200-sglang-empirical",
     ),
@@ -1659,6 +1689,12 @@ HYBRID_CASES = [
         EngineStepParityCase(
             model_path="MiniMaxAI/MiniMax-M2.5",
             database_mode="EMPIRICAL",
+            # EMPIRICAL needs the version's OWN comm tables (custom_allreduce
+            # util grid); the 2026-10 campaign did not collect comm, so the
+            # estimator is pinned to the 0.24.0 data (follow-up: comm tables for
+            # the current versions).
+            backend_version="0.24.0",
+            allow_unlisted_version=True,
         ),
         id="minimax-m25-b200-vllm-empirical",
     ),
@@ -1666,6 +1702,12 @@ HYBRID_CASES = [
         EngineStepParityCase(
             model_path="nvidia/Nemotron-H-56B-Base-8K",
             database_mode="EMPIRICAL",
+            # EMPIRICAL needs the version's OWN comm tables (custom_allreduce
+            # util grid); the 2026-10 campaign did not collect comm, so the
+            # estimator is pinned to the 0.24.0 data (follow-up: comm tables for
+            # the current versions).
+            backend_version="0.24.0",
+            allow_unlisted_version=True,
         ),
         id="nemotron-h-56b-b200-vllm-empirical",
     ),
@@ -1928,7 +1970,7 @@ class TestRustTypedErrorsAcrossFfi:
     (`perf_database.has_perf_data_not_available_cause`, the support-matrix
     HYBRID-miss triage on `EmpiricalNotImplementedError`) could not recognize
     rust-path misses. The boundary now raises the canonical
-    `aisimulate.sdk.errors` classes for the typed variants."""
+    `aisim.sdk.errors` classes for the typed variants."""
 
     def test_silicon_data_gap_raises_typed_perf_data_miss(
         self,
@@ -1945,12 +1987,16 @@ class TestRustTypedErrorsAcrossFfi:
         # fp4_tc_flops — see the missing-dtype test below.)
         _prepare_rust_core(monkeypatch)
         case = EngineStepParityCase(
-            # current-slot data-gap coordinate: head_dim=192 is collected for
-            # fp8 KV only. The model is an fp8 checkpoint (kv would infer fp8
-            # and HIT), so bf16 KV is pinned explicitly to hold the gap. If a
-            # future collection adds bf16@192, re-anchor to a new gap.
+            # data-gap coordinate pinned to the vllm 0.24.0 data: head_dim=192
+            # is collected for fp8 KV only there. The model is an fp8
+            # checkpoint (kv would infer fp8 and HIT), so bf16 KV is pinned
+            # explicitly to hold the gap. The 2026-10 campaign (0.30.0, the
+            # current slot) fills bf16@192, so the gap is a raw data pin, not
+            # a slot.
             model_path="XiaomiMiMo/MiMo-V2-Flash",
             kvcache_quant_mode="bfloat16",
+            backend_version="0.24.0",
+            allow_unlisted_version=True,
         )
         with pytest.raises(errors.PerfDataNotAvailableError) as excinfo:
             _rust_static_breakdown(case)
@@ -2008,8 +2054,8 @@ class TestRustTypedErrorsAcrossFfi:
         assert not perf_database.has_perf_data_not_available_cause(excinfo.value)
         # Python classifies the same query point identically.
         database = _case_database(case)
-        from aisimulate_core.sdk.engine import _evaluate_single_op
-        from aisimulate_core.sdk.operations.mla import MLABmm
+        from aisim_core.sdk.engine import _evaluate_single_op
+        from aisim_core.sdk.operations.mla import MLABmm
 
         with pytest.raises(errors.MissingSystemFlopsError):
             # The retired query_mla_bmm shim's exact twin, through the
@@ -2031,8 +2077,8 @@ class TestRustTypedErrorsAcrossFfi:
         # demanding an fp8_tc_flops entry a100 must never define (the
         # support-matrix FP8 gate is keyed on that entry's presence).
         database = _quiet_call(perf_database.get_database, "a100_sxm", "trtllm", "1.0.0")
-        from aisimulate_core.sdk.engine import _evaluate_single_op
-        from aisimulate_core.sdk.operations.mla import GenerationMLA
+        from aisim_core.sdk.engine import _evaluate_single_op
+        from aisim_core.sdk.operations.mla import GenerationMLA
 
         def _gen_mla(kv_mode):
             # The retired query_generation_mla shim's exact twin (the
@@ -2066,10 +2112,14 @@ class TestRustProvenanceCapture:
         case = EngineStepParityCase(
             model_path="MiniMaxAI/MiniMax-M3",
             database_mode="HYBRID",
-            # xop-borrow coordinate on the current slot: sglang 0.5.14 ships
-            # no MSA module tables (they land at 0.5.16), so MSA borrows
-            # DSA's util — the xop tier this test pins.
+            # xop-borrow coordinate pinned to the sglang 0.5.14 data: that
+            # drop ships no MSA module tables (they land at 0.5.16), so MSA
+            # borrows DSA's util — the xop tier this test pins. 0.5.21 (the
+            # current slot since the 2026-10 campaign) carries the MSA
+            # tables, so the coordinate is a raw data pin, not a slot.
             backend_name="sglang",
+            backend_version="0.5.14",
+            allow_unlisted_version=True,
         )
         with util_empirical.capture_provenance() as tags:
             metrics = _static_metrics(case)
@@ -2132,7 +2182,12 @@ _FPM_ROWS = [
 ]
 
 
-def _fpm_write_pair(data_dir) -> None:
+def _fpm_write_pair(data_dir, power_w=None) -> None:
+    """Write the schema-6 pair, or with ``power_w(row_index)`` a schema-8 pair.
+
+    Schema 8 carries the legacy schema-7 execution identity and a float64
+    ``power_w`` column (W per GPU) under the power-window policy.
+    """
     import hashlib
     import json as _json
 
@@ -2175,6 +2230,18 @@ def _fpm_write_pair(data_dir) -> None:
                 "latency_ms": lat,
             }
         )
+    if power_w is not None:
+        for index, row in enumerate(rows):
+            row.update(
+                model_config_sha256="",
+                execution_profile="full",
+                engram_residency="none",
+                input_modality="text",
+                # Schema 8 binds every row to the sidecar policy.
+                measurement_policy="dynamo_native_single_sample_power_window_v1",
+                measurement_repeats=1,
+                power_w=power_w(index),
+            )
     parquet_path = data_dir / "fpm_forward_perf.parquet"
     pq.write_table(pa.Table.from_pylist(rows), parquet_path)
     digest = hashlib.sha256(parquet_path.read_bytes()).hexdigest()
@@ -2182,9 +2249,13 @@ def _fpm_write_pair(data_dir) -> None:
         _json.dumps(
             {
                 "schema_name": "aic_fpm_forward_perf",
-                "schema_version": 6,
+                "schema_version": 6 if power_w is None else 8,
                 "coordinate_system": "iteration_totals_balanced_v1",
-                "measurement_policy": "dynamo_native_single_sample_v1",
+                "measurement_policy": (
+                    "dynamo_native_single_sample_v1"
+                    if power_w is None
+                    else "dynamo_native_single_sample_power_window_v1"
+                ),
                 "system": "b200_sxm",
                 "backend": "vllm",
                 "backend_version": _FPM_VERSION,
@@ -2197,6 +2268,15 @@ def _fpm_write_pair(data_dir) -> None:
 
 @pytest.fixture(scope="class")
 def fpm_systems_root(tmp_path_factory):
+    yield from _fpm_systems(tmp_path_factory)
+
+
+@pytest.fixture(scope="class")
+def fpm_power_systems_root(tmp_path_factory):
+    yield from _fpm_systems(tmp_path_factory, power_w=lambda index: 300.0 + 10.0 * index)
+
+
+def _fpm_systems(tmp_path_factory, power_w=None):
     import shutil
 
     root = tmp_path_factory.mktemp("fpm_systems")
@@ -2204,7 +2284,7 @@ def fpm_systems_root(tmp_path_factory):
     shutil.copy(f"{pkg_systems}/b200_sxm.yaml", root / "b200_sxm.yaml")
     data_dir = root / "data" / "b200_sxm" / "vllm" / _FPM_VERSION
     data_dir.mkdir(parents=True)
-    _fpm_write_pair(data_dir)
+    _fpm_write_pair(data_dir, power_w)
 
     perf_database.set_systems_paths(f"{root},default")
     rust_engine_step._engine_handle_cache_clear()
@@ -2247,7 +2327,7 @@ _FPM_GENONLY_FROZEN = 4.5
 
 
 # Hybrid speculative fpm (verify-on-FPM): pinned when the config class
-# became reachable (AISimulate schema v18, FpmForwardOp.verify_width). The ngram scheme
+# became reachable (AISim schema v18, FpmForwardOp.verify_width). The ngram scheme
 # is the pure verify-width channel (no draft ops): the decode query maps the
 # widened batch to the equivalent-AR point (tokens = c*w, total KV
 # unchanged) on the same synthetic fixture. Values pinned from the compiled
@@ -2256,12 +2336,64 @@ _FPM_HYBRID_STATIC_GEN_FROZEN = 4.1246337890625  # (ngram k3, batch 1, isl 1024,
 _FPM_HYBRID_MIXED_FROZEN = 18.187255859375  # (ctx 1024, gen 1, isl 1024, osl 2)
 
 
+# AISIM-1973: the same synthetic rows as a schema-8 pair with per-row power
+# 300 W + 10 W * row index. (latency_ms, energy_wms) pinned from the compiled
+# engine at introduction (append-only; there is no Python reference). Each
+# latency equals its schema-6 pin above. Energy is the resolved row's power
+# times its latency: prefill (1, 1024, 0) is row 1 (310 W * 18 ms), decode
+# (4, 4100) is row 12 (420 W * 4.5 ms). In the mixed step, prefill at 1028
+# tokens blends rows 1 and 2 with weight 4/1024. Decode at KV 4104 blends
+# rows 12 and 13 with weight 4/(262144 - 4100) and subtracts the batch-4 KV
+# floor (410 W * 4 ms). Their energies sum to the D5 pin below.
+_FPM_V8_POWER_FROZEN = {
+    "static_ctx": (18.0, 5580.0),
+    "static_gen": (4.5, 1890.0),
+    "mixed": (18.562552704189983, 5850.103399729668),
+    "genonly": (4.5, 1890.0),
+}
+
+
+class TestRustEngineStepFpmPowerParity:
+    """Schema-8 (powered) FPM pins: latency unchanged, energy from row power."""
+
+    def test_fpm_v8_power_pin(self, fpm_power_systems_root, monkeypatch):
+        _prepare_rust_core(monkeypatch)
+        model, backend, database = TestRustEngineStepFpmParity()._build()
+
+        def static(mode, batch, osl):
+            rc = config.RuntimeConfig(batch_size=batch, beam_width=1, isl=1024, osl=osl, prefix=0)
+            summary = backend.run_static(model, database, rc, mode=mode)
+            if mode == "static_ctx":
+                return summary.get_context_latency_dict(), summary.get_context_energy_wms_dict()
+            return summary.get_generation_latency_dict(), summary.get_generation_energy_wms_dict()
+
+        rc = config.RuntimeConfig(batch_size=1, beam_width=1, isl=1024, osl=2, prefix=0)
+        live = {
+            mode: tuple(sum(values.values()) for values in static(mode, batch, osl))
+            for mode, batch, osl in [("static_ctx", 1, 1), ("static_gen", 4, 2)]
+        }
+        live["mixed"] = tuple(backend._get_mix_step_latency(model, database, rc, 1024, 4, 1024, 2, 0)[:2])
+        live["genonly"] = tuple(backend._get_genonly_step_latency(model, database, rc, 4, 1023, 2)[:2])
+        for key, frozen in _FPM_V8_POWER_FROZEN.items():
+            if frozen is None:
+                print(f"\nPIN {key}: {live[key]!r}")
+            else:
+                assert live[key] == frozen, f"{key}: live {live[key]!r} != frozen {frozen!r}"
+        # Power never moves latency: the schema-6 pins of the same points.
+        assert [live[key][0] for key in ("static_ctx", "static_gen", "mixed", "genonly")] == [
+            _FPM_STATIC_FROZEN[("static_ctx", 1, 1024, 1, 0)],
+            _FPM_STATIC_FROZEN[("static_gen", 4, 1024, 2, 0)],
+            _FPM_MIXED_FROZEN[(1024, 4, 1024, 2)],
+            _FPM_GENONLY_FROZEN,
+        ]
+
+
 class TestRustEngineStepFpmHybridParity:
     """Hybrid (fpm target + speculative scheme) parity pins."""
 
     def _build_ngram(self):
-        from aisimulate.sdk.config_builders import build_model_config
-        from aisimulate_core.sdk.speculation import SpeculationConfig
+        from aisim.sdk.config_builders import build_model_config
+        from aisim_core.sdk.speculation import SpeculationConfig
 
         cfg = build_model_config(
             tp_size=2,
@@ -2294,7 +2426,7 @@ class TestRustEngineStepFpmHybridParity:
             assert abs(value - _FPM_HYBRID_STATIC_GEN_FROZEN) <= allowed
 
     def test_hybrid_ngram_mixed_pin(self, fpm_systems_root):
-        from aisimulate_core.sdk.backends.base_backend import MixedStepInput
+        from aisim_core.sdk.backends.base_backend import MixedStepInput
 
         model, backend, database = self._build_ngram()
         rc = config.RuntimeConfig(batch_size=4, beam_width=1, isl=1024, osl=2)
@@ -2315,7 +2447,7 @@ class TestRustEngineStepFpmHybridParity:
 class TestRustEngineStepFpmParity:
     @pytest.mark.parametrize("database_mode", ["SILICON", "HYBRID"])
     def test_auto_skips_absent_op_tables(self, fpm_systems_root, database_mode):
-        from aisimulate_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
+        from aisim_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
 
         cfg = ForwardPassPerfModelConfig(
             model=_FPM_MODEL,
@@ -2350,13 +2482,13 @@ class TestRustEngineStepFpmParity:
             model.close()
         from dataclasses import replace
 
-        from aisimulate_core.sdk.errors import PerfDataNotAvailableError
+        from aisim_core.sdk.errors import PerfDataNotAvailableError
 
         with pytest.raises(PerfDataNotAvailableError, match="required op-level data unavailable"):
             RustForwardPassPerfModel.best_available(replace(cfg, estimation_mode="op_level"))
 
     def test_sol_does_not_require_op_tables(self, fpm_systems_root):
-        from aisimulate_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
+        from aisim_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
 
         model = RustForwardPassPerfModel.best_available(
             ForwardPassPerfModelConfig(
@@ -2391,7 +2523,7 @@ class TestRustEngineStepFpmParity:
     """
 
     def _build(self):
-        from aisimulate.sdk.config_builders import build_model_config
+        from aisim.sdk.config_builders import build_model_config
 
         cfg = build_model_config(
             tp_size=2,
@@ -2437,7 +2569,7 @@ class TestRustEngineStepFpmParity:
         # estimate hitting the fpm_forward table's exact row proves the
         # whole-model engine was selected through the supported predictor API.
         _prepare_rust_core(monkeypatch)
-        from aisimulate_core.sdk.rust_engine_step import RustForwardPassPerfModel
+        from aisim_core.sdk.rust_engine_step import RustForwardPassPerfModel
 
         config = {
             "schema_version": 1,
@@ -2459,7 +2591,7 @@ class TestRustEngineStepFpmParity:
             "nextn": None,
             "forward_model": "fpm",
         }
-        from aisimulate_core.sdk import ForwardPassPerfModelConfig
+        from aisim_core.sdk import ForwardPassPerfModelConfig
 
         model = RustForwardPassPerfModel.best_available(
             ForwardPassPerfModelConfig.from_legacy_engine_config(config, "aggregated")
@@ -2480,7 +2612,7 @@ class TestRustEngineStepFpmParity:
         _prepare_rust_core(monkeypatch)
         import json as _json
 
-        from aisimulate.sdk import engine as sdk_engine
+        from aisim.sdk import engine as sdk_engine
 
         model, _backend, database = self._build()
         spec = _json.loads(

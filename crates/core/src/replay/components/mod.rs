@@ -2,13 +2,18 @@
 // SPDX-License-Identifier: Apache-2.0
 
 mod admission;
+mod detokenization;
 mod encoder;
 mod engine;
 mod tokenization;
 mod types;
 
-pub(crate) use admission::{AdmissionQueue, ReplayReadyArrival};
+pub(crate) use admission::{
+    AdmissionQueue, DEFAULT_MAX_SOURCE_STEPS_PER_INSTANT, DpRankLimits, ReplayReadyArrival,
+};
 pub use admission::{NoReplayMetadata, ReplayAdmissionMetadata};
+pub use detokenization::DetokenizationLatency;
+pub(crate) use detokenization::{DetokenizationStage, PassReceipt};
 pub(crate) use encoder::EncoderPool;
 pub(crate) use engine::EngineComponent;
 pub use tokenization::TokenizationLatency;

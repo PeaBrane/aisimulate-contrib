@@ -23,3 +23,12 @@ mod tests;
 
 #[cfg(test)]
 mod grouped_tests;
+
+#[cfg(test)]
+mod mtp_offload_tests;
+
+#[cfg(test)]
+mod native_mtp_tests;
+
+#[cfg(test)]
+mod hybrid_prefix_tests;

@@ -8,15 +8,26 @@ on:
       daily:
         type: boolean
         default: false
+      pr_number:
+        description: Verified originating PR number from Full CI target validation
+        type: string
+        default: ''
+    secrets:
+      ARTIFACTORY_TOKEN:
+        description: The selected Dynamo job environment supplies this named storage credential
+        required: true
 permissions:
   contents: read
+  actions: read
 jobs:
   commands:
     name: README / ${{ matrix.profile }}
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJSON(inputs.daily && '[{"profile":"development","os":"ubuntu-24.04"},{"profile":"release","os":"ubuntu-24.04"},{"profile":"dynamo","os":"ubuntu-24.04"},{"profile":"macos","os":"macos-14"}]' || '[{"profile":"source","os":"ubuntu-24.04"},{"profile":"dynamo","os":"ubuntu-24.04"}]') }}
+        include: ${{ fromJSON(inputs.daily && '[{"profile":"development","os":"ubuntu-24.04"},{"profile":"release","os":"ubuntu-24.04"},{"profile":"macos","os":"macos-15"}]' || '[{"profile":"source","os":"ubuntu-24.04"}]') }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 330
     env:
@@ -58,6 +69,157 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: readme-${{ matrix.profile }}
+          path: readme-results/
+          if-no-files-found: error
+          retention-days: 30
+
+  dynamo:
+    name: README / dynamo
+    # Fixed RCs are test dependencies: main seeds the same test-only storage
+    # consumed by PRs, without exposing official release storage to PR tokens.
+    environment: pr-wheel-staging
+    # Artifactory DNS is available inside the existing NVIDIA runner network.
+    runs-on: prod-aisim-default-amd64-v1
+    container: ${{ vars.CI_JOB_CONTAINER_IMAGE }}
+    timeout-minutes: 330
+    env:
+      HF_HUB_DISABLE_IMPLICIT_TOKEN: '1'
+      HF_HUB_DISABLE_XET: '1'
+      PIP_DEFAULT_TIMEOUT: '60'
+      AISIM_RC_REVISION: 77d82652b2f83fd67afefc3141d69a5f06e630be
+      DYNAMO_RC_REVISION: 9653d05441b37b6a004837651fd991e44158d755
+      RC_PR_NUMBER: ${{ inputs.pr_number }}
+    steps:
+      - name: Prepare the NVIDIA-connected Dynamo job environment
+        shell: bash
+        run: |
+          {
+            echo "HOME=${GITHUB_WORKSPACE}"
+            echo "USER=runner"
+            echo "CARGO_HOME=${RUNNER_TEMP}/cargo"
+            echo "RUSTUP_HOME=${RUNNER_TEMP}/rustup"
+          } >> "${GITHUB_ENV}"
+          {
+            cat /etc/os-release
+            nproc
+            for resource in /sys/fs/cgroup/cpu.max /sys/fs/cgroup/memory.max; do
+              if [ -f "$resource" ]; then echo "$resource"; cat "$resource"; fi
+            done
+          } | tee "${RUNNER_TEMP}/rc-runner-environment.txt"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: '1.98.0'
+      - name: Fetch historical test baseline
+        run: git fetch origin d066e918705b98e2d55eed55743ce8d225f129ea
+      - name: Install harness dependencies
+        run: python -m pip install --require-hashes -r scripts/readme/requirements.txt
+      - name: Check harness and reporting contracts
+        run: |
+          python -m pytest -c /dev/null -p no:cacheprovider scripts/readme/test_readme_commands.py scripts/readme/test_readme_report.py
+          python scripts/readme/check_readme_commands.py --validate
+      - name: Verify the Dynamo storage credential is available
+        env:
+          ARTIFACTORY_TOKEN: ${{ secrets.ARTIFACTORY_TOKEN }}
+        run: |
+          if [ -z "$ARTIFACTORY_TOKEN" ]; then
+            echo "::error::Dynamo RC storage requires the selected environment's ARTIFACTORY_TOKEN"
+            exit 1
+          fi
+      - name: Prepare and identify the RC native build environment
+        shell: bash
+        env:
+          RC_STORAGE_URL: ${{ vars.WHEEL_STORAGE_URL }}
+        run: |
+          # Fail before compilation if this runner cannot reach the storage DNS.
+          python -c 'import os, socket; from urllib.parse import urlsplit; endpoint = urlsplit(os.environ["RC_STORAGE_URL"]); assert endpoint.scheme == "https" and endpoint.hostname; socket.getaddrinfo(endpoint.hostname, 443)'
+          as_root() {
+            if [ "$(id -u)" = 0 ]; then "$@"; else sudo "$@"; fi
+          }
+          as_root apt-get update
+          as_root apt-get install -y build-essential gh libhwloc-dev libudev-dev pkg-config libclang-dev protobuf-compiler cmake
+          echo "LIBRARY_PATH=${pythonLocation}/lib" >> "${GITHUB_ENV}"
+      - name: Find matching pinned Dynamo RC wheels
+        id: rc-wheels
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RC_STORAGE_REPO: ${{ vars.WHEEL_STORAGE_REPO }}
+          RC_STORAGE_URL: ${{ vars.WHEEL_STORAGE_URL }}
+          RC_JOB_IMAGE: ${{ vars.CI_JOB_CONTAINER_IMAGE }}
+        run: |
+          wheelhouse="${RUNNER_TEMP}/dynamo-rc-wheels"
+          echo "AISIM_RC_WHEELHOUSE=${wheelhouse}" >> "${GITHUB_ENV}"
+          echo "RC_STORAGE_REPO=${RC_STORAGE_REPO}" >> "${GITHUB_ENV}"
+          echo "RC_STORAGE_URL=${RC_STORAGE_URL}" >> "${GITHUB_ENV}"
+          echo "RC_JOB_IMAGE=${RC_JOB_IMAGE}" >> "${GITHUB_ENV}"
+          python scripts/ci/readme_rc_wheels.py prepare --directory "$wheelhouse"
+      - name: Preserve RC build-input and runner evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: readme-rc-build-inputs
+          path: |
+            ${{ env.AISIM_RC_WHEELHOUSE }}/rc-build-inputs.json
+            ${{ runner.temp }}/rc-runner-environment.txt
+          overwrite: true
+          if-no-files-found: error
+      - name: Require the producer build-input record on restore
+        if: steps.rc-wheels.outputs.run-id != ''
+        run: rm -- "$AISIM_RC_WHEELHOUSE/rc-build-inputs.json"
+      - name: Restore verified pinned Dynamo RC wheels
+        if: steps.rc-wheels.outputs.run-id != ''
+        uses: ./.github/actions/wheel-storage
+        with:
+          mode: download
+          name: ${{ steps.rc-wheels.outputs.name }}
+          path: ${{ env.AISIM_RC_WHEELHOUSE }}
+          run-id: ${{ steps.rc-wheels.outputs.run-id }}
+          source-sha: ${{ env.AISIM_RC_REVISION }}
+          architecture: amd64
+          scope: ${{ steps.rc-wheels.outputs.scope }}
+          pr-number: ${{ steps.rc-wheels.outputs.pr-number }}
+          url: ${{ vars.WHEEL_STORAGE_URL }}
+          repo: ${{ vars.WHEEL_STORAGE_REPO }}
+          token: ${{ secrets.ARTIFACTORY_TOKEN }}
+      - name: Build the pinned Dynamo RC wheels
+        if: steps.rc-wheels.outputs.run-id == ''
+        env:
+          CARGO_BUILD_JOBS: '2'
+        run: bash scripts/ci/build_readme_rc_wheels.sh
+      - name: Verify the RC wheel set and build inputs
+        run: python scripts/ci/readme_rc_wheels.py verify --directory "$AISIM_RC_WHEELHOUSE"
+      - name: Execute README commands
+        env:
+          PROFILE: dynamo
+        run: >-
+          python scripts/readme/check_readme_commands.py
+          --profile "$PROFILE"
+          --workspace "$RUNNER_TEMP/readme-$PROFILE"
+          --output "readme-results/$PROFILE"
+      - name: Preserve tested pinned Dynamo RC wheels
+        if: steps.rc-wheels.outputs.run-id == ''
+        uses: ./.github/actions/wheel-storage
+        with:
+          mode: upload
+          name: ${{ steps.rc-wheels.outputs.name }}
+          path: ${{ env.AISIM_RC_WHEELHOUSE }}
+          source-sha: ${{ env.AISIM_RC_REVISION }}
+          architecture: amd64
+          scope: ${{ inputs.pr_number != '' && 'pr' || 'preview' }}
+          pr-number: ${{ inputs.pr_number }}
+          url: ${{ vars.WHEEL_STORAGE_URL }}
+          repo: ${{ vars.WHEEL_STORAGE_REPO }}
+          token: ${{ secrets.ARTIFACTORY_TOKEN }}
+      - name: Preserve command evidence even after failure
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: readme-dynamo
           path: readme-results/
           if-no-files-found: error
           retention-days: 30

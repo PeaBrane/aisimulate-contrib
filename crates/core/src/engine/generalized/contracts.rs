@@ -3,7 +3,9 @@
 
 use std::num::NonZeroU32;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
+
+use crate::engine::{IterationMs, RankWork};
 
 /// Stable identity of one logical mock engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -191,6 +193,17 @@ pub struct RankPass<S, P> {
     pub pending: P,
 }
 
+/// The scheduling half of a rank's pass, returned by
+/// [`RankEngine::schedule_pass`].
+#[derive(Debug)]
+pub enum ScheduledPass<S, P> {
+    /// The rank priced its own pass.
+    Priced(RankPass<S, P>),
+    /// The rank committed this work and retains the pass until
+    /// [`RankEngine::resolve_pass`] supplies its duration.
+    Unpriced(RankWork),
+}
+
 /// Pass-start effects from one rank.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RankPassStarted<T> {
@@ -326,12 +339,51 @@ pub trait RankEngine: Sized {
         now_ms: f64,
     ) -> Result<RankPass<Self::PassStartEffects, Self::PendingPass>>;
 
+    /// Commit one non-preemptive pass's scheduling. A rank that lets its
+    /// group price the pass returns its model work and retains the pass until
+    /// [`Self::resolve_pass`]; the default prices it with
+    /// [`Self::execute_pass`].
+    fn schedule_pass(
+        &mut self,
+        now_ms: f64,
+    ) -> Result<ScheduledPass<Self::PassStartEffects, Self::PendingPass>> {
+        self.execute_pass(now_ms).map(ScheduledPass::Priced)
+    }
+
+    /// Work this rank contributes to a group pass it does not execute.
+    /// `None`, the default, keeps every rank of that pass on its own pricing.
+    fn idle_pass_work(&self) -> Option<RankWork> {
+        None
+    }
+
+    /// Price one group pass at once from every rank's work in DP-rank order.
+    /// Called on one rank; `None`, the default, keeps per-rank pricing.
+    fn price_group_pass(&self, _ranks: &[RankWork]) -> Result<Option<IterationMs>> {
+        Ok(None)
+    }
+
+    /// Finish the pass retained by an unpriced [`Self::schedule_pass`]:
+    /// `iteration` is the group's shared price, or `None` for the rank's own.
+    fn resolve_pass(
+        &mut self,
+        _iteration: Option<&IterationMs>,
+    ) -> Result<RankPass<Self::PassStartEffects, Self::PendingPass>> {
+        bail!("rank engine has no unpriced pass to resolve")
+    }
+
     /// Release the effects of a previously committed pass.
     fn complete_pass(
         &mut self,
         pending: Self::PendingPass,
         end_ms: f64,
     ) -> Result<Self::PassCompletionEffects>;
+
+    /// This rank's contribution to the group boundary reported in idle-rank
+    /// forward telemetry. An implementation may exclude separately priced
+    /// host time while retaining it in the actual pass boundary.
+    fn idle_telemetry_end_ms(&self, _pending: &Self::PendingPass, end_ms: f64) -> f64 {
+        end_ms
+    }
 
     /// Cross the shared completion boundary without a rank-local pass.
     ///
@@ -347,6 +399,17 @@ pub trait RankEngine: Sized {
         _end_ms: f64,
     ) -> Result<Option<Self::PassCompletionEffects>> {
         Ok(None)
+    }
+
+    /// Like `complete_idle_group_pass`, with a separate modeled end time for
+    /// forward telemetry. Scheduling effects still advance to `end_ms`.
+    fn complete_idle_group_pass_with_telemetry(
+        &mut self,
+        started_at_ms: f64,
+        end_ms: f64,
+        _telemetry_end_ms: f64,
+    ) -> Result<Option<Self::PassCompletionEffects>> {
+        self.complete_idle_group_pass(started_at_ms, end_ms)
     }
 
     /// Earliest deadline for independently modeled internal work.
@@ -368,4 +431,19 @@ pub trait RankEngine: Sized {
 
     /// Whether this rank owns no request, pass, or internal work.
     fn is_drained(&self) -> bool;
+
+    /// Earliest time at which outputs held past their pass's completion leave
+    /// the rank. Unlike internal deadlines it is not masked by a pass in flight:
+    /// vLLM returns a pass's outputs while the next pass runs. A command can set
+    /// an emission at its own time, so drivers read this after commands too.
+    /// The default holds none.
+    fn next_emission_ms(&self) -> Option<f64> {
+        None
+    }
+
+    /// Release the held outputs due at `now_ms` as completion effects that
+    /// carry only outputs.
+    fn take_due_emissions(&mut self, _now_ms: f64) -> Result<Option<Self::PassCompletionEffects>> {
+        Ok(None)
+    }
 }

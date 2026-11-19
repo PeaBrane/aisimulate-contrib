@@ -3,7 +3,7 @@
 
 //! External, immutable operation graphs bound to a compiled baseline and data.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256};
 use crate::common::enums::DatabaseMode;
 use crate::operators::Op;
 use crate::operators::measured_composite::invalid;
+use crate::perf_database::dsv4::AttnKind;
 use crate::perfmodel::engine::spec::EngineSpec;
 use crate::{
     AicError, EstimationMode, ForwardPassFallbackPolicy, ForwardPassPerfModelConfig,
@@ -42,6 +43,8 @@ struct ExecutionProfile {
     basis: EngineSpec,
     worker_type: ForwardPassWorkerType,
     ops: Vec<Op>,
+    /// Aggregated profiles use `ops` for prefill and this graph for decode.
+    generation_ops: Option<Vec<Op>>,
     /// Every file needed to load the private systems root, including hardware
     /// YAML, version/source metadata and all retained operation measurements.
     retained_files: Vec<RetainedFile>,
@@ -67,7 +70,6 @@ pub(crate) fn validate_config(config: &ForwardPassPerfModelConfig) -> Result<(),
         || config.database_mode != DatabaseMode::Silicon
         || config.enable_shared_layer != Some(false)
         || config.estimator_config.correction.enabled
-        || config.worker_type == ForwardPassWorkerType::Aggregated
         || config.nextn != 0
         || config.speculation.is_some()
         || config.fpm_profile.is_some()
@@ -85,7 +87,7 @@ pub(crate) fn validate_config(config: &ForwardPassPerfModelConfig) -> Result<(),
         || !is_digest(&selection.sha256)
     {
         return Err(invalid(
-            "requires explicit op_level/SILICON, fallback deny, shared layer and correction disabled, a single prefill or decode worker, PP1/DP1/CP1/DCP1, no speculation or vision encoder, a literal backend version, and an absolute path with a lowercase SHA-256 pin",
+            "requires explicit op_level/SILICON, fallback deny, shared layer and correction disabled, PP1/DP1/CP1/DCP1, no speculation or vision encoder, a literal backend version, and an absolute path with a lowercase SHA-256 pin",
         ));
     }
     Ok(())
@@ -124,15 +126,24 @@ impl ExecutionProfileSelection {
             return Err(invalid("profile SHA-256 does not match its pin"));
         }
         let profile: ExecutionProfile = serde_json::from_slice(&bytes).map_err(invalid)?;
-        if profile.schema_version != 1
+        if !matches!(profile.schema_version, 1 | 2)
             || profile.basis.schema_version != crate::ENGINE_SPEC_SCHEMA_VERSION
-            || profile.worker_type == ForwardPassWorkerType::Aggregated
             || profile.ops.is_empty()
             || profile.retained_files.is_empty()
         {
             return Err(invalid(
                 "unsupported profile schema, phase or empty graph/bundle",
             ));
+        }
+        if profile.worker_type == ForwardPassWorkerType::Aggregated {
+            if profile.schema_version == 1 {
+                return Err(invalid("aggregated profiles require schema_version 2"));
+            }
+            if profile.generation_ops.as_ref().is_none_or(Vec::is_empty) {
+                return Err(invalid("aggregated profiles require generation_ops"));
+            }
+        } else if profile.generation_ops.is_some() {
+            return Err(invalid("generation_ops require an aggregated profile"));
         }
         Ok(profile)
     }
@@ -182,23 +193,13 @@ impl ExecutionProfileSelection {
                 "baseline requires op_level SILICON with primary sources only",
             ));
         }
-        let context = profile.worker_type == ForwardPassWorkerType::Prefill;
-        let baseline = if context {
-            &spec.context_ops
-        } else {
-            &spec.generation_ops
-        };
-        let weights = |ops: &[Op]| ops.iter().map(Op::weight_bytes).sum::<f64>();
-        if !weights(&profile.ops).is_finite()
-            || (weights(baseline) - weights(&profile.ops)).abs() > 1.0
-        {
-            return Err(invalid(
-                "replacement graph must preserve the baseline resident weights",
-            ));
+        let context = profile.worker_type != ForwardPassWorkerType::Decode;
+        validate_replacement(&profile.ops, &spec, context)?;
+        if let Some(generation) = &profile.generation_ops {
+            validate_replacement(generation, &spec, false)?;
         }
-        validate_ops(&profile.ops, &spec, context)?;
         let snapshot = tempfile::Builder::new()
-            .prefix("aisimulate-op-profile-")
+            .prefix("aisim-op-profile-")
             .tempdir()
             .map_err(invalid)?;
         let mut seen = BTreeSet::new();
@@ -249,21 +250,47 @@ impl ExecutionProfileSelection {
         }
         if context {
             spec.context_ops = profile.ops;
-            spec.generation_ops.clear();
+            spec.generation_ops = profile.generation_ops.unwrap_or_default();
         } else {
             spec.generation_ops = profile.ops;
             spec.context_ops.clear();
         }
         spec.engine.extra.insert(
             "execution_profile_phase".into(),
-            if context { "prefill" } else { "decode" }.into(),
+            match profile.worker_type {
+                ForwardPassWorkerType::Prefill => "prefill",
+                ForwardPassWorkerType::Decode => "decode",
+                ForwardPassWorkerType::Aggregated => "aggregated",
+            }
+            .into(),
         );
         spec.engine
             .extra
             .insert("execution_profile_sha256".into(), self.sha256.clone());
+        // Keep v1 EngineSpec hashes compatible with existing saved model states.
+        if profile.schema_version == 2 {
+            spec.engine
+                .extra
+                .insert("execution_profile_schema_version".into(), "2".into());
+        }
         spec.engine.systems_path = Some(snapshot.path().to_path_buf());
         Ok((spec, snapshot))
     }
+}
+
+fn validate_replacement(ops: &[Op], spec: &EngineSpec, context: bool) -> Result<(), AicError> {
+    let baseline = if context {
+        &spec.context_ops
+    } else {
+        &spec.generation_ops
+    };
+    let weights = |ops: &[Op]| ops.iter().map(Op::weight_bytes).sum::<f64>();
+    if !weights(ops).is_finite() || (weights(baseline) - weights(ops)).abs() > 1.0 {
+        return Err(invalid(
+            "replacement graph must preserve the baseline resident weights",
+        ));
+    }
+    validate_ops(ops, spec, context)
 }
 
 /// Path of the first field where the actual compiled spec differs from the
@@ -310,11 +337,25 @@ fn first_difference(actual: &serde_json::Value, pinned: &serde_json::Value) -> S
 }
 
 fn validate_ops(ops: &[Op], spec: &EngineSpec, context: bool) -> Result<(), AicError> {
-    let mut names = BTreeSet::new();
+    // Names are unique, except that the DeepSeek-V4 CSA and HCA attention
+    // modules of a phase share its attention name (`context_attention` or
+    // `generation_attention`), the exact name the engine matches.
+    let mut kinds: BTreeMap<&str, Vec<Option<AttnKind>>> = BTreeMap::new();
     for op in ops {
-        if !names.insert(op.name()) {
+        let kind = match op {
+            Op::Dsv4Context(op) | Op::Dsv4Generation(op) => Some(op.attn_kind),
+            _ => None,
+        };
+        let seen = kinds.entry(op.name()).or_default();
+        if !seen.is_empty()
+            && (kind.is_none()
+                || seen
+                    .iter()
+                    .any(|earlier| earlier.is_none() || *earlier == kind))
+        {
             return Err(invalid("duplicate operation name"));
         }
+        seen.push(kind);
         match op {
             Op::MeasuredComposite(op) => {
                 op.validate()?;
@@ -351,7 +392,10 @@ fn validate_ops(ops: &[Op], spec: &EngineSpec, context: bool) -> Result<(), AicE
 mod tests {
     use serde_json::json;
 
-    use super::first_difference;
+    use super::{first_difference, validate_ops};
+    use crate::operators::Op;
+    use crate::operators::dsv4::Dsv4ModuleOp;
+    use crate::perfmodel::engine::spec::EngineSpec;
 
     #[test]
     fn first_difference_names_the_path_and_both_values() {
@@ -378,5 +422,85 @@ mod tests {
             "extra.foo (present on one side only)"
         );
         assert_eq!(first_difference(&json!({"a": 1}), &json!({"a": 1})), "");
+    }
+
+    /// The minimal DeepSeek-V4 module spec of perf_database/dsv4.rs (`dsv4_op_spec_dims_default_to_pinned_pro`).
+    fn module(name: &str, attn_kind: &str) -> Dsv4ModuleOp {
+        serde_json::from_value(json!({
+            "name": name, "scale_factor": 1.0, "attn_kind": attn_kind, "num_heads": 16,
+            "native_heads": 128, "tp_size": 8, "kv_cache_dtype": "fp8",
+            "fmha_quant_mode": "bfloat16", "gemm_quant_mode": "fp8_block",
+            "architecture": "DeepseekV4ForCausalLM",
+        }))
+        .expect("DeepSeek-V4 module spec")
+    }
+
+    /// The measured scope of the Python profile fixture (test_external_execution_profile.py).
+    fn measured(name: &str) -> Op {
+        serde_json::from_value(json!({"MeasuredComposite": {
+            "name": name, "system": "h200_sxm", "backend": "vllm", "version": "1.0",
+            "is_context": true, "weight_bytes": 0.0, "scale_factor": 1.0,
+            "cells": [{"shape": [1, 4, 0], "latency_ms": 2.0}],
+        }}))
+        .expect("measured scope")
+    }
+
+    /// The engine identity of the Python profile fixture, with empty graphs.
+    fn spec() -> EngineSpec {
+        serde_json::from_value(json!({
+            "schema_version": crate::ENGINE_SPEC_SCHEMA_VERSION,
+            "engine": {
+                "schema_version": crate::ENGINE_CONFIG_SCHEMA_VERSION, "model_name": "test/model",
+                "system_name": "h200_sxm", "backend": "vllm", "backend_version": "1.0",
+                "forward_model": "op_level", "kv_block_size": 16, "tp_size": 1, "pp_size": 1,
+                "weight_dtype": "bfloat16", "activation_dtype": "bfloat16",
+                "kv_cache_dtype": "bfloat16", "database_mode": "SILICON",
+                "enable_shared_layer": false,
+            },
+            "context_ops": [], "generation_ops": [],
+        }))
+        .expect("engine spec")
+    }
+
+    #[test]
+    fn dsv4_csa_and_hca_modules_may_share_their_phase_attention_name() {
+        let spec = spec();
+        let context = [
+            Op::Dsv4Context(module("context_attention", "Csa")),
+            Op::Dsv4Context(module("context_attention", "Hca")),
+        ];
+        validate_ops(&context, &spec, true)
+            .expect("context CSA and HCA modules share context_attention");
+        let generation = [
+            Op::Dsv4Generation(module("generation_attention", "Hca")),
+            Op::Dsv4Generation(module("generation_attention", "Csa")),
+        ];
+        validate_ops(&generation, &spec, false)
+            .expect("generation CSA and HCA modules share generation_attention");
+    }
+
+    #[test]
+    fn any_other_repeated_operation_name_stays_refused() {
+        let spec = spec();
+        let refused = |ops: Vec<Op>| {
+            validate_ops(&ops, &spec, true)
+                .expect_err("repeated name")
+                .to_string()
+        };
+        let message = "invalid engine config: external execution profile: duplicate operation name";
+        let csa = || Op::Dsv4Context(module("context_attention", "Csa"));
+        let hca = || Op::Dsv4Context(module("context_attention", "Hca"));
+        // The same attention kind twice.
+        assert_eq!(refused(vec![csa(), csa()]), message);
+        // A third module repeats an attention kind already seen.
+        assert_eq!(refused(vec![csa(), hca(), csa()]), message);
+        // A DeepSeek-V4 module and another operation under one name, in either order.
+        assert_eq!(refused(vec![csa(), measured("context_attention")]), message);
+        assert_eq!(refused(vec![measured("context_attention"), csa()]), message);
+        // Two operations of another kind.
+        assert_eq!(
+            refused(vec![measured("context_scope"), measured("context_scope")]),
+            message
+        );
     }
 }

@@ -173,6 +173,7 @@ pub fn load_agentic_mooncake(path: &Path, legacy_trace_block_size: usize) -> Res
                     0.0
                 },
                 recorded_api_time_ms: None,
+                recorded_start_ms: None,
                 priority: raw.priority,
                 strict_priority: raw.strict_priority,
                 policy_class: raw.policy_class,
@@ -472,6 +473,7 @@ impl TurnTrace {
     ) -> Result<DirectRequest> {
         let tokens = self.synthesize_tokens(trace_block_size)?;
         Ok(DirectRequest {
+            cache_salt: None,
             tokens,
             max_output_tokens: self.max_output_tokens,
             output_token_ids: self.output_token_ids.clone(),
@@ -1426,10 +1428,12 @@ impl AgenticGraphBuilder {
     }
 
     pub fn finish(self) -> Result<AgenticTrace> {
-        if self.inner.is_empty() {
-            bail!("agentic Mooncake rows did not contain any requests");
-        }
         self.inner.finish()
+    }
+
+    /// Runs `finish`'s checks without compiling the graph.
+    pub(crate) fn validate(mut self) -> Result<()> {
+        self.inner.validate().map(drop)
     }
 }
 
@@ -1543,6 +1547,16 @@ impl AgenticTraceBuilder {
                 raw.recorded_api_time_ms
             );
         }
+        if raw
+            .recorded_start_ms
+            .is_some_and(|start| !start.is_finite() || start < 0.0)
+        {
+            bail!(
+                "trace line {} has invalid recorded_start_ms {:?}",
+                line_idx + 1,
+                raw.recorded_start_ms
+            );
+        }
         for dependency in &raw.dependencies {
             if dependency.request_id.trim().is_empty() {
                 bail!(
@@ -1601,7 +1615,10 @@ impl AgenticTraceBuilder {
             hash_ids,
             not_before_ms: raw.not_before_ms,
             recorded_api_time_ms: raw.recorded_api_time_ms,
-            recorded_interval_ms: None,
+            recorded_interval_ms: raw
+                .recorded_start_ms
+                .map(|start| (start, raw.recorded_api_time_ms.map(|api| start + api))),
+            recorded_start_gates_frontier: raw.recorded_start_ms.is_some(),
             priority: raw.priority.unwrap_or(0),
             strict_priority: raw.strict_priority.unwrap_or(0),
             policy_class: raw.policy_class,
@@ -1611,6 +1628,30 @@ impl AgenticTraceBuilder {
     }
 
     fn finish(mut self) -> Result<AgenticTrace> {
+        let plays = self.validate()?;
+        let hash_values = renumber_hash_ids(&mut self.nodes, self.hash_ids);
+        let graph_digest =
+            canonical_agentic_graph_digest(self.header.block_size, &mut self.nodes, &hash_values)?;
+        let conversation_lineage = super::lineage::conversation_lineage(&self.nodes);
+
+        Ok(AgenticTrace {
+            block_size: self.header.block_size,
+            source: self.header.source,
+            graph_digest,
+            nodes: self.nodes,
+            plays,
+            conversation_lineage,
+            hash_values,
+        })
+    }
+
+    /// Sorts nodes into graph order and checks the graph contract: at least one
+    /// request, dependency targets, acyclicity, roots and source play ordinals.
+    /// Returns the plays in replay order.
+    fn validate(&mut self) -> Result<Vec<AgenticPlay>> {
+        if self.is_empty() {
+            bail!("agentic Mooncake rows did not contain any requests");
+        }
         self.nodes
             .sort_by(|left, right| left.request_id.cmp(&right.request_id));
         let index_by_id: HashMap<&str, usize> = self
@@ -1715,18 +1756,7 @@ impl AgenticTraceBuilder {
         } else {
             plays.sort_by(|left, right| left.play_id.cmp(&right.play_id));
         }
-        let hash_values = renumber_hash_ids(&mut self.nodes, self.hash_ids);
-        let graph_digest =
-            canonical_agentic_graph_digest(self.header.block_size, &mut self.nodes, &hash_values)?;
-
-        Ok(AgenticTrace {
-            block_size: self.header.block_size,
-            source: self.header.source,
-            graph_digest,
-            nodes: self.nodes,
-            plays,
-            hash_values,
-        })
+        Ok(plays)
     }
 }
 
@@ -1814,9 +1844,6 @@ impl AgenticTrace {
         let mut builder = AgenticTraceBuilder::new(header)?;
         for (line_idx, row) in rows.into_iter().enumerate() {
             builder.push(line_idx + 1, row)?;
-        }
-        if builder.is_empty() {
-            bail!("agentic Mooncake rows did not contain any requests");
         }
         builder.finish()
     }
@@ -2008,6 +2035,7 @@ fn canonical_agentic_graph_digest(
                 not_before_ms,
                 recorded_api_time_ms,
                 recorded_interval_ms: _,
+                recorded_start_gates_frontier: _,
                 priority,
                 strict_priority,
                 policy_class,

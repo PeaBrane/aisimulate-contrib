@@ -3,21 +3,21 @@
 
 # Local execution resources
 
-`aisimulate predict`, `aisimulate recommend`, and the public
+`aisim predict`, `aisim recommend`, and the public
 `run_recommendation` Python API check host resources before preparing a run.
 
-**No manual resource configuration is required.** AISimulate automatically
+**No manual resource configuration is required.** AISim automatically
 detects the local machine's available RAM and CPU capacity, reserves host
 headroom, and limits parallel simulations to fit the estimated resource budget.
 You can omit the entire `execution.resources` section. Set explicit limits only
 when you want to override the automatic budget.
 
 Normal package installation includes the required `psutil` and `ijson`
-dependencies. Downstream images that install an AISimulate wheel with
+dependencies. Downstream images that install an AISim wheel with
 `--no-deps` must explicitly install both dependencies before adopting a release
 containing these controls.
 
-These controls describe the machine running AISimulate. Simulated GPU counts,
+These controls describe the machine running AISim. Simulated GPU counts,
 KV-cache memory fractions, traffic concurrency, and request counts retain their
 original meaning.
 
@@ -43,7 +43,9 @@ reserve. The default memory budget is max(0, min(0.9 A, A - 1 GB)); the separate
 and that fraction of effective physical RAM.
 
 Linux cgroup v1/v2 memory limits, current usage, ancestor limits, affinity and CPU
-quotas constrain the host snapshot. Swap does not increase the budget. Automatic
+quotas constrain the host snapshot. Cgroup usage excludes inactive file cache
+(`inactive_file` in `memory.stat`, `total_inactive_file` on v1), which the kernel
+reclaims on demand. Swap does not increase the budget. Automatic
 CPU selection leaves one CPU free when more than one whole CPU is available.
 CPU capacity caps the number of parallel simulations; it does not estimate CPU
 speed or simulation duration. An explicit positive `memory_limit_gb` or integer
@@ -58,7 +60,7 @@ preserves the suggestion batch size, trial budget and requested traffic.
 Admission checks each concrete candidate and the combined memory estimate of
 its batch against fresh host headroom before starting workers. A large load in
 the search domain does not block smaller candidates. If a batch cannot fit,
-AISimulate reduces its parallelism; a candidate that cannot fit alone is recorded
+AISim reduces its parallelism; a candidate that cannot fit alone is recorded
 as `resource_limited`, with no simulated metrics or score. It consumes a trial
 and completes it as an optimizer rejection without a fabricated measurement.
 Completed candidates remain available. Resource-limited candidates are counted
@@ -91,12 +93,16 @@ A sudden jump past the supervisor limit stops the entire execution tree.
 termination outcome. Fields that could not be observed because resource discovery
 failed are null. Errors loading configuration, applying overrides, or validating
 the core schema preserve existing artifacts, including with `--overwrite`.
-`execution-events.jsonl` checkpoints
-completed candidates and batch decisions so evidence survives a supervisor interruption. A completed
-sweep writes `recommendation.json` and selected prediction files as usual, and
-exits with status 3 if any candidates were resource-limited. If the entire tree
-is stopped, the event log contains the completed subset; it is not a finalized
-recommendation. The Python API returns partial sweep results for individual
+`execution-events.jsonl` checkpoints recorded candidates and batch decisions so
+evidence survives a supervisor interruption. `candidate_completed` events omit
+`provenance.runner_metadata`, which can grow with the replay;
+`recommendation.json` keeps it. A completed sweep writes
+`recommendation.json` and selected prediction files as usual, and exits with
+status 3 if any candidates were resource-limited. If the entire tree is stopped,
+the event log contains the candidates recorded so far; it is not a finalized
+recommendation. Replays are recorded in suggestion order, so the log can miss up
+to `optimizer.parallelism − 1` finished replays still waiting for an earlier one
+in their batch. The Python API returns partial sweep results for individual
 candidate refusals, or raises `ResourceLimitError` with bounded partial events
 when the supervisor stops the whole tree. Host evidence is available through
 `result.execution_resources` and excluded from the portable result fingerprint.
@@ -110,7 +116,7 @@ configurable above; the optimizer's candidate timeout remains independent.
 ## Runner estimate contract and limitations
 
 An optional factory method `estimate_host_resources(workload, *, concurrency)`
-returns `aisimulate.resources.ResourceEstimate` with `api_version=1`:
+returns `aisim.resources.ResourceEstimate` with `api_version=1`:
 
 - `allocation_model`: versioned implementation name;
 - `request_count`: concrete count, or null when unresolved;
@@ -125,25 +131,46 @@ v1 estimates retain the previous `max(512 MiB, lower_bound_bytes)` reservation,
 since their bounds may already include process memory. Initial and wave admission
 use the same reservation rule; wave admission also deducts live child RSS.
 
-For synthetic workloads, the built-in native-engine planning model accounts for
-eager session/hash metadata, planned output tokens and active prompts. The Dynamo
-compatibility model accounts for the older eager u32 input vectors and additional
-runtime and output storage. A verified newer adapter can supply its own estimate;
-AISimulate does not import Dynamo or assume that installing a core lazy-source
-API automatically changes the adapter's allocation behavior. Ordinary finite
-Agentic Mooncake, Weka, and agentic-Dynamo replay use the shared workload driver
-with deferred prompts on both stacks; they do not use the synthetic eager-prompt
-estimate.
+For synthetic workloads, the built-in native-engine planning model,
+`engine-session-metadata-v2`, charges every turn 4,096 bytes plus 32 bytes per
+input and output token of that turn. This covers the turn's eagerly stored
+prompt delta or hash IDs, planned output IDs, its share of the session
+transcript, and a prefix-cache index with one-token blocks. A turn retains only
+its own tokens. The 32-byte token allowance is multiplied by the number of
+independent worker/attention-DP caches, capped at the number of turns per pool
+(prefill and decode can each retain a copy of every turn): session
+history can remain cached on multiple workers even after a session completes.
+The cap applies before summing pools: one prefill cache and 32 decode caches
+with 10 turns contribute `min(10, 1) + min(10, 32) = 11` copies.
+This bounds placement without session affinity and assumes no eviction or
+prefix sharing. With a fixed cache count, the retained-token charge grows
+linearly with turns. Prediction uses the configured replicas and attention-DP
+ranks across the aggregated, prefill, and decode roles; initial recommendation
+admission bounds monolithic cache copies by the declared topology domain and GPU
+budget, and candidate admission uses the concrete deployment. AFD roles use their
+separate topology; both prediction and recommendation admission conservatively
+bound their cache copies by the number of turns per pool, independently of the
+worker's `parallelism` mapping or the recommendation GPU budget.
+Active sessions also carry their earlier turns in a request: 32 bytes per
+earlier-turn token, plus 4 bytes per cumulative prompt token. Without a
+concurrency cap, every session counts as active. The Dynamo compatibility model
+accounts for the older eager u32 input vectors and additional runtime and output
+storage. A verified newer adapter can supply its own estimate; AISim does
+not import Dynamo or assume that installing a core lazy-source API automatically
+changes the adapter's allocation behavior. Ordinary finite Agentic Mooncake,
+Weka, and agentic-Dynamo replay use the shared workload driver with deferred
+prompts on both stacks; they do not use the synthetic eager-prompt estimate.
 
 An estimate is a planning heuristic, not a hard RSS limit. An unavoidable lower
 bound can prove a candidate does not fit; it cannot prove that execution fits.
 Supported JSON and JSONL traces are inspected as a stream. Inspection does not
 load complete documents or token arrays, and there is no fixed file or record
 size cutoff. Native-engine Weka uses the peak model described below, including
-snapshot and warmup storage. Every other finite trace replay uses the
+snapshot and warmup storage. Every other finite trace replay, including
+snapshots and warmup, uses the
 [array lower bound with an observed peak](#finite-trace-replays-lower-bound-and-observed-peak).
-Snapshots, warmup and continuous profiles retain the conservative storage
-estimate and its file-size check. A streaming parser still holds individual
+Continuous profiles use the same array lower bound, but no observed peak: they
+run one at a time under supervision. A streaming parser still holds individual
 scalar strings; large values can exceed headroom before an array bound is
 available. The array bound does not cover that risk.
 Unknown allocation models can run one candidate at a time under runtime
@@ -183,14 +210,15 @@ every workload and external adapter.
 
 This model, `trace-observed-peak-v1`, covers Mooncake, Mooncake-delta,
 applied-compute agentic, standard and agentic Dynamo, and Agentic Mooncake
-traces on both stacks, plus Weka on the Dynamo stack, without snapshots, warmup,
-or continuous profiles. These replay paths load one compact trace: hashes are
-retained as IDs and prompts are expanded only for active requests.
-`agentic_lanes` controls active plays within that trace; it does not create a
-copy of the trace per lane. AISimulate does not model the remaining native
-allocations statically, because they change with the replay implementation.
-Instead it records an unavoidable lower bound before execution and measures the
-peak from completed replays.
+traces on both stacks, plus Weka on the Dynamo stack, with or without snapshots
+and warmup. Continuous profiles use only its lower bound. These replay paths
+load one compact trace: hashes are retained as IDs and prompts are expanded only
+for active requests. `agentic_lanes` controls active plays within that trace; it
+does not create a copy of the trace per lane. A snapshot reuses the loaded graph
+and adds one play's request records per lane. AISim does not model the
+remaining native allocations statically, because they change with the replay
+implementation. Instead it records an unavoidable lower bound before execution
+and measures the peak from completed replays.
 
 The lower bound is the maximum of three allocation requirements: 8 bytes per
 source hash ID plus 4 bytes per authored output token where the loader holds
@@ -198,7 +226,9 @@ every source hash array at once (Dynamo, Agentic Mooncake and Dynamo-stack
 Weka); 4 bytes per compact hash ID plus 4 bytes per planned output token in the
 prepared replay; and 4 bytes per token in the largest expanded input prompt.
 These stages are not added together. File bytes, lane count, configured block
-size and total logical input tokens do not multiply this bound.
+size and total logical input tokens do not multiply this bound. Snapshots,
+including warmup and profiles, omit the prompt term: they expand prompts only
+for selected plays after their cuts.
 
 The counters follow each format's loader:
 
@@ -252,19 +282,18 @@ peak and runs alone under the supervisor.
 
 ### Allocation-model provenance
 
-The byte terms in [resources.py](../../python/aisimulate/src/aisimulate/resources.py)
+The byte terms in [resources.py](../../python/aisim/src/aisim/resources.py)
 are versioned admission policies. They do not change simulated operation latency,
 energy, or GPU capacity. Their provenance and qualification are:
 
 | Term | Basis | Qualification |
 |---|---|---|
 | Four bytes per token ID | The native [request protocol](../../crates/core/src/engine/protocol.rs) and [sequence storage](../../crates/core/src/engine/common/sequence.rs) use `Vec<u32>`. The Dynamo compatibility model explicitly assumes eager u32 prompts. | The width is concrete; applying it to an external adapter requires the stated eager-allocation assumption. |
-| Engine session/token retention | The engine model reserves prompt, output, and session/hash bookkeeping from the declared request and turn counts. | The 32-byte token multiplier and 4,096-byte per-request term are conservative policy allowances, not measured object sizes. |
+| Engine session/token retention | The engine model reserves each turn's prompt, output, and session/hash bookkeeping, retained copies across worker/attention-DP caches (at most one per turn per pool), plus the history that active sessions carry. | The 32-byte token multiplier and 4,096-byte per-turn term are conservative policy allowances sized for one-token blocks, where the prefix-cache index adds state per token. They are not measured object sizes; larger blocks need much less. |
 | Dynamo peak expansion | Twice the eager prompt bytes, plus 4,096 bytes per request and 16 bytes per output token. | These extra terms are policy headroom; they do not certify an adapter's peak RSS. |
-| Trace expansion | Snapshot, warmup and continuous-profile traces only: streamed field counts, hash block expansion, and cumulative delta/tool turns; 128 times file bytes, 32 bytes per counted token, and 65,536 bytes per counted request/turn. | Conservative policy allowances. The file-size guard runs before parsing. |
-| Native Weka traces | Separate per-play import and replay phases; see below. | Uses the native importer/driver contracts, including real output arrays and synthesized hashes. Covers snapshot and warmup storage; ordinary finite Weka on the Dynamo stack uses the finite trace lower bound and observed peak instead. |
+| Native Weka traces | Separate per-play import and replay phases; see below. | Uses the native importer/driver contracts, including real output arrays and synthesized hashes. Covers snapshot and warmup storage; Weka on the Dynamo stack uses the finite trace lower bound and observed peak instead. |
 | Process allowances | 256 MiB within the native Weka peak model; 512 MiB for other built-in worker reservations; coordinator RSS plus 256 MiB. | Engineering reserves, not calibrated platform-specific measurements. |
-| Finite trace arrays | Maximum of retained source `Vec<u64>` hashes plus authored `Vec<u32>` outputs, prepared `Vec<u32>` hash/output storage, and the largest `Vec<u32>` input prompt. Covers every finite trace format on both stacks except native-engine Weka, without file-size, block-size or lane multipliers. | Array widths are concrete. Other allocations, including importer temporary storage, are excluded: this is a lower bound, not a peak RSS estimate. Snapshot, warmup and profile modes are excluded. |
+| Finite trace arrays | Maximum of retained source `Vec<u64>` hashes plus authored `Vec<u32>` outputs, prepared `Vec<u32>` hash/output storage, and the largest `Vec<u32>` input prompt. Covers every finite trace format on both stacks except native-engine Weka, without file-size, block-size or lane multipliers. | Array widths are concrete. Other allocations, including importer temporary storage, are excluded: this is a lower bound, not a peak RSS estimate. Continuous profiles use it without an observed peak. |
 | Observed trace peaks | The largest `getrusage` high-water RSS of completed replays of the same trace, times 1.5. | Measured on the executing host and code, so it needs no recalibration when native allocations change. The first replay of a trace runs alone under supervision; the margin is policy headroom that sizes parallel waves only. |
 | Admission and recovery | The sum of candidate estimates must fit one live budget; observed pressure stops workers before bounded retry. | Budget/accounting invariants tested with bounded fixtures and real owned subprocesses. |
 

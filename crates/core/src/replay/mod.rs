@@ -6,7 +6,7 @@
 //! [`Replayer`] owns virtual time, the event queue, logical-worker lifecycle,
 //! placement/scaling policy composition, and report collection. Engine
 //! scheduling and timing are supplied by [`crate::engine`] through its
-//! generalized-engine contract. Dynamo integrations depend on `aisimulate-core` and
+//! generalized-engine contract. Dynamo integrations depend on `aisim-core` and
 //! provide placement/scaling policies; replay never depends back on Dynamo.
 
 mod agg;
@@ -120,6 +120,9 @@ pub use capture::{CANONICAL_SELECTOR_SEED, ReplayCaptureOptions, ReplayDetermini
 pub use components::TrafficStats;
 #[doc(hidden)]
 pub use components::{NoReplayMetadata, ReplayAdmissionMetadata, ReplayEngineObservation};
+/// Cross-crate integration seam; see `docs/replay/api/rust.md`.
+#[doc(hidden)]
+pub use core::ReplayWorkloadSource;
 pub use core::round_robin::{AggregatedRoundRobinPlacement, PoolRoundRobinPlacement};
 pub use core::{EngineEventBatch, NoEngineEvents};
 pub use core::{
@@ -128,6 +131,8 @@ pub use core::{
 };
 #[doc(hidden)]
 pub use engine::ReplayRoleFactory;
+#[cfg(feature = "python")]
+pub(crate) use engine::pipeline_speedup_ratio;
 #[doc(hidden)]
 pub use engine::run_engine_handoff_conformance;
 pub use engine::{
@@ -153,21 +158,23 @@ pub use handoff::{
 };
 #[doc(hidden)]
 pub use protocol::{
-    AgenticRuntimeIdentity, DirectRequest, ReplayPromptTokenSource, ReplayRequestContext,
+    AGENTIC_CONVERSATION_LINEAGE_SCHEMA_V1, AgenticConversationLineage, AgenticRuntimeIdentity,
+    DirectRequest, ReplayPromptTokenSource, ReplayRequestContext,
 };
 pub use protocol::{AuthoredKvHints, ForwardPassSnapshot};
 #[doc(hidden)]
 pub use replayer::ReplayRuntimeInput;
-pub use replayer::{ReplayComposition, Replayer, RoundRobinComposition};
+pub use replayer::{LoadBalanceMethod, ReplayComposition, Replayer, RoundRobinComposition};
 #[doc(hidden)]
 pub use report::TraceCollector;
 pub use report::{
-    G2DomainStats, POWER_DATA_COVERAGE_THRESHOLD, PerRequestAdmissionRecord, PerRequestRecord,
-    PerRequestRoutingRecord, ReplayOperationPowerDiagnostics, ReplayPhasePowerDiagnostics,
-    ReplayPowerDiagnostics, ReplayReport, ReplayRequestPool, ReplayRoutingOutcome,
-    ReplayTerminalStatus, ReplayTerminalStatus as RequestTerminalStatus, SlaThresholds,
-    TraceDistributionStats, TraceGoodputStats, TraceInterTokenLatencyStats, TraceLatencyStats,
-    TracePowerStats, TraceRequestCounts, TraceThroughputStats, TraceTrajectoryStats,
+    CompletionFeedbackSnapshot, G2DomainStats, POWER_DATA_COVERAGE_THRESHOLD,
+    PerRequestAdmissionRecord, PerRequestRecord, PerRequestRoutingRecord,
+    ReplayOperationPowerDiagnostics, ReplayPhasePowerDiagnostics, ReplayPowerDiagnostics,
+    ReplayReport, ReplayRequestPool, ReplayRoutingOutcome, ReplayTerminalStatus,
+    ReplayTerminalStatus as RequestTerminalStatus, SlaThresholds, TraceDistributionStats,
+    TraceGoodputStats, TraceInterTokenLatencyStats, TraceLatencyStats, TracePowerStats,
+    TraceRequestCounts, TraceThroughputStats, TraceTrajectoryStats,
 };
 pub use scaling::{NoScaling, ReplayScalingDecision, ReplayScalingPolicy, ReplayScalingSnapshot};
 #[cfg(test)]
@@ -177,8 +184,11 @@ pub use spec::{
     ReplayRoutingMetadata, ReplaySpec, ReplayTopology, WorkerPoolSpec, WorkerStage,
 };
 pub use telemetry::{
-    ReplaySchedulerIntervalMetrics, ReplaySchedulerMetricsSnapshot, ReplayTelemetryObserver,
-    ReplayTelemetrySampleKind, ReplayTelemetrySnapshot, ReplayTrafficMetricsSnapshot,
+    ReplayPromptSourceCounters, ReplaySchedulerIntervalMetrics, ReplaySchedulerMetricsSnapshot,
+    ReplayTelemetryCapture, ReplayTelemetryHostCache, ReplayTelemetryLifecycle,
+    ReplayTelemetryObserver, ReplayTelemetryPhaseBoundary, ReplayTelemetryRequest,
+    ReplayTelemetrySample, ReplayTelemetrySampleKind, ReplayTelemetrySnapshot,
+    ReplayTelemetryUnits, ReplayTrafficMetricsSnapshot,
 };
 
 // Typed power diagnostics are exported by the native Replay/PyO3 engine path.

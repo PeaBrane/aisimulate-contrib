@@ -34,7 +34,7 @@ concurrency:
 jobs:
   resolve:
     name: Resolve exact accuracy source
-    if: github.repository == 'ai-dynamo/aisimulate' && (github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch')
+    if: github.repository == 'ai-dynamo/aisim' && (github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
@@ -94,7 +94,7 @@ jobs:
                 const artifacts = await github.paginate(github.rest.actions.listWorkflowRunArtifacts, {
                   ...context.repo, run_id: run.id, per_page: 100,
                 });
-                if (artifacts.some(artifact => artifact.name === 'nightly-dist-amd64' && !artifact.expired)) {
+                if (artifacts.some(artifact => artifact.name === 'nightly-dist-amd64-manifest' && !artifact.expired)) {
                   nightlyRun = String(run.id);
                   break;
                 }
@@ -166,6 +166,8 @@ jobs:
       max-parallel: 2
       matrix: ${{ fromJSON(needs.resolve.outputs.matrix) }}
     uses: ./.github/workflows/fpm-accuracy-branch.yml
+    secrets:
+      ARTIFACTORY_TOKEN: ${{ secrets.ARTIFACTORY_TOKEN }}
     permissions:
       contents: read
       actions: read

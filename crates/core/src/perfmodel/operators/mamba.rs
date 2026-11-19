@@ -6,6 +6,7 @@
 //!
 //! Each wraps `db.state_space.query_*` with `scale_factor` + `clamp`.
 
+use crate::common::enums::DatabaseMode;
 use crate::common::error::AicError;
 use crate::operators::base::{PerformanceResult, Source};
 use crate::perf_database::PerfDatabase;
@@ -36,6 +37,19 @@ impl Mamba2Op {
         batch_size: u32,
         seq_len: u32,
     ) -> Result<PerformanceResult, AicError> {
+        // SOL (and the retired SOL_FULL alias) never reads the table, as in
+        // the GEMM, attention, MoE and mHC operators. Mamba2 has no util-space
+        // empirical layer, so EMPIRICAL answers with the same analytic SOL
+        // instead of reading measured rows.
+        if matches!(
+            db.database_mode,
+            DatabaseMode::Sol | DatabaseMode::SolFull | DatabaseMode::Empirical
+        ) {
+            let latency = self.sol_latency_ms(db, batch_size as f64, seq_len as f64);
+            return Ok(PerformanceResult::new(latency, Source::Sol)
+                .clamp_non_negative()
+                .scaled(self.scale_factor));
+        }
         // Mirrors Python `Mamba2Kernel.query`: silicon-first, SOL fallback
         // on perf-DB miss. The op's arg-style SOL is threaded into the table
         // query so the perf_interp engine can util-hold beyond-range queries
@@ -54,14 +68,14 @@ impl Mamba2Op {
             self.chunk_size,
             &|b, s| self.sol_latency_ms(db, b, s),
         ) {
-            Ok(value) => {
+            Ok(Some(value)) => {
                 Ok(
                     PerformanceResult::with_energy(value.latency, value.energy, Source::Silicon)
                         .clamp_non_negative()
                         .scaled(self.scale_factor),
                 )
             }
-            Err(AicError::PerfDatabase(_)) => {
+            Ok(None) | Err(AicError::PerfDatabase(_)) => {
                 let latency = self.sol_latency_ms(db, batch_size as f64, seq_len as f64);
                 Ok(PerformanceResult::new(latency, Source::Sol)
                     .clamp_non_negative()
@@ -145,6 +159,19 @@ impl GdnOp {
         batch_size: u32,
         seq_len: u32,
     ) -> Result<PerformanceResult, AicError> {
+        // SOL (and the retired SOL_FULL alias) never reads the table, as in
+        // the GEMM, attention, MoE and mHC operators. GDN has no util-space
+        // empirical layer, so EMPIRICAL answers with the same analytic SOL
+        // instead of reading measured rows.
+        if matches!(
+            db.database_mode,
+            DatabaseMode::Sol | DatabaseMode::SolFull | DatabaseMode::Empirical
+        ) {
+            let latency = self.sol_latency_ms(db, batch_size as f64, seq_len as f64);
+            return Ok(PerformanceResult::new(latency, Source::Sol)
+                .clamp_non_negative()
+                .scaled(self.scale_factor));
+        }
         // Mirrors Python `GDNKernel.query`: try the silicon table; on a
         // `PerfDataNotAvailableError`-class miss (the perf DB doesn't ship
         // every kernel/phase slice), fall back to a per-kernel SOL formula.
@@ -164,14 +191,14 @@ impl GdnOp {
             &self.mamba_ssm_dtype,
             &|b, s| self.sol_latency_ms(db, b, s),
         ) {
-            Ok(value) => {
+            Ok(Some(value)) => {
                 Ok(
                     PerformanceResult::with_energy(value.latency, value.energy, Source::Silicon)
                         .clamp_non_negative()
                         .scaled(self.scale_factor),
                 )
             }
-            Err(AicError::PerfDatabase(_)) => {
+            Ok(None) | Err(AicError::PerfDatabase(_)) => {
                 let latency = self.sol_latency_ms(db, batch_size as f64, seq_len as f64);
                 Ok(PerformanceResult::new(latency, Source::Sol)
                     .clamp_non_negative()
@@ -286,6 +313,27 @@ impl KdaOp {
         // Verify batching is normalized ONCE here — both the table lookup and
         // the SOL fallback see the adjusted `(batch, seq)` coordinates.
         let (batch_size, seq_len) = self.effective_coords(batch_size, seq_len);
+        // SOL (and the retired SOL_FULL alias) never reads the table, as in
+        // the GEMM, attention, MoE and mHC operators. KDA has no util-space
+        // empirical layer, so EMPIRICAL answers with the same analytic SOL
+        // instead of reading measured rows. The fused-kernel reroutes below
+        // choose measured rows, so they do not apply here; the fused byte
+        // models equal the sum of their constituents, so the per-layer SOL
+        // total is unchanged.
+        if matches!(
+            db.database_mode,
+            DatabaseMode::Sol | DatabaseMode::SolFull | DatabaseMode::Empirical
+        ) {
+            let latency = self.sol_latency_ms_with(
+                db,
+                &self.kernel_source,
+                batch_size as f64,
+                seq_len as f64,
+            );
+            return Ok(PerformanceResult::new(latency, Source::Sol)
+                .clamp_non_negative()
+                .scaled(self.scale_factor));
+        }
         // SM100 sglang datasets verify DSPARK speculation through the fused
         // CuTeDSL kernel (`fused_kda_decode_mtp_dspark`) — one row covering
         // BOTH the conv update and the chain-verify recurrence, with no
@@ -361,14 +409,14 @@ impl KdaOp {
             self.head_v_dim,
             &|b, s| self.sol_latency_ms_with(db, kernel_source, b, s),
         ) {
-            Ok(value) => {
+            Ok(Some(value)) => {
                 Ok(
                     PerformanceResult::with_energy(value.latency, value.energy, Source::Silicon)
                         .clamp_non_negative()
                         .scaled(self.scale_factor),
                 )
             }
-            Err(AicError::PerfDatabase(_)) => {
+            Ok(None) | Err(AicError::PerfDatabase(_)) => {
                 let latency =
                     self.sol_latency_ms_with(db, kernel_source, batch_size as f64, seq_len as f64);
                 Ok(PerformanceResult::new(latency, Source::Sol)
@@ -547,7 +595,7 @@ mod tests {
     fn gdn_flashinfer_lane_sol_matches_python_bs128_census_anchor() {
         let systems_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
-            .join("python/aisimulate/src/aisimulate_core/systems");
+            .join("python/aisim/src/aisim_core/systems");
         let db = PerfDatabase::load(&systems_root, "gb300", "sglang", "0.5.14")
             .expect("gb300/sglang/0.5.14 must load");
         assert_eq!(db.system_spec.gpu.sm_version, Some(103));
@@ -577,7 +625,7 @@ mod tests {
     fn gdn_context_and_fla_sol_state_bytes_follow_resolved_dtype() {
         let systems_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
-            .join("python/aisimulate/src/aisimulate_core/systems");
+            .join("python/aisim/src/aisim_core/systems");
         let db = PerfDatabase::load(&systems_root, "gb300", "sglang", "0.5.14")
             .expect("gb300/sglang/0.5.14 must load");
         let op = |kernel_source: &str, phase: &str, dtype: &str| GdnOp {
@@ -747,5 +795,594 @@ mod tests {
         // Unknown kernel: d_model round-trip.
         let op = kda_op("mystery_kernel", "generation", 0);
         assert_eq!(op.sol_total_bytes(4.0, 0.0), 4.0 * 4096.0 * 2.0 * 2.0);
+    }
+
+    /// A decode op reads its measured row instead of the analytic estimate.
+    /// Synthetic fixture: one `causal_conv1d_update` row at `batch=2`; the
+    /// query hits it exactly, so the expected latency is the stored value
+    /// times `scale_factor`. A decode kernel without rows keeps the analytic
+    /// estimate.
+    #[test]
+    fn mamba2_decode_op_reads_its_measured_row() {
+        use crate::perf_database::energy_test_fixtures::{
+            Col, write_energy_systems_root, write_parquet,
+        };
+        let root = tempfile::tempdir().expect("tmpdir");
+        write_energy_systems_root(root.path());
+        let data = root.path().join("data/test/1.0");
+        std::fs::create_dir_all(&data).expect("mkdir data");
+        write_parquet(
+            &data.join("mamba2_perf.parquet"),
+            &[
+                Col::Str("kernel_source", vec!["causal_conv1d_update"]),
+                Col::Str("phase", vec!["generation"]),
+                Col::I64("batch_size", vec![2]),
+                Col::I64("seq_len", vec![1]),
+                Col::I64("d_model", vec![1024]),
+                Col::I64("d_state", vec![64]),
+                Col::I64("d_conv", vec![4]),
+                Col::I64("nheads", vec![16]),
+                Col::I64("head_dim", vec![64]),
+                Col::I64("n_groups", vec![4]),
+                Col::I64("chunk_size", vec![128]),
+                Col::F64("latency", vec![0.25]),
+            ],
+        );
+        let db = PerfDatabase::load(root.path(), "testsys", "test", "1.0").expect("load");
+        let op = |kernel_source: &str| Mamba2Op {
+            name: "generation_mamba".into(),
+            scale_factor: 2.0,
+            kernel_source: kernel_source.into(),
+            phase: "generation".into(),
+            d_model: 1024,
+            d_state: 64,
+            d_conv: 4,
+            nheads: 16,
+            head_dim: 64,
+            n_groups: 4,
+            chunk_size: 128,
+        };
+        let measured = op("causal_conv1d_update").query(&db, 2, 1024).unwrap();
+        assert_eq!(measured.source, Source::Silicon);
+        assert_eq!(measured.latency_ms, 0.5);
+        let analytic = op("selective_state_update").query(&db, 2, 1024).unwrap();
+        assert_eq!(analytic.source, Source::Sol);
+    }
+
+    /// A per-shard op (8 heads, 2 groups) over a table that holds only the
+    /// full layer (16 heads, 4 groups) prices at the analytic estimate in
+    /// SILICON and HYBRID instead of reading the full-layer row. Hand-derived
+    /// SOL for the shard: conv_dim = 8*64 + 2*2*64 = 768 channels; x = b*s =
+    /// 1024; bytes = x*conv_dim*(d_conv+1)*2 + x*conv_dim*2 = 9_437_184 over
+    /// the fixture's 7.7e12 B/s memory bandwidth, times `scale_factor` 2.0.
+    #[test]
+    fn mamba2_per_shard_shape_miss_prices_at_sol_in_silicon_and_hybrid() {
+        use crate::common::enums::{DatabaseMode, TransferPolicy};
+        use crate::perf_database::energy_test_fixtures::{
+            Col, write_energy_systems_root, write_parquet,
+        };
+        let root = tempfile::tempdir().expect("tmpdir");
+        write_energy_systems_root(root.path());
+        let data = root.path().join("data/test/1.0");
+        std::fs::create_dir_all(&data).expect("mkdir data");
+        write_parquet(
+            &data.join("mamba2_perf.parquet"),
+            &[
+                Col::Str("kernel_source", vec!["causal_conv1d_fn"]),
+                Col::Str("phase", vec!["context"]),
+                Col::I64("batch_size", vec![2]),
+                Col::I64("seq_len", vec![512]),
+                Col::I64("d_model", vec![1024]),
+                Col::I64("d_state", vec![64]),
+                Col::I64("d_conv", vec![4]),
+                Col::I64("nheads", vec![16]),
+                Col::I64("head_dim", vec![64]),
+                Col::I64("n_groups", vec![4]),
+                Col::I64("chunk_size", vec![128]),
+                Col::F64("latency", vec![0.5]),
+            ],
+        );
+        let shard = Mamba2Op {
+            name: "context_mamba".into(),
+            scale_factor: 2.0,
+            kernel_source: "causal_conv1d_fn".into(),
+            phase: "context".into(),
+            d_model: 1024,
+            d_state: 64,
+            d_conv: 4,
+            nheads: 8,
+            head_dim: 64,
+            n_groups: 2,
+            chunk_size: 128,
+        };
+        let expected = 9_437_184.0 / 7.7e12 * 1000.0 * 2.0;
+        for mode in [DatabaseMode::Silicon, DatabaseMode::Hybrid] {
+            let db = PerfDatabase::load(root.path(), "testsys", "test", "1.0")
+                .expect("load")
+                .with_mode(mode, TransferPolicy::ALL);
+            let result = shard.query(&db, 2, 512).unwrap();
+            assert_eq!(result.source, Source::Sol, "{mode:?}");
+            assert!(
+                (result.latency_ms - expected).abs() <= 1e-12 * expected,
+                "{mode:?}"
+            );
+        }
+    }
+
+    /// Mamba2 follows the database-mode semantics of the other table-backed
+    /// operators: SILICON and HYBRID read measured rows, while SOL, the
+    /// retired SOL_FULL alias and EMPIRICAL never read them. Mamba2 has no
+    /// util-space empirical layer, so EMPIRICAL answers with the analytic SOL.
+    ///
+    /// Synthetic fixture: one context row at `[batch=2][seq=512]` and one
+    /// decode row at `[batch=2]`; both queries hit them exactly, so a row
+    /// read returns the stored value times `scale_factor` (2.0). Hand-derived
+    /// SOL for this shape: conv_dim = 16*64 + 2*4*64 = 1536 channels and
+    /// bytes = x*conv_dim*(d_conv+1)*2 + x*conv_dim*2, with x = b*s = 1024 for
+    /// context (18_874_368 bytes) and x = b = 2 for decode (36_864 bytes),
+    /// over the fixture's 7.7e12 B/s memory bandwidth.
+    #[test]
+    fn mamba2_reads_measured_rows_only_in_silicon_and_hybrid() {
+        use crate::common::enums::{DatabaseMode, TransferPolicy};
+        use crate::perf_database::energy_test_fixtures::{
+            Col, write_energy_systems_root, write_parquet,
+        };
+        let root = tempfile::tempdir().expect("tmpdir");
+        write_energy_systems_root(root.path());
+        let data = root.path().join("data/test/1.0");
+        std::fs::create_dir_all(&data).expect("mkdir data");
+        write_parquet(
+            &data.join("mamba2_perf.parquet"),
+            &[
+                Col::Str(
+                    "kernel_source",
+                    vec!["causal_conv1d_fn", "causal_conv1d_update"],
+                ),
+                Col::Str("phase", vec!["context", "generation"]),
+                Col::I64("batch_size", vec![2, 2]),
+                Col::I64("seq_len", vec![512, 1]),
+                Col::I64("d_model", vec![1024, 1024]),
+                Col::I64("d_state", vec![64, 64]),
+                Col::I64("d_conv", vec![4, 4]),
+                Col::I64("nheads", vec![16, 16]),
+                Col::I64("head_dim", vec![64, 64]),
+                Col::I64("n_groups", vec![4, 4]),
+                Col::I64("chunk_size", vec![128, 128]),
+                Col::F64("latency", vec![0.5, 0.25]),
+            ],
+        );
+        let op = |kernel_source: &str, phase: &str| Mamba2Op {
+            name: format!("{phase}_mamba"),
+            scale_factor: 2.0,
+            kernel_source: kernel_source.into(),
+            phase: phase.into(),
+            d_model: 1024,
+            d_state: 64,
+            d_conv: 4,
+            nheads: 16,
+            head_dim: 64,
+            n_groups: 4,
+            chunk_size: 128,
+        };
+        let context = op("causal_conv1d_fn", "context");
+        let decode = op("causal_conv1d_update", "generation");
+        let sol_ms = |bytes: f64| bytes / 7.7e12 * 1000.0 * 2.0;
+        for mode in [
+            DatabaseMode::Silicon,
+            DatabaseMode::Hybrid,
+            DatabaseMode::Empirical,
+            DatabaseMode::Sol,
+            DatabaseMode::SolFull,
+        ] {
+            let db = PerfDatabase::load(root.path(), "testsys", "test", "1.0")
+                .expect("load")
+                .with_mode(mode, TransferPolicy::ALL);
+            let ctx = context.query(&db, 2, 512).unwrap();
+            let dec = decode.query(&db, 2, 1024).unwrap();
+            if matches!(mode, DatabaseMode::Silicon | DatabaseMode::Hybrid) {
+                assert_eq!(
+                    (ctx.source, ctx.latency_ms),
+                    (Source::Silicon, 1.0),
+                    "{mode:?}"
+                );
+                assert_eq!(
+                    (dec.source, dec.latency_ms),
+                    (Source::Silicon, 0.5),
+                    "{mode:?}"
+                );
+            } else {
+                assert_eq!(
+                    (ctx.source, dec.source),
+                    (Source::Sol, Source::Sol),
+                    "{mode:?}"
+                );
+                let (ctx_sol, dec_sol) = (sol_ms(18_874_368.0), sol_ms(36_864.0));
+                assert!(
+                    (ctx.latency_ms - ctx_sol).abs() <= 1e-12 * ctx_sol,
+                    "{mode:?}"
+                );
+                assert!(
+                    (dec.latency_ms - dec_sol).abs() <= 1e-12 * dec_sol,
+                    "{mode:?}"
+                );
+            }
+        }
+    }
+
+    /// GDN follows the database-mode semantics of the other table-backed
+    /// operators: SILICON and HYBRID read measured rows and fall back to the
+    /// analytic SOL on a miss; SOL, the retired SOL_FULL alias and EMPIRICAL
+    /// never read them. GDN has no util-space empirical layer, so EMPIRICAL
+    /// answers with the analytic SOL.
+    ///
+    /// Synthetic fixture: one context row at `[batch=2][seq=512]` and one
+    /// decode row at `[batch=2]`; both queries hit exactly, so a row read
+    /// returns the stored value times `scale_factor` (2.0). Hand-derived SOL:
+    /// conv_channels = 2*4*64 + 8*64 = 1024; context conv bytes =
+    /// x*1024*5*2 + x*1024*2 with x = 2*512 (12_582_912 bytes); decode
+    /// recurrence bytes with x = b = 2, state_size = 8*64*64 = 32768 at
+    /// 4 bytes: read 2*1024*2 + 32768*4*2 = 266_240, write 2*512*2 +
+    /// 32768*4*2 = 264_192, total 530_432 bytes; over the fixture's 7.7e12
+    /// B/s memory bandwidth.
+    #[test]
+    fn gdn_reads_measured_rows_only_in_silicon_and_hybrid() {
+        use crate::common::enums::TransferPolicy;
+        use crate::perf_database::energy_test_fixtures::{
+            Col, write_energy_systems_root, write_parquet,
+        };
+        let root = tempfile::tempdir().expect("tmpdir");
+        write_energy_systems_root(root.path());
+        let data = root.path().join("data/test/1.0");
+        std::fs::create_dir_all(&data).expect("mkdir data");
+        write_parquet(
+            &data.join("gdn_perf.parquet"),
+            &[
+                Col::Str(
+                    "kernel_source",
+                    vec!["causal_conv1d_fn", "fused_sigmoid_gating_delta_rule_update"],
+                ),
+                Col::Str("phase", vec!["context", "generation"]),
+                Col::I64("batch_size", vec![2, 2]),
+                Col::I64("seq_len", vec![512, 1]),
+                Col::I64("d_model", vec![1024, 1024]),
+                Col::I64("d_conv", vec![4, 4]),
+                Col::I64("num_k_heads", vec![4, 4]),
+                Col::I64("head_k_dim", vec![64, 64]),
+                Col::I64("num_v_heads", vec![8, 8]),
+                Col::I64("head_v_dim", vec![64, 64]),
+                Col::F64("latency", vec![0.5, 0.25]),
+            ],
+        );
+        let op = |kernel_source: &str, phase: &str| GdnOp {
+            name: format!("{phase}_gdn"),
+            scale_factor: 2.0,
+            kernel_source: kernel_source.into(),
+            phase: phase.into(),
+            d_model: 1024,
+            d_conv: 4,
+            num_k_heads: 4,
+            head_k_dim: 64,
+            num_v_heads: 8,
+            head_v_dim: 64,
+            mamba_ssm_dtype: "float32".into(),
+        };
+        let context = op("causal_conv1d_fn", "context");
+        let decode = op("fused_sigmoid_gating_delta_rule_update", "generation");
+        let missing = op("chunk_gated_delta_rule", "context");
+        let sol_ms = |bytes: f64| bytes / 7.7e12 * 1000.0 * 2.0;
+        for mode in [
+            DatabaseMode::Silicon,
+            DatabaseMode::Hybrid,
+            DatabaseMode::Empirical,
+            DatabaseMode::Sol,
+            DatabaseMode::SolFull,
+        ] {
+            let db = PerfDatabase::load(root.path(), "testsys", "test", "1.0")
+                .expect("load")
+                .with_mode(mode, TransferPolicy::ALL);
+            let ctx = context.query(&db, 2, 512).unwrap();
+            let dec = decode.query(&db, 2, 1024).unwrap();
+            let miss = missing.query(&db, 2, 512).unwrap();
+            assert_eq!(miss.source, Source::Sol, "{mode:?}");
+            if matches!(mode, DatabaseMode::Silicon | DatabaseMode::Hybrid) {
+                assert_eq!(
+                    (ctx.source, ctx.latency_ms),
+                    (Source::Silicon, 1.0),
+                    "{mode:?}"
+                );
+                assert_eq!(
+                    (dec.source, dec.latency_ms),
+                    (Source::Silicon, 0.5),
+                    "{mode:?}"
+                );
+            } else {
+                assert_eq!(
+                    (ctx.source, dec.source),
+                    (Source::Sol, Source::Sol),
+                    "{mode:?}"
+                );
+                let (ctx_sol, dec_sol) = (sol_ms(12_582_912.0), sol_ms(530_432.0));
+                assert!(
+                    (ctx.latency_ms - ctx_sol).abs() <= 1e-12 * ctx_sol,
+                    "{mode:?}"
+                );
+                assert!(
+                    (dec.latency_ms - dec_sol).abs() <= 1e-12 * dec_sol,
+                    "{mode:?}"
+                );
+            }
+        }
+    }
+
+    /// KDA follows the database-mode semantics of the other table-backed
+    /// operators: SILICON and HYBRID read measured rows and fall back to the
+    /// analytic SOL on a miss; SOL, the retired SOL_FULL alias and EMPIRICAL
+    /// never read them. KDA has no util-space empirical layer, so EMPIRICAL
+    /// answers with the analytic SOL.
+    ///
+    /// Synthetic fixture (the `kda_op` shape, scale_factor 1.0): one context
+    /// row at `[batch=2][seq=64]`, one decode row at `[batch=2]` and one
+    /// verify row at `[batch=2][draft=4]`; every query hits exactly, so a row
+    /// read returns the stored value. Hand-derived SOL with proj = 2048 and
+    /// the fp32 state = 16*128*128*4 = 1_048_576 bytes:
+    /// - context qkv3 conv, x = 2*64 = 128: read 3*(128*2048*5*2) =
+    ///   7_864_320, write 3*(128*2048*2) = 1_572_864, total 9_437_184;
+    /// - decode packed recurrence, x = b = 2: read 2*(3*2048+2048)*2 +
+    ///   1_048_576*2 = 2_129_920, write 2*2048*2 + 1_048_576*2 = 2_105_344,
+    ///   total 4_235_264;
+    /// - verify recurrence at (b=2, s=4), x = 8: read 8*4*2048*2 +
+    ///   1_048_576*2 = 2_228_224, write 8*2048*2 + 1_048_576*8 = 8_421_376,
+    ///   total 10_649_600;
+    /// each over the fixture's 7.7e12 B/s memory bandwidth.
+    #[test]
+    fn kda_reads_measured_rows_only_in_silicon_and_hybrid() {
+        use crate::common::enums::TransferPolicy;
+        use crate::perf_database::energy_test_fixtures::{
+            Col, write_energy_systems_root, write_parquet,
+        };
+        let root = tempfile::tempdir().expect("tmpdir");
+        write_energy_systems_root(root.path());
+        let data = root.path().join("data/test/1.0");
+        std::fs::create_dir_all(&data).expect("mkdir data");
+        write_parquet(
+            &data.join("kda_perf.parquet"),
+            &[
+                Col::Str(
+                    "kernel_source",
+                    vec![
+                        "causal_conv1d_fn_qkv3",
+                        "fused_recurrent_kda_packed_decode",
+                        "fused_sigmoid_gating_delta_rule_update",
+                    ],
+                ),
+                Col::Str("phase", vec!["context", "generation", "verify"]),
+                Col::I64("batch_size", vec![2, 2, 2]),
+                Col::I64("seq_len", vec![64, 1, 4]),
+                Col::I64("d_model", vec![4096, 4096, 4096]),
+                Col::I64("d_conv", vec![4, 4, 4]),
+                Col::I64("num_k_heads", vec![16, 16, 16]),
+                Col::I64("head_k_dim", vec![128, 128, 128]),
+                Col::I64("num_v_heads", vec![16, 16, 16]),
+                Col::I64("head_v_dim", vec![128, 128, 128]),
+                Col::F64("latency", vec![0.5, 0.25, 0.125]),
+            ],
+        );
+        let context = kda_op("causal_conv1d_fn_qkv3", "context", 0);
+        let decode = kda_op("fused_recurrent_kda_packed_decode", "generation", 0);
+        let verify = kda_op("fused_sigmoid_gating_delta_rule_update", "verify", 4);
+        let missing = kda_op("chunk_kda", "context", 0);
+        let sol_ms = |bytes: f64| bytes / 7.7e12 * 1000.0;
+        for mode in [
+            DatabaseMode::Silicon,
+            DatabaseMode::Hybrid,
+            DatabaseMode::Empirical,
+            DatabaseMode::Sol,
+            DatabaseMode::SolFull,
+        ] {
+            let db = PerfDatabase::load(root.path(), "testsys", "test", "1.0")
+                .expect("load")
+                .with_mode(mode, TransferPolicy::ALL);
+            let ctx = context.query(&db, 2, 64).unwrap();
+            // Generation drops the runtime seq.
+            let dec = decode.query(&db, 2, 4096).unwrap();
+            // Verify: effective_coords(8, 1) with draft 4 -> (2, 4).
+            let ver = verify.query(&db, 8, 1).unwrap();
+            let miss = missing.query(&db, 2, 64).unwrap();
+            assert_eq!(miss.source, Source::Sol, "{mode:?}");
+            if matches!(mode, DatabaseMode::Silicon | DatabaseMode::Hybrid) {
+                assert_eq!(
+                    (ctx.source, ctx.latency_ms),
+                    (Source::Silicon, 0.5),
+                    "{mode:?}"
+                );
+                assert_eq!(
+                    (dec.source, dec.latency_ms),
+                    (Source::Silicon, 0.25),
+                    "{mode:?}"
+                );
+                assert_eq!(
+                    (ver.source, ver.latency_ms),
+                    (Source::Silicon, 0.125),
+                    "{mode:?}"
+                );
+            } else {
+                assert_eq!(
+                    (ctx.source, dec.source, ver.source),
+                    (Source::Sol, Source::Sol, Source::Sol),
+                    "{mode:?}"
+                );
+                for (got, bytes) in [
+                    (ctx.latency_ms, 9_437_184.0),
+                    (dec.latency_ms, 4_235_264.0),
+                    (ver.latency_ms, 10_649_600.0),
+                ] {
+                    let want = sol_ms(bytes);
+                    assert!((got - want).abs() <= 1e-12 * want, "{mode:?}");
+                }
+            }
+        }
+    }
+
+    /// The fused verify reroute exists to pick a measured row: when only
+    /// `fused_kda_decode_mtp_dspark` verify rows exist, SILICON folds the
+    /// conv op to zero and routes the recurrence onto the fused row. The
+    /// analytic modes neither probe the table nor return that zero: each op
+    /// prices its own kernel's byte model (the fused byte model equals the
+    /// sum of the two, so the per-layer SOL total is unchanged). The
+    /// recurrence bytes at (b=2, s=4) are the 10_649_600 derived above.
+    #[test]
+    fn kda_analytic_modes_skip_the_fused_verify_reroute() {
+        use crate::common::enums::TransferPolicy;
+        use crate::perf_database::energy_test_fixtures::{
+            Col, write_energy_systems_root, write_parquet,
+        };
+        let root = tempfile::tempdir().expect("tmpdir");
+        write_energy_systems_root(root.path());
+        let data = root.path().join("data/test/1.0");
+        std::fs::create_dir_all(&data).expect("mkdir data");
+        write_parquet(
+            &data.join("kda_perf.parquet"),
+            &[
+                Col::Str("kernel_source", vec!["fused_kda_decode_mtp_dspark"]),
+                Col::Str("phase", vec!["verify"]),
+                Col::I64("batch_size", vec![2]),
+                Col::I64("seq_len", vec![4]),
+                Col::I64("d_model", vec![4096]),
+                Col::I64("d_conv", vec![4]),
+                Col::I64("num_k_heads", vec![16]),
+                Col::I64("head_k_dim", vec![128]),
+                Col::I64("num_v_heads", vec![16]),
+                Col::I64("head_v_dim", vec![128]),
+                Col::F64("latency", vec![0.3]),
+            ],
+        );
+        let conv = kda_op("causal_conv1d_update", "verify", 4);
+        let rec = kda_op("fused_sigmoid_gating_delta_rule_update", "verify", 4);
+        let sol_ms = |bytes: f64| bytes / 7.7e12 * 1000.0;
+
+        for mode in [DatabaseMode::Silicon, DatabaseMode::Hybrid] {
+            let db = PerfDatabase::load(root.path(), "testsys", "test", "1.0")
+                .expect("load")
+                .with_mode(mode, TransferPolicy::ALL);
+            let conv_si = conv.query(&db, 8, 1).unwrap();
+            let rec_si = rec.query(&db, 8, 1).unwrap();
+            assert_eq!(
+                (conv_si.source, conv_si.latency_ms),
+                (Source::Silicon, 0.0),
+                "{mode:?}"
+            );
+            assert_eq!(
+                (rec_si.source, rec_si.latency_ms),
+                (Source::Silicon, 0.3),
+                "{mode:?}"
+            );
+        }
+
+        // Conv update byte model at (b=2, s=4), x = 8, conv channels
+        // 3*proj = 6144: read 8*6144*(4+1)*2 = 491_520, write 8*6144*2 =
+        // 98_304, total 589_824.
+        let conv_want = sol_ms(589_824.0);
+        let rec_want = sol_ms(10_649_600.0);
+        for mode in [
+            DatabaseMode::Sol,
+            DatabaseMode::SolFull,
+            DatabaseMode::Empirical,
+        ] {
+            let db = PerfDatabase::load(root.path(), "testsys", "test", "1.0")
+                .expect("load")
+                .with_mode(mode, TransferPolicy::ALL);
+            let conv_sol = conv.query(&db, 8, 1).unwrap();
+            let rec_sol = rec.query(&db, 8, 1).unwrap();
+            assert_eq!(conv_sol.source, Source::Sol, "{mode:?}");
+            assert!(
+                (conv_sol.latency_ms - conv_want).abs() <= 1e-12 * conv_want,
+                "{mode:?}"
+            );
+            assert_eq!(rec_sol.source, Source::Sol, "{mode:?}");
+            assert!(
+                (rec_sol.latency_ms - rec_want).abs() <= 1e-12 * rec_want,
+                "{mode:?}"
+            );
+        }
+    }
+
+    /// Generation twin of the verify test: when only `kda_fused_decode`
+    /// generation rows exist for the model key, SILICON folds the conv
+    /// update to zero and routes the packed recurrence onto the fused row.
+    /// The analytic modes price each op's own kernel instead: the decode
+    /// packed recurrence at x = b = 2 is the 4_235_264 bytes derived above;
+    /// the conv update at x = b = 2 with conv channels 3*proj = 6144 reads
+    /// 2*6144*(4+1)*2 = 122_880 and writes 2*6144*2 = 24_576, total 147_456.
+    #[test]
+    fn kda_analytic_modes_skip_the_fused_decode_reroute() {
+        use crate::common::enums::TransferPolicy;
+        use crate::perf_database::energy_test_fixtures::{
+            Col, write_energy_systems_root, write_parquet,
+        };
+        let root = tempfile::tempdir().expect("tmpdir");
+        write_energy_systems_root(root.path());
+        let data = root.path().join("data/test/1.0");
+        std::fs::create_dir_all(&data).expect("mkdir data");
+        write_parquet(
+            &data.join("kda_perf.parquet"),
+            &[
+                Col::Str("kernel_source", vec!["kda_fused_decode"]),
+                Col::Str("phase", vec!["generation"]),
+                Col::I64("batch_size", vec![2]),
+                Col::I64("seq_len", vec![1]),
+                Col::I64("d_model", vec![4096]),
+                Col::I64("d_conv", vec![4]),
+                Col::I64("num_k_heads", vec![16]),
+                Col::I64("head_k_dim", vec![128]),
+                Col::I64("num_v_heads", vec![16]),
+                Col::I64("head_v_dim", vec![128]),
+                Col::F64("latency", vec![0.3]),
+            ],
+        );
+        let conv = kda_op("causal_conv1d_update", "generation", 0);
+        let rec = kda_op("fused_recurrent_kda_packed_decode", "generation", 0);
+        let sol_ms = |bytes: f64| bytes / 7.7e12 * 1000.0;
+
+        for mode in [DatabaseMode::Silicon, DatabaseMode::Hybrid] {
+            let db = PerfDatabase::load(root.path(), "testsys", "test", "1.0")
+                .expect("load")
+                .with_mode(mode, TransferPolicy::ALL);
+            let conv_si = conv.query(&db, 2, 4096).unwrap();
+            let rec_si = rec.query(&db, 2, 4096).unwrap();
+            assert_eq!(
+                (conv_si.source, conv_si.latency_ms),
+                (Source::Silicon, 0.0),
+                "{mode:?}"
+            );
+            assert_eq!(
+                (rec_si.source, rec_si.latency_ms),
+                (Source::Silicon, 0.3),
+                "{mode:?}"
+            );
+        }
+
+        let conv_want = sol_ms(147_456.0);
+        let rec_want = sol_ms(4_235_264.0);
+        for mode in [
+            DatabaseMode::Sol,
+            DatabaseMode::SolFull,
+            DatabaseMode::Empirical,
+        ] {
+            let db = PerfDatabase::load(root.path(), "testsys", "test", "1.0")
+                .expect("load")
+                .with_mode(mode, TransferPolicy::ALL);
+            let conv_sol = conv.query(&db, 2, 4096).unwrap();
+            let rec_sol = rec.query(&db, 2, 4096).unwrap();
+            assert_eq!(conv_sol.source, Source::Sol, "{mode:?}");
+            assert!(
+                (conv_sol.latency_ms - conv_want).abs() <= 1e-12 * conv_want,
+                "{mode:?}"
+            );
+            assert_eq!(rec_sol.source, Source::Sol, "{mode:?}");
+            assert!(
+                (rec_sol.latency_ms - rec_want).abs() <= 1e-12 * rec_want,
+                "{mode:?}"
+            );
+        }
     }
 }

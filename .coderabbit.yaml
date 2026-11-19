@@ -1,13 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Adapted and modified for AISimulate from AIConfigurator's .coderabbit.yaml:
+# Adapted and modified for AISim from AIConfigurator's .coderabbit.yaml:
 # https://github.com/ai-dynamo/aiconfigurator/blob/13b5cf2697876692b0a52098266c81162add11fc/.coderabbit.yaml
 # Upstream license: Apache-2.0
 
 # yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
 # Active repository-level CodeRabbit policy. The copy under
-# python/aisimulate/ is preserved migration provenance and is not active here.
+# python/aisim/ is preserved migration provenance and is not active here.
 language: "en-US"
 tone_instructions: >-
   Be direct, technical, and concise. Report only actionable findings tied to
@@ -21,16 +21,66 @@ reviews:
   high_level_summary: true
   high_level_summary_in_walkthrough: true
   high_level_summary_instructions: |
-    Lead with the risk level and the three areas that deserve the most human
-    attention. Identify changed behavior and public contracts, then summarize
-    the evidence supplied and the evidence still missing. Separate technical
-    quality from merge readiness; never treat the bot review as approval.
+    Lead with "Risk: Low/Medium/High" and explain the review route in REVIEW.md.
+    Align Risk with CodeRabbit's documented Triage concept: review evidence
+    combined with review effort. Identify the source: a verified current Triage
+    assessment, or an explicitly labeled review-routing estimate if unavailable.
+    Never claim an estimate is the native Triage score or invent vendor cutoffs.
+    Assess the complete PR independently of the author's label; unresolved
+    uncertainty must not default to Low. Keep Risk separate from Merge Risk.
+    Name up to three areas needing attention; do not invent concerns to fill
+    a quota. Identify changed behavior, public contracts, and the reviewed SHA.
+    Distinguish verified evidence, author-reported results, pending checks,
+    and unavailable evidence. Use accessible current-head checks and linked
+    runs before saying CI evidence is missing; older-head evidence is stale.
+    Full CI normally follows initial reviews in this repository: report it as
+    pending admission when appropriate, never as passed or as a code defect
+    solely because it has not run. Reconcile inline findings and pre-merge
+    warnings; "no inline findings" must not hide a failing custom check.
+    Show the required next action. Low Risk needs CodeRabbit; Medium also needs
+    current-head Codex; High also needs human approval even if Merge Risk is Low.
+    Apply REVIEW.md's combined-review severity floors and repair loop. For High
+    or Critical remaining risk, require a human update before agent fixes.
+    Report a Full CI failure as revoking automatic approval and requiring fresh
+    bot reviews before reapproval; never claim a controller performed an action
+    without evidence. Keep technical risk, CI state, and approval separate.
+  merge_risk_instructions: |
+    Use CodeRabbit's documented Minimal/Low/Moderate/High/Critical meanings for
+    remaining risk in the whole PR at the reviewed commit. Low/Medium/High Risk
+    selects reviewers; High Risk alone does not set a floor for Merge Risk.
+    Do not raise Merge Risk just because important code is touched or lower it
+    just because no inline comment was posted.
+    Account for still-applicable review findings, concrete pre-merge-check
+    failures, and uncovered changes. Trace an apparent failure to the current
+    code and explain its consequence; an outdated or inapplicable warning is
+    not an unresolved defect. Explain any disagreement between the rating and
+    the checks. Material unresolved correctness, numerical, compatibility,
+    security, or validation gaps preclude Minimal. Reserve High/Critical for
+    concrete evidence of the serious/severe failures in the vendor definitions.
+    Use available current-head CI evidence and distinguish a proven pass from
+    an author's claim. Missing Full CI before review-based admission, missing
+    CODEOWNER approval, and branch conflicts are separate readiness facts, not
+    automatically technical defects. A concrete gap in validation of changed
+    behavior still counts even when Full CI is pending. Never present a low
+    rating as Full CI success, human approval, or permission to merge.
+    Apply AISim's combined-review policy in REVIEW.md: an unresolved current-head
+    Codex P0 finding sets at least High (Critical for demonstrated severe impact);
+    P1 sets at least Moderate. These are repository escalation floors, not a
+    claim that the vendors' scales are identical. Neither permits approval.
+    Reconcile all applicable reviews using the highest supported remaining risk;
+    never lower a finding's priority to make the PR approvable. After fixes,
+    rerun required reviews; High Risk still requires human approval even
+    when remaining Merge Risk becomes Minimal/Low. After Full CI failure, older
+    reviews cannot restore automatic approval; fresh required bot reviews must
+    complete after that failure, including when the commit SHA did not change.
   changed_files_summary: true
   estimate_code_review_effort: true
   assess_linked_issues: true
   poem: false
   in_progress_fortune: false
   review_status: true
+  # Fail on review errors; skips and rate limits still need coverage verification.
+  fail_commit_status: true
   review_details: true
   review_progress: true
   collapse_walkthrough: true
@@ -41,9 +91,11 @@ reviews:
     enabled: true
     drafts: false
     auto_incremental_review: true
-    auto_pause_after_reviewed_commits: 5
+    # Keep automatic reviews active through repeated fix/review iterations.
+    auto_pause_after_reviewed_commits: 0
+    # Review ready PRs against every target, including stacked feature branches.
     base_branches:
-      - "release/.*"
+      - ".*"
     ignore_title_keywords:
       - "WIP"
       - "[skip review]"
@@ -52,37 +104,10 @@ reviews:
       - "!wip"
       - "!do-not-review"
 
-  # Use an allowlist so data and compatibility artifacts are reviewed even
-  # when their file types would normally be skipped.
-  path_filters:
-    - ".claude/**"
-    - ".github/**"
-    - "crates/**"
-    - "docker/**"
-    - "docs/**"
-    - "examples/**"
-    - "python/**"
-    - "scripts/**"
-    - "tests/**"
-    - ".coderabbit.yaml"
-    - ".dockerignore"
-    - ".gitattributes"
-    - ".gitignore"
-    - "AGENTS.md"
-    - "Cargo.lock"
-    - "Cargo.toml"
-    - "CODEOWNERS"
-    - "CONTRIBUTORS.md"
-    - "LICENSE"
-    - "README.md"
-    - "REVIEW.md"
-    - "deny.toml"
-    - "pytest.ini"
-    - "*.json"
-    - "*.md"
-    - "*.toml"
-    - "*.yaml"
-    - "*.yml"
+  # Keep current and future source directories eligible without an allowlist.
+  # CodeRabbit's default binary, generated-file, and lock-file ignores still apply.
+  # Data/compatibility changes skipped by those defaults need separate evidence.
+  path_filters: []
 
   path_instructions:
     - path: "**/*"
@@ -98,7 +123,7 @@ reviews:
     - path: "crates/core/src/perfmodel/**"
       instructions: |
         Enforce the single-oracle and golden-diff rules in
-        python/aisimulate/.claude/rules/rust-core/parity.md. Treat formulas,
+        python/aisim/.claude/rules/rust-core/parity.md. Treat formulas,
         table selection, interpolation, quantization, defaults, and fallback
         ordering as numerical behavior. Require an explained before/after
         golden diff or hand-derived oracle evidence for changed answers. Check
@@ -118,7 +143,7 @@ reviews:
         rationale. New behavior needs an independent oracle or justified
         append-only parity case.
 
-    - path: "python/aisimulate/src/aisimulate_core/**"
+    - path: "python/aisim/src/aisim_core/**"
       instructions: |
         Preserve the Rust single oracle: Python may describe operations, load
         raw data, orchestrate, and present results, but must not compute per-op
@@ -126,7 +151,7 @@ reviews:
         explicit absence behavior, and loud handling of corrupt or unsupported
         inputs. Do not reintroduce public per-call query shims.
 
-    - path: "python/aisimulate/src/aisimulate/generator/**"
+    - path: "python/aisim/src/aisim/generator/**"
       instructions: |
         Enforce the mapped generator guidelines. Trace input parsing, defaults,
         rules, parameter mapping, rendering, and emitted artifacts. Preserve
@@ -134,20 +159,26 @@ reviews:
         vLLM, and SGLang consistency plus CLI, validator, docs, and tests when a
         user-facing parameter or supported backend version changes.
 
-    - path: "python/aisimulate/tools/generator_validator/**"
+    - path: "python/aisim/tools/generator_validator/**"
       instructions: |
         Verify the validator checks emitted behavior across applicable backends
         and versions rather than command success alone. New flags, templates,
         or defaults need corresponding output assertions.
 
-    - path: "python/aisimulate/collector/**"
+    - path: "python/aisim/collector/**"
       instructions: |
-        Enforce the mapped collector guidelines. A queued case must execute or
-        raise; only generation-time memory feasibility may filter cases, with
-        counted drops. Reject invented geometry or kernel fallbacks, selector
-        exception machinery, untraceable results, and undocumented producer to
-        consumer schema changes. Verify runtime versions, commands, GPU
-        assumptions, and failure evidence.
+        Enforce the mapped collector guidelines (start from overview.md). Each
+        op has one plan for every backend (collector/op_plans.py), and its
+        getters are the one-line plan_cases call. A queued case must execute
+        or raise. Only collector/skips.py entries, each with its reason as a
+        comment, leave cases out; finer boundaries run and fail. Capacity is
+        refused at run time, before allocation, with a FIXME(kernel-limit):
+        does not fit reason. A worker guard is legal only for a case that would
+        mismeasure, hang or waste significant time. Reject invented geometry
+        or kernel fallbacks, environment switches that change rows, deviations
+        without a note at the deviating code, untraceable results, and
+        undocumented producer to consumer schema changes. Verify runtime
+        versions, commands, GPU assumptions, and failure evidence.
 
     - path: "crates/core/src/engine/**"
       instructions: |
@@ -164,7 +195,7 @@ reviews:
         silent coercion, dropped events, order-dependent behavior, or claims of
         predictive accuracy unsupported by production traces.
 
-    - path: "python/aisimulate/src/aisimulate/**"
+    - path: "python/aisim/src/aisim/**"
       instructions: |
         Check unified CLI, Replay, Sweeper, and orchestration behavior together.
         Preserve documented defaults, plain-output and non-TTY behavior, config
@@ -175,14 +206,14 @@ reviews:
       instructions: |
         Treat these as public and release boundaries. Verify Python imports,
         Rust exports, versions, feature flags, bindings, documentation, and the
-        two-artifact contract stay synchronized. AISimulate must remain
+        two-artifact contract stay synchronized. AISim must remain
         standalone and must not acquire a hard Dynamo runtime dependency.
 
     - path: "**/Cargo.toml"
       instructions: |
         Treat these as public and release boundaries. Verify Python imports,
         Rust exports, versions, feature flags, bindings, documentation, and the
-        two-artifact contract stay synchronized. AISimulate must remain
+        two-artifact contract stay synchronized. AISim must remain
         standalone and must not acquire a hard Dynamo runtime dependency.
 
     - path: "crates/core/src/*.rs"
@@ -191,7 +222,7 @@ reviews:
         Verify Rust exports, Python bindings, feature flags, versions, docs, and
         the two-artifact contract stay synchronized.
 
-    - path: "python/aisimulate/src/aisimulate/__init__.py"
+    - path: "python/aisim/src/aisim/__init__.py"
       instructions: |
         Treat public imports as a compatibility and release boundary. Verify
         exports, bindings, versions, docs, and deprecation behavior stay
@@ -203,6 +234,15 @@ reviews:
         untrusted PR inputs, shell injection, secret exposure, fork behavior,
         exact-head coverage, matrices, caches, artifacts, and release effects.
         Never accept a nested migrated workflow as evidence that hosted CI ran.
+
+    - path: "scripts/ci/**"
+      instructions: |
+        Trace workflow callers and consumers, not only the helper's unit tests.
+        Check complete PR diffs, renames/deletions, exact-head and base identity,
+        trusted copies, pagination, retries, and missing or stale API evidence.
+        Validation and admission selectors must fail closed on unknown inputs;
+        optional cancellation monitors must leave validation running on API errors.
+        Preserve required check names, fork safety, and runner trust boundaries.
 
     - path: "tests/**"
       instructions: |
@@ -234,7 +274,7 @@ reviews:
         local modification notices, and generated derivative records remain
         complete and internally consistent.
 
-    - path: "python/aisimulate/collector/**/patches/**"
+    - path: "python/aisim/collector/**/patches/**"
       instructions: |
         Verify upstream provenance, license text, collection and overlay hashes,
         local modification notices, and generated derivative records remain
@@ -273,6 +313,12 @@ reviews:
           is traced through all affected Rust, Python, CLI, serialization,
           documentation, and test consumers. Fail when a layer is stale, a new
           path is untested, or the PR asserts compatibility without evidence.
+          For external review configuration or instruction-only changes, use
+          published vendor-schema validation and matching policy, documentation,
+          and attribution evidence. Do not require simulator runtime tests or
+          tests that merely assert prompt wording. If necessary evidence is
+          inaccessible, return Inconclusive and identify the affected consumer
+          and missing evidence instead of assuming the path is untested.
       - name: "Modeling and data evidence"
         mode: warning
         instructions: |
@@ -285,16 +331,26 @@ reviews:
         mode: warning
         instructions: |
           Pass when Python and Rust public surfaces, schemas, versions, bindings,
-          and documented defaults remain synchronized; AISimulate stays
+          and documented defaults remain synchronized; AISim stays
           standalone from Dynamo; and the one-wheel plus one-crate artifact
           contract remains intact or is deliberately updated with evidence.
       - name: "Review evidence"
         mode: warning
         instructions: |
-          Pass when the PR description names relevant commands and results,
-          includes negative or boundary validation appropriate to the risk, and
-          distinguishes local, fake-runner, parity, and production evidence.
-          Fail when inactive nested workflows are cited as hosted CI evidence.
+          Inspect CodeRabbit's review findings and their current applicability,
+          the PR's evidence, and accessible checks/runs for the reviewed SHA.
+          Pass when relevant commands and results are supplied, negative or
+          boundary validation fits the changed behavior, and local, fake-runner,
+          parity, and production evidence are distinguished. For policy/docs
+          changes, schema, policy, and link checks can be the relevant evidence;
+          do not require runtime or GPU tests without an affected consumer.
+          Fail for a concrete missing validation of changed behavior, stale-head
+          results claimed as current, inactive nested workflows claimed as hosted
+          CI, or claims that contradict the available results. If necessary
+          evidence cannot be accessed, return Inconclusive and name the gap;
+          do not invent a pass or assume the author omitted it. Pending Full CI
+          before review-based admission is expected; report it separately and
+          assess the available pre-admission validation on its own merits.
 
   tools:
     ruff:
@@ -328,12 +384,12 @@ knowledge_base:
     filePatterns:
       - files: "REVIEW.md,AGENTS.md"
         applyTo: "**/*"
-      - files: "python/aisimulate/.claude/rules/generator-development.md,python/aisimulate/.claude/rules/generator/*.md"
-        applyTo: "python/aisimulate/src/aisimulate/generator/**,python/aisimulate/tools/generator_validator/**"
-      - files: "python/aisimulate/.claude/rules/collector/*.md"
-        applyTo: "python/aisimulate/collector/**,python/aisimulate/tests/unit/collector/**"
-      - files: "python/aisimulate/.claude/rules/rust-core/parity.md"
-        applyTo: "crates/core/src/perfmodel/**,crates/core/perfmodel/**,crates/core/parity_tests/perfmodel/**,python/aisimulate/src/aisimulate_core/**,python/aisimulate/tests/unit/sdk/test_opspec_coverage.py,python/aisimulate/tests/cross_package/test_single_oracle_contract.py"
+      - files: "python/aisim/.claude/rules/generator-development.md,python/aisim/.claude/rules/generator/*.md"
+        applyTo: "python/aisim/src/aisim/generator/**,python/aisim/tools/generator_validator/**"
+      - files: "python/aisim/.claude/rules/collector/*.md"
+        applyTo: "python/aisim/collector/**,python/aisim/tests/unit/collector/**"
+      - files: "python/aisim/.claude/rules/rust-core/parity.md"
+        applyTo: "crates/core/src/perfmodel/**,crates/core/perfmodel/**,crates/core/parity_tests/perfmodel/**,python/aisim/src/aisim_core/**,python/aisim/tests/unit/sdk/test_opspec_coverage.py,python/aisim/tests/cross_package/test_single_oracle_contract.py"
   learnings:
     scope: local
     approval_delay: 7

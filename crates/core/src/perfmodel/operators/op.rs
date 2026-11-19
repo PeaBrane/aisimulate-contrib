@@ -21,21 +21,39 @@ use serde::{Deserialize, Serialize};
 
 use crate::common::error::AicError;
 use crate::operators::{
-    ContextAttentionOp, ContextMlaOp, CustomAllReduceOp, DsaModuleOp, Dsv4MegaMoeOp, Dsv4ModuleOp,
-    Dsv41AttentionOp, Dsv41EngramOp, Dsv41LinearOp, Dsv41MhcOp, Dsv41StageOp, ElementwiseOp,
-    EmbeddingOp, EncoderAttentionOp, FpmForwardOp, GdnOp, GemmOp, GenerationAttentionOp,
-    GenerationMlaOp, KdaOp, Mamba2Op, MhcModuleOp, MlaBmmOp, MlaModuleOp, MoEDispatchOp,
-    MoeAllToAllOp, MoeExpertComputeOp, MoeOp, MsaModuleOp, NcclOp, P2POp, PerformanceResult,
-    Source, VisionEncoderOp, WideEpContextMlaOp, WideEpGenerationMlaOp,
+    AfdCombineOp, AfdFCollectiveOp, AfdTransferOp, ContextAttentionOp, ContextMlaOp,
+    CustomAllReduceOp, DsaModuleOp, Dsv4MegaMoeOp, Dsv4ModuleOp, Dsv41AttentionOp, Dsv41EngramOp,
+    Dsv41LinearOp, Dsv41MhcOp, Dsv41StageOp, ElementwiseOp, EmbeddingOp, EncoderAttentionOp,
+    FpmForwardOp, GdnOp, GemmOp, GenerationAttentionOp, GenerationMlaOp, KdaOp, Mamba2Op,
+    MhcModuleOp, MlaBmmOp, MlaModuleOp, MoEDispatchOp, MoeAllToAllOp, MoeExpertComputeOp, MoeOp,
+    MsaModuleOp, NcclOp, P2POp, PerformanceResult, Source, VisionEncoderOp, WideEpContextMlaOp,
+    WideEpGenerationMlaOp,
 };
 use crate::perf_database::PerfDatabase;
+
+/// The single [`RuntimeContext`] field an op's result depends on
+/// ([`Op::memo_field`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MemoField {
+    NumTokens,
+    BatchSize,
+}
+
+impl MemoField {
+    pub(crate) fn of(self, ctx: &RuntimeContext) -> u32 {
+        match self {
+            Self::NumTokens => ctx.num_tokens,
+            Self::BatchSize => ctx.batch_size,
+        }
+    }
+}
 
 /// Runtime context passed to every op's `query`.
 ///
 /// Mirrors Python's `**kwargs` payload to `op.query(database, ...)`. Each
 /// op variant extracts the fields it needs; non-applicable fields are
 /// safely ignored.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RuntimeContext {
     /// Per-rank batch size for attention queries (context: prefill batch;
     /// generation: decode batch).
@@ -129,12 +147,12 @@ pub enum Op {
     /// `WideEPDeepSeekModel` variant.
     WideEpGenerationMla(WideEpGenerationMlaOp),
     /// Two op groups that execute in parallel on different CUDA streams.
-    /// Mirrors Python `aisimulate.sdk.operations.overlap.OverlapOp`:
+    /// Mirrors Python `aisim.sdk.operations.overlap.OverlapOp`:
     /// `latency = max(sum(group_a), sum(group_b))`.
     Overlap(OverlapOp),
     /// Try a primary op; on perf-DB miss, fall back to summing a list of
     /// granular ops. Mirrors Python
-    /// `aisimulate.sdk.operations.overlap.FallbackOp`: supports the
+    /// `aisim.sdk.operations.overlap.FallbackOp`: supports the
     /// transitional state where some systems have module-level profiling
     /// data and others still ship per-kernel granular data.
     Fallback(FallbackOp),
@@ -191,6 +209,21 @@ pub enum Op {
     Glm53Ffn(Glm53FfnOp),
     Glm53Primitive(Glm53PrimitiveOp),
     MeasuredComposite(crate::operators::measured_composite::MeasuredCompositeOp),
+    /// AFD cross-pool unidirectional P2P transfer (A->F or F->A) — port of
+    /// Python `operations/afd_transfer.py::AFDTransfer` (A/F volume math +
+    /// P2P twin; `comm_overhead_factor` scales latency only).
+    /// APPENDED after `MeasuredComposite` — same positional-index rule as above;
+    /// the four AFD variants bump `ENGINE_SPEC_SCHEMA_VERSION` 29 -> 30.
+    AfdTransfer(AfdTransferOp),
+    /// AFD F-node intra-node AllGather along the token dimension (Python
+    /// `AFDFAllGather`). Shares `AfdFCollectiveOp` with ReduceScatter; the
+    /// `operation` field carries the NCCL flavor.
+    AfdFAllGather(AfdFCollectiveOp),
+    /// AFD F-node intra-node ReduceScatter after F compute (Python
+    /// `AFDFReduceScatter`).
+    AfdFReduceScatter(AfdFCollectiveOp),
+    /// AFD A-side cross-EP local HBM reduce-add (Python `AFDCombine`).
+    AfdCombine(AfdCombineOp),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -337,6 +370,12 @@ impl Op {
             | Op::Kda(_)
             | Op::WideEpContextMla(_)
             | Op::WideEpGenerationMla(_)
+            // Python AFD comm ops carry `_weights = 0.0` (orchestration ops
+            // with no resident weights).
+            | Op::AfdTransfer(_)
+            | Op::AfdFAllGather(_)
+            | Op::AfdFReduceScatter(_)
+            | Op::AfdCombine(_)
             | Op::MoeAllToAll(_) => 0.0,
         }
     }
@@ -393,6 +432,10 @@ impl Op {
             Op::Kda(o) => &o.name,
             Op::MoeAllToAll(o) => &o.name,
             Op::MoeExpertCompute(o) => &o.name,
+            Op::AfdTransfer(o) => &o.name,
+            Op::AfdFAllGather(o) => &o.name,
+            Op::AfdFReduceScatter(o) => &o.name,
+            Op::AfdCombine(o) => &o.name,
         }
     }
 
@@ -448,6 +491,10 @@ impl Op {
             Op::Kda(o) => o.name = name,
             Op::MoeAllToAll(o) => o.name = name,
             Op::MoeExpertCompute(o) => o.name = name,
+            Op::AfdTransfer(o) => o.name = name,
+            Op::AfdFAllGather(o) => o.name = name,
+            Op::AfdFReduceScatter(o) => o.name = name,
+            Op::AfdCombine(o) => o.name = name,
         }
     }
 
@@ -503,6 +550,10 @@ impl Op {
             Op::Kda(o) => o.scale_factor = scale_factor,
             Op::MoeAllToAll(o) => o.scale_factor = scale_factor,
             Op::MoeExpertCompute(o) => o.scale_factor = scale_factor,
+            Op::AfdTransfer(o) => o.scale_factor = scale_factor,
+            Op::AfdFAllGather(o) => o.scale_factor = scale_factor,
+            Op::AfdFReduceScatter(o) => o.scale_factor = scale_factor,
+            Op::AfdCombine(o) => o.scale_factor = scale_factor,
         }
     }
 
@@ -561,6 +612,48 @@ impl Op {
         match self {
             Op::TokenScale(o) => o.op.is_logits_gemm(),
             _ => matches!(self, Op::Gemm(_)) && self.name().contains("logits_gemm"),
+        }
+    }
+
+    /// The one runtime field [`Self::query`] reads for this op, when it reads
+    /// only one: its result is then a pure function of that field, so equal
+    /// values price identically whatever the rest of the context holds. A
+    /// composite qualifies when every member reads the same field: an overlap
+    /// or fallback queries its members at its own context, and a token scale
+    /// queries its op at a scaled one. A token scale that scales up has no
+    /// field: scaling the other of batch size and token count can overflow
+    /// `u32`. `None` also for ops that read several fields (attention, the
+    /// whole-model forward) or none of the rank walks' fields.
+    pub(crate) fn memo_field(&self) -> Option<MemoField> {
+        fn common<'o>(ops: impl IntoIterator<Item = &'o Op>) -> Option<MemoField> {
+            let mut field = None;
+            for op in ops {
+                let member = op.memo_field()?;
+                if *field.get_or_insert(member) != member {
+                    return None;
+                }
+            }
+            field
+        }
+        match self {
+            Op::Dsv41Mhc(_)
+            | Op::Dsv41Engram(_)
+            | Op::Dsv41Linear(_)
+            | Op::Glm53Router(_)
+            | Op::Gemm(_)
+            | Op::Embedding(_)
+            | Op::Elementwise(_)
+            | Op::Moe(_)
+            | Op::MoeDispatch(_)
+            | Op::CustomAllReduce(_)
+            | Op::Nccl(_)
+            | Op::P2P(_)
+            | Op::Mhc(_) => Some(MemoField::NumTokens),
+            Op::MlaBmm(_) => Some(MemoField::BatchSize),
+            Op::TokenScale(op) if op.numerator <= op.denominator => op.op.memo_field(),
+            Op::Overlap(op) => common(op.group_a.iter().chain(&op.group_b)),
+            Op::Fallback(op) => common(std::iter::once(op.primary.as_ref()).chain(&op.fallback)),
+            _ => None,
         }
     }
 
@@ -691,7 +784,7 @@ impl Op {
                     // Primary result passes through verbatim — its energy
                     // rides along (Python returns `self._primary.query(...)`).
                     Ok(r) => Ok(r),
-                    Err(AicError::PerfDatabase(_)) | Err(AicError::Io { .. }) => {
+                    Err(error) if error.is_missing_perf_data() => {
                         // Fallback chain: Python sums PerformanceResults
                         // from a zero/empirical seed (`total =
                         // PerformanceResult(0.0, energy=0.0,
@@ -731,6 +824,13 @@ impl Op {
             // each `query`, exactly where Python does it.
             Op::MoeAllToAll(op) => op.query(db, ctx.num_tokens),
             Op::MoeExpertCompute(op) => op.query(db, ctx.num_tokens),
+            // AFD comm ops: `num_tokens` is Python's kwargs `x` — the token
+            // count held by a single A-rank (the session/model layer passes
+            // `afd_a_batch_tokens`, not a per-rank GEMM token count).
+            Op::AfdTransfer(op) => op.query(db, ctx.num_tokens),
+            Op::AfdFAllGather(op) => op.query(db, ctx.num_tokens),
+            Op::AfdFReduceScatter(op) => op.query(db, ctx.num_tokens),
+            Op::AfdCombine(op) => op.query(db, ctx.num_tokens),
         }
     }
 }
@@ -738,7 +838,7 @@ impl Op {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::enums::GemmQuantMode;
+    use crate::common::enums::{DatabaseMode, GemmQuantMode};
     use crate::operators::gemm::GemmOp;
     use crate::perf_database::PerfDatabase;
     use crate::perf_database::energy_test_fixtures::{Col, write_parquet};
@@ -924,5 +1024,59 @@ mod tests {
         let r = op.query(&db, &ctx()).expect("query");
         assert!((r.latency_ms - 1.0).abs() < 1e-12);
         assert_eq!(r.source, Source::Silicon);
+    }
+
+    #[test]
+    fn fallback_uses_chain_for_gemm_interpolation_coverage_miss() {
+        for mode in [DatabaseMode::Silicon, DatabaseMode::Hybrid] {
+            let (_tmp, mut db) = one_row_gemm_db();
+            db.database_mode = mode;
+            // The only collected (n, k) site is (1024, 1024). This
+            // otherwise valid bf16 query is beyond its two-octave radius.
+            let primary = Op::Gemm(GemmOp::new(
+                "outside_collected_sites",
+                16384,
+                16384,
+                GemmQuantMode::Bfloat16,
+            ));
+            assert!(matches!(
+                primary.query(&db.silicon_view(), &ctx()),
+                Err(AicError::InterpolationCoverage(_))
+            ));
+            let op = Op::Fallback(FallbackOp::new(
+                "coverage_fallback",
+                primary,
+                vec![silicon_leaf(), silicon_leaf()],
+            ));
+            let result = op.query(&db, &ctx()).expect("usable fallback chain");
+            // Two exact measured rows, each 1 ms at 100 W, sum to
+            // 2 ms and 200 W*ms; no empirical primary estimate is used.
+            assert_eq!(result.latency_ms, 2.0, "{mode:?}");
+            assert_eq!(result.energy_wms, 200.0, "{mode:?}");
+            assert_eq!(result.source, Source::Silicon, "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn fallback_preserves_invalid_primary_configuration() {
+        for mode in [DatabaseMode::Silicon, DatabaseMode::Hybrid] {
+            let (_tmp, mut db) = one_row_gemm_db();
+            db.database_mode = mode;
+            let primary = Op::TokenScale(TokenScaleOp {
+                op: Box::new(silicon_leaf()),
+                numerator: 0,
+                denominator: 1,
+            });
+            let op = Op::Fallback(FallbackOp::new(
+                "invalid_primary",
+                primary,
+                vec![silicon_leaf()],
+            ));
+            assert!(matches!(
+                op.query(&db, &ctx()),
+                Err(AicError::InvalidEngineConfig(message))
+                    if message == "draft token widths must be positive"
+            ));
+        }
     }
 }

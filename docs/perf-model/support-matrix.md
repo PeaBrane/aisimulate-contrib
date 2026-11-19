@@ -11,13 +11,14 @@ queries, Replay feature support, and measured accuracy are separate results.
 
 | Path | Required evidence | Coverage boundary |
 | --- | --- | --- |
-| `op_level` + `SILICON` | Registered graph and required collected operation data | A model can construct while a later shape lacks data. Analytical-only operations retain their own source labels. |
+| `op_level` + `SILICON` | Registered graph and required collected operation data | A model can construct while a later shape lacks data. Analytical-only operations retain their own source labels. Linear-attention operations (Mamba2, GDN, KDA) require a table with rows for each kernel the model runs; a missing table or kernel is a construction miss, and only the other modes keep their analytic estimate; a kernel whose rows do not cover the model's per-shard shape prices at the analytic estimate labeled `sol`, as in the other modes. |
 | `op_level` + `HYBRID` / `EMPIRICAL` | Applicable analytical operations and permitted calibration/transfer slices | A transfer is an estimate, not a newly measured cell. Missing calibration remains an error. |
 | `op_level` + `SOL` | Analytical operation and system specifications | Lower-bound modeling does not certify a serving runtime or kernel accuracy. |
 | `fpm_interpolation`, `method: direct` | Verified architecture metadata, resource profile, genuine phase measurements | Exact identity and measured brackets; no out-of-domain extrapolation or analytical graph. |
 | `fpm_interpolation`, `method: sol` | Registered analytical model and matching forward table/sidecar | Only the implemented SOL transfer domain; not every analytical operation is supported by the FPM SOL evaluator. |
+| FPM Replay and legacy aggregate power | Supported non-speculative schema-v8 measurements and at least 90% active-time coverage | Mixed-step watts are **unqualified** pending measured validation. A mixed decode marginal requires measured power for the target and the selected KV-floor baseline. |
 | `fpm_regression` | Valid observed iterations for the selected workload store | Cold or unusable stores return no nonempty prediction. One ready store does not train another. |
-| `fpm_learned` | Explicit selection with `fallback_policy: deny` and exactly one inference artifact or checkpoint; online adaptation requires a training/runtime checkpoint, and the causal selector requires a training seed | Standalone canonical API with complete per-iteration `ForwardPassMetrics`; absent learned stores return `None`. Phase-based Replay, engine CLI prediction/recommendation, and Sweeper timing reject this mode. |
+| `fpm_learned` | Explicit selection with `fallback_policy: deny` and exactly one inference artifact or checkpoint; online adaptation requires a training/runtime checkpoint, and the causal selector requires a training seed | Standalone canonical API with complete per-iteration `ForwardPassMetrics`; absent learned stores return `None`. Replay, engine CLI prediction/recommendation, and Sweeper timing price each pass with one iteration query and require the role's forest stores; latency-only. |
 
 See [selection and fallback](configuration.md#selection-and-fallback) and
 [whole-forward coverage](methods/whole-forward.md). Learned source identity,
@@ -25,16 +26,86 @@ adaptation and correction requirements are documented in
 [learned configuration](fpm_ml/configuration.md#selection-and-supported-execution).
 Explicit invalid configuration is not converted into a fallback estimator.
 
+For learned-model cold start and native mixed fallback, see the
+[online GBDT tutorial](fpm-self-service/online-gbdt.md). The application owns
+initial fitting and observation admission. Native Replay consumes a prepared
+model; an application fallback wrapper does not run inside it. Complete portable
+state snapshots do not support `temporary_mixed_composition`; see the
+[persistence options](fpm-self-service/online-gbdt.md#6-save-resume-and-hand-the-model-to-replay).
+
 Nemotron Super 3.5 checkpoints that declare `NemotronH_Omni_Reasoning_V3`
-use the NemotronH text model. AISimulate reads the nested `llm_config` and
-accepts `linear_attention` and `full_attention` layer names. Inferred
-`W4A16_NVFP4` MoE precision selects the vLLM `nvfp4` execution lane.
-Explicit precision overrides retain their values. This recognition does not
-add vision modeling or measured timing coverage.
+use the NemotronH text model. AISim reads the nested `llm_config` and
+accepts `linear_attention` and `full_attention` layer names. The bundled
+`nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4` export stores routed
+and shared experts as NVFP4 with 4-bit activations. In its 88 decoder
+layers, the Mamba and attention projections are static per-tensor FP8, and
+so is the LM head. Its latent projections and router stay BF16, as do the
+attention projections of its one multi-token prediction (MTP) layer, and
+its KV cache is FP8. AISim infers `nvfp4` for the routed experts. It
+prices the Mamba, attention, shared-expert and latent projections as
+`fp8_static`, and the router and LM-head GEMMs in BF16. For the shared
+experts, the latent projections and the LM head, these lanes differ from
+the stored precision and are approximations. An inferred `W4A16_NVFP4` MoE
+label, which this export does not use, selects the vLLM `nvfp4` execution
+lane. Explicit precision overrides retain their values. AISim does
+not build the MTP layer as its own attention and MoE block. With `nextn`
+above zero, it scales every decode operation, the Mamba operations
+included, by `(nextn + L) / L` for `L` decoder layers. That factor is an
+approximation: it spreads the cost of the attention-plus-MoE MTP block
+evenly over the hybrid graph. Accepted-token progress is applied
+separately by the upper prediction layer, and the MTP weights and KV
+cache are not counted. This support adds no vision modeling and no
+measured timing data. The text path compiles, but the published matrix
+marks every row of this checkpoint `FAIL` with `ENCODER_UNSUPPORTED`,
+because the export declares a vision encoder that AISim does not
+model; the SDK tests cover the text path.
+
+The bundled `nvidia/Qwen3.5-397B-A17B-NVFP4-V2` export has the same text
+configuration as `nvidia/Qwen3.5-397B-A17B-NVFP4` and a different
+quantization recipe. Its routed experts are NVFP4. Its Gated DeltaNet (GDN)
+`in_proj_qkv`, `in_proj_z` and `out_proj` projections, its full-attention
+projections and its shared-expert projections are static per-tensor FP8, and
+its KV cache is FP8. AISim prices those projections as `fp8_static`, the
+routed experts as `nvfp4`, and the router, shared-expert gate and LM-head
+GEMMs in BF16, as the export stores them. The export keeps the GDN
+`in_proj_a` and `in_proj_b` projections in BF16, and AISim prices their
+fused `in_proj_ba` GEMM in BF16 too. The bundled Qwen3.6 NVFP4 exports leave
+the same two projections out of their quantized layers, and a targets-only
+MIXED_PRECISION export (one whose header declares no base precision lane)
+leaves an unlisted module unquantized, so AISim prices that GEMM in BF16
+for them as well. An export that keeps a base lane, such as `quant_method: fp8`
+with a block size, quantizes its unlisted non-expert GEMMs through that lane
+instead. The remaining approximation is the MTP layer. The export
+keeps its multi-token prediction (MTP) layer in BF16. With `nextn` above zero,
+AISim scales the decode graph by `(nextn + L) / L` for `L` decoder
+layers, so it prices that layer with the decoder-layer lanes.
+
+## Modeled power
+
+Power support is a separate result from latency support. A path can return
+latency and still publish no watts. The [modeled-power contract](power.md)
+defines coverage and the 0.9 publication gate.
+
+| Path | Power support |
+| --- | --- |
+| `op_level` with operation tables that carry power | Operation energy in every consumer, including Replay. Replay, unified prediction and recommendation, and the legacy CLI publish watts only at 0.9 coverage; the SDK reports raw watts with their coverage. |
+| `fpm_interpolation`, SOL or direct method, schema-8 vLLM self-benchmark table: AIC-compatible static, aggregated and disaggregated paths without EPD | Numeric watts at coverage of at least 0.9. Checked by synthetic contract tests only; not yet qualified against measured power. |
+| Non-speculative schema-8 `fpm_interpolation` in Replay, unified `predict` and `recommend` | Numeric watts at coverage of at least 0.9, including attention DP. Mixed-step watts remain unqualified pending measured validation. |
+| `fpm_interpolation`, `estimate_forward_pass_time_ms()` iteration queries | Latency only. |
+| `fpm_interpolation` language-model workers under EPD | Withheld: the row would mix op-level encoder and FPM energy. See [withheld paths](power.md#withheld-or-unsupported). |
+| Non-speculative schema-8 `fpm_interpolation`, FPM components of an aggregate mixed step | Measured prefill energy and marginal decode energy with per-component coverage. Mixed-step watts remain unqualified pending measured validation. |
+| `fpm_interpolation` with a draft scheme, speculative Option 1 or Option 2, or a multimodal `text_only` model | Withheld or latency-only. |
+| `fpm_interpolation` over schema-6 or 7 tables, or schema-7 GLM-5.3-Flash native-median, SGLang native-FPM or native-CUDA tables | Latency-only; `power_w` is `null`. |
+| `fpm_regression`, `fpm_learned` | Latency-only. |
+
+Within a schema-8 table, decode points with short context per request, and
+decode points of hybrid, sliding-window and Mamba KV-warmup shadow layouts,
+carry no power. See [whole-forward FPM power](power.md#whole-forward-fpm-power)
+for the reasons and for the collection requirement.
 
 ## Published FPE matrix
 
-The [FPE Support Matrix](https://ai-dynamo.org/aisimulate/fpe-support-matrix/)
+The [FPE Support Matrix](https://ai-dynamo.org/aisim/fpe-support-matrix/)
 is a **strict-native op-level** probe of `EngineHandle.compile` and representative
 forward queries. It does not call `best_available`, enable regression fallback,
 or rescue missing data with HYBRID. It is not a matrix of all estimator paths.
@@ -50,7 +121,7 @@ and query failures remain distinct.
 
 GLM-5.3-Flash build-time rejections of unsupported parallelism, non-native
 checkpoint precision, or backends outside vLLM/SGLang are `SDK_UNREPRESENTABLE`.
-The backend rejection describes AISimulate's modeling coverage; it does not
+The backend rejection describes AISim's modeling coverage; it does not
 establish that the backend itself cannot run the model.
 These rows retain their diagnostics and phases,
 with no latency or `PASS` status. Only recognized build-time diagnostics
@@ -74,10 +145,13 @@ Pages publication belong to [CI accuracy](../ci/accuracy.md).
 ## Versions the CLI accepts
 
 The matrix probes every backend version that has bundled performance data.
-`aisimulate predict` and `aisimulate recommend` accept only the queryable
-versions of each GPU and backend: `current`, plus `previous` when configured in
-[`query_versions.yaml`](../../python/aisimulate/src/aisimulate_core/systems/query_versions.yaml),
-and `next` when a newer data-backed version is available. A `PASS` row at
+`aisim predict` and `aisim recommend` accept only the queryable
+versions of each GPU and backend, defined in
+[`query_versions.yaml`](../../python/aisim/src/aisim_core/systems/query_versions.yaml):
+`current` (the newest completed full collection), `previous` (the full
+collection it replaced, when configured) and `next` (the in-development
+version: the highest version newer than `current` with any measurements
+landed, or `current` itself when nothing newer has data). A `PASS` row at
 any other version is SDK coverage only; the CLI rejects it with an error that
 names the accepted versions. To run the same model, GPU and backend from the
 CLI, set `engine.backend_version: current` or a version the error names.
@@ -94,7 +168,7 @@ have replacement coverage. Primary measurements still take precedence.
 
 ## Accuracy and replay
 
-The [accuracy dashboards](https://ai-dynamo.org/aisimulate/) publish separate
+The [accuracy dashboards](https://ai-dynamo.org/aisim/) publish separate
 FPM and end-to-end comparisons. Interpret each result with its measured runtime,
 workload, source revision, and timing boundary. Separate passing prefill and
 decode engine probes do not establish disaggregated rate matching or queueing.

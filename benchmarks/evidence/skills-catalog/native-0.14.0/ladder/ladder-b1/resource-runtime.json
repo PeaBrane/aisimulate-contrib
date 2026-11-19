@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "status": "completed",
+  "reason": "",
+  "exit_code": 0,
+  "budget": {
+    "memory_limit_bytes": 8000000000,
+    "cpu_limit": 4,
+    "reserved_host_memory_bytes": 1000000000,
+    "coordinator_memory_bytes": 309592064
+  },
+  "requested_resources": {
+    "initialization_timeout_seconds": 60.0,
+    "shutdown_timeout_seconds": 5.0,
+    "memory_limit_gb": 8.0,
+    "cpu_limit": 4,
+    "reserve_memory_gb": 1.0,
+    "reserve_memory_fraction": 0.0,
+    "available_memory_fraction": 0.9
+  },
+  "peak_observed_rss_bytes": 1011924992,
+  "wall_seconds": 11.946631632003118,
+  "thread_limit_per_runtime": 1,
+  "termination_complete": true
+}

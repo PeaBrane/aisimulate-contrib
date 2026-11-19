@@ -42,6 +42,8 @@ jobs:
       matrix:
         release: ${{ fromJSON(needs.discover.outputs.releases) }}
     uses: ./.github/workflows/fpe-release-qualify.yml
+    secrets:
+      ARTIFACTORY_TOKEN: ${{ secrets.ARTIFACTORY_TOKEN }}
     with:
       release: ${{ matrix.release.version }}
       source_sha: ${{ matrix.release.source_sha }}

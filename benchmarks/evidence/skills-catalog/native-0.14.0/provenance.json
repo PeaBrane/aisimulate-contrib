@@ -1,0 +1,28 @@
+{
+  "recorded_at_utc": "2026-11-19T04:49:15.265640+00:00",
+  "source_commit": "77d82652b2f83fd67afefc3141d69a5f06e630be",
+  "source_url": "https://github.com/ai-dynamo/aisim/tree/77d82652b2f83fd67afefc3141d69a5f06e630be",
+  "source_archive_sha256": "2911ccac1294d81d7b27808b6ee556d7950eba51195056e799b66018caaad0d2",
+  "source_path": "python/aisim/src/aisim/sweeper/score.py",
+  "source_sha256": "39d74e39651fc613fc5d1e3ac2c06cc5b034bf0f57bfde0b4b8f7daeacbf775b",
+  "source_hash_matches": true,
+  "metric_whitelist_matches": [
+    {
+      "line": 51,
+      "count": 26
+    }
+  ],
+  "skill_source_head": "0e2539f2ff363305aea4cd55c4434ceb33842f6f",
+  "environment": {
+    "platform": "Linux-6.6.87.2-microsoft-standard-WSL2-x86_64-with-glibc2.39",
+    "python": "3.12.3",
+    "cargo_build_jobs": 4,
+    "cpu_only": true
+  },
+  "scope": "Native CPU simulation and script consumer compatibility. No GPU measurement, predictive accuracy, catalog agent eval, or hosted Full CI is claimed.",
+  "producer_contract_scope": "The 26-key literal is Python score._METRIC_KEYS. Native engine recommendation metrics additionally include raw report keys; the shared subset is the compatibility floor, not an exhaustive native whitelist.",
+  "build_tool_versions": {
+    "maturin": "maturin 1.16.0",
+    "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)"
+  }
+}

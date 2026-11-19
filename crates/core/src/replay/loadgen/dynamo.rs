@@ -676,6 +676,7 @@ fn lower_agentic(
                     0.0
                 },
                 recorded_api_time_ms: None,
+                recorded_start_ms: None,
                 priority: None,
                 strict_priority: None,
                 policy_class: None,

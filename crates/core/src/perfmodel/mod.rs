@@ -28,19 +28,27 @@ pub(crate) mod py_ops;
 // system_spec) with no AIC-domain knowledge. Top-level files (`config`,
 // `session`) and directories (`operators`, `perf_database`) carry the domain
 // logic the compiled `engine` executes.
+pub(crate) mod afd;
 pub(crate) mod common;
 pub(crate) mod config;
 pub mod engine;
 pub mod execution_profile;
 pub(crate) mod fpm;
 pub(crate) mod kd_tree;
+pub(crate) mod memo;
 pub mod memory;
 pub(crate) mod operators;
 pub(crate) mod perf_database;
 pub(crate) mod session;
 
+pub use afd::{
+    AfdPoolRole, AfdRoutingLocation,
+    pipeline::AfdPipelineLayout,
+    plan::{AfdExecutionPlan, AfdLayerTemplate, AfdPhasePlan},
+};
 pub use common::{AicError, enums::DatabaseMode, enums::EncoderParallel};
 pub use engine::spec::{EncoderImageShape, VisionSpec};
+pub use perf_database::fpm_forward::{FpmSeedTargetNormalization, FpmSeedTargetRow};
 // Forward-pass perf model (PR #1152): a forward-pass latency model with online
 // correction, regression fallback, diagnostics, and readiness, built on the
 // compiled [`engine::Engine`]. Re-exported so Rust embedders (the Dynamo
@@ -59,13 +67,20 @@ pub use fpm::{
     CorrectionFactorBounds, CorrectionFeatureSpace, FpmInterpolationConfig, FpmInterpolationMethod,
     FpmLearnedConfig, FpmQueryCoverage, FpmQueryCoverageCounts, FpmQueryGap, FpmQueryPurpose,
     LearnedAdaptation, LearnedDerivativeRefresh, LearnedUpdateMode, LinearFitConfig, OpLevelConfig,
-    RegressionFeatureAxis, RegressionFitConfig, RegressionFitKind, RegressionSamplingConfig,
-    RegressionUpdatePolicy, SelectorConfig, SplineFitConfig, SplineSearchConfig,
-    UnrecordedFpmQuantMode,
+    RegressionFeatureAxis, RegressionFeatureSet, RegressionFitConfig, RegressionFitKind,
+    RegressionSamplingConfig, RegressionUpdatePolicy, SelectorConfig, SplineFitConfig,
+    SplineSearchConfig, UnrecordedFpmQuantMode,
+};
+pub use fpm::{DeploymentLimit, DeploymentLimits, UNKNOWN_IDENTITY, UNKNOWN_SIZE};
+pub use fpm::{
+    ForwardPassCorrectionLimits, ForwardPassCorrectionQueryType, ForwardPassCorrectionReadiness,
+    ForwardPassDeploymentTopology, ForwardPassReadinessReport, ForwardPassStateSnapshotSummary,
+    ForwardPassStoreNotReadyReason, ForwardPassStoreReadiness, STATE_SNAPSHOT_LAYOUT_VERSION,
+    StateSnapshotConfig, StateSnapshotKind, StateSnapshotOptions, StateSnapshotTuning,
 };
 pub use fpm::{
     FpmCacheBudget, FpmCacheBudgetAdjusted, FpmCacheBudgetRequest, FpmCacheGroup, FpmCacheKind,
-    FpmCacheLayout, FpmResourceConfig, FpmRuntimeMemoryConfig,
+    FpmCacheLayout, FpmMambaCache, FpmMambaCacheMode, FpmResourceConfig, FpmRuntimeMemoryConfig,
 };
 // Forward-pass metrics telemetry types and schema version, plus the
 // crate-internal validation helper. Re-exported at the crate root so existing
@@ -113,7 +128,7 @@ pub(crate) fn repo_relative(rel: &str) -> Option<PathBuf> {
 }
 
 /// Register the compatibility AIConfigurator API on the unified native
-/// `aisimulate._runtime` extension module.
+/// `aisim._runtime` extension module.
 #[cfg(feature = "python")]
 pub fn register_python(module: &pyo3::Bound<'_, pyo3::types::PyModule>) -> pyo3::PyResult<()> {
     py::register(module)
@@ -121,5 +136,5 @@ pub fn register_python(module: &pyo3::Bound<'_, pyo3::types::PyModule>) -> pyo3:
 
 pub use fpm::{
     DirectFpmQueryEvidence, ForwardPassEstimate, FpmCoordinates, FpmEstimateEvidence,
-    FpmMeasurementSupport, FpmQueryResolution, FpmRankEstimate,
+    FpmMeasurementSupport, FpmQueryResolution, FpmRankEstimate, SpeculativeForwardPassEstimate,
 };

@@ -1,0 +1,192 @@
+[
+  {
+    "name": "install-wheel",
+    "command": [
+      "/tmp/pr937-release-validation-m_jcw8cc/venv/bin/uv",
+      "pip",
+      "install",
+      "--no-deps",
+      "--python",
+      "/tmp/pr937-release-validation-m_jcw8cc/runtime/bin/python",
+      "/tmp/pr937-release-validation-m_jcw8cc/dist/aisim-0.14.0-cp311-abi3-linux_x86_64.whl"
+    ],
+    "exit_code": 0,
+    "seconds": 0.48,
+    "stdout": "logs/install-wheel.stdout.gz",
+    "stderr": "logs/install-wheel.stderr.gz"
+  },
+  {
+    "name": "version",
+    "command": [
+      "/tmp/pr937-release-validation-m_jcw8cc/runtime/bin/aisim",
+      "--version"
+    ],
+    "exit_code": 0,
+    "seconds": 0.36,
+    "stdout": "logs/version.stdout.gz",
+    "stderr": "logs/version.stderr.gz"
+  },
+  {
+    "name": "recommend",
+    "command": [
+      "/tmp/pr937-release-validation-m_jcw8cc/runtime/bin/aisim",
+      "recommend",
+      "--stack",
+      "engine",
+      "--config",
+      "/tmp/pr937-release-validation-m_jcw8cc/recommendation-input.yaml",
+      "--output-dir",
+      "/tmp/pr937-release-validation-m_jcw8cc/recommendation"
+    ],
+    "exit_code": 0,
+    "seconds": 23.44,
+    "stdout": "logs/recommend.stdout.gz",
+    "stderr": "logs/recommend.stderr.gz"
+  },
+  {
+    "name": "predict",
+    "command": [
+      "/tmp/pr937-release-validation-m_jcw8cc/runtime/bin/aisim",
+      "predict",
+      "--stack",
+      "engine",
+      "--config",
+      "/tmp/pr937-release-validation-m_jcw8cc/recommendation/recommendations/0001.yaml",
+      "--capture-per-request",
+      "--format",
+      "json",
+      "--output-dir",
+      "/tmp/pr937-release-validation-m_jcw8cc/prediction"
+    ],
+    "exit_code": 0,
+    "seconds": 3.03,
+    "stdout": "logs/predict.stdout.gz",
+    "stderr": "logs/predict.stderr.gz"
+  },
+  {
+    "name": "aisim-deployment-search-text",
+    "command": [
+      "/tmp/pr937-release-validation-m_jcw8cc/runtime/bin/python",
+      "/tmp/pr937-release-validation-m_jcw8cc/pr-head/skills/aisim-deployment-search/scripts/summarize_recommendation.py",
+      "/tmp/pr937-release-validation-m_jcw8cc/recommendation"
+    ],
+    "exit_code": 0,
+    "seconds": 0.03,
+    "stdout": "logs/aisim-deployment-search-text.stdout.gz",
+    "stderr": "logs/aisim-deployment-search-text.stderr.gz"
+  },
+  {
+    "name": "aisim-deployment-search-json",
+    "command": [
+      "/tmp/pr937-release-validation-m_jcw8cc/runtime/bin/python",
+      "/tmp/pr937-release-validation-m_jcw8cc/pr-head/skills/aisim-deployment-search/scripts/summarize_recommendation.py",
+      "/tmp/pr937-release-validation-m_jcw8cc/recommendation",
+      "--json"
+    ],
+    "exit_code": 0,
+    "seconds": 0.02,
+    "stdout": "logs/aisim-deployment-search-json.stdout.gz",
+    "stderr": "logs/aisim-deployment-search-json.stderr.gz"
+  },
+  {
+    "name": "aisim-gpu-selection-and-sizing-text",
+    "command": [
+      "/tmp/pr937-release-validation-m_jcw8cc/runtime/bin/python",
+      "/tmp/pr937-release-validation-m_jcw8cc/pr-head/skills/aisim-gpu-selection-and-sizing/scripts/summarize_recommendation.py",
+      "/tmp/pr937-release-validation-m_jcw8cc/recommendation"
+    ],
+    "exit_code": 0,
+    "seconds": 0.02,
+    "stdout": "logs/aisim-gpu-selection-and-sizing-text.stdout.gz",
+    "stderr": "logs/aisim-gpu-selection-and-sizing-text.stderr.gz"
+  },
+  {
+    "name": "aisim-gpu-selection-and-sizing-json",
+    "command": [
+      "/tmp/pr937-release-validation-m_jcw8cc/runtime/bin/python",
+      "/tmp/pr937-release-validation-m_jcw8cc/pr-head/skills/aisim-gpu-selection-and-sizing/scripts/summarize_recommendation.py",
+      "/tmp/pr937-release-validation-m_jcw8cc/recommendation",
+      "--json"
+    ],
+    "exit_code": 0,
+    "seconds": 0.02,
+    "stdout": "logs/aisim-gpu-selection-and-sizing-json.stdout.gz",
+    "stderr": "logs/aisim-gpu-selection-and-sizing-json.stderr.gz"
+  },
+  {
+    "name": "headroom-invalid-load-type",
+    "command": [
+      "/tmp/pr937-release-validation-m_jcw8cc/runtime/bin/python",
+      "/tmp/pr937-release-validation-m_jcw8cc/pr-head/skills/aisim-gpu-selection-and-sizing/scripts/headroom_scan.py",
+      "/tmp/pr937-release-validation-m_jcw8cc/headroom-input.yaml",
+      "--min-goodput-share",
+      "0.9",
+      "--min-compliant-share",
+      "0.95",
+      "--steps",
+      "1.0,2.0",
+      "--workdir",
+      "/tmp/pr937-release-validation-m_jcw8cc/headroom"
+    ],
+    "exit_code": 2,
+    "seconds": 0.15,
+    "stdout": "logs/headroom-invalid-load-type.stdout.gz",
+    "stderr": "logs/headroom-invalid-load-type.stderr.gz",
+    "note": "Validation setup used request_rate instead of supported constant_rate. Corrected the harness; no production change."
+  },
+  {
+    "name": "headroom",
+    "command": [
+      "/tmp/pr937-release-validation-m_jcw8cc/runtime/bin/python",
+      "/tmp/pr937-release-validation-m_jcw8cc/pr-head/skills/aisim-gpu-selection-and-sizing/scripts/headroom_scan.py",
+      "/tmp/pr937-release-validation-m_jcw8cc/headroom-input.yaml",
+      "--min-goodput-share",
+      "0.9",
+      "--min-compliant-share",
+      "0.95",
+      "--steps",
+      "1.0,2.0",
+      "--workdir",
+      "/tmp/pr937-release-validation-m_jcw8cc/headroom"
+    ],
+    "exit_code": 0,
+    "seconds": 6.53,
+    "stdout": "logs/headroom.stdout.gz",
+    "stderr": "logs/headroom.stderr.gz"
+  },
+  {
+    "name": "mode-comparison",
+    "command": [
+      "/tmp/pr937-release-validation-m_jcw8cc/runtime/bin/aisim",
+      "recommend",
+      "--stack",
+      "engine",
+      "--config",
+      "/tmp/pr937-release-validation-m_jcw8cc/mode-comparison-input.yaml",
+      "--output-dir",
+      "/tmp/pr937-release-validation-m_jcw8cc/mode-comparison"
+    ],
+    "exit_code": 0,
+    "seconds": 21.0,
+    "stdout": "logs/mode-comparison.stdout.gz",
+    "stderr": "logs/mode-comparison.stderr.gz"
+  },
+  {
+    "name": "ladder",
+    "command": [
+      "/tmp/pr937-release-validation-m_jcw8cc/runtime/bin/python",
+      "/tmp/pr937-release-validation-m_jcw8cc/pr-head/skills/aisim-gpu-selection-and-sizing/scripts/size_ladder.py",
+      "/tmp/pr937-release-validation-m_jcw8cc/ladder-input.yaml",
+      "--hardware",
+      "b300_sxm",
+      "--budgets",
+      "1,2",
+      "--out-root",
+      "/tmp/pr937-release-validation-m_jcw8cc/ladder"
+    ],
+    "exit_code": 0,
+    "seconds": 19.39,
+    "stdout": "logs/ladder.stdout.gz",
+    "stderr": "logs/ladder.stderr.gz"
+  }
+]

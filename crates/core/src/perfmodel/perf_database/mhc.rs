@@ -121,7 +121,7 @@ impl MhcTable {
     /// Query one op whose rows must carry `architecture` (model-specific
     /// call-site rows). Unlike [`Self::query_module`], rows from another
     /// architecture never answer, even when they share the compute shape;
-    /// a miss is a typed `PerfDatabase` error.
+    /// no rows for this architecture, op and shape is `Ok(None)`.
     pub fn query_architecture_module(
         &self,
         architecture: &str,
@@ -130,23 +130,17 @@ impl MhcTable {
         hc_mult: u32,
         hidden_size: u32,
         sol: &dyn Fn(&str, f64) -> f64,
-    ) -> Result<LeafValue, AicError> {
+    ) -> Result<Option<LeafValue>, AicError> {
         let key = MhcKey {
             op_name: op.to_string(),
             hc_mult,
             hidden_size,
         };
-        let by_tokens = self
-            .load()?
+        self.load()?
             .by_architecture
-            .get(&(architecture.to_owned(), key.clone()))
-            .ok_or_else(|| {
-                AicError::PerfDatabase(format!(
-                    "MHC module data missing for {architecture} {key:?} at {}",
-                    self.data_root.display()
-                ))
-            })?;
-        by_tokens.query(num_tokens as f64, &|t| sol(op, t))
+            .get(&(architecture.to_owned(), key))
+            .map(|by_tokens| by_tokens.query(num_tokens as f64, &|t| sol(op, t)))
+            .transpose()
     }
 
     /// Whether rows tagged `architecture` exist for this op and shape.
@@ -342,10 +336,10 @@ mod tests {
     ///
     /// ```text
     /// PYTHONPATH=src python3 -c "
-    /// from aisimulate.sdk.perf_database import PerfDatabase
-    /// from aisimulate.sdk import common
+    /// from aisim.sdk.perf_database import PerfDatabase
+    /// from aisim.sdk import common
     /// db = PerfDatabase('b200_sxm','sglang','0.5.10',
-    ///                   systems_root='python/aisimulate/src/aisimulate_core/systems', database_mode='SOL')
+    ///                   systems_root='python/aisim/src/aisim_core/systems', database_mode='SOL')
     /// for nt, op in [(3,'pre'), (3,'post'), (3,'both'), (8,'pre')]:
     ///     r = db.query_mhc_module(num_tokens=nt, hidden_size=7168, hc_mult=4,
     ///                             sinkhorn_iters=3, op=op,
@@ -365,9 +359,10 @@ mod tests {
     fn mhc_query_regime_routing() {
         // Structural routing over the three op lanes and an off-grid token
         // count. Math on synthetic grids in perf_interp; values in goldens.
-        let table = MhcTable::new(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
-            "../../python/aisimulate/src/aisimulate_core/systems/data/b200_sxm/sglang/0.5.14",
-        ));
+        let table = MhcTable::new(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../python/aisim/src/aisim_core/systems/data/b200_sxm/sglang/0.5.14"),
+        );
         for &(op, nt) in &[("pre", 3u32), ("post", 3), ("both", 3), ("pre", 8)] {
             let got = table
                 .query_module(op, nt, 4, 7168, &linear_sol)
@@ -478,6 +473,25 @@ mod tests {
             .expect("query must succeed")
             .latency;
         assert_eq!(mid, 2.5);
+    }
+
+    /// Rows of the same shape under another architecture do not answer: the
+    /// miss is `None`, not an error.
+    #[test]
+    fn mhc_architecture_miss_is_none() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        write_mhc_parquet(
+            &tmp.path().join("mhc_module_perf.parquet"),
+            &[("ArchA", "pre", 8, 4, 4096, 1.0)],
+        );
+        let table = MhcTable::new(tmp.path().to_path_buf());
+        let query = |architecture| {
+            table
+                .query_architecture_module(architecture, "pre", 8, 4, 4096, &linear_sol)
+                .expect("query must succeed")
+        };
+        assert_eq!(query("ArchA").map(|row| row.latency), Some(1.0));
+        assert_eq!(query("ArchB"), None);
     }
 
     /// Item 1 (mechanism): beyond-range holds must anchor on the CALLER'S sol

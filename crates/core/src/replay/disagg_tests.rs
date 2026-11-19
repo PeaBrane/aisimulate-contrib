@@ -64,10 +64,145 @@ impl ReplayTelemetryObserver for CaptureTelemetryObserver {
     }
 }
 
+#[test]
+fn disagg_completion_feedback_matches_final_slo_and_gpu_accounting() {
+    let samples = Arc::new(Mutex::new(Vec::new()));
+    let sla = crate::replay::SlaThresholds {
+        ttft_ms: Some(100.0),
+        itl_ms: Some(100.0),
+        e2e_ms: None,
+    };
+    let report = DisaggRuntime::from_requests(
+        &disagg_config(),
+        None,
+        None,
+        VecDeque::from([request(1, 64, 2, 0.0), request(2, 64, 2, 10.0)]),
+        ReplayMode::Trace,
+    )
+    .unwrap()
+    .with_sla_thresholds(sla)
+    .with_telemetry_observer(
+        1.0,
+        Box::new(CaptureTelemetryObserver {
+            samples: samples.clone(),
+        }),
+    )
+    .run()
+    .unwrap()
+    .0
+    .finish();
+    let samples = samples.lock().unwrap();
+    let baseline = samples
+        .first()
+        .unwrap()
+        .completion_feedback
+        .as_ref()
+        .unwrap();
+    let final_sample = samples
+        .last()
+        .unwrap()
+        .completion_feedback
+        .as_ref()
+        .unwrap();
+    assert_eq!(baseline.terminal_requests, 0);
+    assert_eq!(final_sample.sla, sla);
+    assert_eq!(final_sample.completed_requests, 2);
+    assert_eq!(
+        final_sample.good_requests,
+        report.goodput.unwrap().completed_requests as u64
+    );
+    assert_eq!(
+        final_sample.good_requests_strict_itl,
+        final_sample.good_requests
+    );
+    assert!((final_sample.gpu_seconds - report.throughput.gpu_hours * 3600.0).abs() < 1e-9);
+}
+
+#[test]
+fn disagg_baseline_leaves_earlier_latency_pairs_for_the_first_interval_sample() {
+    let samples = Arc::new(Mutex::new(Vec::new()));
+    // Zero-latency passes complete the first request before telemetry starts.
+    let mut config = disagg_config();
+    for args in [&mut config.prefill_args, &mut config.decode_args] {
+        args.timing_model = crate::engine::TimingModelConfig::Fixed {
+            prefill_ms: 0.0,
+            decode_ms: 0.0,
+        };
+    }
+    DisaggRuntime::from_requests(
+        &config,
+        None,
+        None,
+        VecDeque::from([request(1, 64, 2, 0.0), request(2, 64, 2, 10.0)]),
+        ReplayMode::Trace,
+    )
+    .unwrap()
+    .with_telemetry_observer(
+        1.0,
+        Box::new(CaptureTelemetryObserver {
+            samples: samples.clone(),
+        }),
+    )
+    .run()
+    .unwrap();
+    let samples = samples.lock().unwrap();
+    assert_eq!(samples[0].kind, ReplayTelemetrySampleKind::Baseline);
+    let baseline = samples[0].completion_feedback.as_ref().unwrap();
+    assert_eq!(baseline.completed_requests, 1);
+    assert!(baseline.latency_samples.is_empty());
+    assert_eq!(baseline.latency_population, 0);
+    let first = samples[1].completion_feedback.as_ref().unwrap();
+    assert_eq!(first.latency_samples, vec![(0.0, Some(0.0))]);
+    assert_eq!(first.latency_population, 1);
+    let last = samples
+        .last()
+        .unwrap()
+        .completion_feedback
+        .as_ref()
+        .unwrap();
+    assert_eq!(last.completed_requests, 2);
+}
+
+#[test]
+fn disagg_final_sample_reports_a_terminal_recorded_after_the_last_sample() {
+    let samples = Arc::new(Mutex::new(Vec::new()));
+    let mut runtime = DisaggRuntime::from_requests(
+        &disagg_config(),
+        None,
+        None,
+        VecDeque::from([request(1, 64, 2, 10.0)]),
+        ReplayMode::Trace,
+    )
+    .unwrap()
+    .with_telemetry_observer(
+        1.0,
+        Box::new(CaptureTelemetryObserver {
+            samples: samples.clone(),
+        }),
+    );
+    runtime.start_profile_observers().unwrap();
+    // A rejection at the instant of the last sample delivers no token and
+    // admits nothing, so only completion feedback knows about it.
+    let rejected = Uuid::from_u128(2);
+    runtime.collector.on_arrival(rejected, 0.0, 64, 2);
+    runtime
+        .collector
+        .on_terminal(rejected, 0.0, ReplayTerminalStatus::Rejected);
+    runtime.publish_final_telemetry_sample().unwrap();
+    let samples = samples.lock().unwrap();
+    let last = samples.last().unwrap();
+    assert_eq!(last.kind, ReplayTelemetrySampleKind::Final);
+    let feedback = last.completion_feedback.as_ref().unwrap();
+    assert_eq!(feedback.terminal_requests, 1);
+    assert_eq!(feedback.completed_requests, 0);
+}
+
 #[derive(Debug)]
 struct QueueUntilWorkerPlacement {
     scheduler_id: Option<usize>,
     pending: VecDeque<Uuid>,
+    abort_count: usize,
+    fail_abort: bool,
 }
 
 impl QueueUntilWorkerPlacement {
@@ -75,6 +210,8 @@ impl QueueUntilWorkerPlacement {
         Self {
             scheduler_id: None,
             pending: VecDeque::new(),
+            abort_count: 0,
+            fail_abort: false,
         }
     }
 
@@ -136,6 +273,13 @@ impl PlacementPolicy<ReplayRequestPayload> for QueueUntilWorkerPlacement {
         let before = self.pending.len();
         self.pending.retain(|pending| *pending != request_id);
         self.pending.len() != before
+    }
+
+    fn dispatch_aborted(&mut self, request_id: Uuid, _now_ms: f64) -> anyhow::Result<()> {
+        self.abort_count += 1;
+        self.cancel_pending(request_id);
+        anyhow::ensure!(!self.fail_abort, "injected abort failure");
+        Ok(())
     }
 
     fn request_terminal(
@@ -365,6 +509,13 @@ fn transfer_timing_config(
     config.prefill_args.kv_transfer_bytes_per_token = Some(1_000_000);
     config.prefill_args.kv_transfer_timing_mode = mode;
     config.decode_args.kv_transfer_timing_mode = mode;
+    // Destination-missing timing needs a decode cache to hold the prefix.
+    if engine_type == EngineType::Sglang {
+        config
+            .decode_args
+            .sglang
+            .disaggregation_decode_enable_radix_cache = true;
+    }
     config
 }
 
@@ -489,7 +640,7 @@ fn request(
 fn simultaneous_handoffs_follow_arrival_order_across_replays() {
     let request_ids = [3, 1, 2].map(Uuid::from_u128);
     let run = || {
-        let mut flow = DisaggFlowState::new(HandoffOrder::SourceFirst, 0.0, false);
+        let mut flow = DisaggFlowState::new(HandoffOrder::SourceFirst, 0.0, None, false);
         let mut collector = TraceCollector::default();
         let handoffs = request_ids.map(|uuid| {
             flow.on_external_arrival(
@@ -1041,6 +1192,83 @@ fn zero_output_disagg_does_not_count_a_source_token(#[case] engine_type: EngineT
     assert_eq!(report.request_counts.total_output_tokens, 0);
 }
 
+/// Probe: fixed external timing reaches ordinary SGLang ranks through
+/// `PerfModel::External`, injected per role via `ReplayEngineFactory`. Confirm
+/// the generic two-pool handoff semantics:
+/// (a) token accounting — the source emits exactly one first-token signal
+///     (TTFT/conformance marking, excluded from report totals) while the
+///     destination produces all osl tokens after activation;
+/// (b) role admission gating — submits route only to the prefill pool, which
+///     the DestinationFirst lifecycle pinned by `validate()` proves;
+/// (c) transfer timing — the bandwidth-model handoff delay applies unchanged
+///     when a role carries an external provider.
+struct FixedRoleTiming;
+
+impl crate::engine::TimingModel for FixedRoleTiming {
+    fn predict_prefill_ms(&self, _: usize, _: usize, _: usize) -> anyhow::Result<f64> {
+        Ok(5.0)
+    }
+
+    fn predict_decode_ms(&self, _: usize, _: usize, _: usize, _: usize) -> anyhow::Result<f64> {
+        Ok(1.0)
+    }
+}
+
+fn external_role_conformance(
+    provider_on: crate::replay::WorkerStage,
+    handoff_delay: bool,
+) -> NormalizedHandoffConformance {
+    let mut config = sglang_disagg_config();
+    config.num_prefill_workers = 1;
+    config.num_decode_workers = 1;
+    if handoff_delay {
+        config.prefill_args.kv_transfer_bandwidth = Some(1.0);
+        config.prefill_args.kv_transfer_bytes_per_token = Some(1_000_000);
+    }
+    let (prefill_timing, decode_timing) = match provider_on {
+        crate::replay::WorkerStage::Prefill => (Some(Arc::new(FixedRoleTiming) as _), None),
+        crate::replay::WorkerStage::Decode => (None, Some(Arc::new(FixedRoleTiming) as _)),
+        crate::replay::WorkerStage::Aggregated => unreachable!("disagg roles are never aggregated"),
+    };
+    let factory =
+        ReplayEngineFactory::with_optional_role_timing_models(prefill_timing, decode_timing);
+    let config = config.runtime_config_with_factory(true, factory).unwrap();
+    let runtime = HandoffDisaggRuntime::new_composed(
+        &config,
+        AdmissionQueue::new_requests(
+            VecDeque::from([request(90_030, 64, 2, 0.0)]),
+            ReplayMode::Trace,
+        ),
+        true,
+        |_, prefill_topology, _, decode_topology| {
+            Ok((
+                PoolRoundRobinPlacement::new(prefill_topology),
+                PoolRoundRobinPlacement::new(decode_topology),
+            ))
+        },
+    )
+    .unwrap();
+    runtime.run_handoff_conformance(EngineType::Sglang).unwrap()
+}
+
+#[rstest::rstest]
+#[case::provider_on_decode(crate::replay::WorkerStage::Decode, false)]
+#[case::provider_on_prefill(crate::replay::WorkerStage::Prefill, false)]
+#[case::provider_on_decode_with_transfer_delay(crate::replay::WorkerStage::Decode, true)]
+fn external_timed_role_preserves_handoff_semantics(
+    #[case] provider_on: crate::replay::WorkerStage,
+    #[case] handoff_delay: bool,
+) {
+    // `run_handoff_conformance` already validates the DestinationFirst
+    // lifecycle, drain state, and destination KV visibility; pin the token
+    // accounting explicitly: one source-side first-token signal (excluded
+    // from totals), the full osl from the destination, one completion.
+    let capture = external_role_conformance(provider_on, handoff_delay);
+    assert_eq!(capture.source_output_tokens, 1);
+    assert_eq!(capture.destination_output_tokens, 2);
+    assert_eq!(capture.completed_requests, 1);
+}
+
 fn multiturn_trace() -> Trace {
     Trace {
         block_size: 64,
@@ -1257,14 +1485,17 @@ fn canceled_handoff_completion_does_not_refinalize_a_finished_request() {
 
     let decode_completed_at = runtime.now_ms;
     runtime
-        .process_decode_signal(OutputSignal {
-            uuid,
-            token_id: Some(42),
-            completed: true,
-            rejected: false,
-            handoff_delay_ms: None,
-            cached_tokens: None,
-        })
+        .process_decode_signal(
+            OutputSignal {
+                uuid,
+                token_id: Some(42),
+                completed: true,
+                rejected: false,
+                handoff_delay_ms: None,
+                cached_tokens: None,
+            },
+            decode_completed_at,
+        )
         .unwrap();
     assert!(!runtime.state(uuid).unwrap().counted_in_flight);
     assert!(!runtime.state(uuid).unwrap().coordinator.is_complete());
@@ -1295,6 +1526,8 @@ fn canceled_handoff_completion_does_not_refinalize_a_finished_request() {
     );
     assert_eq!(runtime.state(uuid).unwrap().phase, DisaggPhase::Done);
     assert!(runtime.is_done(), "cancellation cleanup must fully drain");
+    let links = runtime.flow.links.as_mut().unwrap();
+    assert!(links.jobs.is_empty() && links.next_event_ms().is_none());
     // Tolerating an already finalized request must not hide double retirement.
     let error = runtime.complete_handoff(uuid).unwrap_err();
     assert_eq!(
@@ -2131,6 +2364,92 @@ fn per_request_handoff_detail_preserves_backend_causality_and_stage_reuse() {
     }
 }
 
+#[rstest::rstest]
+#[case::prefill(true, disagg_config())]
+#[case::decode(false, sglang_disagg_config())]
+fn command_failure_aborts_placement_and_preserves_request_failure(
+    #[case] prefill: bool,
+    #[case] config: TestDisaggConfig,
+    #[values(false, true)] fail_abort: bool,
+) {
+    let config = config.runtime_config(false).unwrap();
+    let mut runtime =
+        DisaggRuntimeImpl::<QueueUntilWorkerPlacement, NoEngineEvents, ()>::new_composed(
+            &config,
+            AdmissionQueue::new_requests(
+                VecDeque::from([request(1, 64, 2, 0.0), request(2, 64, 2, 100.0)]),
+                ReplayMode::Trace,
+            ),
+            false,
+            |_, prefill_topology, _, decode_topology| {
+                Ok((
+                    QueueUntilWorkerPlacement::initially_blocked(prefill_topology),
+                    QueueUntilWorkerPlacement::initially_blocked(decode_topology),
+                ))
+            },
+        )
+        .unwrap()
+        .with_per_request_records(true);
+    runtime.step().unwrap();
+    let uuid = Uuid::from_u128(1);
+    let state = runtime.state_mut(uuid).unwrap();
+    let action = if prefill {
+        state.pending_prefill_action.take()
+    } else {
+        state.pending_destination_action.take()
+    }
+    .unwrap();
+    runtime.prefill_placement.fail_abort = fail_abort;
+    runtime.decode_placement.fail_abort = fail_abort;
+    // Inject failure at the command boundary after a real route/action exists.
+    // No engine accepts ownership, so cleanup must not block subsequent requests.
+    let result = if prefill {
+        runtime.submit_prefill(uuid, usize::MAX, action, None)
+    } else {
+        runtime.reserve_destination(uuid, usize::MAX, action)
+    };
+    assert_eq!(
+        (
+            runtime.prefill_placement.abort_count,
+            runtime.decode_placement.abort_count
+        ),
+        (usize::from(prefill), usize::from(!prefill))
+    );
+    if fail_abort {
+        let error = format!("{:#}", result.unwrap_err());
+        assert!(
+            error.contains("unknown rank") && error.contains("injected abort failure"),
+            "{error}"
+        );
+    } else {
+        result.unwrap();
+        assert_eq!(
+            runtime.state(uuid).unwrap().terminal_status(),
+            Some(ReplayTerminalStatus::Failed)
+        );
+        runtime.prefill_placement.scheduler_id = Some(0);
+        runtime.decode_placement.scheduler_id = Some(0);
+        runtime.run_to_completion().unwrap();
+        assert_eq!(
+            runtime.prefill_placement.abort_count + runtime.decode_placement.abort_count,
+            1
+        );
+        let report = runtime.run().unwrap().0.finish();
+        assert_eq!(report.request_counts.completed_requests, 1);
+        assert_eq!(
+            report
+                .per_request
+                .iter()
+                .map(|r| r.terminal_status)
+                .collect::<Vec<_>>(),
+            [
+                ReplayTerminalStatus::Failed,
+                ReplayTerminalStatus::Completed
+            ],
+        );
+    }
+}
+
 #[test]
 fn rejected_prefill_remains_rejected_during_failed_handoff_cleanup() {
     let mut config = disagg_config();
@@ -2274,6 +2593,10 @@ fn state_cache_handoff_adds_one_state_copy_to_transfer_time() {
                 args.kv_cache_bytes_per_token = Some(1_000_000);
                 args.state_cache = Some(crate::engine::StateCacheConfig {
                     bytes_per_request: 8_000_000,
+                    sliding_window: None,
+                    num_speculative_states: None,
+                    prefill_checkpoint: false,
+                    junction_checkpoints: false,
                 });
             }
         }
@@ -2283,6 +2606,200 @@ fn state_cache_handoff_adds_one_state_copy_to_transfer_time() {
     // One 8 MB state at 1 GB/s on top of 128 tokens x 1 MB.
     let delta = handoff_ms(true) - handoff_ms(false);
     assert!((delta - 8.0).abs() < 1e-6, "delta={delta}");
+}
+
+#[test]
+fn pp_prefill_fill_delays_linked_handoffs_without_holding_the_links() {
+    // Two prompts finish in one PP4 prefill forward and share one sending and one
+    // receiving link. Each handoff waits the fill once; the fill must not be link
+    // work, so the linked delay grows by the same fill as an unlinked handoff.
+    let last_handoff_ms = |linked: bool, fill_passes: f64| {
+        let mut config = sglang_disagg_config();
+        config.num_prefill_workers = 1;
+        config.num_decode_workers = 1;
+        config.prefill_args.pipeline_fill_passes = fill_passes;
+        if linked {
+            config.prefill_args.kv_transfer_bandwidth = Some(1.0);
+            config.prefill_args.kv_transfer_bytes_per_token = Some(1_000_000);
+        }
+        let requests = (0..2u32)
+            .map(|i| DirectRequest {
+                tokens: (1000 * i..1000 * i + 128).collect(),
+                ..request(u128::from(i) + 1, 128, 2, 0.0)
+            })
+            .collect();
+        let (_, stats) = run_trace_collect(&config, requests, None, 1.0);
+        (1..=2u128)
+            .map(|uuid| stats.handoff_ms[&Uuid::from_u128(uuid)])
+            .fold(f64::MIN, f64::max)
+    };
+    let unlinked_fill = last_handoff_ms(false, 3.0) - last_handoff_ms(false, 0.0);
+    let linked_fill = last_handoff_ms(true, 3.0) - last_handoff_ms(true, 0.0);
+    assert!(unlinked_fill > 0.0);
+    assert!(
+        (linked_fill - unlinked_fill).abs() < 1e-9,
+        "linked={linked_fill} unlinked={unlinked_fill}"
+    );
+}
+
+#[test]
+fn a_transfer_with_only_pipeline_fill_completes_when_the_fill_ends() {
+    let mut links = TransferLinks::new(Some(1.0), Some(1.0)).unwrap();
+    let handoff_id = HandoffId::new(Uuid::from_u128(1));
+    links.submit(handoff_id, 0.0, 0, 0, 0.0, 3.0);
+    assert_eq!(links.next_event_ms(), Some(3.0));
+    links.complete_due(3.0);
+    assert_eq!(links.completed, [handoff_id]);
+}
+
+#[test]
+fn same_instant_transfers_compute_rates_once() {
+    let mut links = TransferLinks::new(Some(1.0), Some(1.0)).unwrap();
+    links.submit(HandoffId::new(Uuid::from_u128(1)), 1.0, 0, 0, 0.0, 0.0);
+    assert_eq!(links.next_event_ms(), Some(1.0));
+    let before = links.transfers.rate_refreshes.get();
+    // Independent pairs submitted later at one instant.
+    for pair in 1..=64u32 {
+        let handoff_id = HandoffId::new(Uuid::from_u128(u128::from(pair) + 1));
+        links.submit(handoff_id, 2.0, pair as usize, pair as usize, 0.5, 0.5);
+    }
+    assert_eq!(links.next_event_ms(), Some(1.0));
+    // The step to the shared instant reuses the earlier rates; the new
+    // transfers need one snapshot for the next event.
+    assert_eq!(links.transfers.rate_refreshes.get() - before, 1);
+    // Landing the first transfer changes the job set and needs one more.
+    links.advance(1.0);
+    assert_eq!(links.completed, [HandoffId::new(Uuid::from_u128(1))]);
+    assert_eq!(links.transfers.rate_refreshes.get() - before, 2);
+}
+
+#[test]
+fn pipeline_fill_does_not_hold_shared_transfer_links() {
+    // Two handoffs share a source and destination link. The second still has
+    // 3 ms of pipeline fill, which is compute: the first transfer runs alone
+    // until then, and the second then moves its 2 ms of KV.
+    let mut links = TransferLinks::new(Some(1.0), Some(1.0)).unwrap();
+    let (first, second) = (
+        HandoffId::new(Uuid::from_u128(1)),
+        HandoffId::new(Uuid::from_u128(2)),
+    );
+    links.submit(first, 2.0, 0, 0, 0.0, 0.0);
+    links.submit(second, 2.0, 0, 0, 0.0, 3.0);
+    assert_eq!(links.next_event_ms(), Some(2.0));
+    links.advance(2.0);
+    assert_eq!(links.completed, [first]);
+    links.complete_due(5.0);
+    assert_eq!(links.completed, [first, second]);
+
+    // Overlapping fills still share the links once both transfers start.
+    let mut links = TransferLinks::new(Some(1.0), Some(1.0)).unwrap();
+    links.submit(first, 2.0, 0, 0, 0.0, 1.0);
+    links.submit(second, 2.0, 0, 0, 0.0, 1.0);
+    links.complete_due(5.0);
+    assert_eq!(links.completed, [first, second]);
+    assert!(links.next_event_ms().is_none());
+}
+
+#[test]
+fn an_uncontended_transfer_finishes_exactly_at_its_standalone_delay() {
+    // Unlinked replay schedules a handoff at `now + delay`; a transfer alone on
+    // its links must land on the same bits so same-instant ordering is kept.
+    let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+    let mut unit = || {
+        seed = seed
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (seed >> 11) as f64 / (1u64 << 53) as f64
+    };
+    for destination_gbps in [None, Some(1.7), Some(32.0)] {
+        for _ in 0..1_000 {
+            let mut links = TransferLinks::new(Some(1.7), destination_gbps).unwrap();
+            let (now_ms, delay_ms) = (1.0e6 * unit(), 1.0e3 * unit());
+            links.submit(
+                HandoffId::new(Uuid::from_u128(1)),
+                delay_ms,
+                0,
+                0,
+                now_ms,
+                now_ms,
+            );
+            assert_eq!(links.next_event_ms(), Some(now_ms + delay_ms));
+        }
+    }
+}
+
+#[test]
+fn a_sub_ulp_transfer_residual_completes_at_the_current_time() {
+    // Stopping one ULP short of a completion can leave a residual whose event
+    // is the links' own clock. That event must still complete instead of
+    // pinning the replay to one timestamp. A slower receiving link makes the
+    // rate inexact, which is what leaves such residuals.
+    let mut residuals = 0;
+    let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut unit = || {
+        seed = seed
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (seed >> 11) as f64 / (1u64 << 53) as f64
+    };
+    for _ in 0..20_000 {
+        let mut links = TransferLinks::new(Some(1.0), Some(0.7)).unwrap();
+        let handoff_id = HandoffId::new(Uuid::from_u128(1));
+        let start_ms = 1.0e6 * unit();
+        links.submit(handoff_id, 1.0e3 * unit(), 0, 0, start_ms, start_ms);
+        let event_ms = links.next_event_ms().unwrap();
+        let before_ms = event_ms.next_down();
+        links.advance(before_ms);
+        if links.completed.is_empty() && links.next_event_ms() == Some(before_ms) {
+            residuals += 1;
+            links.complete_due(before_ms);
+            assert_eq!(links.completed, [handoff_id]);
+            assert!(links.next_event_ms().is_none());
+        }
+    }
+    assert!(residuals > 0, "no sub-ULP residual case was exercised");
+}
+
+/// Two 128-token prompts on separate prefill workers hand off together. Alone,
+/// each transfer takes 128 ms at 1 GB/s.
+fn concurrent_handoff_delays(
+    engine_type: EngineType,
+    decode_workers: usize,
+    decode_bandwidth: Option<f64>,
+) -> Vec<f64> {
+    let mut config = transfer_timing_config(engine_type, KvTransferTimingMode::FullPrompt, 1);
+    config.num_prefill_workers = 2;
+    config.num_decode_workers = decode_workers;
+    config.decode_args.kv_transfer_bandwidth = decode_bandwidth;
+    let distinct = |uuid: u128| DirectRequest {
+        tokens: vec![uuid as u32; 128],
+        ..request(uuid, 128, 2, 0.0)
+    };
+    let (_, alone) = run_trace_collect(&config, vec![distinct(1)], None, 1.0);
+    let (_, together) = run_trace_collect(&config, vec![distinct(1), distinct(2)], None, 1.0);
+    let alone_ms = alone.handoff_ms[&Uuid::from_u128(1)];
+    [1, 2]
+        .map(|uuid| together.handoff_ms[&Uuid::from_u128(uuid)] - alone_ms + 128.0)
+        .to_vec()
+}
+
+#[test]
+fn concurrent_handoffs_into_one_decode_rank_share_its_link() {
+    for engine_type in [EngineType::Vllm, EngineType::Sglang] {
+        // Both transfers share the decode rank's 1 GB/s, so both finish
+        // after 256 ms instead of 128 ms.
+        for delay in concurrent_handoff_delays(engine_type, 1, Some(1.0)) {
+            assert!((delay - 256.0).abs() < 1e-6, "{engine_type:?}: {delay}");
+        }
+        // Separate decode ranks give each transfer its own links.
+        for delay in concurrent_handoff_delays(engine_type, 2, Some(1.0)) {
+            assert!((delay - 128.0).abs() < 1e-6, "{engine_type:?}: {delay}");
+        }
+        // Without decode bandwidth only the distinct prefill links bind.
+        for delay in concurrent_handoff_delays(engine_type, 1, None) {
+            assert!((delay - 128.0).abs() < 1e-6, "{engine_type:?}: {delay}");
+        }
+    }
 }
 
 #[test]
@@ -3739,8 +4256,12 @@ mod agentic_pd_qualification {
                 })
                 .collect();
             let prepared = prepared(agentic_trace(64, rows), 2);
+            let mut config = config(backend, false);
+            // The short request must retain its source row while the long
+            // prefill runs, so its client terminal can precede source cleanup.
+            config.prefill_args.max_num_seqs = 2;
             let mut replay = runtime(
-                &config(backend, false),
+                &config,
                 prepared,
                 true,
                 1.0,
@@ -3846,7 +4367,8 @@ mod agentic_pd_qualification {
                     if prefill {
                         replay.process_prefill_signal(signal).unwrap();
                     } else {
-                        replay.process_decode_signal(signal).unwrap();
+                        let now_ms = replay.now_ms;
+                        replay.process_decode_signal(signal, now_ms).unwrap();
                     }
                 }
                 assert_eq!(replay.admission.agentic_phase_evidence().unwrap(), before);

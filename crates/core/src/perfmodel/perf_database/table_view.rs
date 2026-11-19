@@ -5,7 +5,7 @@
 //! `load_*_data` parsers (PR-6, #1357 phase 3).
 //!
 //! Each `view_*` function here reproduces, row for row, what one Python
-//! loader in `aisimulate_core/sdk/operations/*.py` produced before the
+//! loader in `aisim_core/sdk/operations/*.py` produced before the
 //! Python data plane was deleted: the same source order (shared-layer
 //! first-wins), the same column reads and casts, the same key layering, the
 //! same derived fields (`energy = power * latency`), and the same INSERTION
@@ -776,13 +776,6 @@ pub fn view_generation_mla_module(sources: &[PerfSource]) -> Result<Option<ViewN
     Ok(found.map(|_| root))
 }
 
-/// Ensure a (possibly empty) branch exists at `path` — mirrors Python
-/// defaultdict "vivification" that some loaders rely on (deliberately or,
-/// in mamba2's generation case, as a preserved bug).
-fn vivify_branch(root: &mut ViewNode, path: &[String]) {
-    root.descend(path);
-}
-
 /// Tuple keys (mamba-family model keys) are encoded `a|b|c`; the Python
 /// rehydration layer splits them back into int tuples.
 fn tuple_key(parts: &[u32]) -> String {
@@ -793,41 +786,25 @@ fn tuple_key(parts: &[u32]) -> String {
         .join("|")
 }
 
-/// `operations/mamba.py::load_mamba2_data` —
-/// `[kernel_source][phase][model_key]` then `[b][s]` for context rows.
-/// Generation rows reproduce the Python loader's preserved defect: the
-/// conflict probe vivifies `[b]` on a defaultdict and therefore NEVER raises,
-/// so the entry is never stored — each generation row leaves an EMPTY dict at
-/// `[model_key][b]`. Mamba2 is deprecated (removed in PR-7); the view mirrors
-/// the actual Python table bit for bit rather than silently fixing it.
+/// Mamba2 table — `[kernel_source][phase][model_key]`, then `[b][s]` for
+/// context rows and `[b]` for decode rows: the keying
+/// `state_space.rs::load_mamba2_parquet` queries. Unlike the retired Python
+/// loader, decode rows are kept.
 pub fn view_mamba2(sources: &[PerfSource]) -> Result<Option<ViewNode>, AicError> {
-    let mut root = ViewNode::branch();
-    let found = fold_sources(sources, |ctx| {
-        let r = ctx.reader;
-        let kernel_source = str_cell_or_empty(ctx, "kernel_source")?;
-        let phase = str_cell_or_empty(ctx, "phase")?;
-        let b = ctx.row.u32(r.col("batch_size")?)?;
-        let s = ctx.row.u32(r.col("seq_len")?)?;
-        let model_key = tuple_key(&[
-            ctx.row.u32(r.col("d_model")?)?,
-            ctx.row.u32(r.col("d_state")?)?,
-            ctx.row.u32(r.col("d_conv")?)?,
-            ctx.row.u32(r.col("nheads")?)?,
-            ctx.row.u32(r.col("head_dim")?)?,
-            ctx.row.u32(r.col("n_groups")?)?,
-            ctx.row.u32(r.col("chunk_size")?)?,
-        ]);
-        let latency = ctx.row.f64(r.col("latency")?)?;
-        let leaf = classic_leaf(latency, ctx.power()?);
-        if phase == "context" {
-            let path = [kernel_source, phase, model_key, b.to_string()];
-            root.insert_first_wins(&path, &s.to_string(), leaf);
-        } else {
-            vivify_branch(&mut root, &[kernel_source, phase, model_key, b.to_string()]);
-        }
-        Ok(())
-    })?;
-    Ok(found.map(|_| root))
+    view_gdn_like(
+        sources,
+        &[
+            "d_model",
+            "d_state",
+            "d_conv",
+            "nheads",
+            "head_dim",
+            "n_groups",
+            "chunk_size",
+        ],
+        &["context"],
+        false,
+    )
 }
 
 /// Shared shape of `load_gdn_data` / `load_kda_data`:
@@ -2314,7 +2291,7 @@ fn merge_dsv4_split(parts: Vec<Option<ViewNode>>) -> Option<ViewNode> {
 
 /// Attribute registry: every table-view attribute [`table_view_json`]'s
 /// dispatch accepts, with the parquet basenames its fold consumes — exported
-/// over the FFI (`aisimulate_core.table_view_attributes()`) so the Python
+/// over the FFI (`aisim_core.table_view_attributes()`) so the Python
 /// side derives its mirrors from THIS table instead of hand-syncing four
 /// stringly-typed sites (Rust match arms / `VIEW_KEY_LAYERS` / per-class
 /// `load_data` literals / the baseline codec) — the same
@@ -2448,9 +2425,9 @@ pub const TABLE_VIEW_ATTRIBUTES: &[(&str, &[&str])] = &[
 /// The engine-side table view: `attribute` is the PerfDatabase attribute name
 /// the retired Python loader used to fill (`"_gemm_data"`, ...). Returns
 /// `Ok(None)` exactly when that loader returned `None` (every source path
-/// missing), and the loader-shaped nested JSON otherwise. The three DSV4
-/// sparse sub-tables are addressed as
-/// `"_dsv4_sparse_kernel_data.<paged_mqa_logits|hca_attn|csa_attn>"`.
+/// missing), and the loader-shaped nested JSON otherwise. The DSV4 sparse
+/// sub-table is addressed as `"_dsv4_sparse_kernel_data.paged_mqa_logits"`
+/// (the hca_attn / csa_attn sidecars were retired 2026-10-15).
 pub fn table_view_json(tables: &PerfTables, attribute: &str) -> Result<Option<String>, AicError> {
     let src = |basename: &str| {
         tables
@@ -2635,5 +2612,48 @@ mod tests {
         out.clear();
         write_json_f64(&mut out, 2.0);
         assert_eq!(out, "2.0");
+    }
+
+    #[test]
+    fn view_mamba2_keeps_context_and_decode_rows() {
+        use crate::perf_database::energy_test_fixtures::{Col, write_parquet};
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let path = tmp.path().join("mamba2_perf.parquet");
+        write_parquet(
+            &path,
+            &[
+                Col::Str(
+                    "kernel_source",
+                    vec![
+                        "mamba_chunk_scan_combined",
+                        "selective_state_update_flashinfer",
+                    ],
+                ),
+                Col::Str("phase", vec!["context", "generation"]),
+                Col::I64("batch_size", vec![1, 8]),
+                Col::I64("seq_len", vec![1024, 1]),
+                Col::I64("d_model", vec![8192, 8192]),
+                Col::I64("d_state", vec![128, 128]),
+                Col::I64("d_conv", vec![4, 4]),
+                Col::I64("nheads", vec![64, 64]),
+                Col::I64("head_dim", vec![64, 64]),
+                Col::I64("n_groups", vec![8, 8]),
+                Col::I64("chunk_size", vec![256, 256]),
+                Col::F64("latency", vec![2.0, 3.0]),
+            ],
+        );
+        let view = view_mamba2(&[PerfSource(path, None)])
+            .expect("fold")
+            .expect("the source exists");
+        // One context row at [batch][seq_len], one decode row at [batch], as state_space.rs keys them.
+        assert_eq!(
+            view.to_json(),
+            concat!(
+                r#"{"mamba_chunk_scan_combined":{"context":{"8192|128|4|64|64|8|256":"#,
+                r#"{"1":{"1024":{"latency":2.0,"power":0.0,"energy":0.0}}}}},"#,
+                r#""selective_state_update_flashinfer":{"generation":{"8192|128|4|64|64|8|256":"#,
+                r#"{"8":{"latency":3.0,"power":0.0,"energy":0.0}}}}}"#,
+            )
+        );
     }
 }

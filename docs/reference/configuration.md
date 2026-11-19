@@ -5,9 +5,22 @@ SPDX-License-Identifier: Apache-2.0
 
 # Public configuration
 
-The public CLI consumes strict, typed YAML. `predict` accepts concrete values;
+The public CLI consumes YAML or JSON with the same strict, typed schema. `predict` accepts concrete values;
 `recommend` adds supported search domains and an objective. This document is
 not the [`SmartSearchConfig` SDK schema](../sweeper/sdk.md).
+
+Pass either format with `--config PATH`. A `.json` suffix, in any letter case,
+selects Python's JSON parser; other filenames retain YAML parsing, including
+`.yaml`, `.yml`, and files without an extension. The document must be one object
+(mapping). JSON scientific notation such as `1e-7` is read as a number; quoted
+`"1e-7"` remains a string and fails validation in numeric fields. Invalid JSON
+is reported as an error without falling back to YAML.
+
+This format selection applies to `predict`, `recommend`, `perf-model migrate`,
+and the `CorePredictionConfig`, `CoreRecommendationConfig`, and `SmartSearchConfig`
+file readers. The existing `load_yaml()` and `load_yaml_with_text()` helpers
+always parse YAML, including files named `.json`. Their onboarding, checkpoint,
+validation, and `vl collect --config` consumers retain that behavior.
 
 <a id="configuration-model"></a>
 
@@ -20,7 +33,7 @@ Jump to [traffic](../replay/workloads.md), [engine](../replay/engine/README.md),
 These fragments show the available top-level sections; they are not complete runnable inputs.
 Use the [quickstart](../getting-started/quickstart.md) for complete configurations.
 
-Both commands use one strict YAML model:
+Both commands use one strict configuration model, shown here in YAML:
 
 ```yaml
 traffic: {}
@@ -51,7 +64,7 @@ The command determines the document type. There is no top-level `kind` or stack 
 | `optimization` | Rejected | Required | Recommendation objective and candidate GPU constraints. |
 | `optimizer` | Rejected | Optional | Public search controls. |
 
-Unknown fields are rejected everywhere. Every semantic configuration knob is an explicit, typed YAML
+Unknown fields are rejected everywhere. Every semantic configuration knob is an explicit, typed
 field. The selected stack, backend, policy, timing model, or capacity model determines which
 conditional fields are legal; there is no generic configuration passthrough mapping.
 
@@ -63,7 +76,8 @@ component preset only where the field supports that form. Search domains are
 never accepted in a prediction. Presets expand to complete atomic mappings;
 see [presets and search domains](../sweeper/search-space.md).
 
-`--set PATH=YAML_VALUE` applies after YAML loading, in left-to-right order.
+`--set PATH=YAML_VALUE` applies after loading either format, in left-to-right order.
+Override values continue to use YAML syntax, including when the input file is JSON.
 The final value wins, then full validation runs. Replace a complete sequence
 rather than addressing its indices. When changing a tagged object such as
 `traffic.load.type`, replace the whole mapping if the old fields no longer
@@ -118,13 +132,15 @@ The `optimization` section is required, even when its target uses a default.
 
 | Knob | Default | Default Range | Preset | Rules |
 |---|---:|---|---|---|
-| `optimization.target` | `throughput` | `x` | `-` | Maximize `throughput`, `throughput_per_gpu`, `throughput_per_user`, `goodput`, or `goodput_per_gpu`; minimize `ttft`, `e2e_latency`, or `min_gpus`; or compute `pareto`. |
+| `optimization.target` | `throughput` | `x` | `-` | Maximize `throughput`, `throughput_per_gpu`, `throughput_per_user`, `goodput`, or `goodput_per_gpu`; minimize `ttft`, `e2e_latency`, or `min_gpus`; or compute `pareto`. Also accepts the [AIPerf metric selectors](../sweeper/optimization-goals.md#aiperf-metric-selectors). With `--stack dynamo`, `min_gpus` accepts `router` and rejects `planner`. |
 | `optimization.hardware` | `null` | `x` | `-` | One nonempty hardware identifier; required for `engine.hardware: auto`. |
-| `optimization.strict_sla` | `false` | `x` | `-` | When true, reject candidates whose aggregate mean metrics exceed any configured SLA bound before ranking or Pareto analysis. |
+| `optimization.max_topology_candidates` | `10000` | `x` | `-` | Positive integer. Limits each AFD role domain and complete legal compositions in branches containing AFD; overflow is an error, never truncation. Ordinary branches retain their current search behavior. |
+| `optimization.strict_sla` | `false` | `x` | `-` | When true, enforce the configured mean SLA bounds and `constraints.metrics` before ranking or Pareto analysis. |
+| `optimization.constraints.metrics` | `[]` | `x` | `-` | Aggregate constraints on the [AIPerf metric selectors](../sweeper/optimization-goals.md#aiperf-metric-selectors), with `metric`, `operator` (`lte` or `gte`), and nonnegative `threshold`. Enforced only when `strict_sla` is true. |
 | `optimization.constraints.min_candidate_gpus` | `null` | `x` | `-` | Positive when set and no greater than the maximum. |
 | `optimization.constraints.max_candidate_gpus` | `32` | `x` | `-` | Positive. |
-| `optimization.constraints.min_goodput_rps` | `null` | `x` | `-` | Positive finite SLA-compliant requests/s floor for `min_gpus` only; required with request-rate traffic and cannot exceed the offered rate. Optional with fixed concurrency. |
+| `optimization.constraints.min_goodput_rps` | `null` | `x` | `-` | Positive finite SLA-compliant requests/s floor for `min_gpus` only; required with open-loop traffic (a request or session rate, or `trace_timestamps` without `agentic_lanes`). It cannot exceed the offered request rate, which for sessions is `sessions_per_second` times `session.turns`; a trace's timestamp rate is not checked. Optional with fixed concurrency or agentic lanes. |
 
 `optimization.hardware` is one fallback SKU, never a list or inventory.
-Concrete P/D role SKUs can override it. `optimizer` controls execution of the
+Concrete P/D role SKUs can override it. `max_topology_candidates` bounds topology preparation for AFD branches, separately from `optimizer.max_trials`, which bounds evaluated trials. `optimizer` controls execution of the
 search and is described in [search space](../sweeper/search-space.md#optimizer-controls).

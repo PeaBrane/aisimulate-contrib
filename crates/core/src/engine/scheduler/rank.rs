@@ -1,12 +1,15 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-FileCopyrightText: Copyright 2023-2026 SGLang Team
 // SPDX-License-Identifier: Apache-2.0
+// Modified behavioral adaptation of SGLang v0.5.22; see THIRD_PARTY_NOTICES.md.
+// Source: https://github.com/sgl-project/sglang/tree/baa9befa381511cd4d56f83980951e5a45fffc6d
 
 //! Thin neutral contract adapter over the mechanically moved scheduler cores.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
-use anyhow::{Result, anyhow, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
 use uuid::Uuid;
 
 use crate::engine::common::perf_model::PerfModel;
@@ -14,13 +17,15 @@ use crate::engine::common::protocols::{
     DirectRequest, EngineType, KvTransferTimingMode, MockEngineArgs,
     PreemptionMode as CorePreemptionMode, SglangArgs, WorkerType as CoreWorkerType,
 };
-use crate::engine::generalized::{CommandContext, RankEngine, RankIdentity, RankPass};
+use crate::engine::generalized::{
+    CommandContext, RankEngine, RankIdentity, RankPass, ScheduledPass,
+};
 use crate::engine::host_offload::{G2Binding, HostTierHandle};
 use crate::engine::{
     Admission, Backend, Command, CommandEffects, CommandResult, EngineConfig, ForwardPassMetrics,
-    HandoffId, HostOffloadObserver, KvHintSource, LifecycleEvent, Metrics, Output,
-    PassCompletionEffects, PassStartEffects, PendingPass, PreemptionMode, Request, TimingModel,
-    TransferTimingMode, WorkerType,
+    HandoffId, HostOffloadObserver, IterationMs, KvHintSource, LifecycleEvent, Metrics, Output,
+    PassCompletionEffects, PassStartEffects, PendingPass, PreemptionMode, RankWork, Request,
+    TimingModel, TransferTimingMode, WorkerType, predict_group_iteration_ms,
 };
 
 use super::{
@@ -42,9 +47,55 @@ pub fn engine_seed_offset(identity: RankIdentity) -> Result<u64> {
 pub struct SchedulerRank {
     core: EngineCore,
     handoff_requests: HashMap<HandoffId, Uuid>,
+    /// The timing provider every rank of the logical engine shares.
+    timing: Arc<dyn TimingModel>,
+    dp_rank: u32,
+    /// Whether a group pass may be priced as one iteration: only while the
+    /// decode speedup is 1, so the shared duration takes one speedup. With
+    /// another decode speedup, every rank keeps its own phase pricing.
+    group_pricing: bool,
+    /// When the scheduled pass started, until it is resolved.
+    scheduled_at_ms: Option<f64>,
+    /// vLLM `launch`: outputs the engine loop has not returned yet.
+    held_outputs: Option<HeldOutputs>,
+}
+
+/// vLLM's engine loop returns a pass's outputs only after it launches the
+/// next pass (`launch`), which may be after the pass ends.
+#[derive(Default)]
+struct HeldOutputs {
+    /// The latest pass's end and outputs, until the next pass is formed.
+    latest: Option<(f64, Vec<Output>)>,
+    /// Outputs by the time the engine loop returns them, in pass order.
+    returned: VecDeque<(f64, Vec<Output>)>,
+}
+
+impl HeldOutputs {
+    /// Drop a cancelled request's outputs; true when any was held.
+    fn discard(&mut self, request_id: Uuid) -> bool {
+        let mut dropped = false;
+        for (_, outputs) in self.latest.iter_mut().chain(self.returned.iter_mut()) {
+            let before = outputs.len();
+            outputs.retain(|output| output.request_id != request_id);
+            dropped |= outputs.len() != before;
+        }
+        self.latest.take_if(|(_, outputs)| outputs.is_empty());
+        self.returned.retain(|(_, outputs)| !outputs.is_empty());
+        dropped
+    }
+
+    fn is_empty(&self) -> bool {
+        self.latest.is_none() && self.returned.is_empty()
+    }
 }
 
 impl SchedulerRank {
+    /// vLLM `launch`: whether the engine loop launches another pass now, so
+    /// that the outputs it has not returned wait for that launch.
+    fn launches_next_pass(&self) -> bool {
+        self.core.is_ready() && !self.core.waiting_for_external_command()
+    }
+
     pub(crate) fn set_belady_oracle(&mut self, oracle: crate::engine::belady::BeladyOracle) {
         match &mut self.core {
             EngineCore::Vllm(core) => core.set_belady_oracle(oracle),
@@ -74,6 +125,21 @@ impl SchedulerRank {
         self.core.set_host_offload_observer(observer);
     }
 
+    pub(crate) fn decode_load(&self) -> Option<(usize, usize)> {
+        match &self.core {
+            EngineCore::Sglang(core) => Some(core.decode_load()),
+            EngineCore::Vllm(_) => None,
+        }
+    }
+
+    /// Per-rank G2 only. Shared G2 is observed through its deployment registry.
+    pub(crate) fn per_rank_host_cache_metrics(&self) -> Option<crate::engine::HostCacheMetrics> {
+        match &self.core {
+            EngineCore::Vllm(core) => core.per_rank_host_cache_metrics(),
+            EngineCore::Sglang(core) => core.host_cache_metrics(),
+        }
+    }
+
     pub fn new_with_timing_model(
         identity: RankIdentity,
         config: &EngineConfig,
@@ -100,7 +166,7 @@ impl SchedulerRank {
             config.kvcr.is_none(),
             "kvcr is Replay-owned; construct it through ReplaySpec"
         );
-        let mut args = core_args(config, timing);
+        let mut args = core_args(config, Arc::clone(&timing));
         if config.backend == Backend::Sglang {
             normalize_sglang_attention_dp(&mut args, identity.dp_size.get())?;
         }
@@ -125,6 +191,11 @@ impl SchedulerRank {
         Ok(Self {
             core,
             handoff_requests: HashMap::new(),
+            timing,
+            dp_rank: identity.dp_rank,
+            group_pricing: config.decode_speedup_ratio == 1.0,
+            scheduled_at_ms: None,
+            held_outputs: config.launch.map(|_| HeldOutputs::default()),
         })
     }
 
@@ -187,6 +258,16 @@ impl RankEngine for SchedulerRank {
         context: CommandContext,
         pending_pass: Option<&mut Self::PendingPass>,
     ) -> Result<Self::CommandEffects> {
+        if let Command::Submit(request)
+        | Command::SubmitHandoffPrefill { request, .. }
+        | Command::ReserveDestination { request, .. } = &command
+        {
+            ensure!(
+                matches!(self.core, EngineCore::Sglang(_))
+                    || request.cache_salt.as_deref().is_none_or(str::is_empty),
+                "cache_salt is supported only for backend=sglang"
+            );
+        }
         let pending_suppression = pending_output_suppression(&command, &self.handoff_requests);
         let handoff_update = handoff_tracking_update(&command);
         let core_command = Self::core_command(command);
@@ -224,6 +305,15 @@ impl RankEngine for SchedulerRank {
         } else {
             false
         };
+        let suppressed_pending_output = suppressed_pending_output
+            | match (pending_suppression, self.held_outputs.as_mut()) {
+                (Some((request_id, discard_on_noop)), Some(held))
+                    if effects.result != CoreCommandResult::Noop || discard_on_noop =>
+                {
+                    held.discard(request_id)
+                }
+                _ => false,
+            };
         if suppressed_pending_output
             && let Some((request_id, _)) = pending_suppression
             && !effects.retired_requests.contains(&request_id)
@@ -233,6 +323,20 @@ impl RankEngine for SchedulerRank {
             // until the pass completion is observed, so publish the same
             // retirement delta that completion would have carried.
             effects.retired_requests.push(request_id);
+        }
+        // vLLM `launch`: outputs wait for the next pass's launch. When a command
+        // leaves no next pass, the engine loop returns them at once, never
+        // before their pass ended.
+        if self
+            .held_outputs
+            .as_ref()
+            .is_some_and(|held| held.latest.is_some())
+            && !self.launches_next_pass()
+            && let Some(held) = self.held_outputs.as_mut()
+            && let Some((end_ms, outputs)) = held.latest.take()
+        {
+            held.returned
+                .push_back((end_ms.max(context.now_ms), outputs));
         }
         if effects.result != CoreCommandResult::Noop || suppressed_pending_output {
             self.apply_handoff_tracking_update(handoff_update);
@@ -269,19 +373,68 @@ impl RankEngine for SchedulerRank {
             .finish_group_pass(any_rank_prefilled, any_rank_ran_model);
     }
 
+    /// A pass of this rank alone: a one-rank group.
     fn execute_pass(
         &mut self,
         now_ms: f64,
     ) -> Result<RankPass<Self::PassStartEffects, Self::PendingPass>> {
-        let pass = self.core.try_execute_hidden_pass(now_ms)?;
+        let ScheduledPass::Unpriced(work) = self.schedule_pass(now_ms)? else {
+            unreachable!("scheduler ranks leave their passes to the group price");
+        };
+        let iteration = self.price_group_pass(std::slice::from_ref(&work))?;
+        self.resolve_pass(iteration.as_ref())
+    }
+
+    fn schedule_pass(
+        &mut self,
+        now_ms: f64,
+    ) -> Result<ScheduledPass<Self::PassStartEffects, Self::PendingPass>> {
+        let work = self.core.schedule_pass(now_ms)?;
+        self.scheduled_at_ms = Some(now_ms);
+        Ok(ScheduledPass::Unpriced(work))
+    }
+
+    fn idle_pass_work(&self) -> Option<RankWork> {
+        Some(RankWork::idle(self.dp_rank))
+    }
+
+    /// One timing query for the whole group. Providers without iteration
+    /// pricing return `None`, so every rank prices its own phases, as it also
+    /// does under a decode speedup other than 1 and in an all-idle group.
+    fn price_group_pass(&self, ranks: &[RankWork]) -> Result<Option<IterationMs>> {
+        if !self.group_pricing {
+            return Ok(None);
+        }
+        predict_group_iteration_ms(self.timing.as_ref(), ranks)
+            .context("external iteration prediction failed")
+    }
+
+    fn resolve_pass(
+        &mut self,
+        iteration: Option<&IterationMs>,
+    ) -> Result<RankPass<Self::PassStartEffects, Self::PendingPass>> {
+        let started_at_ms = self
+            .scheduled_at_ms
+            .take()
+            .ok_or_else(|| anyhow!("scheduler rank has no scheduled pass to resolve"))?;
+        let pass = self.core.resolve_pass(iteration)?;
         let end_ms = pass.end_ms;
+        let end_without_selection_ms = pass.end_without_selection_ms;
+        let previous_returned_ms = pass.previous_returned_ms;
         let (same_timestamp_retry, start_effects, completion_effects) = split_pass(pass)?;
+        if let Some(held) = self.held_outputs.as_mut()
+            && let Some((previous_end_ms, outputs)) = held.latest.take()
+        {
+            held.returned
+                .push_back((previous_returned_ms.unwrap_or(previous_end_ms), outputs));
+        }
         Ok(RankPass {
             end_ms,
             same_timestamp_retry,
             start_effects,
             pending: PendingPass {
-                started_at_ms: now_ms,
+                started_at_ms,
+                end_without_selection_ms,
                 effects: completion_effects,
             },
         })
@@ -315,8 +468,8 @@ impl RankEngine for SchedulerRank {
         pending.effects.metrics = self.metrics();
         pending.effects.metrics.sglang_cache_hit_tokens = sglang_cache_hit_tokens;
         pending.effects.metrics.sglang_cache_total_tokens = sglang_cache_total_tokens;
-        // Under the SGLang host loop a pass ends when the scheduler thread returns
-        // to its loop, not when its forward does; FPM telemetry wants the forward.
+        // SGLang passes can include preselection write-back waits or end before
+        // their forward under the host loop. FPM telemetry wants the forward itself.
         pending.effects.forward_pass_metrics.duration_ms = self
             .core
             .last_forward_ms()
@@ -327,13 +480,35 @@ impl RankEngine for SchedulerRank {
                     .retain(|_, request_id| *request_id != output.request_id);
             }
         }
+        // vLLM `launch`: the engine loop returns this pass's outputs once it
+        // has launched the next pass, which it forms now if it has work.
+        if self.held_outputs.is_some()
+            && !pending.effects.outputs.is_empty()
+            && self.launches_next_pass()
+            && let Some(held) = self.held_outputs.as_mut()
+        {
+            held.latest = Some((end_ms, std::mem::take(&mut pending.effects.outputs)));
+        }
         Ok(pending.effects)
+    }
+
+    fn idle_telemetry_end_ms(&self, pending: &Self::PendingPass, end_ms: f64) -> f64 {
+        pending.end_without_selection_ms.unwrap_or(end_ms)
     }
 
     fn complete_idle_group_pass(
         &mut self,
         started_at_ms: f64,
         end_ms: f64,
+    ) -> Result<Option<Self::PassCompletionEffects>> {
+        self.complete_idle_group_pass_with_telemetry(started_at_ms, end_ms, end_ms)
+    }
+
+    fn complete_idle_group_pass_with_telemetry(
+        &mut self,
+        started_at_ms: f64,
+        end_ms: f64,
+        telemetry_end_ms: f64,
     ) -> Result<Option<Self::PassCompletionEffects>> {
         self.core.complete_engine_boundary(end_ms);
         let lifecycle_events = self
@@ -348,7 +523,7 @@ impl RankEngine for SchedulerRank {
             kv_events,
             metrics: self.metrics(),
             forward_pass_metrics: ForwardPassMetrics {
-                duration_ms: (end_ms - started_at_ms).max(0.0),
+                duration_ms: (telemetry_end_ms - started_at_ms).max(0.0),
                 ..Default::default()
             },
             ..PassCompletionEffects::default()
@@ -375,7 +550,35 @@ impl RankEngine for SchedulerRank {
     }
 
     fn is_drained(&self) -> bool {
-        self.core.is_drained()
+        self.core.is_drained() && self.held_outputs.as_ref().is_none_or(HeldOutputs::is_empty)
+    }
+
+    fn next_emission_ms(&self) -> Option<f64> {
+        let held = self.held_outputs.as_ref()?;
+        held.returned.front().map(|(at_ms, _)| *at_ms)
+    }
+
+    fn take_due_emissions(&mut self, now_ms: f64) -> Result<Option<Self::PassCompletionEffects>> {
+        let Some(held) = self.held_outputs.as_mut() else {
+            return Ok(None);
+        };
+        let mut outputs = Vec::new();
+        while held
+            .returned
+            .front()
+            .is_some_and(|(at_ms, _)| *at_ms <= now_ms)
+        {
+            let (_, due) = held.returned.pop_front().expect("peeked returned outputs");
+            outputs.extend(due);
+        }
+        if outputs.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(PassCompletionEffects {
+            outputs,
+            metrics: self.metrics(),
+            ..PassCompletionEffects::default()
+        }))
     }
 }
 
@@ -436,14 +639,18 @@ fn core_args(config: &EngineConfig, timing: Arc<dyn TimingModel>) -> MockEngineA
         num_gpu_blocks: config.num_gpu_blocks,
         block_size: config.block_size,
         max_model_len: config.max_model_len,
-        max_num_seqs: Some(config.max_num_seqs),
+        max_num_seqs: (config.backend != Backend::Sglang || config.max_num_seqs != usize::MAX)
+            .then_some(config.max_num_seqs),
         max_num_batched_tokens: Some(config.max_num_batched_tokens),
         prefill_schedule_interval: config.prefill_schedule_interval,
         prefill_decode_interval: config.prefill_decode_interval,
+        max_concurrent_batches: config.max_concurrent_batches(),
+        launch: config.launch,
         enable_prefix_caching: config.enable_prefix_caching,
         enable_chunked_prefill: config.enable_chunked_prefill,
         speedup_ratio: config.speedup_ratio,
         decode_speedup_ratio: config.decode_speedup_ratio,
+        pipeline_fill_passes: config.pipeline_fill_passes,
         worker_type: match config.worker_type {
             WorkerType::Aggregated => CoreWorkerType::Aggregated,
             WorkerType::Prefill => CoreWorkerType::Prefill,
@@ -453,11 +660,12 @@ fn core_args(config: &EngineConfig, timing: Arc<dyn TimingModel>) -> MockEngineA
         aic_nextn: config.aic_nextn,
         aic_nextn_accept_rates: config.aic_nextn_accept_rates.clone(),
         aic_mtp_seed: config.aic_mtp_seed,
+        disable_eagle_block_drop: config.disable_eagle_block_drop,
         kv_transfer_bytes_per_token: config.kv_transfer_bytes_per_token,
         kv_cache_bytes_per_token: config.kv_cache_bytes_per_token,
         kv_cache_groups: config.kv_cache_groups.clone(),
         kv_cache_capacity_bytes: config.kv_cache_capacity_bytes,
-        native_host_offload: config.native_host_offload.clone(),
+        native_host_offload: config.resolved_host_offload(),
         state_cache: config.state_cache,
         prefix_match_unit: config.prefix_match_unit,
         kv_transfer_bandwidth: config.kv_transfer_bandwidth,
@@ -470,6 +678,7 @@ fn core_args(config: &EngineConfig, timing: Arc<dyn TimingModel>) -> MockEngineA
             PreemptionMode::Fifo => CorePreemptionMode::Fifo,
         },
         sglang: Some(SglangArgs {
+            hicache: config.sglang.hicache,
             schedule_policy: Some(
                 match config.sglang.schedule_policy {
                     crate::engine::SglangSchedulePolicy::Fifo => "fifo",
@@ -482,8 +691,15 @@ fn core_args(config: &EngineConfig, timing: Arc<dyn TimingModel>) -> MockEngineA
             chunked_prefill_size: Some(config.sglang.chunked_prefill_size),
             clip_max_new_tokens: Some(config.sglang.clip_max_new_tokens),
             schedule_conservativeness: Some(config.sglang.schedule_conservativeness),
+            scheduler_select_time_ms: config.sglang.scheduler_select_time_ms,
             vlm_cache_bytes: Some(config.sglang.vlm_cache_bytes),
             host_loop: config.sglang.host_loop,
+            disaggregation_decode_enable_radix_cache: config
+                .sglang
+                .disaggregation_decode_enable_radix_cache,
+            num_reserved_decode_tokens: Some(config.sglang.num_reserved_decode_tokens),
+            disaggregation_decode_extra_slots: config.sglang.disaggregation_decode_extra_slots,
+            swa_prefix_tails: config.sglang.swa_prefix_tails,
             frontend: config.frontend.clone(),
         }),
         emit_kv_events: config.emit_kv_events,
@@ -530,6 +746,7 @@ fn core_request(request: Request) -> DirectRequest {
         uuid: Some(request.request_id),
         arrival_timestamp_ms: None,
         session_id: request.session_id,
+        cache_salt: request.cache_salt.filter(|salt| !salt.is_empty()),
         images: request.images,
         kv_hint: request.kv_hint,
     }
@@ -643,6 +860,7 @@ fn split_pass(
         same_timestamp_retry,
         output_signals,
         admissions,
+        g1_prefix_cache_lookup,
         pressure_events,
         lifecycle_events,
         mocker_metrics,
@@ -667,6 +885,7 @@ fn split_pass(
             .collect(),
         pressure_events,
         kv_events: start_kv,
+        g1_prefix_cache_lookup,
     };
     let completion = PassCompletionEffects {
         outputs: output_signals
@@ -719,6 +938,147 @@ mod tests {
     };
 
     #[rstest::rstest]
+    fn cache_salt_rejects_unsupported_backends_before_mutating_request_state(
+        #[values(Backend::Vllm, Backend::Trtllm)] backend: Backend,
+        #[values(WorkerType::Aggregated, WorkerType::Prefill, WorkerType::Decode)]
+        worker_type: WorkerType,
+    ) {
+        let config = EngineConfig {
+            worker_type,
+            num_gpu_blocks: 16,
+            block_size: 4,
+            ..EngineConfig::for_backend(backend)
+        };
+        let mut rank = SchedulerRank::new(
+            RankIdentity {
+                worker_id: 0,
+                dp_rank: 0,
+                dp_size: NonZeroU32::MIN,
+            },
+            &config,
+        )
+        .unwrap();
+        let request_id = Uuid::from_u128(1);
+        let handoff_id = HandoffId::from(Uuid::from_u128(2));
+        let mut request: Request = serde_json::from_value(serde_json::json!({
+            "request_id": request_id,
+            "tokens": [1, 2, 3, 4],
+            "max_output_tokens": 2,
+            "cache_salt": "alpha",
+        }))
+        .unwrap();
+        let command = |request| match worker_type {
+            WorkerType::Aggregated => Command::Submit(request),
+            WorkerType::Prefill => Command::SubmitHandoffPrefill {
+                handoff_id,
+                request,
+            },
+            WorkerType::Decode => Command::ReserveDestination {
+                handoff_id,
+                request,
+            },
+        };
+        let context = CommandContext {
+            now_ms: 0.0,
+            pass_in_flight: false,
+        };
+        let before = rank.metrics();
+        let error = rank
+            .apply_command_effects(command(request.clone()), context, None)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cache_salt is supported only for backend=sglang")
+        );
+        assert_eq!(rank.metrics(), before);
+        assert!(rank.is_drained());
+        assert!(rank.handoff_requests.is_empty());
+        request.cache_salt = Some(String::new());
+        let effects = rank
+            .apply_command_effects(command(request), context, None)
+            .unwrap();
+        let expected = if worker_type == WorkerType::Decode {
+            CommandResult::DestinationAccepted { request_id }
+        } else {
+            CommandResult::Submitted(request_id)
+        };
+        assert_eq!(effects.result, expected);
+    }
+
+    #[rstest::rstest]
+    #[case::unset(serde_json::json!({}), 6)]
+    #[case::zero(serde_json::json!({"disaggregation_decode_extra_slots": 0}), 2)]
+    #[case::explicit(serde_json::json!({"disaggregation_decode_extra_slots": 1}), 3)]
+    fn json_decode_extra_slots_control_destination_admission(
+        #[case] sglang: serde_json::Value,
+        #[case] limit: u128,
+    ) {
+        let config: EngineConfig = serde_json::from_value(serde_json::json!({
+            "backend": "sglang",
+            "worker_type": "decode",
+            "num_gpu_blocks": 16384,
+            "block_size": 1,
+            "max_num_seqs": 2,
+            "sglang": sglang,
+            "timing_model": {"type": "fixed", "prefill_ms": 1.0, "decode_ms": 1.0}
+        }))
+        .unwrap();
+        let mut core = SglangCore::new(core_args(&config, config.built_in_timing_model().unwrap()));
+        for id in 1..=limit + 1 {
+            let handoff_id = HandoffId::from(Uuid::from_u128(id));
+            let effects = core
+                .apply_command_effects(
+                    CoreCommand::ReserveDestination {
+                        handoff_id,
+                        request: DirectRequest {
+                            uuid: Some(Uuid::from_u128(id)),
+                            tokens: vec![id as u32; 8],
+                            max_output_tokens: 1,
+                            ..Default::default()
+                        },
+                    },
+                    true,
+                )
+                .unwrap();
+            assert_eq!(effects.lifecycle_events.len(), usize::from(id <= limit));
+            if id <= limit {
+                core.apply_command(CoreCommand::ActivateDestination { handoff_id })
+                    .unwrap();
+            }
+        }
+        let released = core
+            .apply_command_effects(
+                CoreCommand::CancelDestination {
+                    handoff_id: HandoffId::from(Uuid::from_u128(1)),
+                },
+                true,
+            )
+            .unwrap();
+        assert_eq!(released.lifecycle_events.len(), 1);
+        core.apply_command(CoreCommand::ActivateDestination {
+            handoff_id: HandoffId::from(Uuid::from_u128(limit + 1)),
+        })
+        .unwrap();
+        let mut outputs = 0;
+        let mut now = 0.0;
+        for _ in 0..10 {
+            let pass = core.execute_hidden_pass(now);
+            now = pass.end_ms;
+            outputs += pass
+                .output_signals
+                .iter()
+                .filter(|signal| signal.token_id.is_some())
+                .count();
+            if core.is_drained() {
+                break;
+            }
+        }
+        assert!(core.is_drained());
+        assert_eq!(outputs, limit as usize);
+    }
+
+    #[rstest::rstest]
     fn unsupported_native_images_reject_without_consuming_request_or_handoff_ids(
         #[values(Backend::Vllm, Backend::Trtllm)] backend: Backend,
         #[values(WorkerType::Aggregated, WorkerType::Prefill, WorkerType::Decode)]
@@ -747,6 +1107,7 @@ mod tests {
         let request_id = Uuid::from_u128(1);
         let handoff_id = HandoffId::from(Uuid::from_u128(2));
         let mut request = Request {
+            cache_salt: None,
             request_id,
             tokens: (0..8).collect(),
             max_output_tokens: 1,
@@ -936,6 +1297,7 @@ mod tests {
             let first = Uuid::from_u128(94_001);
             rank.apply_command_effects(
                 Command::Submit(Request {
+                    cache_salt: None,
                     request_id: first,
                     tokens: vec![1, 2, 3, 4],
                     max_output_tokens: 20,
@@ -959,6 +1321,7 @@ mod tests {
             let second = Uuid::from_u128(94_002);
             rank.apply_command_effects(
                 Command::Submit(Request {
+                    cache_salt: None,
                     request_id: second,
                     tokens: (10..22).collect(),
                     max_output_tokens: 1,
@@ -1029,8 +1392,8 @@ mod tests {
         rank_for_worker(WorkerType::Aggregated)
     }
 
-    fn rank_for_worker(worker_type: WorkerType) -> SchedulerRank {
-        let config = EngineConfig {
+    fn rank_config(worker_type: WorkerType) -> EngineConfig {
+        EngineConfig {
             worker_type,
             num_gpu_blocks: 8,
             block_size: 4,
@@ -1042,7 +1405,11 @@ mod tests {
                 decode_ms: 10.0,
             },
             ..EngineConfig::default()
-        };
+        }
+    }
+
+    fn rank_for_worker(worker_type: WorkerType) -> SchedulerRank {
+        let config = rank_config(worker_type);
         SchedulerRank::new(
             RankIdentity {
                 worker_id: 1,
@@ -1101,6 +1468,7 @@ mod tests {
         let effects = rank
             .apply_command_effects(
                 Command::Submit(Request {
+                    cache_salt: None,
                     request_id,
                     tokens,
                     max_output_tokens: 0,
@@ -1148,6 +1516,7 @@ mod tests {
                 Command::SubmitHandoffPrefill {
                     handoff_id,
                     request: Request {
+                        cache_salt: None,
                         request_id: restore_id,
                         tokens: vec![1, 2, 3, 4],
                         max_output_tokens: 0,
@@ -1179,6 +1548,7 @@ mod tests {
         let effects = rank
             .apply_command_effects(
                 Command::Submit(Request {
+                    cache_salt: None,
                     request_id,
                     tokens: vec![1, 2, 3, 4],
                     max_output_tokens: output_token_ids.len(),
@@ -1230,6 +1600,184 @@ mod tests {
         assert!(effects.suppressed_pending_output);
         assert_eq!(effects.retired_requests, vec![request_id]);
         assert!(pending.effects.outputs.is_empty());
+    }
+
+    #[test]
+    fn a_cancel_drops_outputs_vllm_has_not_returned() {
+        // With `launch`, the first pass's output waits in the rank for the
+        // next pass's launch; cancelling the request drops it.
+        let request_id = Uuid::from_u128(90_002);
+        let config = EngineConfig {
+            launch: Some(crate::engine::PassLaunchConfig {
+                decode_ms: 1.0,
+                piecewise_ms: 1.0,
+                eager_ms: 1.0,
+                max_cudagraph_capture_size: 16,
+                eager_queue_fraction: 0.0,
+            }),
+            ..rank_config(WorkerType::Aggregated)
+        };
+        let mut rank = SchedulerRank::new(
+            RankIdentity {
+                worker_id: 1,
+                dp_rank: 0,
+                dp_size: NonZeroU32::MIN,
+            },
+            &config,
+        )
+        .unwrap();
+        let pending = start_request_pass(&mut rank, request_id, vec![5, 6]);
+        assert!(rank.complete_pass(pending, 0.0).unwrap().outputs.is_empty());
+        let effects = rank
+            .apply_command_effects(
+                Command::CancelRequest {
+                    request_id,
+                    discard_pending_output: false,
+                },
+                CommandContext {
+                    now_ms: 0.0,
+                    pass_in_flight: false,
+                },
+                None,
+            )
+            .unwrap();
+        assert!(effects.suppressed_pending_output);
+        assert!(rank.is_drained());
+    }
+
+    /// The case from review: fixed 100/10 ms passes, launches of 150 ms, and
+    /// requests A, B and C with 1, 2 and 4 output tokens (and D with 4 when
+    /// `with_d`). Runs two passes: A's output leaves at 110 ms, and B's final
+    /// output then waits for the next pass's launch.
+    fn hold_b_final_output(with_d: bool) -> (SchedulerRank, [Uuid; 3]) {
+        let [a, b, c, d] = [1, 2, 3, 4].map(|n| Uuid::from_u128(96_000 + n));
+        let config = EngineConfig {
+            num_gpu_blocks: 16,
+            max_num_seqs: 4,
+            timing_model: TimingModelConfig::Fixed {
+                prefill_ms: 100.0,
+                decode_ms: 10.0,
+            },
+            launch: Some(crate::engine::PassLaunchConfig {
+                decode_ms: 150.0,
+                piecewise_ms: 1.0,
+                eager_ms: 150.0,
+                max_cudagraph_capture_size: 16,
+                eager_queue_fraction: 0.0,
+            }),
+            ..rank_config(WorkerType::Aggregated)
+        };
+        let mut rank = SchedulerRank::new(
+            RankIdentity {
+                worker_id: 1,
+                dp_rank: 0,
+                dp_size: NonZeroU32::MIN,
+            },
+            &config,
+        )
+        .unwrap();
+        let mut requests = vec![(a, vec![5]), (b, vec![5, 6]), (c, vec![5, 6, 7, 8])];
+        if with_d {
+            requests.push((d, vec![5, 6, 7, 8]));
+        }
+        for (request_id, outputs) in requests {
+            let submitted = rank
+                .apply_command_effects(
+                    Command::Submit(Request {
+                        cache_salt: None,
+                        request_id,
+                        tokens: vec![1, 2, 3, 4],
+                        max_output_tokens: outputs.len(),
+                        output_token_ids: Some(outputs),
+                        session_id: None,
+                        images: Vec::new(),
+                        kv_hint: None,
+                    }),
+                    CommandContext {
+                        now_ms: 0.0,
+                        pass_in_flight: false,
+                    },
+                    None,
+                )
+                .unwrap();
+            assert_eq!(submitted.result, CommandResult::Submitted(request_id));
+        }
+        let first = rank.execute_pass(0.0).unwrap();
+        assert_eq!(first.end_ms, 100.0);
+        assert!(
+            rank.complete_pass(first.pending, 100.0)
+                .unwrap()
+                .outputs
+                .is_empty()
+        );
+        let second = rank.execute_pass(100.0).unwrap();
+        assert_eq!(second.end_ms, 110.0);
+        assert_eq!(rank.next_emission_ms(), Some(110.0));
+        let returned = rank.take_due_emissions(110.0).unwrap().unwrap().outputs;
+        assert!(
+            returned
+                .iter()
+                .any(|output| output.request_id == a && output.completed)
+        );
+        assert!(
+            rank.complete_pass(second.pending, 110.0)
+                .unwrap()
+                .outputs
+                .is_empty()
+        );
+        assert_eq!(rank.next_emission_ms(), None);
+        (rank, [a, b, c])
+    }
+
+    fn cancel(rank: &mut SchedulerRank, request_id: Uuid, now_ms: f64) -> bool {
+        rank.apply_command_effects(
+            Command::CancelRequest {
+                request_id,
+                discard_pending_output: false,
+            },
+            CommandContext {
+                now_ms,
+                pass_in_flight: false,
+            },
+            None,
+        )
+        .unwrap()
+        .suppressed_pending_output
+    }
+
+    #[test]
+    fn a_cancel_that_leaves_no_next_pass_returns_the_held_outputs() {
+        // Cancelling C leaves nothing to launch, so vLLM returns B's final
+        // output at once instead of holding it for a launch that never comes.
+        let (mut rank, [_, b, c]) = hold_b_final_output(false);
+        assert!(cancel(&mut rank, c, 110.0));
+        assert_eq!(rank.next_emission_ms(), Some(110.0));
+        assert!(!rank.is_ready());
+        assert!(!rank.is_drained());
+        let returned = rank.take_due_emissions(110.0).unwrap().unwrap().outputs;
+        assert_eq!(returned.len(), 1);
+        assert_eq!(returned[0].request_id, b);
+        assert!(returned[0].completed);
+        assert!(rank.is_drained());
+        assert_eq!(rank.next_emission_ms(), None);
+    }
+
+    #[test]
+    fn a_cancel_that_leaves_a_next_pass_keeps_the_held_outputs_for_its_launch() {
+        // D still runs after C is cancelled, so B's final output waits for the
+        // launch of D's next pass, which ends with that pass at 120 ms.
+        let (mut rank, [_, b, c]) = hold_b_final_output(true);
+        assert!(cancel(&mut rank, c, 110.0));
+        assert_eq!(rank.next_emission_ms(), None);
+        rank.execute_pass(110.0).unwrap();
+        assert_eq!(rank.next_emission_ms(), Some(120.0));
+        let returned = rank.take_due_emissions(120.0).unwrap().unwrap().outputs;
+        assert!(
+            returned
+                .iter()
+                .any(|output| output.request_id == b && output.completed)
+        );
+        assert!(returned.iter().all(|output| output.request_id != c));
     }
 
     #[test]
@@ -1299,6 +1847,7 @@ mod tests {
         let submission = rank
             .apply_command_effects(
                 Command::Submit(Request {
+                    cache_salt: None,
                     request_id: busy_id,
                     tokens: vec![21, 22, 23, 24],
                     max_output_tokens: 0,
@@ -1323,6 +1872,7 @@ mod tests {
         let arrival = rank
             .apply_command_effects(
                 Command::Submit(Request {
+                    cache_salt: None,
                     request_id: arrival_id,
                     tokens: vec![31, 32, 33, 34],
                     max_output_tokens: 0,
@@ -1383,6 +1933,7 @@ mod tests {
         let error = rank
             .apply_command_effects(
                 Command::Submit(Request {
+                    cache_salt: None,
                     request_id: restore_id,
                     tokens: vec![41, 42, 43, 44],
                     max_output_tokens: 0,
@@ -1442,6 +1993,7 @@ mod tests {
             let effects = rank
                 .apply_command_effects(
                     Command::Submit(Request {
+                        cache_salt: None,
                         request_id: *request_id,
                         tokens: tokens.clone(),
                         max_output_tokens: 0,
@@ -1482,6 +2034,7 @@ mod tests {
             let busy_id = Uuid::from_u128(94_000 + u128::from(cancel_source));
             rank.apply_command_effects(
                 Command::Submit(Request {
+                    cache_salt: None,
                     request_id: busy_id,
                     tokens: vec![21, 22, 23, 24],
                     max_output_tokens: 0,
@@ -1576,6 +2129,7 @@ mod tests {
                 Command::ReserveDestination {
                     handoff_id,
                     request: Request {
+                        cache_salt: None,
                         request_id,
                         tokens: vec![1, 2, 3, 4],
                         max_output_tokens: 1,
@@ -1647,6 +2201,7 @@ mod tests {
             let effects = rank
                 .apply_command_effects(
                     Command::Submit(Request {
+                        cache_salt: None,
                         request_id,
                         tokens,
                         max_output_tokens: 8,
@@ -1705,6 +2260,7 @@ mod tests {
                 Command::SubmitHandoffPrefill {
                     handoff_id,
                     request: Request {
+                        cache_salt: None,
                         request_id,
                         tokens: vec![1, 2, 3, 4],
                         max_output_tokens: 1,
@@ -1800,6 +2356,7 @@ mod tests {
                 Command::ReserveDestination {
                     handoff_id: historical_handoff,
                     request: Request {
+                        cache_salt: None,
                         images: Vec::new(),
                         request_id: history,
                         tokens: (1..=9).collect(),
@@ -1851,6 +2408,7 @@ mod tests {
                 Command::SubmitHandoffPrefill {
                     handoff_id: consumer_handoff,
                     request: Request {
+                        cache_salt: None,
                         images: Vec::new(),
                         request_id: consumer,
                         tokens: (1..=9).collect(),

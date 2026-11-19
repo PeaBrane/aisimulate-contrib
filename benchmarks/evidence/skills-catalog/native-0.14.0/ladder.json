@@ -1,0 +1,56 @@
+{
+  "config": "/tmp/pr937-release-validation-m_jcw8cc/ladder-input.yaml",
+  "hardware": "b300_sxm",
+  "offered_rps": 1.0,
+  "min_goodput_rps": 0.9,
+  "arrival_window_s": 300.0,
+  "warnings": [],
+  "probe": {
+    "vllm": {
+      "state": "covered",
+      "message": ""
+    },
+    "sglang": {
+      "state": "covered",
+      "message": ""
+    }
+  },
+  "steps": [
+    {
+      "phase": "ladder",
+      "budget": 1,
+      "exit": 0,
+      "status": "qualified",
+      "detail": "",
+      "output_dir": "/tmp/pr937-release-validation-m_jcw8cc/ladder/ladder-b1",
+      "log_file": "/tmp/pr937-release-validation-m_jcw8cc/ladder/ladder-b1.aisim.log",
+      "fallback_warnings": [
+        "Sweeper agg: evaluating:   0%|          | 0/2 [00:02<?, ?trial/s]WARNING:aisim_core.sdk.perf_database:Loading low-fidelity fallback rows for mla_bmm_perf.parquet from /tmp/pr937-release-validation-m_jcw8cc/runtime/lib/python3.12/site-packages/aisim_core/systems/data/b300_sxm/mla_bmm/trtllm/1.3.0rc29/mla_bmm_perf.parquet. Queries returning these rows are framework-implicit and may differ from real ",
+        "WARNING:aisim_core.sdk.perf_database:Loading low-fidelity fallback rows for mla_bmm_perf.parquet from /tmp/pr937-release-validation-m_jcw8cc/runtime/lib/python3.12/site-packages/aisim_core/systems/data/b300_sxm/mla_bmm/trtllm/1.3.0rc20/mla_bmm_perf.parquet. Queries returning these rows are framework-implicit and may differ from real backend behavior.",
+        "Loading low-fidelity fallback rows for mla_bmm_perf.parquet from /tmp/pr937-release-validation-m_jcw8cc/runtime/lib/python3.12/site-packages/aisim_core/systems/data/b300_sxm/mla_bmm/trtllm/1.3.0rc29/mla_bmm_perf.parquet. Queries returning these rows are framework-implicit and may differ from real backend behavior.",
+        "Loading low-fidelity fallback rows for mla_bmm_perf.parquet from /tmp/pr937-release-validation-m_jcw8cc/runtime/lib/python3.12/site-packages/aisim_core/systems/data/b300_sxm/mla_bmm/trtllm/1.3.0rc20/mla_bmm_perf.parquet. Queries returning these rows are framework-implicit and may differ from real backend behavior."
+      ],
+      "counts": {
+        "cache_hits": 0,
+        "evaluated": 2,
+        "failed": 0,
+        "feasible": 2,
+        "infeasible": 0,
+        "resource_limited": 0,
+        "timed_out": 0,
+        "unsupported": 0
+      },
+      "used_gpus": 1,
+      "config_file": "/tmp/pr937-release-validation-m_jcw8cc/ladder/ladder-b1/recommendations/0001.yaml"
+    }
+  ],
+  "answer": {
+    "statement": "smallest qualifying configuration found in the tested search space",
+    "used_gpus": 1,
+    "budget": 1,
+    "phase": "ladder",
+    "status": "qualified",
+    "output_dir": "/tmp/pr937-release-validation-m_jcw8cc/ladder/ladder-b1",
+    "config_file": "/tmp/pr937-release-validation-m_jcw8cc/ladder/ladder-b1/recommendations/0001.yaml"
+  }
+}

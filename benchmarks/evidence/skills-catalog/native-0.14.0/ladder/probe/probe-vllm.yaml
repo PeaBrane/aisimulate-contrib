@@ -1,0 +1,22 @@
+traffic:
+  source:
+    type: synthetic
+    input_tokens: 1024
+    output_tokens: 128
+  load:
+    type: concurrency
+    concurrency: 1
+  stop:
+    requests: 1
+engine:
+  mode: aggregated
+  model: Qwen/Qwen3.5-35B-A3B
+  hardware: b300_sxm
+  backend: vllm
+  workers:
+    aggregated: {}
+  context_length: 2048
+execution:
+  resources:
+    memory_limit_gb: 8
+    cpu_limit: 4

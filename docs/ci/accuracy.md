@@ -36,7 +36,7 @@ A branch matrix runs at most two campaigns
 at once, with separate wheels, artifacts, and provenance. Main reuses a qualified
 amd64 wheel for its exact SHA when available, even while nightly staging waits for
 approval; otherwise it builds one. Each release builds its own wheel. Both the
-AISimulate replay and bundled legacy AIC baseline use their branch's wheel. Manual
+AISim replay and bundled legacy AIC baseline use their branch's wheel. Manual
 runs evaluate one explicit `main` or `release/*` SHA from the trusted main workflow.
 
 Campaign jobs use the configured `CI_JOB_CONTAINER_IMAGE`, Python 3.12, and
@@ -44,7 +44,7 @@ Campaign jobs use the configured `CI_JOB_CONTAINER_IMAGE`, Python 3.12, and
 snapshot manifest and observation Parquet files at the pinned commit. It verifies
 artifact sizes, hashes, schemas and identities before producing local tables.
 The evaluated wheel's baseline CLI and config adapter are selected from its own
-package layout: `aiconfigurator.*` on 0.12 releases or `aisimulate.*` after the
+package layout: `aiconfigurator.*` on 0.12 releases or `aisim.*` after the
 namespace migration. Ambiguous wheels with both baseline APIs are rejected.
 Baseline provenance records the selected API, adapter, and actual console entry point;
 the public summary retains that entry point. Wheel byte checks and imports run before downloading measurements.
@@ -64,7 +64,7 @@ retain resolved source evidence per shard. Actual concurrency depends on runner
 capacity (up to eight shard jobs across the two admitted branches).
 
 To inspect an encrypted artifact locally, set `HF_TOKEN` to the token used by
-that run, plus `GITHUB_REPOSITORY=ai-dynamo/aisimulate` and its `GITHUB_RUN_ID`.
+that run, plus `GITHUB_REPOSITORY=ai-dynamo/aisim` and its `GITHUB_RUN_ID`.
 Run `python scripts/e2e_accuracy/private_artifacts.py open DOWNLOADED_DIR OUTPUT_DIR`
 in the campaign environment. Token rotation requires a new complete workflow run;
 old ciphertext cannot be opened with the replacement token.
@@ -79,6 +79,12 @@ incomplete campaigns cannot publish. A release selector may still show a histori
 snapshot until that release has a qualified campaign. See the
 [accuracy campaign contract](../../pages/e2e-accuracy/README.md)
 for pinned scheduler settings, measurement selection, and provenance.
+
+AgentX snapshots that lack silicon receipts required by the current contract
+are rejected and shown as failed refreshes. Pages can still deploy the other
+qualified results and documentation. Missing measured speculative acceptance
+continues to fail AgentX evaluation; no default acceptance or partial cohort
+can qualify as a complete campaign.
 
 ### Weekly accuracy Slack report
 
@@ -102,6 +108,12 @@ and publishes successful branch results independently; failed refreshes retain
 the prior qualified result. Accuracy is advisory, outside PR prediction campaigns
 and release staging gates. See [FPM details](../../pages/fpm-accuracy/README.md).
 
+Each configuration runs in a fresh worker process so native estimator and
+training state is released between configurations. A lost worker or an early
+dependency exit fails the campaign; partial results cannot qualify. Evaluators
+use the import namespaces and project layout shipped by each exact release wheel,
+including releases that predate the AISim package rename.
+
 Manual dispatch accepts optional `hf_revision`, a full 40-character dataset commit.
 Use it to evaluate a migrated dataset branch with compatible preview consumers
 before promoting either change to main. Scheduled runs continue to resolve HF main.
@@ -121,7 +133,7 @@ system. The command imports that installed native runtime; it must not prepend
 the source-only application package to Python's import path:
 
 ```bash
-python python/aisimulate/tools/support_matrix/generate_fpe_support_matrix.py \
+python python/aisim/tools/support_matrix/generate_fpe_support_matrix.py \
   --output-dir fpe-support-matrix/b200_sxm \
   --system b200_sxm \
   --forward-model op_level \
@@ -132,15 +144,15 @@ After all system shards finish, build the split CSV files consumed by the
 interactive page:
 
 ```bash
-python python/aisimulate/tools/support_matrix/build_fpe_support_matrix.py \
+python python/aisim/tools/support_matrix/build_fpe_support_matrix.py \
   fpe-support-matrix \
-  --output-dir python/aisimulate/src/aisimulate_core/systems/fpe_support_matrix
+  --output-dir python/aisim/src/aisim_core/systems/fpe_support_matrix
 ```
 
 Use filters and a deterministic topology cap for a focused smoke run:
 
 ```bash
-python python/aisimulate/tools/support_matrix/generate_fpe_support_matrix.py \
+python python/aisim/tools/support_matrix/generate_fpe_support_matrix.py \
   --output-dir fpe-support-matrix-smoke \
   --model Qwen/Qwen3-8B \
   --system b200_sxm \
@@ -293,15 +305,60 @@ The page links to the CI run and shows both tested source and probe tooling.
 
 To reproduce a release result, check out the recorded tooling commit at the
 workspace root and the recorded release source under `release-source/`.
-Download the run's `fpe-release-wheel-<version>` artifact into the workspace (preserving
-its `fpe-release-wheel/` directory and `fpe-release-shards.json`), install the
-release's locked environment and exact wheel as in the workflow. The matrix's
-per-cell command uses `release-source/python/aisimulate/.venv/bin/python`
+For a local restore, set `FPE_RELEASE` to the recorded release version,
+`FPE_SOURCE_SHA` to its full release source SHA, `FPE_TOOLING_SHA` to the full
+tooling SHA, and `FPE_RUN_ID` to the producing **Release branch nightly CI** run ID
+(not a local retry or a later consumer run). Obtain `WHEEL_STORAGE_URL` and
+`WHEEL_STORAGE_REPO` from that run's `automated-release` environment
+configuration, and supply an authorized read credential as `ARTIFACTORY_TOKEN`
+through your local secret manager or environment. Authenticate `gh` with access
+to the producing run; the GitHub token and Artifactory token are separate.
+
+Run the following from the tooling checkout root. It downloads the run's
+`fpe-release-wheel-<version>-manifest` Actions artifact, which contains only
+`wheel-manifest.json`, then invokes the transfer script directly:
+
+```bash
+set -euo pipefail
+
+gh run download "${FPE_RUN_ID:?}" --repo ai-dynamo/aisim \
+  --name "fpe-release-wheel-${FPE_RELEASE:?}-manifest" --dir release-wheel-manifest
+
+GITHUB_REPOSITORY=ai-dynamo/aisim \
+GITHUB_REPOSITORY_ID="$(gh api repos/ai-dynamo/aisim --jq .id)" \
+GITHUB_SHA="${FPE_TOOLING_SHA:?}" \
+GITHUB_RUN_ID="${FPE_RUN_ID:?}" \
+STORAGE_MODE=download \
+STORAGE_SCOPE=official \
+STORAGE_PR_NUMBER='' \
+STORAGE_NAME="fpe-release-wheel-${FPE_RELEASE:?}" \
+STORAGE_PATH=. \
+STORAGE_URL="${WHEEL_STORAGE_URL:?}" \
+STORAGE_REPO="${WHEEL_STORAGE_REPO:?}" \
+STORAGE_TOKEN="${ARTIFACTORY_TOKEN:?}" \
+STORAGE_RUN_ID="${FPE_RUN_ID:?}" \
+STORAGE_SOURCE_SHA="${FPE_SOURCE_SHA:?}" \
+STORAGE_ARCHITECTURE=amd64 \
+STORAGE_MANIFEST=release-wheel-manifest/wheel-manifest.json \
+python3 .github/actions/wheel-storage/transfer.py
+```
+
+The script from the recorded tooling commit restores `fpe-release-wheel/`
+(including the wheel and its provenance), `fpe-release-shards.json`, and
+`fpe-release-probes.json` into the workspace. It binds the release source,
+tooling commit, producer run, repository, and `amd64` architecture, reads the
+producer attempt from the manifest, and verifies each object's size and SHA-256
+before replacing local files. No `GITHUB_RUN_ATTEMPT` is needed for a download.
+Install the release's locked environment and exact restored wheel as in the
+workflow. The matrix's per-cell command uses the selected release source project's
+`.venv/bin/python` (`release-source/python/aisim` or `release-source/python/aisimulate`)
 directly to run the verified release wrapper with the recorded source, tooling,
 and branch. Each invocation requires a fresh `release-probe-harness/` directory;
 remove only that generated directory between reproductions. Raw shard reports
-and the wheel are retained for seven
-days; the smaller qualified web dataset is retained for 90 days.
+remain Actions artifacts for seven days, as does the completion manifest.
+Configure Artifactory retention for the handoff payload to at least seven days;
+the wheel payload is not retained in Actions. The smaller qualified web dataset
+is retained for 90 days.
 
 The deployed `data/fpe-support-matrix/branches.json` catalog lists available
 and unavailable branches. Main retains the existing data path, and release
@@ -378,7 +435,7 @@ the end of the main message.
 
 The E2E table has six columns: Branch, Overall, vLLM, SGLang, TRT-LLM, Coverage.
 Each accuracy cell is **TPOT%/TTFT% MAPE** (for example `24.32%/43.67%`)
-for AISimulate, not legacy AIC.
+for AISim, not legacy AIC.
 Main-message detail tables independently group by model and by GPU, within each branch,
 combining frameworks. They average successful point errors directly; they do
 not average already-aggregated MAPEs. Coverage is predicted / eligible points,
@@ -395,7 +452,7 @@ For each branch:
   evidence during this search. Without one, explicitly report an initial baseline.
 - Require identical measurement revision/content and evaluation-rule fingerprints.
   The rule fingerprint covers evaluator source and its branch workflow at the
-  producer revision, not the evaluated AISimulate package revision. The FPM
+  producer revision, not the evaluated AISim package revision. The FPM
   fingerprint includes `scripts/notifications/accuracy_digest.py`, which supplies its point
   codec. A change
   establishes a new baseline and reports comparison unavailable, not recovery.
@@ -429,7 +486,7 @@ GitHub Actions runs the notifier; the Slack app supplies its bot identity. No
 server, Event Subscriptions, Socket Mode, or slash commands are needed.
 
 At https://api.slack.com/apps, choose **Create New App > From scratch**, name it
-`AISimulate Daily`, and select the workspace containing the daily channel.
+`AISim Daily`, and select the workspace containing the daily channel.
 Under **OAuth & Permissions > Bot Token Scopes**, add:
 
 - `chat:write` to post the main message and replies.
@@ -442,7 +499,7 @@ Click **Install to Workspace** (or request workspace approval), then copy the
 installed app, reinstall it to apply the new permissions.
 
 In **#swdl-dynamo-aisim-daily**, open **Channel details > Integrations > Add apps**
-and add `AISimulate Daily`. Store its bot token only as repository
+and add `AISim Daily`. Store its bot token only as repository
 secret `SLACK_ACCURACY_BOT_TOKEN`. Configure repository variables:
 
 | Variable | Value |

@@ -5,15 +5,15 @@ SPDX-License-Identifier: Apache-2.0
 
 # Recommendation output ABI
 
-[`output_adapter.py`](../../python/aisimulate/src/aisimulate/output_adapter.py)
+[`output_adapter.py`](../../python/aisim/src/aisim/output_adapter.py)
 defines `RecommendationOutputAdapter` and `OUTPUT_ADAPTER_API_VERSION = 1`.
 An output adapter adds artifacts or live observations to a recommendation;
 it does not change replay, candidate scores or saved prediction inputs.
 
 ## Identity and required writer
 
-The entry-point group is `aisimulate.output_adapters`. A selected `--output`
-name also identifies its top-level configuration section. AISimulate extracts
+The entry-point group is `aisim.output_adapters`. A selected `--output`
+name also identifies its top-level configuration section. AISim extracts
 explicitly selected output sections before simulation-schema validation.
 An adapter declares the same `name`, integer `api_version = 1`, and:
 
@@ -55,6 +55,9 @@ receive a deep copy of their event data, and every callback executes
 synchronously on the search path. Return promptly; failure aborts the
 recommendation through `OutputAdapterExecutionError`. A subscription returning
 another type is invalid.
+`on_candidate` receives records in candidate-ledger order: each batch's
+pre-replay rejections, then its replays in suggestion order, whichever parallel
+replay finishes first.
 Callbacks and final `write()` may run on different adapter instances, so their
 contract does not provide shared in-memory state.
 
