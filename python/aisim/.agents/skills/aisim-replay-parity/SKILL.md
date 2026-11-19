@@ -28,7 +28,8 @@ same-timestamp event-only progress scenario. Validate that concern with a focuse
 when a change specifically affects replay liveness or same-time settlement.
 
 Before changing or qualifying replay behavior, read
-`crates/core/src/replay/README.md` and `crates/core/src/replay/CLAUDE.md`.
+the [replay implementation guide](../../../../../crates/core/src/replay/README.md)
+and [replay agent instructions](../../../../../crates/core/src/replay/AGENTS.md).
 
 ## Required inputs
 
