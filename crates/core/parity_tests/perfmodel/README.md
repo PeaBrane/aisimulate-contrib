@@ -220,7 +220,7 @@ These are prediction-regression baselines, not whole-model silicon validation.
 
 `MOEModel` (Mixtral, GPT-OSS, Qwen2/Qwen3-MoE, MiniMax-M2) now emits
 `context_logits_gemm`, the prefill LM-head projection every other family
-already had. The selective refresh from
+already had. The original selective refresh from
 `fdd84a8e9377dab2547e171f9ff126769fd51b1f` covers 21 engine-step records and
 six per-op cases. No compiled-engine reference moved outside its tolerance.
 
@@ -232,6 +232,38 @@ prefill-bearing metrics increase by 0.020 to 0.084 ms. Decode-only metrics are
 unchanged. MoE records compared at the 1% tolerance still pass and were not
 refreshed. The refreshed records are exactly the `post_freeze_pins` entries
 that name the commit above, each passed to `pin_goldens.py --refresh`.
+
+After merging main at `44447963d93cca0709d670b6d501a9a987922bb1`, the same
+21 engine-step and six per-op records were regenerated from
+`57c934b78553af6c489eb7d29938bfd7ad4ed7a0` with `pin_goldens.py --refresh`.
+Their keys are identified by that revision in `post_freeze_pins`. This retains
+main's newer tables, hybrid transfer behavior, and all unrelated golden records.
+The new per-op heads cost 0.026997 to 0.028902 ms; every other per-op field,
+including all generation entries, is unchanged. Updated prefill-bearing
+engine metrics increase by 0.020000 to 0.085876 ms. For example:
+
+| Case | Main static context (ms) | With head (ms) | Static generation (ms), unchanged |
+| --- | ---: | ---: | ---: |
+| MiniMax-M2.5, B200 empirical | 22.201 | 22.227 | 8.172 |
+| MiniMax-M2.5 NVFP4, H200 cross-profile | 72.467 | 72.508 | 8.661 |
+| Qwen3-235B, B200 cross-profile | 24.310 | 24.337 | 280.612 |
+| Qwen3-235B, B200 cross-quant | 91.047 | 91.074 | 13.457 |
+
+The causal control uses the same release wheel and data, wrapping
+`MOEModel.__init__` to remove only `context_logits_gemm` from `context_ops`
+after construction. All 27 control records reproduce main's goldens within
+1e-10 relative tolerance. Restoring the head produces the narrow diff above;
+static generation and disaggregated TPOT remain unchanged. These comparisons
+are numerical regression evidence, not measured serving accuracy.
+
+Main also replaced the Python AFD session and partition API with native AFD
+pool composition. The migrated regressions check that the head occurs once in
+the A-pool suffix, never in the F pool or repeated layer templates, and compare
+native context/decode evaluation with independent per-request GEMM shapes.
+Native AFD already supplied a missing prefill head from decode, so this change
+does not require refreshing its separate AFD goldens. Host work adds one existing
+GEMM query per ordinary context pass; it is not multiplied by the layer count
+and introduces no cache or additional preparation pass.
 
 ### B200 SGLang dense-prefix correction in PR #303
 
