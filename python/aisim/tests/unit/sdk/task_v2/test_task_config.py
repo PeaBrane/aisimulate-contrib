@@ -1895,6 +1895,101 @@ def test_run_single_agg_calls_predict_agg_worker_with_fixed_point(monkeypatch):
     assert captured["system_spec"] is loaded_spec
 
 
+@pytest.mark.parametrize("missing_role", ["agg", "prefill", "decode", "both"])
+def test_run_single_epd_withholds_absent_worker_power_and_preserves_latency(monkeypatch, missing_role):
+    from unittest.mock import MagicMock
+
+    from aisim.sdk import predict, sweep
+
+    serving_mode = "agg" if missing_role == "agg" else "disagg"
+    worker = {
+        "model": "m",
+        "isl": 4000,
+        "osl": 500,
+        "prefix": 0,
+        "concurrency": 1,
+        "bs": 1,
+        "global_bs": 1,
+        "tp": 4,
+        "pp": 1,
+        "dp": 1,
+        "moe_tp": 1,
+        "moe_ep": 1,
+        "parallel": "tp4pp1dp1",
+        "ttft": 80.0,
+        "tpot": 0.0,
+        "seq/s": 10.0,
+        "tokens/s/user": 0.0,
+        "gemm": "fp8",
+        "kvcache": "fp8",
+        "fmha": "fp8",
+        "moe": "fp8",
+        "comm": "half",
+        "memory": 12.3,
+        "backend": "trtllm",
+        "version": "1.3.0",
+        "system": "h200_sxm",
+        "power_w": 500.0,
+    }
+    rows = {
+        "agg": dict(
+            worker,
+            tpot=25.0,
+            request_latency=80.0 + 25.0 * 499,
+            **{"tokens/s": 5000.0, "tokens/s/gpu": 1250.0, "num_total_gpus": 4},
+        ),
+        "prefill": dict(worker),
+        "decode": dict(worker, ttft=0.0, tpot=25.0, **{"seq/s": 5.0, "tokens/s/user": 40.0}),
+    }
+
+    def summary(**kwargs):
+        return _build_fake_summary(result_dict=dict(rows[kwargs.get("role", "agg")]))
+
+    monkeypatch.setattr("aisim.sdk.perf_database.get_database_view", lambda *a, **kw: MagicMock())
+    monkeypatch.setattr("aisim.sdk.backends.factory.get_backend", lambda *a, **kw: MagicMock())
+    monkeypatch.setattr("aisim.sdk.models.get_model", lambda *a, **kw: MagicMock())
+    monkeypatch.setattr(predict, "predict_agg_worker", summary)
+    monkeypatch.setattr(predict, "predict_disagg_worker", summary)
+    monkeypatch.setattr(
+        sweep,
+        "_get_encoder_worker_candidates",
+        lambda **kw: [
+            {
+                "encoder_latency": 50.0,
+                "seq/s": 80.0,
+                "num_total_gpus": 1,
+                "tp": 1,
+                "bs": 1,
+                "memory": 1.0,
+                "power_w": 200.0,
+                "power_coverage": 1.0,
+            }
+        ],
+    )
+    identity = {
+        "model_path": "Qwen/Qwen3-VL-8B-Instruct",
+        "system_name": "h200_sxm",
+        "backend_name": "sglang",
+    }
+    if serving_mode == "disagg":
+        identity = {f"{role}_{key}": value for role in ("prefill", "decode") for key, value in identity.items()}
+    task = Task(serving_mode=serving_mode, enable_epd=True, **identity)
+
+    def evaluate():
+        if serving_mode == "agg":
+            return task.run_single_agg(tp=4, batch_size=1, encoder_tp=1)
+        return task.run_single_disagg(prefill_tp=4, decode_tp=2, decode_batch_size=64, encoder_tp=1)
+
+    powered = evaluate()
+    assert powered["power_w"] > 0
+    for role, row in rows.items():
+        if missing_role in (role, "both"):
+            del row["power_w"]
+    withheld = evaluate()
+    assert withheld["power_w"] is None
+    assert {k: v for k, v in powered.items() if k != "power_w"} == {k: v for k, v in withheld.items() if k != "power_w"}
+
+
 def test_run_single_agg_rejects_disagg_task():
     t = Task(
         serving_mode="disagg",

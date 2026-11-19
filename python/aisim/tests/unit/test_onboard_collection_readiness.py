@@ -31,6 +31,55 @@ def _read(case):
     return assess_readiness(case["request"], case["root"], case["checkpoint"].parent)
 
 
+@pytest.mark.parametrize(
+    "quality_case", [{"measure_power": False}, {"measure_power": True}], indirect=True, ids=["legacy", "powered"]
+)
+@pytest.mark.parametrize("bound", [False, True], ids=["discovered", "bound"])
+def test_readiness_rejects_measure_power_mismatch(quality_case, monkeypatch, bound):
+    case = quality_case
+    request = case["request"]
+    saved_options = json.loads((case["campaign"] / "collection-plan.json").read_text())["options"]
+    if request.collection.measure_power:
+        assert saved_options["measure_power"] is True
+    else:
+        # The historical frozen payload omits the option and loads as False.
+        assert "measure_power" not in saved_options
+    kwargs = {}
+    if bound:
+        # This fixture supplies native timing artifacts; runtime-memory
+        # compatibility is independent of the power-option comparison.
+        monkeypatch.setattr(
+            "aisim.support.runtime.verify_collection_runtime_bindings", lambda *_: {"status": "compatible"}
+        )
+        kwargs["runtime_bindings"] = [
+            {
+                "phase": cell.workload_kind,
+                "plan": {"path": str(case["campaign"] / "collection-plan.json")},
+                "checkpoint": {"path": str(case["checkpoint"])},
+            }
+            for cell in case["plan"].cells
+        ]
+
+    def read(value):
+        return assess_readiness(value, case["root"], case["checkpoint"].parent, **kwargs)
+
+    assert read(request)["ready_for_full_collection"]
+    mismatched = request.model_copy(
+        update={
+            "collection": request.collection.model_copy(update={"measure_power": not request.collection.measure_power})
+        }
+    )
+    report = read(mismatched)
+    assert report["status"] == "blocked"
+    assert not report["ready_for_full_collection"]
+    if bound:
+        assert set(report["blockers"]) == {
+            f"{phase}: measure_power differs from the request" for phase in request.collection_phases
+        }
+    else:
+        assert "saved collection differs from the reviewed onboarding request" in " ".join(report["blockers"])
+
+
 def _decode(report):
     return next(item for item in report["selected_cells"] if item["cell"]["workload_kind"] == "decode")
 

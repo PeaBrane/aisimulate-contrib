@@ -470,46 +470,8 @@ are rejected before interpolation; the existing execution-identity and real-KV
 requirements still apply. The legacy `dynamo_native_single_sample_v1` contract
 is unchanged.
 
-Schema 8 adds vLLM self-benchmark power measurements while retaining schema 7's
-execution identity. Both the sidecar and every row must declare
-`measurement_policy: dynamo_native_single_sample_power_window_v1`. This policy
-is accepted only with schema 8 and backend `vllm`; missing, null, legacy, or
-unknown row policies are rejected.
-
-| Field | Schema-8 contract |
-|---|---|
-| `measurement_policy` | Required in the sidecar and every row; `dynamo_native_single_sample_power_window_v1` |
-| `power_w` | Required nullable Parquet DOUBLE (float64) column; mean watts per GPU from a separate power window of at least two seconds |
-| `latency_ms` | Single-sample forward latency in milliseconds, preserved independently of the power window |
-
-Every non-null `power_w` must be finite and greater than zero. Null records
-measured latency with unknown power; the Rust loader represents that power as
-NaN rather than inventing a zero-watt measurement. Schema 6 and 7 remain
-latency-only and do not read `power_w`. Fake-KV healing retains the selected
-anchor's power, including unknown power.
-
-FPM forward operators return operation energy in watt-milliseconds from
-schema-8 power and resolved latency. Direct interpolation uses the same
-measured anchors and weights for both values. SOL interpolation uses its
-resolved power, and a prefill latency clamp scales energy. If a selected
-anchor lacks power, the operation returns zero energy as the uncovered-data
-sentinel. For example, a 500 W, 7 ms result carries 3500 W·ms.
-
-In a mixed step, the prefill contributes its own energy. Effective decode
-energy subtracts the KV-floor result when both queries have power and the
-marginal latency is positive. Coverage is tracked per component. The
-detailed ForwardPassMetrics result carries the native component energies.
-The scalar iteration query still returns latency.
-
-Native Replay, SDK, and legacy CLI predictions publish numeric watts at 90%
-coverage or above for supported configurations. Mixed-step watts are
-unqualified until measured validation passes. See the
-[power output contract](../power.md#publication-gate) for publication guards.
-
-The accuracy dataset gate validates the schema-8 policy, row binding, DOUBLE
-column, and power values before admitting a pair. Its Gym worker adapter still
-rejects schema 7 and 8 execution identities as unsupported; artifact validation
-does not establish predictor support or measured serving accuracy.
+Schema 8 adds measured per-row power under its own sidecar policy; see
+[measured power](#measured-power-schema-8).
 
 For a Kimi K3 text profile, an explicit configuration can be:
 
@@ -569,3 +531,110 @@ rejected before payload decoding. Configuration and profiles without DCP
 remain accepted as unrecorded DCP.
 
 Detailed per-query support and weights are described in the [Python API](../api/python.md#direct-fpm-query-evidence).
+
+## Measured power (schema 8)
+
+Schema 8 adds measured GPU power to vLLM self-benchmark tables. It is the only
+whole-forward table that supplies operation energy. Where V1 publishes that
+power, and where it does not, is described in
+[modeled power](../power.md#whole-forward-fpm-power).
+
+### Table contract
+
+- The sidecar declares `schema_version: 8` and `measurement_policy:
+  dynamo_native_single_sample_power_window_v1`; no other sidecar field is
+  added. Schema 8 pairs only with this policy and backend `vllm`. Every other
+  policy stays at schema 6 or 7 and is latency-only.
+- Every row must also declare
+  `measurement_policy: dynamo_native_single_sample_power_window_v1`; missing,
+  null, legacy or unknown row policies are rejected. One pair therefore cannot
+  hold power-window rows next to latency-only rows.
+- The Parquet file must have a `power_w` column (float64, nullable), even when
+  every value is null. It is the mean power of one GPU over the row's power
+  window, averaged across `topology.total_gpus`, in watts. Every non-null value
+  must be finite and greater than zero. `null` means that the point has no
+  power; the reason stays in the raw rank artifact. The Rust loader represents
+  it as NaN rather than inventing a zero-watt measurement.
+- Units are ms, W and W-ms. Power is never derived from latency, TDP or power
+  limits.
+
+Schema 6 and 7 pairs load as before, do not read `power_w`, and their latency
+is unchanged. A loader that predates schema 8 rejects a schema-8 pair instead
+of dropping its power. Fake-KV healing keeps the selected anchor's power,
+including unknown power.
+
+The collector publishes schema 8 as soon as any row comes from a power-window
+run, even when every window was unavailable. It refuses to merge power-window
+rows into an existing schema-6 or 7 pair, or latency-only rows into a schema-8
+pair, before writing anything; publish to a clean destination or collect every
+cell with the same `--fpm-measure-power` setting.
+
+The accuracy dataset gate validates the schema-8 policy, row binding, DOUBLE
+column and power values before it admits a pair. Its Gym worker adapter still
+rejects schema 7 and 8 execution identities as unsupported, so passing artifact
+validation does not establish predictor support or measured serving accuracy.
+
+### Measurement method
+
+The latency sample is unchanged: one synchronized iteration defines
+`latency_ms`. Power comes from a separate window that follows it:
+
+1. Dynamo repeats the same point in synchronized iterations until the measured
+   window lasts at least `FPM_POWER_MIN_WINDOW_S`, 2 s. NVML counter
+   calibration found that the energy counter updates every 100 ms on H200 and
+   B200, and the window must span at least 20 updates. A single iteration
+   lasts milliseconds, which would mostly measure counter quantization.
+2. It reads the NVML cumulative energy counter
+   (`nvmlDeviceGetTotalEnergyConsumption`, mJ, which equals W-ms) on every GPU
+   at the window's group-barrier edges.
+3. `power_w = sum over GPUs of energy_wms / (total_gpus * window_ms)`. Because
+   the window consists of synchronized group iterations, it includes the time
+   ranks spend waiting, as the latency sample does.
+
+Prefill repeats use fresh suffix token IDs from the same generator, so they
+are not served from the prefix cache. The prefix tokens and `cache_salt` stay
+as staged. A repeat whose cached-token count differs from the latency sample's
+makes the point's power unavailable (`prefill_cache_mismatch`).
+
+Decode repeats append one token per request per iteration, so the KV read
+grows during the window. The artifact records this drift. When it exceeds 10%
+of the point's `total_kv_read_tokens`, the point keeps its latency and gets
+`power_w: null`. With roughly 100 to 1,000 iterations in a 2 s window, decode
+points with less than about ten times that many context tokens per request
+carry no power. The low-KV end of every decode curve is therefore unpowered.
+
+A point also keeps its latency with `power_w: null` when any rank reports the
+window unavailable, for example `nvml_error`, `nvml_permission`,
+`counter_wrap` or `window_below_minimum`. Decode points of hybrid,
+sliding-window and Mamba KV-warmup shadow layouts always report power
+unavailable (`kvwarm_shadow_headroom`). The DeepSeek-V4.1 real-KV and
+GLM-5.3-Flash prefix-seed adapters stay on their pinned runtime without the
+window, and the SGLang native-FPM client writes no power. Collection details
+and the opt-out are in the
+[onboarding guide](../fpm-self-service/implementation.md#how-the-collection-grid-is-determined).
+
+### From rows to operation energy
+
+The SOL and direct methods blend each row's power with the same weights as its
+latency, using the anchors selected by that method: exact hits, curve
+interpolation, SOL transfer, decode brackets and the decode pass baseline. The FPM operation then returns
+`energy_wms = power_w * latency_ms` for the query. A prefill clamp scales
+latency and energy and leaves power unchanged.
+
+A query that touches a row without power, whether as an exact hit, an
+interpolation neighbour, a bracket side or a boundary-hold anchor, returns
+energy 0. Its latency is unchanged. Energy 0 is the missing-data sentinel, so
+the query counts as uncovered and coverage drops by exactly its latency.
+Queries whose rows all carry power stay covered.
+
+In a non-speculative mixed step, the prefill contributes its own energy.
+Effective decode energy is `max(0, E_target - E_floor)` only when the marginal
+latency is positive and both target and KV-floor baseline queries have power;
+otherwise it is zero. Coverage is tracked per component, so powered prefill
+cannot cover an unpowered decode marginal. Mixed-step watts remain unqualified
+until measured validation passes.
+
+Native Replay and the detailed forward-pass result carry component energy for
+supported schema-8 configurations. The scalar
+`estimate_forward_pass_time_ms()` iteration query still returns latency only.
+Schema-6/7, speculative and fitted providers remain latency-only.

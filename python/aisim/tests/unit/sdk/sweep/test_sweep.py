@@ -586,7 +586,8 @@ def test_sweep_disagg_retains_role_fallbacks_through_matching_and_dedupe(monkeyp
     assert result.iloc[0][MOE_COMM_FALLBACKS_COLUMN] == (context, generation)
 
 
-def test_sweep_disagg_epd_composes_encoder_stage(monkeypatch):
+@pytest.mark.parametrize("missing_role", ["prefill", "decode", "both"])
+def test_sweep_disagg_epd_composes_encoder_stage(monkeypatch, missing_role):
     """EPD end-to-end semantics on synthetic candidates.
 
     Pins the three EPD invariants: (1) enable_epd flips the prefill workers
@@ -640,7 +641,16 @@ def test_sweep_disagg_epd_composes_encoder_stage(monkeypatch):
         sweep,
         "_get_encoder_worker_candidates",
         lambda **_kwargs: [
-            {"encoder_latency": 50.0, "seq/s": 80.0, "num_total_gpus": 2, "tp": 2, "bs": 4, "memory": 1.5}
+            {
+                "encoder_latency": 50.0,
+                "seq/s": 80.0,
+                "num_total_gpus": 2,
+                "tp": 2,
+                "bs": 4,
+                "memory": 1.5,
+                "power_w": 200.0,
+                "power_coverage": 1.0,
+            }
         ],
     )
 
@@ -686,6 +696,14 @@ def test_sweep_disagg_epd_composes_encoder_stage(monkeypatch):
     assert (epd_row["(e)tp"], epd_row["(e)bs"]) == (2, 4)
     # request latency = corrected prefill ttft + tpot*(osl-1) + corrected encode stage.
     assert epd_row["request_latency"] == pytest.approx(108.0 + 8.0 * 99 + 90.0)
+
+    assert epd_row["power_w"] > 0
+    for role, candidates in (("prefill", pure_prefill_df), ("decode", decode_df)):
+        if missing_role in (role, "both"):
+            candidates.drop(columns="power_w", inplace=True)
+    missing = sweep_disagg(**common_kwargs, enable_epd=True, encoder_tp_list=[2]).iloc[0]
+    assert missing["power_w"] is None
+    pd.testing.assert_series_equal(epd_row.drop("power_w"), missing.drop("power_w"))
 
 
 @pytest.mark.parametrize("video", [False, True])
@@ -848,7 +866,16 @@ def test_sweep_agg_epd_composes_encoder_stage(monkeypatch):
         sweep,
         "_get_encoder_worker_candidates",
         lambda **_kwargs: [
-            {"encoder_latency": 50.0, "seq/s": 80.0, "num_total_gpus": 2, "tp": 2, "bs": 4, "memory": 1.5}
+            {
+                "encoder_latency": 50.0,
+                "seq/s": 80.0,
+                "num_total_gpus": 2,
+                "tp": 2,
+                "bs": 4,
+                "memory": 1.5,
+                "power_w": 200.0,
+                "power_coverage": 1.0,
+            }
         ],
     )
 
@@ -879,6 +906,12 @@ def test_sweep_agg_epd_composes_encoder_stage(monkeypatch):
     assert row["num_total_gpus"] == 30
     assert row["seq/s"] == pytest.approx(70.0)
     assert row["concurrency"] == 32 * 7
+
+    assert row["power_w"] > 0
+    del agg_row["power_w"]
+    missing = sweep.sweep_agg(**common_kwargs, enable_epd=True, encoder_tp_list=[2]).iloc[0]
+    assert missing["power_w"] is None
+    pd.testing.assert_series_equal(row.drop("power_w"), missing.drop("power_w"))
 
     # Replica budget: num_gpu_list=[6] leaves exactly one feasible cell.
     row = sweep.sweep_agg(**common_kwargs, enable_epd=True, encoder_tp_list=[2], num_gpu_list=[6]).iloc[0]
@@ -1231,7 +1264,7 @@ def test_rate_match_agg_epd_keeps_cluster_packing_winner():
 def test_overlay_encoder_stage_degradation_knob_and_coverage_blend():
     """The overlay honors a custom encoder degradation and re-weights
     power_coverage with the same time weights as power_w; rows without a
-    coverage key must not gain one."""
+    coverage key must not gain one, and withhold watts for partial encoder data."""
     row = {
         "ttft": 100.0,
         "tpot": 10.0,
@@ -1254,27 +1287,40 @@ def test_overlay_encoder_stage_degradation_knob_and_coverage_blend():
         "power_w": 0.0,
         "power_coverage": 0.0,
     }
-    out = sweep._overlay_encoder_stage(row, enc, 1, encoder_degradation=0.5)
+    powers = {"prefill_power": 100.0, "decode_power": 200.0}
+    out = sweep._overlay_encoder_stage(row, enc, 1, encoder_degradation=0.5, **powers)
     assert out["seq/s"] == pytest.approx(4.0)  # 8.0 x 0.5 x 1 caps the row's 10.0
     # decode_time = 10 x (11 - 1); coverage = (0 x 50 + 1.0 x 200) / 250.
     assert out["power_coverage"] == pytest.approx(0.8)
     # Sweep rows (no coverage channel): anything short of full encoder
-    # energy data zeroes the blended power instead of understating it.
+    # energy data withholds the blended power instead of understating it.
     bare = {k: v for k, v in row.items() if k != "power_coverage"}
     for partial in (0.99, float("nan")):
-        zeroed = sweep._overlay_encoder_stage(bare, dict(enc, power_coverage=partial), 1, prefill_power=100.0)
-        assert "power_coverage" not in zeroed
-        assert zeroed["power_w"] == 0.0
-    covered = sweep._overlay_encoder_stage(bare, dict(enc, power_coverage=1.0), 1, prefill_power=100.0)
+        withheld = sweep._overlay_encoder_stage(bare, dict(enc, power_coverage=partial), 1, **powers)
+        assert "power_coverage" not in withheld
+        assert withheld["power_w"] is None
+    covered = sweep._overlay_encoder_stage(bare, dict(enc, power_coverage=1.0), 1, **powers)
     assert covered["power_w"] > 0.0
-    # A withheld (None) prefill or decode watt value stays withheld, with or
+    # A withheld or omitted prefill or decode watt value stays withheld, with or
     # without a coverage channel, instead of being zero-filled or diluted.
     for source in (row, bare):
-        for powers in ({"prefill_power": None}, {"decode_power": None}):
-            withheld = sweep._overlay_encoder_stage(
-                dict(source, power_w=None), dict(enc, power_coverage=1.0), 1, **{"prefill_power": 100.0, **powers}
-            )
-            assert withheld["power_w"] is None
+        reference = sweep._overlay_encoder_stage(source, dict(enc, power_coverage=1.0), 1, **powers)
+        for missing_role in ("prefill_power", "decode_power", "both"):
+            for missing_value in ("absent", None, float("nan")):
+                partial_powers = dict(powers)
+                for role in powers:
+                    if missing_role in (role, "both"):
+                        if missing_value == "absent":
+                            del partial_powers[role]
+                        else:
+                            partial_powers[role] = missing_value
+                withheld = sweep._overlay_encoder_stage(source, dict(enc, power_coverage=1.0), 1, **partial_powers)
+                assert withheld["power_w"] is None
+                assert {k: v for k, v in withheld.items() if k != "power_w"} == {
+                    k: v for k, v in reference.items() if k != "power_w"
+                }
+    zero = sweep._overlay_encoder_stage(bare, dict(enc, power_coverage=1.0), 1, prefill_power=0.0, decode_power=0.0)
+    assert zero["power_w"] == 0.0
 
 
 def test_sweep_agg_epd_top_k_defers_to_encoder_pairing(monkeypatch):

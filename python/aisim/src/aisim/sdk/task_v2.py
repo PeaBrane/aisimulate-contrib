@@ -2890,8 +2890,8 @@ class Task:
             encoder_tp=encoder_tp,
             encoder_batch_size=encoder_batch_size,
             encoder_num_workers=encoder_num_workers,
-            prefill_power=result.get("power_w", 0.0),
-            decode_power=result.get("power_w", 0.0),
+            prefill_power=result.get("power_w"),
+            decode_power=result.get("power_w"),
         )
 
     def run_single_disagg(
@@ -3047,8 +3047,8 @@ class Task:
             encoder_tp=encoder_tp,
             encoder_batch_size=encoder_batch_size,
             encoder_num_workers=encoder_num_workers,
-            prefill_power=p_dict.get("power_w", 0.0),
-            decode_power=d_dict.get("power_w", 0.0),
+            prefill_power=p_dict.get("power_w"),
+            decode_power=d_dict.get("power_w"),
         )
 
 

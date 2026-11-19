@@ -1638,7 +1638,7 @@ def _run_agg_estimate(
     return EstimateResult(
         ttft=result_dict["ttft"],
         tpot=result_dict["tpot"],
-        power_w=result_dict.get("power_w", 0.0),
+        power_w=result_dict.get("power_w"),
         isl=isl,
         osl=osl,
         batch_size=batch_size,
@@ -2058,7 +2058,7 @@ def _run_disagg_estimate(
     return EstimateResult(
         ttft=result_dict["ttft"],
         tpot=result_dict["tpot"],
-        power_w=result_dict.get("power_w", 0.0),
+        power_w=result_dict.get("power_w"),
         isl=isl,
         osl=osl,
         batch_size=prefill_batch_size,

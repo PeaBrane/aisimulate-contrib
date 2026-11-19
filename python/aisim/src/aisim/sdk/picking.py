@@ -141,7 +141,7 @@ def _build_disagg_summary_dict(
     tpot = decode_summary_dict["tpot"]
     decode_time = tpot * max(osl - 1, 0)
     disagg_power_avg = disagg_power_w(
-        prefill_summary_dict.get("power_w", 0.0), decode_summary_dict.get("power_w", 0.0), ttft, decode_time
+        prefill_summary_dict.get("power_w"), decode_summary_dict.get("power_w"), ttft, decode_time
     )
 
     return {

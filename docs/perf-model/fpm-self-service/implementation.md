@@ -642,7 +642,9 @@ To reuse an archived latency-only campaign, explicitly set
 means `true`, even for a request saved before power collection was introduced;
 readiness rejects that request against the latency-only campaign. The request
 does not record when the field was omitted, so AISim cannot infer a historical
-opt-out. To retain `true`, collect a new campaign with power enabled instead.
+opt-out. Both discovered campaigns and explicitly bound phase plans must
+match this setting. To retain `true`, re-plan in a new directory and collect
+a new campaign with power enabled instead.
 
 ### Serving roles and CUDA graph settings
 

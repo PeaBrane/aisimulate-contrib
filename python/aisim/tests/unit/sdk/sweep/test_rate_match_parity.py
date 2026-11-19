@@ -150,15 +150,32 @@ def test_rate_match_zero_osl_does_not_divide_by_zero():
         assert new_result[key] == old_result[key]
 
 
-def test_rate_match_missing_power_w_defaults_to_zero():
+@pytest.mark.parametrize("missing_role", ["prefill", "decode", "both"])
+@pytest.mark.parametrize("missing_value", ["absent", None, float("nan")], ids=["absent", "null", "nan"])
+def test_rate_match_withholds_power_when_either_worker_has_no_power(missing_role, missing_value):
     p = _make_prefill_dict()
-    del p["power_w"]
     d = _make_decode_dict()
-    del d["power_w"]
+    for role, row in (("prefill", p), ("decode", d)):
+        if missing_role in (role, "both"):
+            if missing_value == "absent":
+                del row["power_w"]
+            else:
+                row["power_w"] = missing_value
     new_result = _rate_match_dict(p, 1, d, 1)
     old_result = _build_disagg_summary_dict(p, 1, d, 1)
+    assert new_result["power_w"] is None
+    assert old_result["power_w"] is None
     for key in new_result:
         assert new_result[key] == old_result[key]
+
+
+@pytest.mark.parametrize("compose", [_rate_match_dict, _build_disagg_summary_dict])
+def test_rate_match_preserves_explicit_zero_power(compose):
+    p = _make_prefill_dict(power_w=0.0)
+    d = _make_decode_dict()
+    result = compose(p, 1, d, 1)
+    decode_ms = 25.0 * 499
+    assert result["power_w"] == pytest.approx(700.0 * decode_ms / (80.0 + decode_ms))
 
 
 def test_rate_match_counts_cp_in_gpu_accounting():

@@ -252,8 +252,10 @@ power block without `step_wall_times_s`. `--fpm-measure-power` (default on; neve
 `--smoke`) requests the per-point power window and publishes `power_w`; see the
 [onboarding guide](../../../docs/perf-model/fpm-self-service/implementation.md#how-the-collection-grid-is-determined)
 for its requirements and publication rules. Formal
-`fpm_forward_perf.parquet` output uses metadata schema 7 for latency-only pairs
-and schema 8 for power-window pairs, and records
+`fpm_forward_perf.parquet` output uses metadata schema 7, or schema 8 once any
+row comes from a power-window (schema-3 artifact) run, even if every
+`power_w` is null (see the
+[schema-8 contract](../../../docs/perf-model/methods/whole-forward.md#measured-power-schema-8)), and records
 `collector_attempt_id`, `runtime_run_id`, `runtime_grid_digest`, and
 `kv_seed_regime` on every row. The seed regime is `real_kv`, `fake_fallback`,
 an approved `skip:<reason>`, `legacy`, or `n/a`; non-benign warm-up skips
@@ -270,8 +272,21 @@ The default publication gate requires every frozen cell to pass.
 `--fpm-publish-partial` explicitly publishes passed cells, records the exact
 `missing_cells` in the checkpoint, and still returns a nonzero incomplete-run
 result. The database checkpoint also records
-`skipped_first_publisher_wins`. A validated completed schema-v6 database is
-terminal on resume even if raw cell artifacts have since been pruned.
+`skipped_first_publisher_wins`. A validated completed schema-7 or 8 database
+is terminal on resume even if raw cell artifacts have since been pruned.
+A completed schema-6 commit record cannot be finalized by this collector.
+A latency-only publication into a destination containing a schema-6 pair
+merges its rows, assigns them legacy execution identity, and writes a
+schema-7 commit record. Publish to a fresh output directory to leave the
+schema-6 pair unchanged.
+
+To resume a campaign created before power collection was introduced, pass
+`--no-fpm-measure-power` along with its original arguments and `--resume`.
+The default now enables power, which changes the frozen plan and produces
+`FPM checkpoint does not match the current frozen plan` for that archived
+campaign. Keep power enabled only in a new campaign; do not edit the old
+plan or checkpoint to bypass the mismatch.
+
 `run-manifest.json` schema v2 is invocation-scoped: its `attempts` include the
 attempt ID, timestamps, final status, and partial phase timings for failed
 attempts; a no-op resume writes no historical attempts.

@@ -176,7 +176,7 @@ def _rate_match_dict(
     ttft = p["ttft"]
     tpot = d["tpot"]
     decode_time = tpot * max(osl - 1, 0)
-    disagg_power_avg = disagg_power_w(p.get("power_w", 0.0), d.get("power_w", 0.0), ttft, decode_time)
+    disagg_power_avg = disagg_power_w(p.get("power_w"), d.get("power_w"), ttft, decode_time)
 
     return {
         "model": p["model"],
@@ -1012,8 +1012,8 @@ def _overlay_encoder_stage(
     disagg_dict: dict,
     encoder_worker: dict,
     encoder_num_worker: int,
-    prefill_power: float | None = 0.0,
-    decode_power: float | None = 0.0,
+    prefill_power: float | None = None,
+    decode_power: float | None = None,
     ttft_scale: float = 1.0,
     encoder_degradation: float = _RATE_MATCH_ENCODER_DEGRADATION,
 ) -> dict:
@@ -1027,7 +1027,9 @@ def _overlay_encoder_stage(
     ``seq/s`` is capped and the rate-derived columns rescale with it;
     ``power_w`` (and ``power_coverage``, when the row carries it) is
     re-weighted over the encode + prefill + decode timeline. A withheld
-    (``None``/NaN) prefill or decode power keeps ``power_w`` ``None``.
+    (omitted/``None``/NaN) prefill or decode power keeps ``power_w`` ``None``.
+    Rows without a coverage channel also withhold watts when encoder
+    coverage is below 1.0 or unavailable.
     """
     row = dict(disagg_dict)
     encoder_latency = encoder_worker["encoder_latency"]
@@ -1055,9 +1057,8 @@ def _overlay_encoder_stage(
         elif not lm_power_withheld and not encoder_worker.get("power_coverage", 0.0) >= 1.0:
             # Sweep rows carry no coverage channel to express a partially
             # covered encoder, so anything short of full encoder energy data
-            # fails closed to the no-data sentinel instead of silently
-            # understating the blended power.
-            row["power_w"] = 0.0
+            # withholds the blended power instead of understating it.
+            row["power_w"] = None
     row["encoder_latency"] = encoder_latency
     row["ttft"] = prefill_ttft + encoder_ttft_share
     row["request_latency"] = row["request_latency"] + encoder_ttft_share
@@ -1164,8 +1165,8 @@ def _rate_match_agg_epd(
                         cell,
                         enc_worker,
                         e_num,
-                        prefill_power=r.get("power_w", 0.0),
-                        decode_power=r.get("power_w", 0.0),
+                        prefill_power=r.get("power_w"),
+                        decode_power=r.get("power_w"),
                         encoder_degradation=encoder_degradation,
                     )
                 )
@@ -1302,8 +1303,8 @@ def _find_best_disagg_under_constraint(
                             disagg_dict,
                             enc_worker,
                             e_num,
-                            prefill_power=p_worker.get("power_w", 0.0),
-                            decode_power=d_worker.get("power_w", 0.0),
+                            prefill_power=p_worker.get("power_w"),
+                            decode_power=d_worker.get("power_w"),
                             ttft_scale=autoscale_ttft_correction_factor,
                             encoder_degradation=encoder_degradation,
                         )

@@ -171,6 +171,9 @@ def test_overlay_differential_against_aic(mode, language_gpus, workers):
     assert actual.metrics["mean_ttft_ms"] == expected["ttft"]
     assert actual.metrics["mean_e2e_latency_ms"] == expected["request_latency"]
     assert actual.metrics["mean_tpot_ms"] == expected["tpot"]
+    assert expected["power_w"] is None
+    assert actual.metrics["power_w"] is None
+    assert actual.metrics["power_coverage"] is None
     assert (
         actual.metrics["mean_output_token_throughput_per_user"]
         == _report().metrics["mean_output_token_throughput_per_user"]

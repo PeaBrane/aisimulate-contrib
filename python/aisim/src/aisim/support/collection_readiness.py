@@ -384,6 +384,9 @@ def _bound_readiness(request: SupportRequest, bindings: list[dict[str, Any]]) ->
         for binding in bindings:
             campaign = Path(binding["plan"]["path"]).parent
             plan = load_repeatability_source(campaign)
+            if plan.options.measure_power != request.collection.measure_power:
+                blockers.append(f"{binding['phase']}: measure_power differs from the request")
+                continue
             cell = next(cell for cell in plan.cells if cell.workload_kind == binding["phase"])
             checkpoint = json.loads(Path(binding["checkpoint"]["path"]).read_text())
             result = _cell_report(plan, cell, campaign, checkpoint["cells"][cell.cell_id])

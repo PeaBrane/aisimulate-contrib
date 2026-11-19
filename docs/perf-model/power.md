@@ -26,12 +26,21 @@ tracks a later change to both paths.
 FPM v6/v7 have no row-power evidence. FPM watts are withheld for speculative
 schemes, models with encoder operations, and language-only EPD workers. The
 legacy disaggregated result withholds watts when either worker withholds them.
+Missing `power_w` keys, explicit `None`, and NaN all mean withheld worker power.
+This also applies to SDK E+agg and E+P+D sweeps and single-point `Task` rows:
+the encoder overlay preserves `power_w: None` when any language worker lacks
+power, without changing latency or throughput. An omitted overlay power
+argument is withheld as well. Sweep rows without a coverage field also withhold
+watts when encoder coverage is below 1.0 or unavailable. Explicit zero worker
+watts remain numeric during composition; absence is never replaced with zero.
 `Task.run_single_agg()` and `Task.run_single_disagg()` include `power_coverage`.
 Raw SDK summaries expose it through `get_power_data_coverage()`. Below
 the gate, available operation energy remains accessible for diagnostics.
 Mixed-step watts are **unqualified** until the measured mixed-step campaign
 passes. The result uses the standard power fields.
 See [schema-8 behavior](methods/whole-forward.md) for the interpolation contract.
+Where V1 publishes whole-forward FPM watts, and where it withholds them, is
+summarized in [whole-forward FPM power](#whole-forward-fpm-power).
 
 The current producers and consumers are
 [Replay reports](../../crates/core/src/replay/report.rs),
@@ -211,6 +220,127 @@ value. Unavailable values must not be serialized as strings or zero watts.
 Before validating or serializing a host-language metrics object, producers
 must reject `NaN` and positive or negative infinity;
 permissive encoder extensions are not valid JSON values under this contract.
+
+## Whole-forward FPM power
+
+Schema-8 whole-forward FPM tables record measured GPU power per row. The
+[table contract and measurement method](methods/whole-forward.md#measured-power-schema-8)
+describe how a row's `power_w` is measured and turned into operation energy.
+This section describes where that power is published.
+
+### Supported paths
+
+Numeric FPM watts come from non-speculative `fpm_interpolation` with the SOL
+or direct method over a schema-8 vLLM self-benchmark table, on these paths:
+
+- native Replay and unified `aisim predict` and `aisim recommend`, including
+  attention-DP configurations;
+- the SDK `InferenceSession.run_static` (`static`, `static_ctx`,
+  `static_gen`), `InferenceSession.run_agg` and
+  `DisaggInferenceSession.run_disagg`;
+- `aiconfigurator cli estimate` with `--estimate-mode static`, `static_ctx`,
+  `static_gen`, `agg` or `disagg`, and the aggregated and disaggregated rows
+  of the `default` and `exp` sweeps, all without `--enable-epd` (EPD rows are
+  [withheld](#withheld-or-unsupported)).
+
+An aggregated run combines mixed steps with pure-decode steps. Non-speculative
+mixed steps retain measured prefill energy and subtract measured KV-floor
+energy from the decode target when both have power and marginal latency is
+positive. Each component contributes its own covered latency. Aggregated watts
+are total energy over total active latency and follow the same gate.
+Mixed-step watts remain unqualified pending measured validation.
+
+Each FPM query contributes `E_i = power_w * L_i`. A query that touched a row
+without power contributes `E_i = 0` and is uncovered. Every step of a static
+decode trajectory counts as its own query, weighted by its repeat count, so
+coverage is the latency share of the queries that touched only powered rows.
+The [coverage](#operation-evidence-and-coverage) formulas above apply
+unchanged. A disaggregated row weights each worker's watts by its time:
+`(prefill_power_w * ttft + decode_power_w * decode_ms) / (ttft + decode_ms)`,
+with `decode_ms = tpot * (osl - 1)`.
+
+The SDK applies the 0.9 [publication gate](#publication-gate) to FPM models
+itself, so direct SDK callers and the legacy CLI see the same result: below
+the gate, `power_w` and the context, generation and end-to-end power getters
+return `None`, while latency, energy and the true coverage stay available.
+A disaggregated row has no watts when either worker withheld its own.
+Op-level SDK outputs are not gated and keep their raw watts and coverage.
+
+Coverage depends on the context length per request. Decode points below
+roughly ten times the power-window iteration count in context tokens per
+request carry no power, so short-context workloads can fall below the gate
+even on a powered table.
+
+A static or disaggregated FPM run over a schema-6 or 7 table now reports
+`power_w: None` instead of `0.0`. Its latency is unchanged.
+
+### Withheld or unsupported
+
+These report no numeric FPM watts in V1. Latency is unaffected.
+
+| Path | Result |
+| --- | --- |
+| `estimate_forward_pass_time_ms()` iteration queries | Latency only; the query has no power output. |
+| `fpm_regression` and `fpm_learned` (telemetry-trained), including roles restored from a state snapshot | Latency-only. |
+| Draft-scheme FPM (FPM target with operation-level draft, such as EAGLE-3) | Watts withheld pending qualification. |
+| Speculative Option 1 (`draft_length`) and Option 2 (measured SD-round tables) | Latency-only. |
+| A multimodal model with `fpm_interpolation.text_only` | Watts withheld whenever the model has encoder operations, including runs without images and the decode worker of a disaggregated run. |
+| EPD (`--enable-epd`) with FPM language-model workers (`language_only`) | Watts withheld in E+agg (aggregate rule) and E+P+D, single point and sweep, because the row would mix op-level encoder energy with FPM energy. Single-point rows keep the true coverage. |
+| Schema-6 and 7 tables, including every table published before schema 8 | `power_w: null`. |
+| GLM-5.3-Flash native-median, SGLang native-FPM and native-CUDA (`model_step_cuda`) tables | Latency-only. V1 covers the vLLM self-benchmark only. |
+| DeepSeek-V4.1 real-KV and GLM-5.3-Flash prefix-seed adapter cells | Collected without a power window. |
+| Decode points of hybrid, sliding-window and Mamba KV-warmup shadow layouts | Power unavailable per point. |
+
+### Collection requirement
+
+The FPM collector measures power by default. A power-measuring plan needs a
+Dynamo image whose self-benchmark accepts `--benchmark-power-window-s`, and
+fails before model loading on an older image. Opt out with
+`--no-fpm-measure-power`, or `collection.measure_power: false` in guided
+onboarding; see the
+[onboarding guide](fpm-self-service/implementation.md#how-the-collection-grid-is-determined).
+
+An archived latency-only campaign has power disabled, including when its
+saved plan predates the `measure_power` field. Guided readiness rejects it
+against a request with `collection.measure_power: true` (also the default
+when omitted). Set the request field explicitly to `false` to reuse that
+campaign. Guided readiness supports this reuse only for schema-v11 plans;
+it rejects other schema versions before checking `collection.measure_power`.
+To retain power collection, re-plan and collect in a new campaign
+directory instead. For a direct collector resume of a pre-power campaign,
+pass `--no-fpm-measure-power` with its original arguments and `--resume`.
+
+### Synthetic contract tests
+
+These tests write synthetic schema-6, 7 and 8 pairs. They check semantics,
+not accuracy:
+
+- [`test_fpm_power_reconciliation.py`](../../python/aisim/tests/unit/sdk/test_fpm_power_reconciliation.py)
+  checks that published static watts equal summed operation energy over summed
+  latency at full coverage; that schema-6, 7 and all-null
+  schema-8 tables give `None` with unchanged latency; that unpowered low-KV
+  decode rows remove exactly their queries' latency from coverage; that Replay,
+  `predict` and `recommend` publish power from fully powered schema-8 tables;
+  that restored fitted roles remain unsupported; that a draft-scheme static
+  `cli estimate` withholds watts at full coverage; that aggregate sweeps
+  publish watts only at 0.9 coverage, retaining mixed-step energy, and
+  none under a draft scheme; and that disaggregated sweep rows weight each
+  worker's watts by its time.
+- In [`test_fpm_forward.py`](../../python/aisim/tests/unit/sdk/test_fpm_forward.py),
+  `TestFPMPowerPublication` checks each publication gate, and
+  `TestFPMStaticPowerCoverage` checks per-query coverage of static decode
+  trajectories, including the 0.9 threshold.
+
+### Measured validation
+
+FPM power accuracy has not been qualified yet. AISIM-1973 ends with a GPU
+pipe-cleaning run that exercises the whole chain on a minimal matrix and
+reports its errors for information only. Accuracy qualification comes with a
+later power-collection campaign. It compares leave-one-out point power per
+phase (median error at most 5%, p90 at most 10%) and end-to-end busy-iteration
+power against DCGM energy (at most 10% per configuration at three or more load
+levels). A configuration that misses these tolerances is left out of the
+support matrix. Results go under `benchmarks/evidence/`, not these pages.
 
 ## Provenance boundary
 

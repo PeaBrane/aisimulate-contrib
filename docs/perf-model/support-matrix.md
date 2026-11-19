@@ -80,6 +80,29 @@ keeps its multi-token prediction (MTP) layer in BF16. With `nextn` above zero,
 AISim scales the decode graph by `(nextn + L) / L` for `L` decoder
 layers, so it prices that layer with the decoder-layer lanes.
 
+## Modeled power
+
+Power support is a separate result from latency support. A path can return
+latency and still publish no watts. The [modeled-power contract](power.md)
+defines coverage and the 0.9 publication gate.
+
+| Path | Power support |
+| --- | --- |
+| `op_level` with operation tables that carry power | Operation energy in every consumer, including Replay. Replay, unified prediction and recommendation, and the legacy CLI publish watts only at 0.9 coverage; the SDK reports raw watts with their coverage. |
+| `fpm_interpolation`, SOL or direct method, schema-8 vLLM self-benchmark table: AIC-compatible static, aggregated and disaggregated paths without EPD | Numeric watts at coverage of at least 0.9. Checked by synthetic contract tests only; not yet qualified against measured power. |
+| Non-speculative schema-8 `fpm_interpolation` in Replay, unified `predict` and `recommend` | Numeric watts at coverage of at least 0.9, including attention DP. Mixed-step watts remain unqualified pending measured validation. |
+| `fpm_interpolation`, `estimate_forward_pass_time_ms()` iteration queries | Latency only. |
+| `fpm_interpolation` language-model workers under EPD | Withheld: the row would mix op-level encoder and FPM energy. See [withheld paths](power.md#withheld-or-unsupported). |
+| Non-speculative schema-8 `fpm_interpolation`, FPM components of an aggregate mixed step | Measured prefill energy and marginal decode energy with per-component coverage. Mixed-step watts remain unqualified pending measured validation. |
+| `fpm_interpolation` with a draft scheme, speculative Option 1 or Option 2, or a multimodal `text_only` model | Withheld or latency-only. |
+| `fpm_interpolation` over schema-6 or 7 tables, or schema-7 GLM-5.3-Flash native-median, SGLang native-FPM or native-CUDA tables | Latency-only; `power_w` is `null`. |
+| `fpm_regression`, `fpm_learned` | Latency-only. |
+
+Within a schema-8 table, decode points with short context per request, and
+decode points of hybrid, sliding-window and Mamba KV-warmup shadow layouts,
+carry no power. See [whole-forward FPM power](power.md#whole-forward-fpm-power)
+for the reasons and for the collection requirement.
+
 ## Published FPE matrix
 
 The [FPE Support Matrix](https://ai-dynamo.org/aisim/fpe-support-matrix/)

@@ -20,6 +20,55 @@ pytestmark = pytest.mark.unit
 class TestCLIEstimateUnit:
     """Unit tests for cli_estimate API internals."""
 
+    @pytest.mark.parametrize("mode", ["agg", "disagg"])
+    @pytest.mark.parametrize("power_fields", [{}, {"power_w": None}, {"power_w": 0.0}, {"power_w": 450.0}])
+    def test_estimate_preserves_optional_summary_power(self, monkeypatch, mode, power_fields):
+        import aisim.legacy_cli.api as api
+        import aisim.sdk.backends.factory as backend_factory
+        import aisim.sdk.inference_session as inference_session
+        import aisim.sdk.models as models
+        import aisim.sdk.perf_database as perf_database
+
+        summary = MagicMock()
+        summary.check_oom.return_value = False
+        summary.check_kv_cache_oom.return_value = False
+        summary.get_result_dict.return_value = {"ttft": 12.0, "tpot": 3.0, **power_fields}
+        summary.get_power_data_coverage.return_value = 1.0
+        summary.get_moe_comm_fallbacks.return_value = ()
+        session = MagicMock()
+        session.run_agg.return_value = summary
+        session.run_disagg.return_value = summary
+        monkeypatch.setattr(inference_session, "InferenceSession", lambda *args, **kwargs: session)
+        monkeypatch.setattr(inference_session, "DisaggInferenceSession", lambda *args, **kwargs: session)
+        monkeypatch.setattr(perf_database, "get_database_view", lambda *args, **kwargs: object())
+        monkeypatch.setattr(backend_factory, "get_backend", lambda *args, **kwargs: object())
+        monkeypatch.setattr(models, "get_model", lambda *args, **kwargs: object())
+        monkeypatch.setattr(api, "resolve_context_fmha_by_data", lambda *args, **kwargs: None)
+        monkeypatch.setattr(api, "resolve_dsv4_moe_arch", lambda *args, **kwargs: None)
+        monkeypatch.setattr(api, "resolve_nvfp4_for_system", lambda *args, **kwargs: None)
+
+        result = api.cli_estimate(
+            model_path="Qwen/Qwen3-32B",
+            system_name="h200_sxm",
+            backend_version="test",
+            mode=mode,
+            ctx_tokens=128,
+            prefill_batch_size=1,
+            prefill_num_workers=1,
+            decode_batch_size=1,
+            decode_num_workers=1,
+        )
+
+        assert result.power_w == power_fields.get("power_w")
+        assert result.get().get("power_w") == power_fields.get("power_w")
+        assert result.power_is_available is (power_fields.get("power_w") is not None)
+        assert (result.ttft, result.tpot) == (12.0, 3.0)
+        assert result.raw == {"ttft": 12.0, "tpot": 3.0, "power_coverage": 1.0, **power_fields}
+        if mode == "agg":
+            session.run_agg.assert_called_once()
+        else:
+            session.run_disagg.assert_called_once()
+
     def test_static_estimate_resolves_coverage_gated_moe_comm_before_model_build(self, monkeypatch):
         import aisim.legacy_cli.api as api
         import aisim.sdk.inference_session as inference_session

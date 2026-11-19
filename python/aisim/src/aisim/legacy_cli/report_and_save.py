@@ -154,8 +154,8 @@ def _plot_worker_setup_table(
         top_configs["total_gpus_used"] = top_configs["num_total_gpus"] * top_configs["replicas"]
 
     def _power_cell(row) -> str:
-        # power_w == 0.0 on an EPD row is the no-data sentinel (incomplete
-        # encoder energy data), not a real 0 W estimate; None is withheld.
+        # EPD rows with withheld encoder energy carry power_w=None.
+        # Render missing or sub-1 W EPD values as unavailable.
         if (row.get("(e)workers") or 0) > 0 and (pd.isna(row["power_w"]) or row["power_w"] < 1.0):
             return "n/a"
         return _format_power(row["power_w"])
