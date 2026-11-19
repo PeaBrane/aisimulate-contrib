@@ -34,16 +34,24 @@ concurrency:
 
 jobs:
   policy:
-    name: Repository Policy
+    # Retain the required check name while owning all repository-policy work.
+    name: codeowners
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
     env:
       EXPECTED_SHA: ${{ inputs.expected_sha }}
       TARGET_SHA: ${{ inputs.expected_sha || github.event.pull_request.head.sha || github.sha }}
+      BASE_SHA: ${{ inputs.base_sha || github.event.pull_request.base.sha || github.event.before }}
+      PR_MERGE_SHA: ${{ github.event_name == 'pull_request' && github.sha || '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ env.TARGET_SHA }}
+          # Fetch the proposed merge and both parents, then validate the exact
+          # head first. The merge's ownership coverage is checked below.
+          ref: ${{ env.PR_MERGE_SHA || env.TARGET_SHA }}
           fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
@@ -51,13 +59,22 @@ jobs:
           python-version: "3.12"
       - name: Verify exact target
         run: |
+          if [[ "${GITHUB_EVENT_NAME}" == 'pull_request' ]]; then
+            git checkout --detach "${TARGET_SHA}"
+          fi
           test "$(git rev-parse HEAD)" = "${TARGET_SHA}"
           if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
             test -n "${EXPECTED_SHA}"
             test "${TARGET_SHA}" = "${GITHUB_SHA}"
           fi
+      - name: Select script dependency lock validation
+        id: script-locks
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/ci/select_fast_ci_checks.py
       - run: python -m pip install --require-hashes -r scripts/ci/requirements.txt
       - name: Check script dependency locks
+        if: steps.script-locks.outputs.dependency_locks != 'false'
         run: |
           groups=$(python -c 'import pathlib, tomllib; print(" ".join(tomllib.loads(pathlib.Path("scripts/pyproject.toml").read_text())["dependency-groups"]))')
           for group in ${groups}; do
@@ -93,34 +110,23 @@ jobs:
           python -m unittest discover -s scripts/ci -p test_documentation_links.py
           python scripts/ci/check_documentation_links.py
       - name: Check CODEOWNERS policy and generated artifacts
-        run: |
-          python -m pytest -c /dev/null .github/codeowners/test_*.py -q \
-            -p no:cacheprovider \
-            --override-ini="addopts=" \
-            --override-ini="filterwarnings="
-          python .github/codeowners/build_codeowners.py \
-            --areas .github/codeowners/areas.yaml \
-            --repo . \
-            --strict
-          python .github/codeowners/emit_codeowners.py \
-            --areas .github/codeowners/areas.yaml \
-            --out CODEOWNERS \
-            --external .github/codeowners/external_contributors.yaml \
-            --contributors-out CONTRIBUTORS.md
-          if [[ -n "$(git status --porcelain --untracked-files=all -- \
-              CODEOWNERS CONTRIBUTORS.md)" ]]; then
-            git diff -- CODEOWNERS CONTRIBUTORS.md || true
-            git status --short --untracked-files=all -- CODEOWNERS CONTRIBUTORS.md
-            echo "::error::Generated CODEOWNERS artifacts are out of date."
-            exit 1
-          fi
+        run: bash scripts/ci/check_codeowners.sh
       - name: Check active workflow contracts
         run: |
           python scripts/prediction_regression/check_prediction_numerics.py --fetch-baseline-only
-          python -m pytest -c /dev/null tests/test_ci_workflow_contracts.py tests/test_full_ci_fail_fast.py tests/test_artifactory_wheel_handoff.py tests/test_ci_qualification.py tests/test_release_fpe.py -q \
+          python -m pytest -c /dev/null tests/test_ci_workflow_contracts.py tests/test_full_ci_fail_fast.py tests/test_artifactory_wheel_handoff.py tests/test_ci_qualification.py tests/test_release_fpe.py tests/test_fast_ci_policy.py -q \
             -p no:cacheprovider \
             --override-ini="addopts=" \
             --override-ini="filterwarnings=error"
+      - name: Check proposed merge CODEOWNERS
+        if: github.event_name == 'pull_request'
+        run: |
+          if [[ "$(git rev-parse "${TARGET_SHA}^{tree}")" == "$(git rev-parse "${PR_MERGE_SHA}^{tree}")" ]]; then
+            echo "PR head and proposed merge have identical contents; ownership checks already passed."
+          else
+            git checkout --detach "${PR_MERGE_SHA}"
+            bash scripts/ci/check_codeowners.sh
+          fi
 
   python-static:
     name: Python Static Checks
@@ -260,7 +266,7 @@ jobs:
               >> "${GITHUB_STEP_SUMMARY}"
           }
 
-          record_required "Repository Policy" "${POLICY_RESULT}"
+          record_required "codeowners (repository policy)" "${POLICY_RESULT}"
           record_required "Python Static Checks" "${PYTHON_STATIC_RESULT}"
           record_required "Rust Format" "${RUST_FORMAT_RESULT}"
 

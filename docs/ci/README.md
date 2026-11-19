@@ -114,7 +114,7 @@ Manual dispatches and site-change triggers are listed below.
 | [FPE Support Matrix](../../.github/workflows/fpe-support-matrix.yml) | Called by Main branch nightly CI; manual dispatch with `expected_sha` | Broad native operation-level support qualification |
 | [Release branch nightly CI](../../.github/workflows/release-nightly-ci.yml) | Daily at 09:23 UTC; manual dispatch on `main` | Schedules FPE support-matrix refreshes for discovered `release/*` branches |
 | [FPE Support Matrix (release)](../../.github/workflows/fpe-release-qualify.yml) | Called once per release by Release branch nightly CI | Builds the release wheel, probes all shards, and uploads its qualified matrix artifact |
-| [codeowners](../../.github/workflows/codeowners.yml) | PRs and pushes to `main` | Independent ownership coverage and generated-file checks; overlaps with Fast CI |
+| [codeowners](../../.github/workflows/fast-ci.yml) | Part of every Fast CI run | Required repository-policy status, including ownership coverage and generated-file checks |
 | [Forward Prediction Performance (advisory)](../../.github/workflows/performance.yml) | Every trusted `pull-request/*` push; selects relevant PR files before benchmarking; manual dispatch for a PR | Paired base/head prediction-runtime benchmark, outside Full CI |
 | [E2E Accuracy Matrix](../../.github/workflows/e2e-accuracy.yml) | Daily at 10:17 UTC for `main` and all `release/*` heads; manual dispatch for one evaluated SHA, plus preview-only pinned `agentx_revision` and optional `agentx_campaign_catalog` ([constraints](#agentx-accuracy-extension)) | Advisory accuracy campaigns using one wheel for both CLIs; publishes qualified artifacts |
 | [GitHub Pages](../../.github/workflows/pages.yml) | FPE Support Matrix, Main branch nightly CI, Release branch nightly CI, E2E Accuracy Matrix, or FPM Accuracy Matrix completion; relevant site changes on PRs/`main`; daily at 09:17 UTC; manual dispatch | Validates qualified FPE and accuracy snapshots, tests FPE branch selection in Chromium, and builds public pages; deployment is restricted to trusted `main` |
@@ -136,8 +136,9 @@ packages and requires no additional runner or manual dispatch.
 Gate documentation-only changes do not select a benchmark or an additional
 controller run.
 
-Ownership checks, prediction performance, E2E accuracy, and Pages run independently
-of the Fast/Full validation gates. E2E accuracy does not gate nightly staging.
+Prediction performance, E2E accuracy, and Pages run independently
+of the Fast/Full validation gates. Ownership validation is part of Fast CI and
+also supplies the required `codeowners` status. E2E accuracy does not gate nightly staging.
 Pages consumes qualification evidence after producer completion.
 The DCO sign-off check and review services are additional PR signals, not jobs
 inside Fast CI. See [CONTRIBUTING.md](../../CONTRIBUTING.md) for DCO requirements.
@@ -176,7 +177,7 @@ Fast CI has three substantive jobs, followed by an aggregate result:
 
 | Job | Checks |
 | --- | --- |
-| Repository Policy | Copyright and packaged legal files; CODEOWNERS policy tests, ownership coverage, and generated artifacts; workflow/selection and qualification contract tests |
+| codeowners (repository policy) | Copyright and packaged legal files; bundled-configuration provenance; local documentation links; script dependency locks when relevant; CODEOWNERS policy tests, ownership coverage, and generated artifacts; workflow/selection and qualification contract tests |
 | Python Static Checks | Ruff lint and formatting on the configured AISim/test paths, Python syntax compilation, and changed-line whitespace |
 | Rust Format | `cargo fmt --all -- --check` |
 | Fast CI Success | Requires the three jobs to succeed for every PR, branch push, or manual run |
@@ -187,6 +188,31 @@ Ruff checks all Python packages under `python/aisim/src/`, including
 `aisim_core` and the legacy import shims, plus `python/aisim/collector/`.
 The [workflow](../../.github/workflows/fast-ci.yml) also lists the test paths
 checked by Ruff.
+
+The repository-policy job retains the required check name `codeowners`; the
+separate ownership workflow is consolidated into this job. It validates the
+exact PR head first, including rejection of shadow `.github/CODEOWNERS` and
+`docs/CODEOWNERS` files. For PR events it also validates GitHub's proposed merge
+when that commit's tree differs from the head. Identical trees reuse the head
+result. Both checks use the same ownership-test, full-tree coverage, and
+generated-file validation commands. Other policy checks run once on the head.
+Pushes and manual runs validate their exact target. The required `codeowners`
+status and its Infra/maintainer review routing remain in place.
+
+Script lock regeneration runs when the complete change touches its manifest,
+requirements locks, uv configuration, or the selection/validation machinery.
+PRs and trusted copies use the complete PR diff, not only the latest push.
+Lifecycle pushes use the entire push range. Manual runs, missing history,
+changed PR heads, and unavailable comparison metadata regenerate every lock
+conservatively. Hash-verified dependency installation and all other validation
+continue on every run. This reduces repeated resolver work; it is not a change
+to application-test coverage or a promise of a large latency reduction.
+
+The [PR #896 evidence record](../../benchmarks/evidence/ci-pr-896/README.md)
+contains the historical raw timing excerpts and their limitations. Quantified
+runner-work and elapsed-time savings remain unmeasured hypotheses: the
+unpaired runs do not establish a net improvement or exercise hosted lock
+skipping. The selector tests establish skip/regenerate behavior separately.
 
 Every standalone run publishes `Fast CI Success`. Full CI contains only a
 lightweight **Require Fast CI** job, which reads the standalone run and verifies

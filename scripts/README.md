@@ -54,9 +54,14 @@ The other group/output pairs are `e2e-accuracy` → `e2e_accuracy/`,
 `fpm-accuracy` → `fpm_accuracy/`, and `pages`, `readme`, and `release` → the
 same-named directories. The E2E source resolver uses requests and PyYAML; its
 group is also included in Pages, which imports the resolver during validation.
-Fast CI regenerates every group lock with
-`uv==0.12.6` from the hashed CI lock and rejects changed or missing locks. It retains existing transitive pins unless
-the declarations require a change; use `--upgrade` for an intentional refresh.
+Fast CI regenerates every group lock with `uv==0.12.6` from the hashed CI lock
+when the complete PR or push changes the script manifest, a group lock, uv
+configuration, or the Fast CI lock-validation machinery. Manual runs and
+unavailable comparison history or metadata always regenerate. Unrelated changes
+skip this resolver work while retaining hash-verified dependency installation
+and the rest of Fast CI. Regeneration rejects changed or missing locks and
+retains existing transitive pins unless the declarations require a change;
+use `--upgrade` for an intentional refresh.
 The `ci`, `pages`, and `readme` groups use pytest 9 to match AISim's dev extra.
 Do not use `uv sync` in a wheel-evaluation environment: it can remove the wheel under test.
 Historical release builds install tooling dependencies from the current harness

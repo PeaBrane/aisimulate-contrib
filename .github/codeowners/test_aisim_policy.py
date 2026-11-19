@@ -145,7 +145,7 @@ def test_representative_routing_contract() -> None:
 
     # Active and imported repository metadata.
     assert _owners(".github/workflows/ci.yml") == {INFRA}
-    assert _owners(".github/workflows/fast-ci.yml") == {INFRA}
+    assert _owners(".github/workflows/fast-ci.yml") == {INFRA, MAINTAINERS}
     assert _owners(".gitattributes") == {INFRA, MAINTAINERS}
     assert _owners("scripts/release/build_release_artifacts.py") == {INFRA, MAINTAINERS}
     assert _owners("tests/test_source_compliance.py") == {INFRA}
@@ -161,7 +161,6 @@ def test_representative_routing_contract() -> None:
         INFRA,
         MAINTAINERS,
     }
-    assert _owners(".github/workflows/codeowners.yml") == {INFRA, MAINTAINERS}
     assert _owners(".github/codeowners/areas.yaml") == {INFRA, MAINTAINERS}
     assert _owners("python/aisim/.github/codeowners/areas.yaml") == {
         INFRA,
