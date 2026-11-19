@@ -801,6 +801,7 @@ def test_agentic_g2_accepts_multiple_replicas(nested_rank, scopes, field, value)
         (("cluster_shared",), "num_workers", 1.5),
         (("dp_rank_local",), "num_workers", True),
         (("dp_rank_local", "cluster_shared"), "num_prefill_workers", 0),
+        ((None, "cluster_shared"), "num_decode_workers", True),
     ],
 )
 def test_agentic_g2_rejects_invalid_worker_counts(nested_rank, scopes, field, value):
@@ -808,6 +809,21 @@ def test_agentic_g2_rejects_invalid_worker_counts(nested_rank, scopes, field, va
     spec = replace(spec, backend_deployment=replace(spec.backend_deployment, **{field: value}))
     with pytest.raises(ValueError, match=f"{field} to be a positive integer"):
         EngineReplayRunnerFactory().capabilities().require_compatible(spec)
+
+
+@pytest.mark.parametrize("nested_rank", [False, True])
+@pytest.mark.parametrize(
+    "scopes,field",
+    [
+        (("dp_rank_local", None), "num_prefill_workers"),
+        ((None, "cluster_shared"), "num_decode_workers"),
+        (("cluster_shared", "cluster_shared"), "num_decode_workers"),
+    ],
+)
+def test_agentic_g2_accepts_several_workers_per_pd_role(nested_rank, scopes, field):
+    spec = _agentic_g2_spec(scopes=scopes, nested_rank=nested_rank)
+    spec = replace(spec, backend_deployment=replace(spec.backend_deployment, **{field: 3}))
+    EngineReplayRunnerFactory().capabilities().require_compatible(spec)
 
 
 @pytest.mark.parametrize("nested_rank", [False, True])
