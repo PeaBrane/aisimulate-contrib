@@ -169,8 +169,8 @@ def _predict(args: argparse.Namespace, raw: dict[str, Any], factory) -> int:
     capture_telemetry = args.capture_telemetry or args.export_html
     if capture_telemetry and (args.stack != "engine" or args.online):
         raise ValueError("telemetry capture requires offline --stack engine")
-    if config.traffic.load.agentic_warmup_policy != "repeated_prefixes" and (args.stack != "engine" or args.online):
-        raise ValueError(f"{config.traffic.load.agentic_warmup_policy} CLI requires offline --stack engine")
+    if config.traffic.load.agentic_warmup_policy != "repeated_prefixes" and args.online:
+        raise ValueError(f"{config.traffic.load.agentic_warmup_policy} requires offline execution")
     if (
         config.engine.speculation is not None
         and config.engine.speculation.kind == "ngram"
@@ -322,12 +322,6 @@ def _recommend(args: argparse.Namespace, raw: dict[str, Any], factory) -> int:
     output_adapters = resolve_output_adapters(output_configs)
     core_raw, adapter_raw = split_config_sections(raw, command="recommend")
     config = CoreRecommendationConfig.model_validate(core_raw)
-    if (
-        config.traffic is not None
-        and config.traffic.load.agentic_warmup_policy != "repeated_prefixes"
-        and args.stack != "engine"
-    ):
-        raise ValueError(f"{config.traffic.load.agentic_warmup_policy} CLI requires offline --stack engine")
     adapters = _resolve_section_adapters(adapter_raw, args.stack)
     result = run_recommendation(
         config,
@@ -436,19 +430,19 @@ def _write_resource_plan(args, plan: dict[str, Any]) -> None:
     sys.stdout.write(json.dumps(plan, indent=2, allow_nan=False) + "\n")
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def main(argv: Sequence[str] | None = None, *, _prepared_config: dict[str, Any] | None = None) -> int:
     # A supervised worker writes under its supervisor's output-directory lock;
     # a direct call takes its own. Either way the lock ends with this command.
     with OutputDirectoryOwnership():
         adopt_inherited_output_lock()
         try:
-            return _main(argv)
+            return _main(argv, _prepared_config=_prepared_config)
         finally:
             # Parsing or validation can exit before any preparation claims it.
             discard_inherited_output_lock()
 
 
-def _main(argv: Sequence[str] | None = None) -> int:
+def _main(argv: Sequence[str] | None = None, *, _prepared_config: dict[str, Any] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(list(sys.argv[1:] if argv is None else argv))
     if args.command == "onboard":
@@ -471,10 +465,13 @@ def _main(argv: Sequence[str] | None = None) -> int:
     except StackResolutionError as exc:
         parser.error(str(exc))
     try:
-        raw = _load_mapping(args.config)
-        # Paths written in the file start at the file's folder; --set paths start at the working directory.
-        raw = anchor_paths(raw, config_folder(args.config), args.command)
-        _apply_overrides(raw, args.overrides, command=args.command)
+        if _prepared_config is None:
+            raw = _load_mapping(args.config)
+            # Paths written in the file start at the file's folder; --set paths start at the working directory.
+            raw = anchor_paths(raw, config_folder(args.config), args.command)
+            _apply_overrides(raw, args.overrides, command=args.command)
+        else:
+            raw = _prepared_config
         if args.command == "predict":
             return _predict(args, raw, factory)
         return _recommend(args, raw, factory)

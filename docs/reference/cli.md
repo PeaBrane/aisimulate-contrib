@@ -262,9 +262,17 @@ Specifically, overwrite may replace `prediction.json`, `report.html`, `recommend
 `execution-events.jsonl`, `afd-replay-spec.json`, `afd-qualification.json`, and numbered
 `recommendations/NNNN.yaml` files.
 Other files, including non-numbered files inside `recommendations/`, are preserved. Invalid
-configuration loading, overrides, core-schema validation, unknown top-level sections, and stacks or
-output adapters that are not installed leave existing artifacts intact. Errors raised while
-importing an installed plugin or inside an adapter occur after the known outputs are removed.
+configuration loading, overrides, core-schema validation, unknown top-level sections, stacks or
+output adapters that are not installed, and agentic warmup policies that the stack does not
+advertise leave existing artifacts intact, including a failed run's diagnostics, with or without
+`--overwrite`. So does a resource refusal, timeout or
+interrupt while AISim asks an installed stack whether it supports a non-default warmup policy; such
+a run writes no resource reports. A signal-terminated support probe exits `130`, as does cancellation
+with Ctrl-C. Errors raised while importing an installed plugin or inside an
+adapter occur after the known outputs are removed.
+If the effective configuration changes during the warmup support check, including scalar types or
+adapter section order, the command exits `2` before cleanup;
+otherwise execution uses the checked configuration, including path anchoring and `--set` overrides.
 
 For `engine.ais_perf_model`, an entry key that is not a perf-model field is a validation error, so
 existing artifacts stay. A key written twice inside `engine.ais_perf_model` in the configuration

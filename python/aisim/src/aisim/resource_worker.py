@@ -32,10 +32,37 @@ def main() -> int:
     if hasattr(os, "nice"):
         os.nice(5)
     command = sys.argv[1]
-    if command == "cli":
+    if command in {"cli", "cli-prepared"}:
         from .main import main as _main
 
+        if command == "cli-prepared":
+            with Path(sys.argv[2]).open("rb") as source:
+                prepared_config = pickle.load(source)
+            return _main(sys.argv[3:], _prepared_config=prepared_config)
         return _main(sys.argv[2:])
+    if command == "warmup-support":
+        from .stack import StackLoadError, resolve_runner_factory
+
+        try:
+            capabilities = resolve_runner_factory(sys.argv[3]).capabilities()
+        except (ResourceLimitError, StackLoadError) as exc:
+            # Stack discovery wraps entry-point import and constructor failures.
+            refusal = exc if isinstance(exc, ResourceLimitError) else exc.__cause__
+            if isinstance(refusal, ResourceLimitError):
+                sys.stderr.write(f"aisim: {refusal}\n")
+                return 3
+            return 1
+        except Exception:
+            return 1  # The execution process reports stack errors in their usual order.
+        try:
+            capabilities.require_agentic_warmup_policy(sys.argv[4])
+        except ValueError as exc:
+            try:
+                Path(sys.argv[2]).write_text(str(exc), encoding="utf-8")
+            except OSError:
+                pass  # The exit code carries the refusal even without a diagnostic file.
+            return 2
+        return 0
     if command != "recommend":
         raise ValueError("invalid private execution command")
     root = Path(sys.argv[2])
