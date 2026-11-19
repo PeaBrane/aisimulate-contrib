@@ -5755,6 +5755,74 @@ mod forward_pass_metrics {
             assert!(pass.fpm.is_some(), "FPM should always be present");
         }
     }
+    const BLOCK_SIZE: usize = 4;
+
+    #[test]
+    fn second_identical_multichunk_prompt_reuses_cache_beyond_first_chunk() {
+        let mut core = SglangCore::new(fpm_args_with_chunked_prefill(16, 32));
+        let prompt: Vec<u32> = (0..40).collect();
+
+        let prefill_per_pass_until_output =
+            |core: &mut SglangCore, uuid: Uuid, start_ms: f64| -> (Vec<u64>, f64) {
+                let mut collector = crate::engine::trace::TraceCollector::default();
+                let mut prefill_per_pass = Vec::new();
+                let mut now_ms = start_ms;
+                for _ in 0..64 {
+                    let pass = core.execute_pass(&mut collector, now_ms);
+                    prefill_per_pass
+                        .push(pass.fpm.as_ref().map(|f| f.sum_prefill_tokens).unwrap_or(0));
+                    now_ms = pass.end_ms;
+                    if pass.output_signals.iter().any(|s| s.uuid == uuid) {
+                        return (prefill_per_pass, now_ms);
+                    }
+                }
+                panic!("request {uuid} emitted no output within 64 passes");
+            };
+
+        let first = Uuid::from_u128(1);
+        core.receive(DirectRequest {
+            uuid: Some(first),
+            ..direct_request(prompt.clone(), 1)
+        });
+        let (cold_passes, end_ms) = prefill_per_pass_until_output(&mut core, first, 0.0);
+        assert_eq!(
+            cold_passes,
+            [16, 16, 8],
+            "cold request must compute every prompt token in three chunks and emit output only after the last chunk"
+        );
+
+        let second = Uuid::from_u128(2);
+        core.receive(DirectRequest {
+            uuid: Some(second),
+            ..direct_request(prompt.clone(), 1)
+        });
+        let (warm_passes, _) = prefill_per_pass_until_output(&mut core, second, end_ms);
+        let warm_prefill: u64 = warm_passes.iter().sum();
+
+        assert!(
+            (1..=BLOCK_SIZE as u64).contains(&warm_prefill),
+            "warm identical prompt must compute 1 through {BLOCK_SIZE} tokens using the cache across chunks: computed {warm_prefill} tokens"
+        );
+    }
+
+    fn fpm_args_with_chunked_prefill(
+        chunked_prefill_size: usize,
+        num_gpu_blocks: usize,
+    ) -> MockEngineArgs {
+        MockEngineArgs::builder()
+            .engine_type(EngineType::Sglang)
+            .block_size(BLOCK_SIZE)
+            .num_gpu_blocks(num_gpu_blocks)
+            .max_num_seqs(Some(4))
+            .speedup_ratio(0.0)
+            .sglang(Some(SglangArgs {
+                page_size: Some(BLOCK_SIZE),
+                chunked_prefill_size: Some(chunked_prefill_size),
+                ..Default::default()
+            }))
+            .build()
+            .unwrap()
+    }
 }
 
 #[test]
