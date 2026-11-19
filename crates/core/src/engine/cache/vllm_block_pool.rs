@@ -30,16 +30,21 @@ new_key_type! {
 
 /// Distinguish token blocks from the capacity units of a state snapshot.
 /// A multi-block state has one key per slot, all with the same prefix identity.
+/// A grouped cache keys every block of every group with `Grouped`, state
+/// blocks included.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum CacheKey {
     Token(SequenceHash),
     State { prefix: SequenceHash, slot: usize },
+    Grouped { group: u16, hash: SequenceHash },
 }
 
 impl CacheKey {
     fn prefix_hash(self) -> SequenceHash {
         match self {
-            Self::Token(hash) | Self::State { prefix: hash, .. } => hash,
+            Self::Token(hash) | Self::State { prefix: hash, .. } | Self::Grouped { hash, .. } => {
+                hash
+            }
         }
     }
 }
@@ -208,6 +213,14 @@ impl StateIndex {
                 .filter_map(move |(slot, copies)| Some(((prefix, slot), copies.as_ref()?)))
         })
     }
+}
+
+/// Grouped keys keep their own index, so equal hashes of two groups stay two
+/// keys. A copy's cached hash and its group give its key.
+#[derive(Default)]
+struct GroupedIndex {
+    by_key: FxHashMap<(u16, SequenceHash), HashCopies>,
+    by_copy: FxHashMap<BlockCopyId, u16>,
 }
 
 enum CopyRemoval {
@@ -438,6 +451,7 @@ pub(crate) struct VllmBlockPool {
     // Fine token keys share a physical page; removed together at page eviction.
     token_aliases: Option<Box<FxHashMap<BlockCopyId, Vec<SequenceHash>>>>,
     state_index: Option<Box<StateIndex>>,
+    grouped_index: Option<Box<GroupedIndex>>,
     /// See [`Self::state_visibility_epoch`].
     state_visibility_epoch: u64,
     /// Intrusive ordinary LRU: head is evicted first, tail was released last.
@@ -469,6 +483,7 @@ impl VllmBlockPool {
             by_hash: FxHashMap::default(),
             token_aliases: None,
             state_index: None,
+            grouped_index: None,
             state_visibility_epoch: 0,
             inactive_head: None,
             inactive_tail: None,
@@ -926,6 +941,16 @@ impl VllmBlockPool {
                 self.state_visibility_epoch += u64::from(inserted.0);
                 inserted
             }
+            CacheKey::Grouped { group, hash } => {
+                // Belady rekeying walks token and state copies only.
+                assert!(self.belady.is_none(), "grouped keys use LRU eviction");
+                let index = self.grouped_index.get_or_insert_with(Default::default);
+                assert!(
+                    index.by_copy.insert(id, group).is_none(),
+                    "private copy retains a grouped key"
+                );
+                Self::index_copy(&mut index.by_key, (group, hash), id)
+            }
         };
         if became_redundant {
             self.refresh_belady_hash(hash.prefix_hash());
@@ -1331,6 +1356,13 @@ impl VllmBlockPool {
     }
 
     fn copy_key(&self, id: BlockCopyId, hash: SequenceHash) -> CacheKey {
+        if let Some(&group) = self
+            .grouped_index
+            .as_ref()
+            .and_then(|index| index.by_copy.get(&id))
+        {
+            return CacheKey::Grouped { group, hash };
+        }
         self.state_key(id).unwrap_or(CacheKey::Token(hash))
     }
 
@@ -1338,6 +1370,9 @@ impl VllmBlockPool {
         match hash {
             CacheKey::Token(hash) => self.by_hash.get(&hash),
             CacheKey::State { prefix, slot } => self.state_index.as_ref()?.get(prefix, slot),
+            CacheKey::Grouped { group, hash } => {
+                self.grouped_index.as_ref()?.by_key.get(&(group, hash))
+            }
         }
         .map(|copies| copies.primary)
     }
@@ -1358,6 +1393,15 @@ impl VllmBlockPool {
                 .as_mut()
                 .expect("cached state index")
                 .remove(prefix, slot, id),
+            CacheKey::Grouped { group, hash } => {
+                let index = self.grouped_index.as_mut().expect("cached grouped index");
+                assert_eq!(
+                    index.by_copy.remove(&id),
+                    Some(group),
+                    "grouped identity changed"
+                );
+                Self::remove_from_index(&mut index.by_key, (group, hash), id)
+            }
         };
         if !removed && self.belady.is_some() && !self.key_has_duplicates(hash) {
             self.refresh_belady_hash(hash.prefix_hash());
@@ -1372,6 +1416,10 @@ impl VllmBlockPool {
                 .state_index
                 .as_ref()
                 .and_then(|index| index.get(prefix, slot)),
+            CacheKey::Grouped { group, hash } => self
+                .grouped_index
+                .as_ref()
+                .and_then(|index| index.by_key.get(&(group, hash))),
         };
         copies.is_some_and(|copies| copies.duplicates.is_some())
     }
@@ -1742,6 +1790,12 @@ impl VllmBlockPool {
                     .iter()
                     .flat_map(|index| index.iter())
                     .map(|((prefix, slot), copies)| (CacheKey::State { prefix, slot }, copies)),
+            )
+            .chain(
+                self.grouped_index
+                    .iter()
+                    .flat_map(|index| index.by_key.iter())
+                    .map(|(&(group, hash), copies)| (CacheKey::Grouped { group, hash }, copies)),
             );
         for (expected_hash, copies) in entries {
             for id in copies.iter() {
@@ -1774,6 +1828,11 @@ impl VllmBlockPool {
                         .is_some_and(|copies| copies.iter().any(|copy| copy == id)),
                     "state identity points to the wrong key"
                 );
+            }
+        }
+        if let Some(index) = &self.grouped_index {
+            for id in index.by_copy.keys() {
+                assert!(indexed.contains(id), "grouped identity is not indexed");
             }
         }
 
@@ -1829,7 +1888,7 @@ impl VllmBlockPool {
         let removed_hash = if remove_hash {
             match hash {
                 CacheKey::Token(hash) => Some(hash),
-                CacheKey::State { .. } => None,
+                CacheKey::State { .. } | CacheKey::Grouped { .. } => None,
             }
         } else {
             None
