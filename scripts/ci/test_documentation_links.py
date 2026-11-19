@@ -3,14 +3,62 @@
 
 """Behavioral coverage for local documentation destination checks."""
 
+import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from scripts.ci.check_documentation_links import check_file, local_links
+from scripts.ci.check_documentation_links import check_file, documentation_files, local_links
 
 
 class DocumentationLinksTest(unittest.TestCase):
+    def setUp(self):
+        # Git hooks export overrides that can redirect commands out of the fixtures.
+        environment = {name: value for name, value in os.environ.items() if not name.startswith("GIT_")}
+        self.enterContext(patch.dict(os.environ, environment, clear=True))
+
+    def test_default_scan_finds_broken_links_in_agent_guides_and_skill_references(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            # Keep untracked fixtures visible despite personal Git ignore rules.
+            subprocess.run(["git", "-C", str(root), "config", "--local", "core.excludesFile", os.devnull], check=True)
+            guides = [
+                "REVIEW.md",
+                "crates/example/AGENTS.md",
+                ".agents/skills/example/references/verification.md",
+                "skills/example/SKILL.md",
+                "python/aisim/.claude/rules/example.md",
+            ]
+            for name in [*guides, "scratch.md"]:
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("[example](missing.md)")
+            failures = [failure for page in documentation_files(root) for failure in check_file(page, root)]
+            self.assertCountEqual(failures, [f"{name}:1: missing local destination: missing.md" for name in guides])
+
+    def test_default_scan_rejects_a_skill_file_outside_the_checkout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "repo"
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            subprocess.run(["git", "-C", str(root), "config", "--local", "core.excludesFile", os.devnull], check=True)
+            script = root / "scripts/ci/check_documentation_links.py"
+            script.parent.mkdir(parents=True)
+            script.write_bytes(Path(__file__).with_name(script.name).read_bytes())
+            outside = root.parent / "outside.md"
+            outside.write_text("[fixture](outside-marker.md)")
+            link = root / ".agents/skills/example/SKILL.md"
+            link.parent.mkdir(parents=True)
+            link.symlink_to(outside)
+
+            result = subprocess.run([sys.executable, str(script)], cwd=root, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("SKILL.md: expected a Markdown file inside the repository", result.stdout)
+            self.assertNotIn("outside-marker.md", result.stdout)
+
     def test_extracts_inline_images_references_and_balanced_destinations(self):
         cases = {
             "[guide](guide.md#setup)": "guide.md",

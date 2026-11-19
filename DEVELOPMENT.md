@@ -132,7 +132,9 @@ python scripts/ci/check_documentation_links.py
 
 It checks inline/image links and reference definitions in the root README,
 development/contribution guides, `docs/`, the application README, and
-`python/aisim/docs/`. It uses Markdown parsing to ignore code examples and HTML
+`python/aisim/docs/`. It also checks `REVIEW.md`, scoped `AGENTS.md` and
+`CLAUDE.md` files, and Markdown in the project and package skill directories
+and package Claude rules. It uses Markdown parsing to ignore code examples and HTML
 comments. Diagnostics point to the containing Markdown block. Remote URLs,
 heading anchors, and HTML links require separate review. Run the actual
 documented commands when their behavior changes; link checks do not validate
