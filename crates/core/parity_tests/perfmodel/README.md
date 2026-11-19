@@ -260,10 +260,28 @@ Main also replaced the Python AFD session and partition API with native AFD
 pool composition. The migrated regressions check that the head occurs once in
 the A-pool suffix, never in the F pool or repeated layer templates, and compare
 native context/decode evaluation with independent per-request GEMM shapes.
-Native AFD already supplied a missing prefill head from decode, so this change
-does not require refreshing its separate AFD goldens. Host work adds one existing
-GEMM query per ordinary context pass; it is not multiplied by the layer count
-and introduces no cache or additional preparation pass.
+Native AFD already supplied a missing prefill head from decode, so pure AFD
+records remain unchanged. Two AFD-decode cases have an ordinary MoE prefill
+companion and therefore also need the missing projection:
+
+| Fixture case | Main TTFT (ms) | With head (ms) | Main duration (ms) | With head (ms) |
+| --- | ---: | ---: | ---: | ---: |
+| `afd_e2e`: `qwen3-30b-a3b-h200-sglang-pd-decode` | 62.926544 | 62.948496 | 4118.221288 | 4118.309096 |
+| `afd_execution_plan`: `qwen_tp2_pd_decode` | 36.3799505 | 36.4020465 | 106.298492 | 106.320588 |
+
+The same control described above reproduces every prior expected field in
+these two records within 1e-10 relative tolerance. Restoring the ordinary head
+adds 0.021952 ms per wave in the first case, hence 4 * 0.021952 = 0.087808 ms
+over four waves. The second case adds 0.022096 ms. Decode timing, exact
+request/token/GPU accounting, memory, and every existing per-operation power
+diagnostic are unchanged; the prefill diagnostics gain only the missing head.
+Only these two cases were regenerated using `scripts/afd_parity.py refresh-e2e`
+and `refresh-layouts` with a verified source/binary build snapshot. All other
+AFD cases and tolerances are retained.
+
+Host work adds one existing GEMM query per ordinary context pass; it is not
+multiplied by the layer count and introduces no cache or additional preparation
+pass.
 
 ### B200 SGLang dense-prefix correction in PR #303
 

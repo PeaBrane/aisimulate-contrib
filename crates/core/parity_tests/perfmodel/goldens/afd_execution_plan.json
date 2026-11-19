@@ -1201,16 +1201,16 @@
       },
       "expected": {
         "completed_requests": 4,
-        "duration_ms": 106.298492,
+        "duration_ms": 106.320588,
         "mean_tpot_ms": 7.075561,
-        "mean_ttft_ms": 36.3799505,
+        "mean_ttft_ms": 36.4020465,
         "total_input_tokens": 512,
         "total_output_tokens": 32
       },
       "generation": {
-        "binary_sha256": "c1b97eec61a78ac749fde8a27e1c101d2926a2ef5fec7e96dd01cfa43a4f8b55",
+        "binary_sha256": "a3ddcd4d1d0537bd556b25ff381601d15e465e7cf61f9b4e76ebbb514f3887dc",
         "command": [
-          "aisimulate",
+          "aisim",
           "predict",
           "--stack",
           "engine",
@@ -1222,16 +1222,17 @@
           "json"
         ],
         "config_sha256": "06d966ea8bf146e347a6fdfddf7303a19819b1802b75dcd8ebda270747278943",
-        "data_tree": "912b4f8edaf5a8d53e36c3edd52bf6b5eb7f724c",
-        "reason": "Pinned main integration: duration 101.44430400000003 -> 116.85120400000004 ms before review fixes. Removed frozen replay: integrated default -> final dynamic duration 106.298492 ms. The candidate exactly matches the independently executed explicit-dynamic baseline, including request/token totals. See benchmarks/evidence/afd-review585-round3/layout-deltas.json.",
-        "source_commit": "257b58d867a49e50384a72382ec73c989786118a",
-        "source_inventory_sha256": "ee3223b7d9c2c4f2fe8db45007f5934ca7760179dc48792e3d4bcd883fa16dea",
+        "data_tree": "d995d0e84443e7f4f1f15cd657e3305718b9d3b0",
+        "native_source_inventory_sha256": "5cc295e8d51270eb12ff85b218aaeb2789012b08b199bdee915a57d0663e76db",
+        "reason": "The ordinary MoE prefill companion now includes its context_logits_gemm. A same-release-binary and same-data control removing only this head reproduces all previous expected fields within 1e-10 relative tolerance. Restoring the head increases duration and mean TTFT by 0.022096 ms; mean TPOT and exact lifecycle/token/GPU accounting remain unchanged. Pure native AFD already supplied the head.",
+        "source_commit": "fca92377ddbb796c7a8ce4bcbdc1b2b52e697568",
+        "source_inventory_sha256": "b0b6a5e02cc19f3028a44e32a3174aeccbe63c253df1ad6fee8781cb38d84f52",
         "source_kind": "workspace_snapshot",
-        "source_snapshot": "candidate-manifest.source.tar.gz",
-        "source_snapshot_sha256": "1ab326013e8cc4dc649e452a1179cb57e8f1e0a1f7a3c66b618bfd618987c3a3",
-        "source_tree": "c46e8e4e998846b083ca0ddbe053686bd0774e9b",
+        "source_snapshot": "afd-build-manifest.source.tar.gz",
+        "source_snapshot_sha256": "6a4f71d859d4a1c7b508449093cd023ce7d4ec330a26f3afc806ce9fbfed8da9",
+        "source_tree": "f4c973fbdd6ae2760cbff25960942e9f588a6935",
         "trace_sha256": null,
-        "workspace_dirty": true
+        "workspace_dirty": false
       },
       "historical_generations": [
         {
@@ -1261,9 +1262,35 @@
           "source_tree": "b3bbc557dc6d0f54f9ef0de5ab734ea929da8617",
           "toolchain": "rustc 1.99.0 (b940084d7 2026-09-28)",
           "trace_sha256": null
+        },
+        {
+          "binary_sha256": "c1b97eec61a78ac749fde8a27e1c101d2926a2ef5fec7e96dd01cfa43a4f8b55",
+          "command": [
+            "aisimulate",
+            "predict",
+            "--stack",
+            "engine",
+            "--config",
+            "<generated-layout.yaml>",
+            "--output-dir",
+            "<temporary>",
+            "--format",
+            "json"
+          ],
+          "config_sha256": "06d966ea8bf146e347a6fdfddf7303a19819b1802b75dcd8ebda270747278943",
+          "data_tree": "912b4f8edaf5a8d53e36c3edd52bf6b5eb7f724c",
+          "reason": "Pinned main integration: duration 101.44430400000003 -> 116.85120400000004 ms before review fixes. Removed frozen replay: integrated default -> final dynamic duration 106.298492 ms. The candidate exactly matches the independently executed explicit-dynamic baseline, including request/token totals. See benchmarks/evidence/afd-review585-round3/layout-deltas.json.",
+          "source_commit": "257b58d867a49e50384a72382ec73c989786118a",
+          "source_inventory_sha256": "ee3223b7d9c2c4f2fe8db45007f5934ca7760179dc48792e3d4bcd883fa16dea",
+          "source_kind": "workspace_snapshot",
+          "source_snapshot": "candidate-manifest.source.tar.gz",
+          "source_snapshot_sha256": "1ab326013e8cc4dc649e452a1179cb57e8f1e0a1f7a3c66b618bfd618987c3a3",
+          "source_tree": "c46e8e4e998846b083ca0ddbe053686bd0774e9b",
+          "trace_sha256": null,
+          "workspace_dirty": true
         }
       ],
-      "modeling_change": "Pinned main integration: duration 101.44430400000003 -> 116.85120400000004 ms before review fixes. Removed frozen replay: integrated default -> final dynamic duration 106.298492 ms. The candidate exactly matches the independently executed explicit-dynamic baseline, including request/token totals. See benchmarks/evidence/afd-review585-round3/layout-deltas.json.",
+      "modeling_change": "The ordinary MoE prefill companion now includes its context_logits_gemm. A same-release-binary and same-data control removing only this head reproduces all previous expected fields within 1e-10 relative tolerance. Restoring the head increases duration and mean TTFT by 0.022096 ms; mean TPOT and exact lifecycle/token/GPU accounting remain unchanged. Pure native AFD already supplied the head.",
       "trace": false
     },
     "qwen_tp2_pd_prefill": {
