@@ -23,16 +23,12 @@ from __future__ import annotations
 import argparse
 import re
 import sys
-import tomllib
 from pathlib import Path
 
 PYPROJECT = Path("python/aisim/pyproject.toml")
-# Stamp the workspace and historical explicit core versions. Inherited package
-# versions must stay inherited; never stamp a dependency's version in their place.
-CARGO_MANIFESTS = [Path("Cargo.toml"), Path("crates/core/Cargo.toml")]
-
-VERSION_LINE_RE = re.compile(r'^(\s*version\s*=\s*")([^"]+)(")\s*$', re.MULTILINE)
-
+# GitLab copies this file alone and runs it with system Python (including <3.11).
+VERSION_LINE_RE = re.compile(r"""^[ \t]*version\s*=\s*(["'])([^"']+)\1\s*(?:#.*)?$""")
+INHERITED_VERSION_RE = re.compile(r"version\s*(?:\.\s*workspace\s*=\s*true|=\s*\{\s*workspace\s*=\s*true\s*\})")
 SUFFIX_RE = re.compile(r"^\.dev[0-9]{8}(?:[0-9]{10})?$")
 
 
@@ -40,19 +36,26 @@ def semver(suffix: str) -> str:
     return "-dev." + suffix[len(".dev") :]
 
 
-def rewrite(path: Path, tail: str) -> str:
-    text = path.read_text()
-
-    def bump(match: re.Match[str]) -> str:
-        if match.group(2).endswith(tail):
-            return match.group(0)  # already stamped
-        return f"{match.group(1)}{match.group(2)}{tail}{match.group(3)}"
-
-    new_text, count = VERSION_LINE_RE.subn(bump, text, count=1)
-    if count != 1:
-        raise SystemExit(f"no version line found in {path}")
-    path.write_text(new_text)
-    return str(VERSION_LINE_RE.search(new_text).group(2))
+def rewrite(path: Path, table: str, tail: str) -> str | None:
+    lines = path.read_text().splitlines(keepends=True)
+    in_table = False
+    for index, line in enumerate(lines):
+        entry = line.partition("#")[0].strip()
+        if entry.startswith("["):
+            in_table = entry == f"[{table}]"
+        elif in_table:
+            if table == "package" and INHERITED_VERSION_RE.fullmatch(entry):
+                return None  # Cargo inherits the stamped workspace version.
+            match = VERSION_LINE_RE.fullmatch(line.rstrip("\r\n"))
+            if match:
+                version = match[2]
+                if not version.endswith(tail):
+                    end = match.end(2)
+                    lines[index] = line[:end] + tail + line[end:]
+                    path.write_text("".join(lines))
+                    version += tail
+                return version
+    raise SystemExit(f"no supported version declaration in [{table}] in {path}")
 
 
 def main() -> int:
@@ -71,14 +74,13 @@ def main() -> int:
     project = root / PYPROJECT
     if not project.is_file():
         project = root / "python/aisimulate/pyproject.toml"
-    stamped = [rewrite(project, args.suffix)]
-    for path in CARGO_MANIFESTS:
-        manifest = root / path
-        package = tomllib.loads(manifest.read_text()).get("package", {})
-        if package.get("version") == {"workspace": True}:
-            continue
-        stamped.append(rewrite(manifest, semver(args.suffix)))
-    print(f"apply_dev_version: {', '.join(stamped)}", file=sys.stderr)
+    crate_suffix = semver(args.suffix)
+    stamped = [
+        rewrite(project, "project", args.suffix),
+        rewrite(root / "Cargo.toml", "workspace.package", crate_suffix),
+        rewrite(root / "crates/core/Cargo.toml", "package", crate_suffix),
+    ]
+    print(f"apply_dev_version: {', '.join(v for v in stamped if v is not None)}", file=sys.stderr)
     return 0
 
 

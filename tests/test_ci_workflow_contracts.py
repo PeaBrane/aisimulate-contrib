@@ -4601,6 +4601,27 @@ def test_current_release_tools_stamp_and_validate_historical_manifests(
         assert f"{base_version}-dev.{suffix[4:]}" in core_manifest.read_text()
 
 
+def test_standalone_gitlab_stamper_preserves_dependency_versions(tmp_path):
+    # GitLab extracts just the stamper and runs system Python without tomllib.
+    stamper = tmp_path / "stamper.py"
+    shutil.copyfile(REPOSITORY_ROOT / "scripts/release/apply_dev_version.py", stamper)
+    (tmp_path / "tomllib.py").write_text('raise ModuleNotFoundError("tomllib unavailable")\n')
+    project = tmp_path / "python/aisim/pyproject.toml"
+    project.parent.mkdir(parents=True)
+    project.write_text('[project]\nversion = "0.15.0"\n')
+    workspace = tmp_path / "Cargo.toml"
+    dependency = '[workspace.dependencies.other]\nversion = "1.2.3"\n'
+    workspace.write_text(dependency + '[workspace.package]\nversion = "0.15.0"\n')
+    core = tmp_path / "crates/core/Cargo.toml"
+    core.parent.mkdir(parents=True)
+    core.write_text('[package]\nversion = { workspace = true }\n[dependencies.other]\nversion = "1.2.3"\n')
+    original_core = core.read_bytes()
+
+    subprocess.run([sys.executable, "-E", "-S", str(stamper), ".dev20261120", str(tmp_path)], check=True)
+    assert workspace.read_text() == dependency + '[workspace.package]\nversion = "0.15.0-dev.20261120"\n'
+    assert core.read_bytes() == original_core
+
+
 def test_manual_fpe_uses_current_harness_and_selected_inventory_for_every_job():
     workflow = _workflow("fpe-support-matrix.yml")
     assert workflow["env"]["FPE_SOURCE_SHA"] == "${{ inputs.expected_sha }}"
