@@ -434,19 +434,25 @@ round trips, with wheel hashes and request counts in `installed-cli-*` artifacts
 
 ## Application test inventory and exceptions
 
-Full CI uses **12 application jobs per architecture, 24 total**. Paths in this
+Full CI uses **7 application jobs per architecture, 14 total**. Paths in this
 table are relative to `python/aisim/` unless marked repository-root.
 
 | Shard | Test selection | Parallelism per architecture |
 | --- | --- | --- |
 | `contracts` | Repository-root `tests/`, `tests/cross_package/`, CLI compatibility, and collection inventory | One job; four workers for repository-root tests |
 | `unit` | Entire `tests/unit/` and `tests/golden/`, including unmarked tests | Four disjoint groups, four workers each |
-| `integration` | Entire `tests/integration/` against the installed native wheel and packaged data | One job, two workers |
-| `cli-build` | Build-marked `tests/e2e/cli/`; recommendation E2E runs separately within group 1 | Four disjoint groups, four workers each; recommendation runs serially |
-| `support-matrix` | Build-marked `tests/e2e/support_matrix/` | One job, pytest automatic worker count |
-| `tools-build` | Build-marked `tests/e2e/tools/`; installed FPM verification reuses the wheel | One job, pytest automatic worker count |
+| `cli-build` | Build-marked `tests/e2e/cli/`; recommendation E2E runs first, separately | One job, four workers; recommendation runs serially |
+| `integration-build` | Entire `tests/integration/` against the installed native wheel and packaged data, then build-marked `tests/e2e/support_matrix/` and `tests/e2e/tools/`; installed FPM verification reuses the wheel | One job; two workers for integration, pytest automatic worker count for the build-marked suites |
 
-The `support-matrix` shard includes the required native FPE probes from
+Each job pays for runner start-up, checkout and dependency installation, so
+suites that run for only a few minutes share a job. Keep every job shorter than
+`contracts`, the longest, so that sharing does not lengthen Full CI. Within a
+job each suite is a separate step: a later suite still runs and reports when an
+earlier one fails, and is skipped only when installation failed or the job was
+cancelled. Only `contracts` checks out the full Git history, which the
+repository-root tests read; the other jobs fetch the tested commit alone.
+
+The `integration-build` shard's support-matrix tests include the required native FPE probes from
 `.github/fpe-required-probes.json`. Resolved identities must be unique under the
 nightly qualifier's identity fields. Each identity must exist in the live matrix
 inventory and have a topology passing prefill, decode start, decode end, and
@@ -456,8 +462,10 @@ model/system/backend matrix remains in nightly. The tests resolve each selector
 through the installed wheel's current version policy using nightly's discovery
 helper, so version-policy changes are exercised before release.
 
-Unit and CLI groups use pytest-split's `least_duration` partitioning. Every
-group is scheduled when application tests are selected. Integration coverage
+Unit groups use pytest-split's `least_duration` partitioning. The CLI job keeps
+the same options with a single group, so splitting it again only needs more
+matrix entries. Every group is scheduled when application tests are selected.
+Integration coverage
 includes configuration-adapter estimates, memory estimation, configuration
 picking, and TRT-LLM KV capacity; selecting the whole directory includes newly
 added modules without requiring a marker.

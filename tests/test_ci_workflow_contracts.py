@@ -741,15 +741,18 @@ def test_fast_prerequisite_cli_errors_leave_success_summary_unwritten(tmp_path, 
         ("tests/unit/generator/test_unmarked.py", set(), "unit"),
         ("tests/unit/sdk/test_mixed.py", {"integration"}, "unit"),
         ("tests/golden/generator/test_contract.py", set(), "unit"),
-        ("tests/integration/test_new.py", set(), "integration"),
+        ("tests/integration/test_new.py", set(), "integration-build"),
         ("tests/cross_package/test_public_api.py", set(), "contracts"),
         ("tests/e2e/cli/test_new.py", {"build"}, "cli-build"),
-        ("tests/e2e/support_matrix/test_new.py", {"build"}, "support-matrix"),
-        ("tests/e2e/tools/test_new.py", {"build"}, "tools-build"),
+        ("tests/e2e/support_matrix/test_new.py", {"build"}, "integration-build"),
+        ("tests/e2e/tools/test_new.py", {"build"}, "integration-build"),
     ],
 )
 def test_collected_inventory_assigns_cases_without_requiring_unit_markers(path, markers, expected):
     assert assignment(path, markers, {})[0] == expected
+    # Inventory shards name the Full CI legs that run the case.
+    shards = _workflow("ci.yml")["jobs"]["application-tests"]["strategy"]["matrix"]["shard"]
+    assert expected in {shard["suite"] for shard in shards}
 
 
 def test_collected_inventory_requires_explicit_manual_exceptions():
@@ -1066,24 +1069,24 @@ def test_full_ci_owns_migrated_expensive_suites() -> None:
     assert {shard["suite"] for shard in jobs["application-tests"]["strategy"]["matrix"]["shard"]} == {
         "contracts",
         "unit",
-        "integration",
+        "integration-build",
         "cli-build",
-        "support-matrix",
-        "tools-build",
     }
     application_commands = _run_commands(jobs["application-tests"])
     compatibility_commands = _run_commands(jobs["python-compatibility"])
     assert "python/aisim/tests/cross_package" in application_commands
     assert "python/aisim/tests/cross_package" in compatibility_commands
     assert "tests/unit tests/golden" in application_commands
-    integration_steps = [
-        step for step in jobs["application-tests"]["steps"] if step.get("if") == "matrix.shard.suite == 'integration'"
+    integration_build_steps = [
+        step for step in jobs["application-tests"]["steps"] if "'integration-build'" in step.get("if", "")
     ]
-    assert len(integration_steps) == 1
-    assert "tests/integration" in integration_steps[0]["run"]
-    assert "--ignore" not in integration_steps[0]["run"]
-    assert "-m" not in shlex.split(integration_steps[0]["run"])[3:]
-    assert integration_steps[0]["working-directory"] == "python/aisim"
+    # The merged leg keeps each suite's own selection, workers and timeout.
+    assert [shlex.split(step["run"])[3:] for step in integration_build_steps] == [
+        ["-q", "-ra", "tests/integration", "-n", "2", "--timeout=600"],
+        ["-q", "tests/e2e/support_matrix", "-m", "build", "-n", "auto", "--timeout=180"],
+        ["-q", "tests/e2e/tools", "-m", "build", "-n", "auto", "--timeout=600"],
+    ]
+    assert all(step["working-directory"] == "python/aisim" for step in integration_build_steps)
     assert "scripts/ci/check_application_test_inventory.py" in application_commands
     assert "tests/e2e/cli" in application_commands
     assert "tests/e2e/support_matrix" in application_commands
@@ -2764,18 +2767,99 @@ def test_parallel_test_matrix_has_no_missing_or_duplicate_partitions():
         "prediction-regression",
     }.issubset(jobs["readiness"]["needs"])
     assert set(jobs["stage-application-wheel"]["needs"]) == {"readiness", "application-wheel"}
-    for suite in ("unit", "cli-build"):
-        steps = [
-            step for step in jobs["application-tests"]["steps"] if step.get("if") == f"matrix.shard.suite == '{suite}'"
-        ]
-        assert len(steps) == 1
-        command = steps[0]["run"]
+    split_steps = [step for step in jobs["application-tests"]["steps"] if "--splits" in step.get("run", "")]
+    assert [re.findall(r"matrix\.shard\.suite == '([\w-]+)'", step["if"]) for step in split_steps] == [
+        ["unit"],
+        ["cli-build"],
+    ]
+    for step in split_steps:
+        command = step["run"]
         assert command.count("--splits ") == 1
         assert command.count("--group ") == 1
         assert command.count("--splitting-algorithm ") == 1
         assert "--splits ${{ matrix.shard.groups }}" in command
         assert "--group ${{ matrix.shard.group }}" in command
         assert "--splitting-algorithm least_duration" in command
+
+
+def _unwrap_expression(expression: str) -> str:
+    return expression.strip().removeprefix("${{").removesuffix("}}").strip()
+
+
+def _application_expression(expression: str, shard: dict, *, outcomes: dict, failed: bool, cancelled: bool):
+    # Evaluate the workflow's own expression with GitHub's operand-returning
+    # `&&`/`||`, which Python's `and`/`or` share. actionlint checks the syntax.
+    def substitute(match):
+        token = match[0]
+        if token.startswith("'"):
+            return token
+        if token.startswith("steps."):
+            return repr(outcomes.get(token.split(".")[1], ""))
+        return repr(int(shard["group"]) if token == "matrix.shard.group" else shard[token.rsplit(".", 1)[1]])
+
+    expression = _unwrap_expression(expression)
+    expression = re.sub(r"'[^']*'|steps\.[\w-]+\.outcome|matrix\.shard\.\w+", substitute, expression)
+    for function, value in (
+        ("!cancelled()", not cancelled),
+        ("cancelled()", cancelled),
+        ("always()", True),
+        ("success()", not failed and not cancelled),
+        ("failure()", failed),
+    ):
+        expression = expression.replace(function, repr(value))
+    return eval(expression.replace("&&", " and ").replace("||", " or "), {"__builtins__": {}}, {})
+
+
+def _application_leg_steps(job: dict, shard: dict, *, failing: str = "", cancelled: bool = False) -> list[str]:
+    ran, outcomes, failed = [], {}, False
+    for step in job["steps"]:
+        name = step.get("name") or step["uses"]
+        condition = _unwrap_expression(step.get("if", "success()"))
+        if not re.search(r"\b(?:success|failure|always|cancelled)\(\)", condition):
+            condition = f"success() && ({condition})"
+        runs = _application_expression(condition, shard, outcomes=outcomes, failed=failed, cancelled=cancelled)
+        outcome = "skipped" if not runs else "failure" if name == failing else "success"
+        outcomes[step.get("id", "")] = outcome
+        failed = failed or outcome == "failure"
+        if runs:
+            ran.append(name)
+    return ran
+
+
+def test_application_test_legs_still_report_every_suite_after_an_earlier_failure():
+    job = _workflow("ci.yml")["jobs"]["application-tests"]
+    install = "Install the prebuilt application and test dependencies"
+    suite_steps = {
+        "contracts": ["Run repository and package contracts"],
+        "unit": ["Run unit tests"],
+        "cli-build": ["Run recommendation E2E without parallel resource contention", "Run remaining CLI build tests"],
+        "integration-build": [
+            "Run migrated integration tests against the installed wheel",
+            "Run support-matrix build tests",
+            "Run tool build tests",
+        ],
+    }
+    test_steps = {name for names in suite_steps.values() for name in names}
+    assert test_steps == {step["name"] for step in job["steps"] if "pytest" in step.get("run", "")}
+    assert job["timeout-minutes"] == "15"
+    checkout = next(step for step in job["steps"] if step.get("uses", "").startswith("actions/checkout@"))
+    depths = {}
+    for shard in job["strategy"]["matrix"]["shard"]:
+        expected = suite_steps[shard["suite"]]
+
+        def tests_run(**kwargs) -> list[str]:
+            return [name for name in _application_leg_steps(job, shard, **kwargs) if name in test_steps]
+
+        assert tests_run() == expected
+        for failing in expected:
+            assert tests_run(failing=failing) == expected
+        assert tests_run(failing=install) == []
+        assert tests_run(cancelled=True) == []
+        depths[shard["suite"]] = _application_expression(
+            checkout["with"]["fetch-depth"], shard, outcomes={}, failed=False, cancelled=False
+        )
+    # Repository-root contracts read Git history; the application suites do not.
+    assert depths == {"contracts": 0, "unit": 1, "cli-build": 1, "integration-build": 1}
 
 
 @pytest.mark.parametrize("failed", ["package", "rust", "neither"])
