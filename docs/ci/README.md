@@ -115,7 +115,7 @@ Manual dispatches and site-change triggers are listed below.
 | [Release branch nightly CI](../../.github/workflows/release-nightly-ci.yml) | Daily at 09:23 UTC; manual dispatch on `main` | Schedules FPE support-matrix refreshes for discovered `release/*` branches |
 | [FPE Support Matrix (release)](../../.github/workflows/fpe-release-qualify.yml) | Called once per release by Release branch nightly CI | Builds the release wheel, probes all shards, and uploads its qualified matrix artifact |
 | [codeowners](../../.github/workflows/fast-ci.yml) | Part of every Fast CI run | Required repository-policy status, including ownership coverage and generated-file checks |
-| [Forward Prediction Performance (advisory)](../../.github/workflows/performance.yml) | Every trusted `pull-request/*` push; selects relevant PR files before benchmarking; manual dispatch for a PR | Paired base/head prediction-runtime benchmark, outside Full CI |
+| [Forward Prediction Performance (advisory)](../../.github/workflows/performance.yml) | Every trusted `pull-request/*` push; benchmarks only ready PRs targeting `main` or `release/*` with relevant files; manual dispatch for any PR | Paired base/head prediction-runtime benchmark, outside Full CI |
 | [E2E Accuracy Matrix](../../.github/workflows/e2e-accuracy.yml) | Daily at 10:17 UTC for `main` and all `release/*` heads; manual dispatch for one evaluated SHA, plus preview-only pinned `agentx_revision` and optional `agentx_campaign_catalog` ([constraints](#agentx-accuracy-extension)) | Advisory accuracy campaigns using one wheel for both CLIs; publishes qualified artifacts |
 | [GitHub Pages](../../.github/workflows/pages.yml) | FPE Support Matrix, Main branch nightly CI, Release branch nightly CI, E2E Accuracy Matrix, or FPM Accuracy Matrix completion; relevant site changes on PRs/`main`; daily at 09:17 UTC; manual dispatch | Validates qualified FPE and accuracy snapshots, tests FPE branch selection in Chromium, and builds public pages; deployment is restricted to trusted `main` |
 
@@ -127,6 +127,14 @@ head and base, and reports an explicit skip for unrelated changes. API failures
 or changed revisions fail selection; empty, incomplete, or oversized file lists
 run the benchmark conservatively. Manual dispatch forces a comparison after the
 same revision checks: the trusted copy must match the current PR head.
+
+Automatic pushes skip draft PRs and stacked PRs, whose base is not `main` or
+`release/*`, before reading the file list. The summary names the reason;
+nothing allocates the benchmark runner. Selection runs again on each trusted
+push, so a PR that is marked ready or retargeted is compared on its next push.
+Manual dispatch with `pr_number` compares any PR without waiting. The
+[Simulation Performance (advisory)](../../.github/workflows/simulation-performance.yml)
+workflow uses the same selector with its own path list, so it follows these rules.
 
 If the PR changes the performance gate's Python files or the shared prediction
 grid, the benchmark job also runs the PR's controller against the same base and

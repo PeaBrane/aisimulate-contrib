@@ -217,6 +217,8 @@ def test_forward_perf_selects_before_allocating_the_benchmark_runner():
     selector = workflow["jobs"]["select"]
     compare = workflow["jobs"]["compare"]
     assert selector["runs-on"] == "ubuntu-24.04"
+    # Draft and stacked-base skips are selector decisions with a reported reason.
+    assert "if" not in selector
     assert "python scripts/performance/select_forward_perf.py" in _run_commands(selector)
     assert compare["needs"] == "select"
     assert compare["if"] == "needs.select.outputs.run_comparison == 'true'"
@@ -327,10 +329,11 @@ def test_forward_perf_skips_incompatible_data_policies(tmp_path, base_protocol):
         assert not summary.exists()
 
 
-def _forward_api(pages, *, count=None, after=None, canonical="a" * 40):
+def _forward_api(pages, *, count=None, after=None, canonical="a" * 40, draft=False, base_ref="main"):
     pull = {
         "head": {"sha": "a" * 40},
-        "base": {"sha": "b" * 40, "ref": "main"},
+        "base": {"sha": "b" * 40, "ref": base_ref},
+        "draft": draft,
         "changed_files": sum(map(len, pages)) if count is None else count,
     }
     calls = []
@@ -387,6 +390,45 @@ def test_forward_perf_uses_complete_pr_files(pages, count, expected):
     assert any("/files?per_page=100" in call for call in calls) is (count != 3001)
 
 
+@pytest.mark.parametrize("selector", ["select_forward_perf", "select_simulation_perf"])
+@pytest.mark.parametrize(
+    ("draft", "base_ref", "reason"),
+    [
+        (False, "main", None),
+        (False, "release/0.3", None),
+        (True, "main", "PR is a draft"),
+        (True, "feature/base", "PR is a draft"),
+        (False, "feature/base", "PR targets `feature/base`"),
+        (False, "release/0.3/backport", "PR targets `release/0.3/backport`"),
+        (False, "mainline", "PR targets `mainline`"),
+    ],
+)
+def test_perf_pushes_skip_drafts_and_stacked_bases(selector, draft, base_ref, reason):
+    module = importlib.import_module(f"scripts.performance.{selector}")
+    api, calls = _forward_api([[{"filename": "crates/core/src/python.rs"}]], draft=draft, base_ref=base_ref)
+    result = module.select_comparison("owner/repo", "push", "refs/heads/pull-request/236", "a" * 40, api=api)
+    assert result["number"] == "236"
+    assert result["head_sha"] == "a" * 40
+    assert result["base_ref"] == base_ref
+    assert calls[0] == calls[-1] == "repos/owner/repo/pulls/236"
+    if reason is None:
+        assert result["run_comparison"] == "true"
+        assert any("/files?per_page=100" in call for call in calls)
+    else:
+        # Skips need no file list, but still re-read the PR for a stable revision.
+        assert result["run_comparison"] == "false"
+        assert result["reason"].startswith(reason)
+        assert "Dispatch manually with pr_number" in result["reason"]
+        assert calls == ["repos/owner/repo/pulls/236"] * 2
+
+
+@pytest.mark.parametrize("draft", [None, "false"])
+def test_perf_selection_rejects_an_unknown_draft_state(draft):
+    api, _ = _forward_api([[{"filename": "crates/core/src/python.rs"}]], draft=draft)
+    with pytest.raises(ValueError, match="Invalid draft state for PR #236"):
+        forward_perf.select_comparison("owner/repo", "push", "refs/heads/pull-request/236", "a" * 40, api=api)
+
+
 @pytest.mark.parametrize(
     ("path", "expected"),
     [
@@ -407,13 +449,19 @@ def test_forward_perf_path_matching_preserves_directory_boundaries(path, expecte
     assert forward_perf.matches_path(path) is expected
 
 
-def test_forward_perf_manual_dispatch_forces_comparison_of_the_trusted_copy():
-    api, calls = _forward_api([[{"filename": "docs/ci.md"}]])
+@pytest.mark.parametrize(
+    ("draft", "base_ref"),
+    [(False, "main"), (True, "main"), (False, "feature/base"), (True, "feature/base")],
+)
+def test_forward_perf_manual_dispatch_forces_comparison_of_the_trusted_copy(draft, base_ref):
+    api, calls = _forward_api([[{"filename": "docs/ci.md"}]], draft=draft, base_ref=base_ref)
     result = forward_perf.select_comparison(
         "owner/repo", "workflow_dispatch", "refs/heads/main", "c" * 40, "236", api=api
     )
     assert result["run_comparison"] == "true"
+    assert result["reason"] == "Manual dispatch requests a comparison."
     assert result["head_sha"] == "a" * 40
+    assert result["base_ref"] == base_ref
     assert not any("/files?" in call for call in calls)
 
 
@@ -442,9 +490,22 @@ def test_forward_perf_rejects_changed_or_stale_revisions(change):
         )
 
 
-@pytest.mark.parametrize("fail_api", [False, True])
-def test_forward_perf_cli_reports_skip_or_api_failure(monkeypatch, tmp_path, fail_api):
-    api, _ = _forward_api([[{"filename": "docs/ci.md"}]])
+@pytest.mark.parametrize(
+    ("scenario", "reason"),
+    [
+        ("unrelated", "No PR files affect forward prediction."),
+        ("draft", "PR is a draft"),
+        ("stacked", "PR targets `feature/base`"),
+        ("api_failure", None),
+    ],
+)
+def test_forward_perf_cli_reports_skip_or_api_failure(monkeypatch, tmp_path, scenario, reason):
+    fail_api = scenario == "api_failure"
+    api, _ = _forward_api(
+        [[{"filename": "docs/ci.md"}]],
+        draft=scenario == "draft",
+        base_ref="feature/base" if scenario == "stacked" else "main",
+    )
 
     def run(command, **kwargs):
         assert command[:4] == ["gh", "api", "--paginate", "--slurp"]
@@ -469,7 +530,7 @@ def test_forward_perf_cli_reports_skip_or_api_failure(monkeypatch, tmp_path, fai
         assert not (tmp_path / "summary").exists()
     else:
         assert "run_comparison=false" in (tmp_path / "output").read_text()
-        assert "**SKIPPED**" in (tmp_path / "summary").read_text()
+        assert f"**SKIPPED** — {reason}" in (tmp_path / "summary").read_text()
 
 
 def _fast_run(**overrides):
@@ -4317,7 +4378,7 @@ def test_simulation_performance_rollout_and_revision_contract():
 def test_simulation_performance_selects_complete_pr_files(path, expected):
     from scripts.performance import select_simulation_perf
 
-    pull = {"head": {"sha": "a" * 40}, "base": {"sha": "b" * 40, "ref": "main"}, "changed_files": 1}
+    pull = {"head": {"sha": "a" * 40}, "base": {"sha": "b" * 40, "ref": "main"}, "draft": False, "changed_files": 1}
 
     def api(endpoint):
         return [[{"filename": path}]] if "/files?" in endpoint else [pull]

@@ -14,7 +14,8 @@ The workflow starts on every trusted `pull-request/*` push. A small
 GitHub-hosted selection job checks the complete PR change set against
 `scripts/performance/select_forward_perf.py` before starting the benchmark runner. This
 also works when the bot creates a branch with an empty push commit list.
-Unrelated PRs, including gate documentation-only changes, produce an explicit skip.
+Unrelated PRs, including gate documentation-only changes, produce an explicit skip,
+as do draft PRs and PRs whose base is not `main` or `release/*`.
 Manual dispatch forces a comparison only when the trusted copy matches the current
 PR head; an older trusted copy fails selection instead of benchmarking an older revision.
 
