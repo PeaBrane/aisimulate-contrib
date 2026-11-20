@@ -337,15 +337,10 @@ jobs:
     name: Rust feature modes
     needs: [fast-ci, select-full-ci]
     if: ${{ needs.select-full-ci.outputs.rust_feature_modes == 'true' }}
-    runs-on: prod-aisim-default-amd64-v1
-    timeout-minutes: 15
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target-feature-tests
-    container:
-      image: ${{ vars.CI_JOB_CONTAINER_IMAGE }}
-      env:
-        HOME: /__w/aisim/aisim
-        USER: runner
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -927,17 +922,12 @@ jobs:
     name: Python ${{ matrix.python-version }} compatibility
     needs: [fast-ci, select-full-ci]
     if: ${{ needs.select-full-ci.outputs.python_compatibility == 'true' }}
-    runs-on: prod-aisim-default-amd64-v1
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.11", "3.13"]
-    container:
-      image: ${{ vars.CI_JOB_CONTAINER_IMAGE }}
-      env:
-        HOME: /__w/aisim/aisim
-        USER: runner
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:

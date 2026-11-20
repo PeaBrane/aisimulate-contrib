@@ -1011,6 +1011,9 @@ GITHUB_HOSTED_JOBS = {
     ("ci.yml", "rust"): {"amd64": "ubuntu-24.04", "arm64": "ubuntu-24.04-arm"},
     ("ci.yml", "public-api-rust"): {"amd64": "ubuntu-24.04", "arm64": "ubuntu-24.04-arm"},
     ("ci.yml", "python-compliance"): {"amd64": "ubuntu-24.04"},
+    ("ci.yml", "python-compatibility"): {"amd64": "ubuntu-24.04"},
+    ("ci.yml", "rust-feature-modes"): {"amd64": "ubuntu-24.04"},
+    ("collector-check.yml", "check"): {"amd64": "ubuntu-24.04"},
     ("collector-check.yml", "cross-backend-consistency"): {"amd64": "ubuntu-24.04"},
 }
 

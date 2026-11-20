@@ -667,6 +667,8 @@ container instead, so they do not queue for the self-hosted pools:
 | Cargo Deny, Rust, Public API Rust | `ubuntu-24.04` (amd64) and `ubuntu-24.04-arm` (arm64) |
 | Python Dependency Licenses | `ubuntu-24.04` |
 | Collector Data / Perf data sanity (informational) | `ubuntu-24.04` |
+| Python 3.11 and 3.13 compatibility, Rust feature modes | `ubuntu-24.04` |
+| Collector Data / Check collector data | `ubuntu-24.04` |
 
 These jobs install Python with `actions/setup-python` and the stable Rust
 toolchain as before. Hosted images already provide `cc`, `c++` and `make`, so
@@ -674,6 +676,11 @@ toolchain as before. Hosted images already provide `cc`, `c++` and `make`, so
 these jobs on hosted labels without a container, secrets, an environment or wheel
 storage. Moving one back to a self-hosted pool needs a reason, such as a new
 Artifactory dependency.
+
+Python compatibility, Rust feature modes and the collector data check build
+AISim from source with `pip install './python/aisim[dev]'` instead of
+downloading the application test wheel from Artifactory, so they need no
+internal network access either.
 
 ### Maintenance ownership
 
