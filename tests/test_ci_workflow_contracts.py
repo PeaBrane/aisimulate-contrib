@@ -1001,6 +1001,43 @@ def test_workflow_runner_selectors_match_registered_pools_and_runbook() -> None:
         assert "prod-aisimulate-default-" not in path.read_text(), path
 
 
+# Jobs that need nothing from the NVIDIA network stay off the capped self-hosted
+# pools. Values map each matrix architecture to its GitHub-hosted label.
+GITHUB_HOSTED_JOBS = {
+    ("ci.yml", "cargo-deny"): {"amd64": "ubuntu-24.04", "arm64": "ubuntu-24.04-arm"},
+    ("ci.yml", "rust"): {"amd64": "ubuntu-24.04", "arm64": "ubuntu-24.04-arm"},
+    ("ci.yml", "public-api-rust"): {"amd64": "ubuntu-24.04", "arm64": "ubuntu-24.04-arm"},
+    ("ci.yml", "python-compliance"): {"amd64": "ubuntu-24.04"},
+    ("collector-check.yml", "cross-backend-consistency"): {"amd64": "ubuntu-24.04"},
+}
+
+
+@pytest.mark.parametrize(("workflow_name", "job_name"), sorted(GITHUB_HOSTED_JOBS))
+def test_public_network_jobs_run_on_github_hosted_runners(workflow_name: str, job_name: str) -> None:
+    job = _workflow(workflow_name)["jobs"][job_name]
+    expected = GITHUB_HOSTED_JOBS[(workflow_name, job_name)]
+    if job["runs-on"] == "${{ matrix.runner }}":
+        include = job["strategy"]["matrix"]["include"]
+        assert "arch" not in job["strategy"]["matrix"]
+        runners = {entry["arch"]: entry["runner"] for entry in include}
+        assert len(runners) == len(include)
+        assert "${{ matrix.arch }}" in job["name"]
+    else:
+        assert "strategy" not in job or "arch" not in job["strategy"]["matrix"]
+        runners = {"amd64": job["runs-on"]}
+    assert runners == expected
+    assert int(job["timeout-minutes"]) > 0
+    # Hosted runners cannot resolve Artifactory and get no internal job image.
+    assert "container" not in job
+    assert "environment" not in job
+    serialized = json.dumps(job)
+    for internal in ("wheel-storage", "WHEEL_STORAGE", "ARTIFACTORY", "secrets.", "vars.", "/__w/"):
+        assert internal not in serialized, internal
+    if job_name == "cargo-deny":
+        targets = {entry["arch"]: entry["cargo_deny_target"] for entry in job["strategy"]["matrix"]["include"]}
+        assert targets == {"amd64": "x86_64-unknown-linux-musl", "arm64": "aarch64-unknown-linux-musl"}
+
+
 def test_full_ci_owns_migrated_expensive_suites() -> None:
     jobs = _workflow("ci.yml")["jobs"]
 

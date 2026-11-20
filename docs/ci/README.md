@@ -642,6 +642,28 @@ Keep the previous digest for rollback. Manylinux release/platform builders have
 their own image definitions; changing the shared runner image does not replace
 all builders.
 
+### Runner placement
+
+GitHub-hosted runners cannot resolve NVIDIA Artifactory, so every job that reads
+or writes wheels in Artifactory runs on the self-hosted
+`prod-aisim-default-amd64-v1` or `prod-aisim-default-arm64-v1` pool inside the
+CI job image. Those pools have a fixed concurrency limit. Full CI jobs that need
+nothing from the NVIDIA network run on GitHub-hosted runners without a job
+container instead, so they do not queue for the self-hosted pools:
+
+| Job | Runner |
+| --- | --- |
+| Cargo Deny, Rust, Public API Rust | `ubuntu-24.04` (amd64) and `ubuntu-24.04-arm` (arm64) |
+| Python Dependency Licenses | `ubuntu-24.04` |
+| Collector Data / Perf data sanity (informational) | `ubuntu-24.04` |
+
+These jobs install Python with `actions/setup-python` and the stable Rust
+toolchain as before. Hosted images already provide `cc`, `c++` and `make`, so
+`ci_install_build_tools.sh` skips apt there. A workflow contract test keeps
+these jobs on hosted labels without a container, secrets, an environment or wheel
+storage. Moving one back to a self-hosted pool needs a reason, such as a new
+Artifactory dependency.
+
 ### Maintenance ownership
 
 Update this guide alongside workflow triggers, component selection, test
