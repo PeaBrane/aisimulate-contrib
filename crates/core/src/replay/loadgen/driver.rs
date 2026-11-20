@@ -35,7 +35,7 @@ use super::types::{
 };
 use super::{
     AgenticPlaySnapshot, AgenticReplayContext, AgenticSnapshotEvidence, PreparedAgenticSnapshots,
-    SYNTHETIC_OUTPUT_SEED, planned_output_token_ids,
+    SYNTHETIC_OUTPUT_SEED, SyntheticOutputStream, planned_output_token_ids,
 };
 use crate::engine::ImageSpec;
 use crate::engine::belady::{SequenceHash, input_sequence_hashes};
@@ -384,6 +384,9 @@ struct TurnRuntime {
     prompt_tokens: PromptTokens,
     max_output_tokens: usize,
     output_token_ids: Option<Vec<u32>>,
+    // A trace turn without authored ids records where its ids sit in the
+    // synthetic output stream and draws them at dispatch.
+    output_stream_offset: Option<u64>,
     delay_after_previous_ms: f64,
     priority: i32,
     strict_priority: u32,
@@ -940,6 +943,7 @@ pub struct WorkloadDriver {
     agentic_profile: Option<AgenticProfileState>,
     agentic_speedup: f64,
     sessions: Vec<SessionRuntime>,
+    output_stream: SyntheticOutputStream,
     in_flight: FxHashMap<Uuid, InFlightTurn>,
     agentic_settling: FxHashMap<Uuid, usize>,
     ready_sessions: BinaryHeap<ReadySession>,
@@ -2127,6 +2131,7 @@ impl WorkloadDriver {
                         },
                         max_output_tokens: source.max_output_tokens,
                         output_token_ids: None,
+                        output_stream_offset: None,
                         delay_after_previous_ms: 0.0,
                         priority: source.priority,
                         strict_priority: source.strict_priority,
@@ -2207,6 +2212,7 @@ impl WorkloadDriver {
             agentic_profile: None,
             agentic_speedup: speedup,
             sessions,
+            output_stream: SyntheticOutputStream::new(),
             in_flight: FxHashMap::default(),
             agentic_settling: FxHashMap::default(),
             ready_sessions,
@@ -2455,6 +2461,7 @@ impl WorkloadDriver {
                     prompt_tokens,
                     max_output_tokens: node.max_output_tokens,
                     output_token_ids,
+                    output_stream_offset: None,
                     delay_after_previous_ms: 0.0,
                     priority: node.priority,
                     strict_priority: node.strict_priority,
@@ -2561,6 +2568,7 @@ impl WorkloadDriver {
             agentic_profile: None,
             agentic_speedup: 1.0,
             sessions,
+            output_stream: SyntheticOutputStream::new(),
             in_flight: FxHashMap::default(),
             agentic_settling: FxHashMap::default(),
             ready_sessions,
@@ -2581,7 +2589,7 @@ impl WorkloadDriver {
             u32::try_from(engine_block_size).context("engine_block_size does not fit in u32")?;
         let trace_block_size = trace.block_size;
         let is_concurrency = matches!(&policy, SchedulingPolicy::Concurrency(_));
-        let mut output_rng = StdRng::seed_from_u64(SYNTHETIC_OUTPUT_SEED);
+        let mut next_output_offset = 0_u64;
         let sessions: Vec<SessionRuntime> = trace
             .sessions
             .into_iter()
@@ -2591,7 +2599,10 @@ impl WorkloadDriver {
                 } else {
                     Some(session.first_arrival_timestamp_ms.unwrap_or(0.0))
                 };
-                let turns = session
+                // Collecting `Result`s has no length hint, so a one-turn session
+                // would start with room for four turns.
+                let mut turns = Vec::with_capacity(session.turns.len());
+                session
                     .turns
                     .into_iter()
                     .map(|mut turn| -> Result<TurnRuntime> {
@@ -2605,18 +2616,19 @@ impl WorkloadDriver {
                             std::mem::take(&mut turn.hash_ids),
                             trace_block_size,
                         )?;
-                        let output_token_ids = Some(planned_output_token_ids(
-                            turn.output_token_ids,
-                            turn.max_output_tokens,
-                            &mut output_rng,
-                        ));
+                        let mut output_stream_offset = None;
+                        if turn.output_token_ids.is_none() {
+                            output_stream_offset = Some(next_output_offset);
+                            next_output_offset += turn.max_output_tokens as u64;
+                        }
                         Ok(TurnRuntime {
                             request_id: None,
                             play_id: None,
                             prompt_tokens,
                             replay_key: turn.replay_key,
                             max_output_tokens: turn.max_output_tokens,
-                            output_token_ids,
+                            output_token_ids: turn.output_token_ids,
+                            output_stream_offset,
                             delay_after_previous_ms: turn.delay_after_previous_ms,
                             priority: turn.priority,
                             strict_priority: turn.strict_priority,
@@ -2626,7 +2638,10 @@ impl WorkloadDriver {
                             deterministic_request_id: None,
                         })
                     })
-                    .collect::<Result<Vec<_>>>()?;
+                    .try_for_each(|turn| -> Result<()> {
+                        turns.push(turn?);
+                        Ok(())
+                    })?;
                 let cumulative_capacity = if prompt_mode == PromptMode::DeltaCumulative {
                     turns
                         .iter()
@@ -2635,7 +2650,7 @@ impl WorkloadDriver {
                                 + turn
                                     .output_token_ids
                                     .as_ref()
-                                    .map_or(0, |output| output.len())
+                                    .map_or(turn.max_output_tokens, Vec::len)
                         })
                         .sum()
                 } else {
@@ -2678,6 +2693,7 @@ impl WorkloadDriver {
             agentic_profile: None,
             agentic_speedup: 1.0,
             sessions,
+            output_stream: SyntheticOutputStream::new(),
             in_flight: FxHashMap::default(),
             agentic_settling: FxHashMap::default(),
             ready_sessions,
@@ -2910,6 +2926,10 @@ impl WorkloadDriver {
             };
             let session = &mut self.sessions[session_index];
             let turn = &mut session.turns[turn_index];
+            if let Some(offset) = turn.output_stream_offset {
+                turn.output_token_ids =
+                    Some(self.output_stream.ids_at(offset, turn.max_output_tokens));
+            }
             let replay_context = turn
                 .request_id
                 .as_ref()
@@ -4060,6 +4080,7 @@ mod tests {
                 .iter()
                 .all(|turn| matches!(turn.prompt_tokens, PromptTokens::Deferred { .. }))
         }));
+        assert_eq!(driver.sessions[1].turns.capacity(), 1);
 
         let ready = driver.pop_ready(0.0, 1);
         assert_eq!(ready.len(), 1);
@@ -4442,6 +4463,43 @@ mod tests {
             WorkloadDriver::new_agentic_trace(trace, 1).unwrap(),
             3,
         );
+    }
+
+    #[test]
+    fn output_ids_drawn_at_dispatch_follow_trace_order() {
+        let trace = Trace {
+            block_size: 1,
+            sessions: [
+                (2.0, 70, None),
+                (3.0, 2, Some(vec![7, 8])),
+                (0.0, 5, None),
+                (1.0, 130, None),
+            ]
+            .into_iter()
+            .enumerate()
+            .map(
+                |(index, (arrival, max_output_tokens, output_token_ids))| SessionTrace {
+                    session_id: format!("s{index}"),
+                    first_arrival_timestamp_ms: Some(arrival),
+                    turns: vec![TurnTrace {
+                        input_length: 1,
+                        max_output_tokens,
+                        output_token_ids,
+                        hash_ids: vec![index as u32],
+                        ..Default::default()
+                    }],
+                },
+            )
+            .collect(),
+        };
+        // The single-turn path draws every plan up front, in trace order.
+        let planned = trace.to_single_turn_requests().unwrap();
+
+        let mut driver = WorkloadDriver::new_trace(trace, 1).unwrap();
+        for (at_ms, index) in [(0.0, 2), (1.0, 3), (2.0, 0), (3.0, 1)] {
+            let request = driver.pop_ready(at_ms, usize::MAX).pop().unwrap().request;
+            assert_eq!(request.output_token_ids, planned[index].output_token_ids);
+        }
     }
 
     #[test]

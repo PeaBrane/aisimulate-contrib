@@ -134,7 +134,7 @@ use the same reservation rule; wave admission also deducts live child RSS.
 For synthetic workloads, the built-in native-engine planning model,
 `engine-session-metadata-v2`, charges every turn 4,096 bytes plus 32 bytes per
 input and output token of that turn. This covers the turn's
-hash IDs, planned output IDs, its share of the session
+hash IDs, its share of the session
 transcript, and a prefix-cache index with one-token blocks. A turn retains only
 its own tokens. The 32-byte token allowance is multiplied by the number of
 independent worker/attention-DP caches, capped at the number of turns per pool
@@ -223,12 +223,21 @@ and measures the peak from completed replays.
 The lower bound is the maximum of three allocation requirements: 8 bytes per
 source hash ID plus 4 bytes per authored output token where the loader holds
 every source hash array at once (Dynamo, Agentic Mooncake and Dynamo-stack
-Weka); 4 bytes per compact hash ID plus 4 bytes per planned output token in the
-prepared replay; and 4 bytes per token in the largest expanded input prompt.
+Weka); 4 bytes per compact hash ID plus 4 bytes per output token that the
+prepared replay holds; and 4 bytes per token in the largest array one dispatch
+creates, which is the largest expanded input prompt or the largest output drawn
+for one request.
 These stages are not added together. File bytes, lane count, configured block
 size and total logical input tokens do not multiply this bound. Snapshots,
 including warmup and profiles, omit the prompt term: they expand prompts only
 for selected plays after their cuts.
+
+The output tokens that the prepared replay holds depend on the trace kind. An
+agentic graph (Agentic Mooncake, agentic Dynamo and Dynamo-stack Weka) plans
+every request's output IDs before its first dispatch, so every output token
+counts. A session trace (Mooncake, Mooncake-delta, applied-compute agentic and
+standard Dynamo) holds only authored `output_token_ids` and draws the rest as it
+dispatches each request.
 
 The counters follow each format's loader:
 
@@ -239,10 +248,11 @@ The counters follow each format's loader:
   bound omits the source-hash term. A Mooncake or Mooncake-delta row without
   an input length is sized as its hash count times the configured block size,
   as the loader does.
-- Applied-compute agentic counts `num_turns + 1` requests per session and its
-  assistant and final response lengths. Each turn's prompt adds the previous
-  response and tool output, so the final cumulative prompt is the largest. The
-  loader synthesizes hashes, so the bound counts none.
+- Applied-compute agentic counts `num_turns + 1` requests per session. Each
+  turn's prompt adds the previous response and tool output, so the final
+  cumulative prompt is the largest; the largest assistant or final response is
+  the largest drawn output. The loader synthesizes hashes, so the bound counts
+  none.
 - Dynamo-stack Weka counts normal, streaming, and nested subagent requests in JSON, JSONL,
   and directories. Its graph has `ceil(input_length / block_size)` hashes per
   request, including generated hashes absent from the source. Inspection first
@@ -292,7 +302,7 @@ energy, or GPU capacity. Their provenance and qualification are:
 | Dynamo peak expansion | Twice the eager prompt bytes, plus 4,096 bytes per request and 16 bytes per output token. | These extra terms are policy headroom; they do not certify an adapter's peak RSS. |
 | Native Weka traces | Separate per-play import and replay phases; see below. | Uses the native importer/driver contracts, including real output arrays and synthesized hashes. Covers snapshot and warmup storage; Weka on the Dynamo stack uses the finite trace lower bound and observed peak instead. |
 | Process allowances | 256 MiB within the native Weka peak model; 512 MiB for other built-in worker reservations; coordinator RSS plus 256 MiB. | Engineering reserves, not calibrated platform-specific measurements. |
-| Finite trace arrays | Maximum of retained source `Vec<u64>` hashes plus authored `Vec<u32>` outputs, prepared `Vec<u32>` hash/output storage, and the largest `Vec<u32>` input prompt. Covers every finite trace format on both stacks except native-engine Weka, without file-size, block-size or lane multipliers. | Array widths are concrete. Other allocations, including importer temporary storage, are excluded: this is a lower bound, not a peak RSS estimate. Continuous profiles use it without an observed peak. |
+| Finite trace arrays | Maximum of retained source `Vec<u64>` hashes plus authored `Vec<u32>` outputs, prepared `Vec<u32>` hash/output storage, and the largest `Vec<u32>` input prompt or drawn output. Covers every finite trace format on both stacks except native-engine Weka, without file-size, block-size or lane multipliers. | Array widths are concrete. Other allocations, including importer temporary storage, are excluded: this is a lower bound, not a peak RSS estimate. Continuous profiles use it without an observed peak. |
 | Observed trace peaks | The largest `getrusage` high-water RSS of completed replays of the same trace, times 1.5. | Measured on the executing host and code, so it needs no recalibration when native allocations change. The first replay of a trace runs alone under supervision; the margin is policy headroom that sizes parallel waves only. |
 | Admission and recovery | The sum of candidate estimates must fit one live budget; observed pressure stops workers before bounded retry. | Budget/accounting invariants tested with bounded fixtures and real owned subprocesses. |
 
