@@ -1443,6 +1443,56 @@ def test_runner_preserves_native_host_offload_rank_config():
     assert rank["native_host_offload"] == engine_args["native_host_offload"]
 
 
+def _wait_power_prediction(**worker: object) -> dict:
+    return {
+        "engine": {
+            "mode": "aggregated",
+            "model": "Qwen/Qwen3-0.6B",
+            "hardware": "h200_sxm",
+            "backend": "vllm",
+            "context_length": 4096,
+            "workers": {
+                "aggregated": {
+                    **worker,
+                    "kv_cache": {"capacity": {"type": "fixed", "blocks": 128}},
+                    "timing": {"type": "fixed", "prefill_ms": 1.0, "decode_ms": 1.0},
+                }
+            },
+        }
+    }
+
+
+def _native_rank(config: CorePredictionConfig) -> dict:
+    runtime = RecordingRuntime()
+    EngineReplayRunnerFactory(runtime=runtime).create(0).run(prediction_to_replay_spec(config))
+    execution = runtime.execution_spec.get("spec", runtime.execution_spec)
+    return execution["engine"]["rank"]
+
+
+def test_prediction_wait_power_reaches_native_role_after_round_trip():
+    config = CorePredictionConfig.model_validate(_wait_power_prediction(wait_power_w=60))
+    restored = CorePredictionConfig.model_validate_json(config.model_dump_json(exclude_unset=True))
+    assert _native_rank(restored)["wait_power_w"] == 60.0
+
+
+def test_unset_wait_power_is_omitted_from_native_role():
+    config = CorePredictionConfig.model_validate(_wait_power_prediction())
+    assert "wait_power_w" not in _native_rank(config)
+
+
+@pytest.mark.parametrize("watts", [-1.0, math.nan, math.inf, "60"])
+def test_wait_power_rejects_negative_non_finite_or_string_watts(watts):
+    with pytest.raises(ValidationError, match="wait_power_w"):
+        CorePredictionConfig.model_validate(_wait_power_prediction(wait_power_w=watts))
+
+
+def test_afd_workers_do_not_accept_wait_power():
+    from aisim.config.engine import AFDWorkerPredictionConfig
+
+    assert "wait_power_w" not in AFDWorkerPredictionConfig.model_fields
+    assert AFDWorkerPredictionConfig.model_config.get("extra") == "forbid"
+
+
 def test_public_host_offload_config_reaches_native_execution_rank():
     runtime = RecordingRuntime()
     public = CorePredictionConfig.model_validate(

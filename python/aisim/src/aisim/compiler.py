@@ -912,6 +912,8 @@ def _worker_engine_args(
         "enable_prefix_caching": cache.prefix_caching,
         "startup_time": worker.startup_seconds,
     }
+    if worker.wait_power_w is not None:
+        payload["wait_power_w"] = worker.wait_power_w
     if backend == "sglang" and role == "decode" and cache.decode_radix_cache:
         payload["sglang"] = {"disaggregation_decode_enable_radix_cache": True}
     if worker.scheduler.async_scheduling is not None:

@@ -2286,6 +2286,7 @@ impl VllmCore {
         };
         let end_ms = forward_time.end_ms(pass.compute_start_ms);
         let mut result = pass.result;
+        result.forward_time = forward_time;
         result.end_ms = end_ms;
         // `launch`: vLLM returns the previous pass's outputs, then decides the
         // next pass, once it has launched this pass and the previous pass has
@@ -3156,6 +3157,7 @@ impl VllmCore {
             }),
         };
         let result = EnginePassResult {
+            forward_time: ForwardTime::default(),
             committed_requests,
             // The forward's end and the retry it implies are set when it is
             // priced; `now_ms` holds their place.

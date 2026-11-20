@@ -627,8 +627,8 @@ components; a documentation-only run and a complete matrix measure different
 workloads. Use job timestamps rather than the overall workflow completion time
 when staging is waiting.
 
-The application wheel-build job allows ten minutes on AMD64 and fifteen on
-ARM64. The ARM64 build budget includes cold release compilation, manylinux
+The application wheel-build job allows fifteen minutes on both AMD64 and
+ARM64. The build budget includes cold release compilation, manylinux
 repair, provenance checks, and wheel handoff; compilation can consume most of
 ten minutes before those final steps run. Application test shards retain their
 separate fifteen-minute job budget and all per-test timeouts.

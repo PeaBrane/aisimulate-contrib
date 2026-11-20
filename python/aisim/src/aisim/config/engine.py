@@ -795,6 +795,7 @@ class WorkerPredictionConfig(StrictModel):
     kv_cache: KvCachePredictionConfig = Field(default_factory=KvCachePredictionConfig)
     timing: TimingConfig = Field(default_factory=TimingConfig)
     startup_seconds: float = Field(default=0.0, ge=0.0)
+    wait_power_w: NonNegativeFloat | None = None
 
 
 def _frontend_implies_host_loop(value: Any) -> Any:

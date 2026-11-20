@@ -218,6 +218,14 @@
             "diagnostics": {
               "type": "object",
               "properties": {
+                "attention_dp_wait_ms": {
+                  "type": "number",
+                  "minimum": 0
+                },
+                "step_power_w": {
+                  "type": ["number", "null"],
+                  "exclusiveMinimum": 0
+                },
                 "power_w": {
                   "type": [
                     "number",

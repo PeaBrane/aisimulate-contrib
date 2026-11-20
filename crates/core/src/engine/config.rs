@@ -1273,6 +1273,9 @@ pub struct EngineConfig {
     /// Additional divisor applied to decode latency.
     #[serde(default = "default_one")]
     pub decode_speedup_ratio: f64,
+    /// Assumed watts per GPU during in-pass attention-DP rank wait.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wait_power_w: Option<f64>,
     /// Later pipeline stages a prefill forward still crosses after its pass retires (PP size - 1
     /// on a PP prefill worker, whose passes retire at the per-stage rate); delays the KV handoff.
     #[serde(default)]
@@ -1400,6 +1403,8 @@ struct EngineConfigWire {
     #[serde(default = "default_one")]
     decode_speedup_ratio: f64,
     #[serde(default)]
+    wait_power_w: Option<f64>,
+    #[serde(default)]
     pipeline_fill_passes: f64,
     #[serde(default)]
     aic_nextn: Option<usize>,
@@ -1489,6 +1494,7 @@ impl<'de> Deserialize<'de> for EngineConfig {
             enable_chunked_prefill: wire.enable_chunked_prefill,
             speedup_ratio: wire.speedup_ratio,
             decode_speedup_ratio: wire.decode_speedup_ratio,
+            wait_power_w: wire.wait_power_w,
             pipeline_fill_passes: wire.pipeline_fill_passes,
             aic_nextn: wire.aic_nextn,
             aic_nextn_accept_rates: wire.aic_nextn_accept_rates,
@@ -1541,6 +1547,7 @@ impl Default for EngineConfig {
             enable_chunked_prefill: true,
             speedup_ratio: 1.0,
             decode_speedup_ratio: 1.0,
+            wait_power_w: None,
             pipeline_fill_passes: 0.0,
             aic_nextn: None,
             aic_nextn_accept_rates: None,
@@ -2016,6 +2023,11 @@ impl EngineConfig {
             "decode_speedup_ratio must be finite and non-negative"
         );
         ensure!(
+            self.wait_power_w
+                .is_none_or(|watts| watts.is_finite() && watts >= 0.0),
+            "wait_power_w must be finite and non-negative"
+        );
+        ensure!(
             self.pipeline_fill_passes.is_finite()
                 && self.pipeline_fill_passes >= 0.0
                 && self.pipeline_fill_passes.fract() == 0.0,
@@ -2297,6 +2309,39 @@ impl EngineConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wait_power_round_trips_and_rejects_negative_or_non_finite_watts() {
+        let config: EngineConfig =
+            serde_json::from_value(serde_json::json!({"wait_power_w": 60.0})).unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.wait_power_w, Some(60.0));
+        let wire = serde_json::to_value(&config).unwrap();
+        assert_eq!(wire["wait_power_w"], 60.0);
+        let round_trip: EngineConfig = serde_json::from_value(wire).unwrap();
+        assert_eq!(round_trip.wait_power_w, Some(60.0));
+
+        let unset = EngineConfig::default();
+        assert!(unset.wait_power_w.is_none());
+        assert!(
+            serde_json::to_value(&unset)
+                .unwrap()
+                .get("wait_power_w")
+                .is_none()
+        );
+
+        for watts in [-1.0, f64::NAN, f64::INFINITY] {
+            let config = EngineConfig {
+                wait_power_w: Some(watts),
+                ..EngineConfig::default()
+            };
+            let error = config.validate().unwrap_err().to_string();
+            assert!(
+                error.contains("wait_power_w must be finite and non-negative"),
+                "{watts}: {error}"
+            );
+        }
+    }
 
     #[test]
     fn mamba_native_config_round_trip_defaults_and_rejections() {

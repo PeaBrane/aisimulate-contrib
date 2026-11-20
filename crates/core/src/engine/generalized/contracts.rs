@@ -362,6 +362,21 @@ pub trait RankEngine: Sized {
         Ok(None)
     }
 
+    /// Whether phase-priced passes contribute to attention-DP power evidence.
+    fn tracks_attention_dp_wait(&self) -> bool {
+        false
+    }
+
+    /// Modeled forward duration of the just resolved phase-priced pass.
+    fn phase_priced_forward_ns(&self) -> u128 {
+        0
+    }
+
+    /// Record the phase-priced group's uncovered wait with its shared provider.
+    fn record_phase_priced_wait(&self, _wait_ms: f64) -> Result<()> {
+        Ok(())
+    }
+
     /// Finish the pass retained by an unpriced [`Self::schedule_pass`]:
     /// `iteration` is the group's shared price, or `None` for the rank's own.
     fn resolve_pass(

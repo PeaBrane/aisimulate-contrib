@@ -132,6 +132,10 @@ def format_power_diagnostics(
         f"coverage={_format_percent(coverage)} "
         f"gate={_format_percent(gate)} status={status}"
     )
+    if "attention_dp_wait_ms" in diagnostics:
+        wait = _format_latency(diagnostics["attention_dp_wait_ms"])
+        step_power = _format_power(diagnostics.get("step_power_w"))
+        lines.append(f"Attention-DP wait: {wait} across ranks. Step power: {step_power}")
     reason = diagnostics.get("unavailable_reason")
     if isinstance(reason, str) and reason:
         lines.append(f"Reason: {reason}")
