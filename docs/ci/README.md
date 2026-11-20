@@ -172,7 +172,10 @@ configures automated review separately from GitHub Actions.
    or release owner.
 
 Trusted copy-pr-bot branches also launch Full CI automatically as a coverage
-backstop. Check that the copy's SHA matches the PR head before using its result.
+backstop. The bot copies ready PRs only: drafts run Fast CI until they are
+marked ready, or until a maintainer comments `/ok to test <sha>` to copy one
+explicitly (see [copy-pr-bot.yaml](../../.github/copy-pr-bot.yaml)).
+Check that the copy's SHA matches the PR head before using its result.
 If that run already validates the current head, a second manual launch is
 unnecessary. The maintainer admission boundary remains in place. Conditional
 Codex review and a review-completion dispatcher are not implemented by these

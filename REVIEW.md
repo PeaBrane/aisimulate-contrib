@@ -205,7 +205,9 @@ verifying those conditions, supplying the reviewed full commit SHA through the
 required `expected_sha` input. For manual validation, dispatch standalone Fast CI
 with the same ref and SHA first, then dispatch Full CI. Trusted copy-pr-bot
 `pull-request/*` branches also run Full CI automatically as a temporary coverage backstop while the `main`
-ruleset does not require the exact-SHA checks; treat such a run as PR evidence
+ruleset does not require the exact-SHA checks. The bot copies only ready PRs
+automatically; a draft is copied when it is marked ready or on `/ok to test <sha>`.
+Treat such a run as PR evidence
 only after confirming that its copied SHA equals the PR head. Automatic runs on
 `main` and `release/*` remain lifecycle validation outside the pre-merge
 sequence. Do not remove the copy-branch backstop until the ruleset enforces the

@@ -1916,6 +1916,14 @@ def test_full_ci_preserves_every_lifecycle_and_tag_run(event, ref):
     assert _full_ci_concurrency_group(event, ref, "101") != _full_ci_concurrency_group(event, ref, "102")
 
 
+def test_copy_pr_bot_syncs_ready_prs_but_not_drafts():
+    # Every trusted-copy push starts Full CI and the advisory performance
+    # workflows on the self-hosted pools; drafts keep Fast CI only until they
+    # are marked ready or a maintainer comments `/ok to test <sha>`.
+    config = yaml.safe_load((REPOSITORY_ROOT / ".github/copy-pr-bot.yaml").read_text())
+    assert config == {"enabled": True, "auto_sync_draft": False, "auto_sync_ready": True}
+
+
 def test_fast_ci_is_standalone_with_an_exact_commit_prerequisite() -> None:
     fast_ci = _workflow("fast-ci.yml")
     assert "workflow_call" not in fast_ci["on"]
