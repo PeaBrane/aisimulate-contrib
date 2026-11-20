@@ -13,10 +13,10 @@ from __future__ import annotations
 
 import pytest
 
-from aisim_core.sdk import common, config
+from aisim_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel, common, config
 from aisim_core.sdk.models import get_model
 from aisim_core.sdk.models.afd import build_afd_model
-from aisim_core.sdk.perf_database import get_database
+from aisim_core.sdk.perf_database import get_database, get_database_view
 
 pytestmark = pytest.mark.unit
 
@@ -212,3 +212,59 @@ def test_moe_logits_latency_uses_one_token_per_request(afd_database, afd_pool, i
     }
     if is_context and seq_len > 1:
         assert float(logits._engine_query(afd_database, x=4 * seq_len)) > expected_logits
+
+
+@pytest.mark.parametrize("model_path", ["Qwen/Qwen3-30B-A3B", "Qwen/Qwen3-8B", "deepseek-ai/DeepSeek-R1"])
+@pytest.mark.parametrize("prefill,decode", [(1, 0), (3, 5), (128, 256), (0, 5)])
+def test_scheduled_iteration_logits_project_each_request_once(model_path, prefill, decode):
+    # Exercise the public telemetry consumer of get_mix_step_ops, including
+    # existing dense/DeepSeek heads. Formula-only SOL keeps the oracle's shape
+    # independent of measurement-grid coverage. The large batch crosses the
+    # LM-head memory/compute boundary and distinguishes request counts from 1.
+    database = get_database_view("h200_sxm", "sglang", "0.5.14", database_mode="SOL")
+    graph = get_model(model_path, config.ModelConfig(**_BF16), "sglang")
+    metrics = [
+        {
+            "scheduled_requests": {
+                "num_prefill_requests": prefill,
+                "sum_prefill_tokens": prefill * 32,
+                "sum_prefill_kv_tokens": prefill * 512,
+                "num_decode_requests": decode,
+                "sum_decode_kv_tokens": decode * 4096,
+            }
+        }
+    ]
+    model = RustForwardPassPerfModel.best_available(
+        ForwardPassPerfModelConfig(
+            model=model_path,
+            system="h200_sxm",
+            backend="sglang",
+            backend_version="0.5.14",
+            worker_type="aggregated",
+            estimation_mode="op_level",
+            database_mode="SOL",
+            **{key: value.name for key, value in _BF16.items()},
+        )
+    )
+    try:
+        detail = model.estimate_forward_pass_detailed(metrics)
+        assert detail["latency_ms"] == model.estimate_forward_pass_time_ms(metrics)
+        operations = detail["ranks"][0]["operations"]
+        heads = [op for op in operations if op["name"].endswith("logits_gemm")]
+        phase = "context" if prefill else "generation"
+        logits = next(op for op in getattr(graph, f"{phase}_ops") if op._name.endswith("logits_gemm"))
+        # There are prefill+decode final hidden states, even though the shared
+        # transformer pass processes prefill*32+decode tokens. Decode attention
+        # is a separate pass; generation_logits_gemm must not run there too.
+        expected = float(logits._engine_query(database, x=prefill + decode))
+        assert len(heads) == 1
+        assert heads[0]["name"] == f"{phase}_logits_gemm"
+        assert heads[0]["latency_ms"] == pytest.approx(expected, rel=1e-12)
+        assert sum(op["latency_ms"] for op in operations) == pytest.approx(detail["latency_ms"], rel=1e-12)
+        if prefill and decode and prefill + decode > 100:
+            assert expected > float(logits._engine_query(database, x=1))
+        if not prefill:
+            static = model.static_phase_diagnostics(batch_size=decode, context_length=4095, prefill=False)
+            assert operations == static
+    finally:
+        model.close()

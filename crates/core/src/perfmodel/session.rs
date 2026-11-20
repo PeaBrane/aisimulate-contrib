@@ -642,7 +642,8 @@ pub(crate) fn generation_op_runtime(
 /// Algorithm (mirrors Python):
 /// 1. Combined non-attention pass: iterate `context_ops`, **skip**
 ///    context-attention ops, with `batch=1`, `isl=ctx_tokens+gen_tokens`,
-///    `prefix=combined_prefix`.
+///    `prefix=combined_prefix`. The logits head projects one final hidden
+///    state per scheduled request (`prefill_batch + decode_batch` rows).
 /// 2. Context attention contribution: re-run only context-attention ops with
 ///    the prefill batch shape (`batch = prefill_batch` requests of
 ///    `new_tokens_per_prefill_req` tokens).
@@ -698,7 +699,9 @@ pub(crate) fn get_mix_step_ops<'a>(
             continue;
         }
         let x = if op.is_logits_gemm() {
-            1
+            // Decode's non-attention work also runs in this shared pass;
+            // pass 3 queries only generation attention, not its logits head.
+            prefill_batch + decode_batch
         } else {
             effective_isl_combined
         };
@@ -800,6 +803,67 @@ mod tests {
     use crate::perf_database::energy_test_fixtures::{
         Col, write_energy_systems_root, write_parquet,
     };
+
+    #[test]
+    fn mixed_logits_project_each_scheduled_request_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = write_energy_systems_root(tmp.path());
+        // Synthetic measurements distinguish one, five and nine output rows.
+        // Each scheduled request contributes one final hidden state, regardless
+        // of its prefill length or cached prefix. Power is a constant 100 W.
+        write_parquet(
+            &data.join("gemm_perf.parquet"),
+            &[
+                Col::Str("gemm_dtype", vec!["bfloat16"; 3]),
+                Col::I64("m", vec![1, 5, 9]),
+                Col::I64("n", vec![1024; 3]),
+                Col::I64("k", vec![1024; 3]),
+                Col::F64("latency", vec![1.0, 5.0, 9.0]),
+                Col::F64("power", vec![100.0; 3]),
+            ],
+        );
+        let db = PerfDatabase::load(tmp.path(), "testsys", "vllm", "1.0").unwrap();
+        let head = |name| Op::Gemm(GemmOp::new(name, 1024, 1024, GemmQuantMode::Bfloat16));
+        let context_ops = [head("context_logits_gemm")];
+        let generation_ops = [head("generation_logits_gemm")];
+        let context_plan = OpListPlan::new(&context_ops);
+        let generation_plan = OpListPlan::new(&generation_ops);
+        let memo = OpMemo::new(16, &context_ops, &generation_ops);
+        // Include cold and warm queries with different request mixes and
+        // equal totals, then return to the one-request prefill boundary.
+        for (prefill, decode, expected_rows) in [(3, 2, 5), (1, 4, 5), (1, 0, 1), (3, 6, 9)] {
+            let mut visits = Vec::new();
+            let latency = get_mix_step_ops(
+                &context_ops,
+                &generation_ops,
+                Some(&context_plan),
+                Some(&generation_plan),
+                Some(&memo),
+                &db,
+                prefill * 1024,
+                decode,
+                1024,
+                prefill,
+                512,
+                prefill * 512,
+                4096,
+                decode,
+                |context, _, op, runtime, result, divisor| {
+                    visits.push((context, op.name().to_owned(), runtime.num_tokens));
+                    assert_eq!(result.energy_wms, f64::from(expected_rows) * 100.0);
+                    assert_eq!(divisor, 1.0);
+                },
+            )
+            .unwrap();
+            assert_eq!(latency, f64::from(expected_rows));
+            // Pass 3 runs only decode attention: the shared context head
+            // already projected the decode rows and must be charged once.
+            assert_eq!(
+                visits,
+                [(true, "context_logits_gemm".into(), expected_rows)]
+            );
+        }
+    }
 
     #[test]
     fn dsv41_stage_memo_preserves_first_child_error_and_omits_failed_children() {

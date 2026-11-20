@@ -283,6 +283,24 @@ Host work adds one existing GEMM query per ordinary context pass; it is not
 multiplied by the layer count and introduces no cache or additional preparation
 pass.
 
+The scheduled-iteration telemetry path (`get_mix_step_ops`, reached through
+`estimate_forward_pass_time_ms` / `estimate_forward_pass_detailed`) also prices
+the shared logits head with one row per scheduled prefill **and** decode
+request. Three prefills of 1024 new tokens and two decodes require five LM-head
+rows, rather than the prior one row or the shared transformer's 3074 rows.
+The decode pass queries only attention, so it must not charge a second head.
+The Rust regression uses synthetic measurements of 1, 5 and 9 ms at those
+row counts, with constant 100 W power, and checks cold and cached results.
+Public-consumer regressions cover MoE, dense Qwen3 and DeepSeek heads, a single
+prefill, cached prefixes, and decode-only agreement with static diagnostics.
+
+This correction also applies to existing dense-family context heads. The
+frozen mixed-step records in the engine-step and compiled-engine suites use
+the separate SDK `mixed_step_latency` composition, not `get_mix_step_ops`;
+their values and tolerances remain unchanged. The correction adds one integer
+sum per logits query with no new queries, allocations, preparation, or retained
+state.
+
 ### B200 SGLang dense-prefix correction in PR #303
 
 Four existing B200 cases change because `deepseek_v32._dense_mlp_groups` now honors `first_k_dense_replace=3` and the checkpoint's packed-linear quantization exclusions. Previously those three dense layers were counted as MoE layers. DeepSeek-V3.2 now has 58 MoE plus three FP8-block dense layers (61 total); both GLM-5 cases have 75 MoE plus three BF16 dense layers (78 total). GLM-5.2 also has 75 MoE plus three dense layers, with its excluded packed gate/up and down projections using BF16 instead of inheriting the global NVFP4 GEMM mode.
