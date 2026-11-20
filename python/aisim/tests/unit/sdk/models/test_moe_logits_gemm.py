@@ -222,7 +222,7 @@ def test_scheduled_iteration_logits_project_each_request_once(model_path, prefil
     # independent of measurement-grid coverage. The large batch crosses the
     # LM-head memory/compute boundary and distinguishes request counts from 1.
     database = get_database_view("h200_sxm", "sglang", "0.5.14", database_mode="SOL")
-    graph = get_model(model_path, config.ModelConfig(**_BF16), "sglang")
+    graph = get_model(model_path, config.ModelConfig(moe_tp_size=1, moe_ep_size=1, **_BF16), "sglang")
     metrics = [
         {
             "scheduled_requests": {
@@ -243,6 +243,8 @@ def test_scheduled_iteration_logits_project_each_request_once(model_path, prefil
             worker_type="aggregated",
             estimation_mode="op_level",
             database_mode="SOL",
+            moe_tp_size=1,
+            moe_ep_size=1,
             **{key: value.name for key, value in _BF16.items()},
         )
     )
