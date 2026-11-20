@@ -308,7 +308,7 @@ pub enum FpmMambaCacheMode {
 /// ran with. Selection and sizing do not read them. Grouped prefix caching
 /// needs `enable_prefix_caching` true and `hash_block_size_tokens`, and replay
 /// then hashes prompts in blocks of `hash_block_size_tokens`. Replay models grouped prefix caching
-/// for vLLM 0.31.0 and 0.32.0 only. For a linear profile, the simulated
+/// for vLLM 0.31.0, 0.32.0 and 0.33.0 only. For a linear profile, the simulated
 /// deployment decides prefix caching.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

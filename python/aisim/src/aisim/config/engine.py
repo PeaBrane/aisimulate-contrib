@@ -1660,6 +1660,12 @@ def _validate_fpm_profile(engine, modes: set[str], backends: set[str]) -> None:
                         prefix_match_unit=cache.prefix_match_unit,
                         max_batched_tokens=worker.scheduler.max_batched_tokens,
                     )
+                    # Only a prediction states the interval. The search space and the onboarding plan run with 1.
+                    if backend_version == "0.33.0" and worker.scheduler.prefill_schedule_interval != 1:
+                        raise ValueError(
+                            "grouped prefix caching on vLLM 0.33.0 requires prefill_schedule_interval=1; vLLM 0.33.0 "
+                            "holds prefills at attention DP size 1 too, and replay does not model that"
+                        )
                 if cache.host_offload is not None or cache.g3_offload is not None:
                     raise ValueError("grouped FPM cache supports only HBM; host and G3 offload are unsupported")
                 if cache.capacity.type == "fixed" or cache.bytes_per_token != "auto":
@@ -1675,7 +1681,7 @@ def _validate_fpm_profile(engine, modes: set[str], backends: set[str]) -> None:
 
 
 # The vLLM versions whose grouped prefix-caching rules the Rust rule table holds.
-GROUPED_PREFIX_CACHING_VERSIONS = ("0.31.0", "0.32.0")
+GROUPED_PREFIX_CACHING_VERSIONS = ("0.31.0", "0.32.0", "0.33.0")
 
 
 def grouped_prefix_caching_requirements(
@@ -1698,7 +1704,7 @@ def grouped_prefix_caching_requirements(
     if memory is None or memory.enable_prefix_caching is not True or memory.hash_block_size_tokens is None:
         raise ValueError(f"grouped FPM cache requires {field}=false for cold replay")
     if backend_version not in GROUPED_PREFIX_CACHING_VERSIONS:
-        raise ValueError("grouped FPM cache prefix caching is modeled for vLLM 0.31.0 and 0.32.0 only")
+        raise ValueError("grouped FPM cache prefix caching is modeled for vLLM 0.31.0, 0.32.0 and 0.33.0 only")
     # Replay applies the grouped rules of the label, so evidence that a runtime of another version recorded is refused.
     # A profile imported before the field existed passes as before.
     if memory.runtime_framework_version is not None and memory.runtime_framework_version != backend_version:

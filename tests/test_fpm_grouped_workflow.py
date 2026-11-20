@@ -290,7 +290,7 @@ def _with_prefix_evidence(profile, *, hash_block=64, version="0.31.0"):
             group.update(block_size_tokens=hash_block, page_size_bytes=64, prefix_cacheable=True)
             if group["kind"] == "state":
                 group["blocks_per_request"] = 1
-                if version == "0.32.0":
+                if version in ("0.32.0", "0.33.0"):
                     group["prefill_checkpoint_blocks"] = 0
     return profile
 
@@ -1109,7 +1109,8 @@ def _prefix_search(profile, root, version):
         ("non_cacheable_full_attention", None),
         ("state_without_align", "requires mamba_cache_mode=align for a prefix-cacheable state group"),
         ("vllm_0320", None),
-        ("vllm_0300", "is modeled for vLLM 0.31.0 and 0.32.0 only"),
+        ("vllm_0330", None),
+        ("vllm_0300", "is modeled for vLLM 0.31.0, 0.32.0 and 0.33.0 only"),
         ("unequal_pages", "requires equal page_size_bytes across cache groups"),
         ("other_unit", "must equal the profile's hash_block_size_tokens for a grouped FPM cache"),
     ],
@@ -1118,7 +1119,9 @@ def test_grouped_prefix_caching_needs_vllm_evidence_with_align_mode(grouped_case
     from aisim.sweeper.config import SearchSpace
 
     profile, root = grouped_case
-    version = {"no_evidence": "0.25.1", "vllm_0320": "0.32.0", "vllm_0300": "0.30.0"}.get(case, "0.31.0")
+    version = {"no_evidence": "0.25.1", "vllm_0320": "0.32.0", "vllm_0330": "0.33.0", "vllm_0300": "0.30.0"}.get(
+        case, "0.31.0"
+    )
     profile = _with_state_group(profile)
     if case != "no_evidence":
         profile = _with_prefix_evidence(profile, version=version)
@@ -1159,7 +1162,7 @@ def test_grouped_prefix_caching_needs_vllm_evidence_with_align_mode(grouped_case
             SearchSpace.model_validate(search)
 
 
-@pytest.mark.parametrize("version", ["0.31.0", "0.32.0"])
+@pytest.mark.parametrize("version", ["0.31.0", "0.32.0", "0.33.0"])
 def test_grouped_prefix_caching_replays_with_reuse(grouped_case, tmp_path, version):
     profile, root = grouped_case
     profile = _with_prefix_evidence(_with_state_group(profile), version=version)
@@ -1173,12 +1176,12 @@ def test_grouped_prefix_caching_replays_with_reuse(grouped_case, tmp_path, versi
     assert cli.main(["predict", "-c", str(path), "--output-dir", str(output), "--capture-per-request"]) == 0
     report = json.loads((output / "prediction.json").read_text())
     assert report["completed_requests"] == 2
-    # Both versions keep the state at 512, the last 64-token boundary below the 520-token prompt, so the
+    # Every version keeps the state at 512, the last 64-token boundary below the 520-token prompt, so the
     # identical second request reuses 512 tokens.
     assert [row["reused_input_tokens"] for row in report["per_request"]] == [0, 512]
 
 
-@pytest.mark.parametrize("version", ["0.31.0", "0.32.0"])
+@pytest.mark.parametrize("version", ["0.31.0", "0.32.0", "0.33.0"])
 @pytest.mark.parametrize(
     "host",
     [
@@ -1309,7 +1312,7 @@ def test_grouped_plan_without_the_probe_hash_block_stays_cold(grouped_case, tmp_
 
 @pytest.mark.parametrize("version", ["0.30.0", "0.25.1"])
 def test_grouped_plan_on_an_unmodeled_vllm_version_stays_cold(grouped_case, tmp_path, monkeypatch, version):
-    # Replay models grouped prefix caching for vLLM 0.31.0 and 0.32.0 only, so a hand-made profile of another
+    # Replay models grouped prefix caching for vLLM 0.31.0, 0.32.0 and 0.33.0 only, so a hand-made profile of another
     # version with evidence and markers plans the cold replay that it planned before.
     profile, _root = grouped_case
     profile = _with_prefix_evidence(profile, version=version)
@@ -1462,22 +1465,23 @@ def _onboarding_plan(profile, tmp_path, capsys, version, runtime_version=None):
     return stderr, files
 
 
-_NOT_MODELED = (
-    "Grouped prefix caching is not modeled for vLLM 0.33.0, so the plan of this profile runs without prefix caching, "
-    "although its runtime memory records prefix caching on."
-)
+def _not_modeled(version):
+    return (
+        f"Grouped prefix caching is not modeled for vLLM {version}, so the plan of this profile runs without prefix "
+        "caching, although its runtime memory records prefix caching on."
+    )
 
 
 @reads_saved_config
-def test_grouped_vllm_0330_plan_keeps_its_files_and_prints_that_prefix_caching_is_not_modeled(
+def test_grouped_plan_of_a_version_without_rules_keeps_its_files_and_prints_that_prefix_caching_is_not_modeled(
     grouped_case, tmp_path, capsys
 ):
-    # The runtime probe of vLLM 0.33.0 ran with prefix caching, but the rule table models vLLM 0.31.0 and 0.32.0
-    # only. The plan stays cold, and only the command output says why, so a saved plan keeps its bytes.
+    # A hand-made profile of vLLM 0.30.0 records prefix caching on, but the rule table models vLLM 0.31.0, 0.32.0
+    # and 0.33.0 only. The plan stays cold, and only the command output says why, so a saved plan keeps its bytes.
     profile, _root = grouped_case
-    profile = _with_prefix_evidence(_with_state_group(profile), version="0.33.0")
-    stderr, files = _onboarding_plan(profile, tmp_path, capsys, "0.33.0")
-    assert stderr.strip() == _NOT_MODELED
+    profile = _with_prefix_evidence(_with_state_group(profile), version="0.30.0")
+    stderr, files = _onboarding_plan(profile, tmp_path, capsys, "0.30.0")
+    assert stderr.strip() == _not_modeled("0.30.0")
     for name in ("predict/pilot.yaml", "recommend/pilot.yaml"):
         worker = yaml.safe_load(files[name])["engine"]["workers"]["aggregated"]
         assert worker["kv_cache"]["prefix_caching"] is False
@@ -1486,7 +1490,9 @@ def test_grouped_vllm_0330_plan_keeps_its_files_and_prints_that_prefix_caching_i
 
 
 @reads_saved_config
-@pytest.mark.parametrize("version,probe_prefix_caching", [("0.33.0", False), ("0.31.0", True), ("0.32.0", True)])
+@pytest.mark.parametrize(
+    "version,probe_prefix_caching", [("0.33.0", False), ("0.33.0", True), ("0.31.0", True), ("0.32.0", True)]
+)
 def test_grouped_plan_prints_no_prefix_caching_note_without_probe_prefix_caching_or_on_a_modeled_version(
     grouped_case, tmp_path, capsys, version, probe_prefix_caching
 ):
@@ -1498,19 +1504,19 @@ def test_grouped_plan_prints_no_prefix_caching_note_without_probe_prefix_caching
     stderr, files = _onboarding_plan(profile, tmp_path, capsys, version)
     assert "prefix caching" not in stderr
     worker = yaml.safe_load(files["predict/pilot.yaml"])["engine"]["workers"]["aggregated"]
-    assert worker["kv_cache"]["prefix_caching"] is (version != "0.33.0")
+    assert worker["kv_cache"]["prefix_caching"] is probe_prefix_caching
 
 
 @reads_saved_config
 @pytest.mark.parametrize("label", ["0.31.0", "0.32.0", "custom-vllm"])
 def test_grouped_plan_decides_prefix_caching_by_the_observed_vllm_version(grouped_case, tmp_path, capsys, label):
     # `onboard probe-runtime` keeps an explicit dataset label and records the vLLM version that it observed as
-    # runtime_framework_version. The evidence is that of vLLM 0.33.0, which replay does not model, so the plan stays
-    # cold under a label with grouped rules too, and the note names the observed version.
+    # runtime_framework_version. The evidence is that of vLLM 0.33.0, which has grouped rules, but the label differs
+    # and replay would take the rules of the label. The plan stays cold, and the note names both versions.
     profile, _root = grouped_case
     profile = _with_prefix_evidence(_with_state_group(profile), version=label)
     stderr, files = _onboarding_plan(profile, tmp_path, capsys, label, runtime_version="0.33.0")
-    assert stderr.strip() == _NOT_MODELED
+    assert stderr.strip() == _label_differs("0.33.0", label)
     for name in ("predict/pilot.yaml", "recommend/pilot.yaml"):
         worker = yaml.safe_load(files[name])["engine"]["workers"]["aggregated"]
         assert worker["kv_cache"]["prefix_caching"] is False
@@ -1558,7 +1564,7 @@ def test_grouped_plan_with_modeled_evidence_under_another_label_is_cold(grouped_
 
 
 @reads_saved_config
-@pytest.mark.parametrize("version", ["0.31.0", "0.32.0"])
+@pytest.mark.parametrize("version", ["0.31.0", "0.32.0", "0.33.0"])
 def test_grouped_plan_with_the_evidence_version_of_its_label_keeps_prefix_caching_on(
     grouped_case, tmp_path, capsys, version
 ):
@@ -1607,7 +1613,7 @@ def _prefix_caching_of(plan):
 
 
 @reads_saved_config
-@pytest.mark.parametrize("version", ["0.31.0", "0.32.0"])
+@pytest.mark.parametrize("version", ["0.31.0", "0.32.0", "0.33.0"])
 def test_grouped_plan_saved_cold_by_an_earlier_planner_still_verifies(
     grouped_case, tmp_path, monkeypatch, capsys, version
 ):
@@ -1652,8 +1658,18 @@ def test_grouped_plan_saved_cold_by_an_earlier_planner_still_verifies(
 
 
 @reads_saved_config
-@pytest.mark.parametrize("version", ["0.31.0", "0.33.0"])
-def test_grouped_plan_saved_cold_refuses_any_other_change(grouped_case, tmp_path, capsys, monkeypatch, version):
+@pytest.mark.parametrize(
+    "version,change,refused",
+    [
+        ("0.31.0", "requests", True),
+        ("0.30.0", "prefix_caching", True),
+        ("0.31.0", "prefix_caching", False),
+        ("0.33.0", "prefix_caching", False),
+    ],
+)
+def test_grouped_plan_saved_cold_refuses_any_other_change(
+    grouped_case, tmp_path, capsys, monkeypatch, version, change, refused
+):
     from aisim.support import plan as plan_module
 
     profile, _root = grouped_case
@@ -1662,92 +1678,220 @@ def test_grouped_plan_saved_cold_refuses_any_other_change(grouped_case, tmp_path
     _onboarding_plan(profile, tmp_path, capsys, version)
     monkeypatch.undo()
     plan = tmp_path / "collection"
-    pilot = yaml.safe_load((plan / "predict/pilot.yaml").read_text())
-    if version == "0.31.0":
-        # A cold plan with one more change is neither the plan of the planner nor that of the earlier planner.
-        pilot["traffic"]["stop"]["requests"] += 1
-    else:
-        # A vLLM 0.33.0 profile plans cold under both planners, so a plan with prefix caching on is a rendering of
-        # neither.
-        pilot["engine"]["workers"]["aggregated"]["kv_cache"]["prefix_caching"] = True
-    # The hashes of the plan are written again, so only the comparison with the renderings can refuse it.
-    data = yaml.safe_dump(pilot, sort_keys=False).encode()
-    (plan / "predict/pilot.yaml").write_bytes(data)
     saved = json.loads((plan / "support-plan.json").read_text())
-    saved["generated_files_sha256"]["predict/pilot.yaml"] = hashlib.sha256(data).hexdigest()
+    for name in ("predict/pilot.yaml", "recommend/pilot.yaml"):
+        pilot = yaml.safe_load((plan / name).read_text())
+        if change == "requests":
+            # A cold plan with one more change is neither the plan of the planner nor that of the earlier planner.
+            pilot["traffic"]["stop"]["requests"] += 1
+        else:
+            # Prefix caching on in both pilots is the plan of the planner for a version with grouped rules. A vLLM
+            # 0.30.0 profile has no grouped rules and plans cold under both planners, so there it is a rendering of
+            # neither.
+            pilot["engine"]["workers"]["aggregated"]["kv_cache"]["prefix_caching"] = True
+        # The hashes of the plan are written again, so only the comparison with the renderings can refuse it.
+        data = yaml.safe_dump(pilot, sort_keys=False).encode()
+        (plan / name).write_bytes(data)
+        saved["generated_files_sha256"][name] = hashlib.sha256(data).hexdigest()
     (plan / "support-plan.json").write_text(json.dumps(saved, indent=2, sort_keys=True) + "\n")
+    request = SupportRequest.from_yaml(plan / "request.yaml")
+    if not refused:
+        plan_module.check_plan(request, plan)
+        return
     with pytest.raises(ValueError, match="support-plan.json was modified; choose a new output directory"):
-        plan_module.check_plan(SupportRequest.from_yaml(plan / "request.yaml"), plan)
+        plan_module.check_plan(request, plan)
 
 
 @reads_saved_config
-def test_grouped_vllm_0330_plan_is_the_same_under_the_earlier_planner(grouped_case, tmp_path, capsys, monkeypatch):
-    # The evidence of vLLM 0.33.0 has no grouped rules, so both planners write the cold plan, byte for byte.
+def test_a_grouped_vllm_0330_plan_saved_cold_still_verifies(grouped_case, tmp_path, capsys, monkeypatch):
+    # Before replay had grouped rules for vLLM 0.33.0, the planner wrote this profile's plan cold, the same bytes as
+    # the earlier planner writes.
     from aisim.support import plan as plan_module
 
     profile, _root = grouped_case
     profile = _with_prefix_evidence(_with_state_group(profile), version="0.33.0")
-    _stderr, files = _onboarding_plan(profile, tmp_path, capsys, "0.33.0")
+    monkeypatch.setattr(plan_module, "grouped_prefix_caching_requirements", _refuse_prefix_caching)
+    _onboarding_plan(profile, tmp_path, capsys, "0.33.0")
+    monkeypatch.undo()
+    plan = tmp_path / "collection"
+    request = SupportRequest.from_yaml(plan / "request.yaml")
+    pilot = plan / "predict/pilot.yaml"
+    before = pilot.read_bytes()
+    assert _prefix_caching_of(plan) == [False, False]
+    plan_module.check_plan(request, plan)
+    assert pilot.read_bytes() == before
+    # A changed file of the saved plan is still refused.
+    pilot.write_bytes(before.replace(b"prefix_caching: false", b"prefix_caching: true"))
+    with pytest.raises(ValueError, match="was modified or missing; choose a new output directory"):
+        plan_module.check_plan(request, plan)
+    pilot.write_bytes(before)
+    # `onboard plan --overwrite` writes the plan of the planner, which turns prefix caching on.
+    config = tmp_path / "request.yaml"
+    assert cli.main(["onboard", "plan", "--config", str(config), "--output-dir", str(plan), "--overwrite"]) == 0
+    assert _prefix_caching_of(plan) == [True, True]
+    plan_module.check_plan(request, plan)
+
+
+@reads_saved_config
+@pytest.mark.parametrize("version", ["0.30.0", "0.25.1"])
+def test_a_version_without_rules_plans_the_same_bytes_under_the_earlier_planner(
+    grouped_case, tmp_path, capsys, monkeypatch, version
+):
+    # A version without grouped rules plans cold, so the planner and the earlier planner write the same plan.
+    from aisim.support import plan as plan_module
+
+    profile, _root = grouped_case
+    profile = _with_prefix_evidence(_with_state_group(profile), version=version)
+    _stderr, files = _onboarding_plan(profile, tmp_path, capsys, version)
     (tmp_path / "collection").rename(tmp_path / "planner")
     monkeypatch.setattr(plan_module, "grouped_prefix_caching_requirements", _refuse_prefix_caching)
-    _stderr, earlier = _onboarding_plan(profile, tmp_path, capsys, "0.33.0")
+    _stderr, earlier = _onboarding_plan(profile, tmp_path, capsys, version)
     assert files == earlier
     worker = yaml.safe_load(files["predict/pilot.yaml"])["engine"]["workers"]["aggregated"]
     assert worker["kv_cache"]["prefix_caching"] is False
 
 
-def test_grouped_prefix_caching_refuses_evidence_of_another_vllm_version(grouped_case):
-    # A profile that records vLLM 0.33.0 evidence under the label 0.32.0 cannot replay with the rules of the label.
+@reads_saved_config
+@pytest.mark.parametrize("case", ["unmarked_group", "non_cacheable_window"])
+@pytest.mark.parametrize("version", ["0.31.0", "0.32.0", "0.33.0"])
+def test_the_marker_and_window_refusals_hold_on_each_version(grouped_case, tmp_path, capsys, case, version):
+    from aisim.sweeper.config import SearchSpace
+
+    error = {
+        "unmarked_group": "every cache group to declare prefix_cacheable",
+        "non_cacheable_window": "do not model a sliding-window attention group with prefix_cacheable=false",
+    }[case]
+    profile, root = grouped_case
+    profile = _with_prefix_evidence(_with_state_group(profile), version=version)
+    for deployment in profile["deployments"]:
+        groups = deployment["resources"]["cache_groups"]
+        if case == "unmarked_group":
+            del groups[1]["prefix_cacheable"]
+        else:
+            # The window group of the fixture, as the Rust rule table refuses it.
+            assert groups[1]["kind"] == "attention" and groups[1]["sliding_window"]
+            groups[1]["prefix_cacheable"] = False
+    with pytest.raises(ValidationError, match=error):
+        CorePredictionConfig.model_validate(_prefix_caching_prediction(profile, root, version))
+    with pytest.raises(ValidationError, match=error):
+        SearchSpace.model_validate(_prefix_search(profile, root, version))
+    stderr, _files = _onboarding_plan(profile, tmp_path, capsys, version)
+    assert "prefix caching" not in stderr
+    assert _prefix_caching_of(tmp_path / "collection") == [False, False]
+
+
+@pytest.mark.parametrize("label,recorded", [("0.32.0", "0.33.0"), ("0.33.0", "0.32.0")])
+def test_grouped_prefix_caching_refuses_evidence_of_another_vllm_version(grouped_case, label, recorded):
+    # A profile that records the evidence of one vLLM version under the label of another cannot replay with the rules
+    # of the label.
     from aisim.sweeper.config import SearchSpace
 
     profile, root = grouped_case
-    profile = _with_prefix_evidence(_with_state_group(profile), version="0.32.0")
-    CorePredictionConfig.model_validate(_prefix_caching_prediction(profile, root, "0.32.0"))
-    SearchSpace.model_validate(_prefix_search(profile, root, "0.32.0"))
+    profile = _with_prefix_evidence(_with_state_group(profile), version=label)
+    CorePredictionConfig.model_validate(_prefix_caching_prediction(profile, root, label))
+    SearchSpace.model_validate(_prefix_search(profile, root, label))
     for deployment in profile["deployments"]:
-        deployment["resources"]["runtime_memory"]["runtime_framework_version"] = "0.33.0"
+        deployment["resources"]["runtime_memory"]["runtime_framework_version"] = recorded
     error = (
-        r"grouped FPM cache prefix caching requires runtime_memory.runtime_framework_version \(0.33.0\) to equal "
-        r"the deployment's backend_version \(0.32.0\)"
+        rf"grouped FPM cache prefix caching requires runtime_memory.runtime_framework_version \({recorded}\) to equal "
+        rf"the deployment's backend_version \({label}\)"
     )
     with pytest.raises(ValidationError, match=error):
-        CorePredictionConfig.model_validate(_prefix_caching_prediction(profile, root, "0.32.0"))
+        CorePredictionConfig.model_validate(_prefix_caching_prediction(profile, root, label))
     with pytest.raises(ValidationError, match=error):
-        SearchSpace.model_validate(_prefix_search(profile, root, "0.32.0"))
+        SearchSpace.model_validate(_prefix_search(profile, root, label))
     # With prefix caching off, the profile replays cold as before.
-    cold = _prefix_caching_prediction(profile, root, "0.32.0")
+    cold = _prefix_caching_prediction(profile, root, label)
     cold["engine"]["workers"]["aggregated"]["kv_cache"] = {"prefix_caching": False}
     CorePredictionConfig.model_validate(cold)
 
 
-def test_grouped_vllm_0330_profile_refuses_prefix_caching_before_replay(grouped_case):
-    # The Rust gate refuses vllm_version 0.33.0 with prefix caching. A prediction and a search refuse it first, in
-    # Python, so that no replay reaches that gate.
-    from aisim.sweeper.config import SearchSpace
+_INTERVAL_TEXT = (
+    "grouped prefix caching on vLLM 0.33.0 requires prefill_schedule_interval=1; vLLM 0.33.0 holds prefills at "
+    "attention DP size 1 too, and replay does not model that"
+)
+
+
+@pytest.mark.parametrize("version,interval,refused", [("0.33.0", 1, False), ("0.33.0", 2, True), ("0.32.0", 2, False)])
+def test_grouped_prefix_caching_on_vllm_0330_refuses_a_prefill_schedule_interval_above_one(
+    grouped_case, version, interval, refused
+):
+    profile, root = grouped_case
+    profile = _with_prefix_evidence(_with_state_group(profile), version=version)
+    raw = _prefix_caching_prediction(profile, root, version)
+    raw["engine"]["workers"]["aggregated"]["scheduler"]["prefill_schedule_interval"] = interval
+    if not refused:
+        CorePredictionConfig.model_validate(raw)
+        return
+    with pytest.raises(ValidationError, match=_INTERVAL_TEXT):
+        CorePredictionConfig.model_validate(raw)
+    # With prefix caching off the rank does not read the version, so the cold replay keeps the interval.
+    raw["engine"]["workers"]["aggregated"]["kv_cache"] = {"prefix_caching": False}
+    CorePredictionConfig.model_validate(raw)
+
+
+@reads_saved_config
+@pytest.mark.parametrize("label,recorded", [("0.32.0", "0.33.0"), ("0.33.0", "0.32.0")])
+def test_grouped_plan_with_recorded_evidence_of_another_version_is_cold(
+    grouped_case, tmp_path, capsys, label, recorded
+):
+    profile, _root = grouped_case
+    profile = _with_prefix_evidence(_with_state_group(profile), version=label)
+    for deployment in profile["deployments"]:
+        deployment["resources"]["runtime_memory"]["runtime_framework_version"] = recorded
+    stderr, files = _onboarding_plan(profile, tmp_path, capsys, label)
+    assert stderr.strip() == _label_differs(recorded, label)
+    for name in ("predict/pilot.yaml", "recommend/pilot.yaml"):
+        worker = yaml.safe_load(files[name])["engine"]["workers"]["aggregated"]
+        assert worker["kv_cache"]["prefix_caching"] is False
+
+
+@reads_saved_config
+def test_grouped_vllm_0330_plan_with_an_unmarked_window_group_is_cold_without_a_note(grouped_case, tmp_path, capsys):
+    # The probe import writes no prefix_cacheable for a group with a SlidingWindowMLASpec layer. The version has
+    # rules and equals the label, so no note blames the version.
+    profile, root = grouped_case
+    profile = _with_prefix_evidence(_with_state_group(profile), version="0.33.0")
+    for deployment in profile["deployments"]:
+        window = next(group for group in deployment["resources"]["cache_groups"] if group.get("sliding_window"))
+        del window["prefix_cacheable"]
+    stderr, files = _onboarding_plan(profile, tmp_path, capsys, "0.33.0")
+    assert "prefix caching" not in stderr
+    for name in ("predict/pilot.yaml", "recommend/pilot.yaml"):
+        worker = yaml.safe_load(files[name])["engine"]["workers"]["aggregated"]
+        assert worker["kv_cache"]["prefix_caching"] is False
+    with pytest.raises(ValidationError, match="every cache group to declare prefix_cacheable"):
+        CorePredictionConfig.model_validate(_prefix_caching_prediction(profile, root, "0.33.0"))
+
+
+def test_grouped_vllm_0330_profile_without_checkpoint_fields_is_refused_by_native_replay(grouped_case):
+    # The Python gates do not read the checkpoint fields, so the prediction validates. The rule table refuses the
+    # rank with the text of its own row.
+    from aisim.runner import EngineReplayRunnerFactory
 
     profile, root = grouped_case
     profile = _with_prefix_evidence(_with_state_group(profile), version="0.33.0")
-    raw = _prediction(profile, root)
-    raw["engine"]["backend_version"] = "0.33.0"
-    raw["engine"]["workers"]["aggregated"]["kv_cache"]["prefix_caching"] = True
-    error = "is modeled for vLLM 0.31.0 and 0.32.0 only"
-    with pytest.raises(ValidationError, match=error):
-        CorePredictionConfig.model_validate(raw)
-    with pytest.raises(ValidationError, match=error):
-        SearchSpace.model_validate(_prefix_search(profile, root, "0.33.0"))
+    for deployment in profile["deployments"]:
+        for group in deployment["resources"]["cache_groups"]:
+            group.pop("prefill_checkpoint_blocks", None)
+    _write_timings(root, profile, version="0.33.0")
+    config = CorePredictionConfig.model_validate(_prefix_caching_prediction(profile, root, "0.33.0"))
+    error = "kv_cache_groups with vllm_version=0.33.0 require prefill_checkpoint_blocks on every prefix-cacheable state"
+    with pytest.raises(RuntimeError, match=error):
+        EngineReplayRunnerFactory().create(0).run(prediction_to_replay_spec(config))
 
 
 _GLM_PAGE = 13_045_120
 
 
 def _glm_shaped_profile(profile, version):
-    """A hand-made profile of vLLM 0.31.0 or 0.32.0 with six GLM-5.3-Flash TP 4 cache groups and a pool of 64 blocks.
+    """A hand-made profile of vLLM 0.31.0, 0.32.0 or 0.33.0 with six GLM-5.3-Flash TP 4 cache groups and 64 blocks.
 
     The kinds, blocks and layer counts of the groups are those that the vLLM 0.33.0 runtime probe records (fixture
     glm53flash_vllm_0330_probe): MLA and indexer attention of 22 layers and four KDA MambaSpec states of 9, 9, 8 and 8
     layers with 2,176-token blocks, and a CircularBufferSpec ring of 11 layers with 4-token blocks. The prefix-caching
     evidence equals the probe's: prefix caching on, align mode and a hash block of 2,176 tokens. The page size, the pool
-    and the group order are hand-made. The state groups keep prefill_checkpoint_blocks 0, which both rule rows accept.
+    and the group order are hand-made. The state groups keep prefill_checkpoint_blocks 0, which every rule row accepts.
     The page is the sum of the pages of the attention layers, 13,045,120 bytes, the block row of vLLM 0.31.0.
     vLLM 0.32.0 rounds the row up to the least common multiple of the block-stride alignments of all layers (v0.32.0
     vllm/v1/core/kv_cache_utils.py:1533-1551): 13,516,800 bytes for this model at TP 4 on GB300, 25 times the least
@@ -1808,7 +1952,7 @@ def _glm_shaped_profile(profile, version):
     return profile
 
 
-@pytest.mark.parametrize("version", ["0.31.0", "0.32.0"])
+@pytest.mark.parametrize("version", ["0.31.0", "0.32.0", "0.33.0"])
 def test_glm_shaped_grouped_profile_replays_a_multi_turn_trace_with_hits(grouped_case, tmp_path, monkeypatch, version):
     # A trace has no known host memory peak, so the CLI replays it only in a supervised child. Model the
     # supervisor context of that child, as test_unified_cli.py does.
@@ -1876,7 +2020,7 @@ def test_glm_shaped_grouped_profile_replays_a_multi_turn_trace_with_hits(grouped
     report = json.loads((output / "prediction.json").read_text())
     assert report["completed_requests"] == 4
     # Turn two hits the state that turn one keeps at (9000 - 1) / 2176 * 2176 = 8704, and turn three the one that
-    # turn two keeps at (13000 - 1) / 2176 * 2176 = 10880. Both versions reuse 19,584 tokens. Turn four finds
+    # turn two keeps at (13000 - 1) / 2176 * 2176 = 10880. Every version reuses 19,584 tokens. Turn four finds
     # 6,528 tokens of cached full-attention blocks, which a linear pool would reuse. Under retention 0 no state is
     # kept at 6,528 or below, so the grouped path reuses nothing.
     assert [row["reused_input_tokens"] for row in report["per_request"]] == [0, 8704, 10880, 0]

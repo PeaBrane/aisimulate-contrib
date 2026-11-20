@@ -1024,8 +1024,9 @@ sub-block matching without an explicit full-state scratch count.
   Grouped caches run with prefix caching on only under these conditions,
   which prediction, recommendation and planning check. Planning tests the
   vLLM version of the evidence, as the next paragraph says. The profile
-  deployment's `backend_version` is `0.31.0` or `0.32.0`, and its runtime
-  memory records `enable_prefix_caching: true` and `hash_block_size_tokens`.
+  deployment's `backend_version` is `0.31.0`, `0.32.0` or `0.33.0`, and its
+  runtime memory records `enable_prefix_caching: true` and
+  `hash_block_size_tokens`.
   Every group declares `prefix_cacheable`. No group is a `convolution` group,
   because grouped prefix caching does not support convolution groups yet. No
   attention group with a `sliding_window` has `prefix_cacheable: false`: a
@@ -1037,23 +1038,35 @@ sub-block matching without an explicit full-state scratch count.
   runtime memory records `runtime_framework_version`, the vLLM version of its
   evidence, that version equals the `backend_version`. A set
   `prefix_match_unit` equals `hash_block_size_tokens`. For GLM-5.3-Flash, the
-  hash block and `max_batched_tokens` are multiples of 4.
+  hash block and `max_batched_tokens` are multiples of 4. On vLLM 0.33.0,
+  `scheduler.prefill_schedule_interval` is 1. vLLM 0.33.0 holds prefills at
+  attention DP size 1 too, and replay does not model that; see
+  [vLLM prefill schedule interval](workers.md#vllm-prefill-schedule-interval).
+  A recommendation and an onboarding plan run with 1. A prediction or a native
+  rank that you write by hand and that sets another value is refused.
 
   The runtime probe import takes prefix-caching evidence only from a vLLM
   0.33.0 record, and it records that version as
-  `runtime_memory.runtime_framework_version`. Replay has no grouped
-  prefix-caching rules for vLLM 0.33.0. `aisim onboard plan` and
+  `runtime_memory.runtime_framework_version`. `aisim onboard plan` and
   `aisim onboard finalize` test the vLLM version of the evidence: that field,
   else the request's `runtime_framework_version`, else the `backend_version`.
   They turn prefix caching on only when that version has grouped rules and
   equals the `backend_version`. So the plan of a profile from the runtime
-  probe sets `prefix_caching: false`, also when `onboard init --fpm-profile`
-  reuses the profile. When its probe ran with prefix caching, these commands
-  print a note that names the vLLM version of the evidence. A prediction or
-  recommendation that turns prefix caching on for such a profile is refused
-  before replay, by the version rule or by the rule on the recorded version.
+  probe with the label `0.33.0` sets `prefix_caching: true` when the profile
+  meets the conditions above, also when `onboard init --fpm-profile` reuses
+  the profile. Under another label the plan sets `prefix_caching: false`.
+  When the probe ran with prefix caching and the version of the evidence has
+  no grouped rules or differs from the label, these commands print a note
+  that names that version and, when it has grouped rules, the label. A
+  prediction or recommendation that turns prefix caching on for a profile
+  whose recorded version differs from its label is refused before replay.
   `onboard probe-runtime` keeps an explicit dataset label that differs from the
-  observed runtime; keep the label equal to the probed version. A profile
+  observed runtime; keep the label equal to the probed version. A plan that
+  was saved while replay had no grouped rules for vLLM 0.33.0 holds
+  `prefix_caching: false`. The commands that verify a saved plan still accept
+  it and keep its files. `aisim onboard plan --overwrite` writes the plan again
+  with prefix caching on, and `aisim onboard finalize` writes the plan of the
+  resolved profile with prefix caching on. A profile
   imported before the version was recorded holds no `prefix_cacheable` marks
   either, because the import writes the marks and the version together, so
   its plan is cold and a prediction or recommendation with prefix caching is
@@ -1064,8 +1077,9 @@ sub-block matching without an explicit full-state scratch count.
   conditions, and native replay applies the rules of the label to that
   evidence, after the startup checks below. That use is not modeled. A
   hand-made profile of `backend_version`
-  0.31.0 or 0.32.0 with prefix-caching evidence, without a recorded version or
-  with that version, can turn grouped prefix caching on, also in its plan.
+  0.31.0, 0.32.0 or 0.33.0 with prefix-caching evidence, without a recorded
+  version or with that version, can turn grouped prefix caching on, also in
+  its plan.
 
   Native replay checks more at startup and refuses the rank otherwise. Every
   state group holds one block per request. At least one group is
@@ -1074,10 +1088,13 @@ sub-block matching without an explicit full-state scratch count.
   scheduler block, the least common multiple of the group blocks, fits in
   the machine's unsigned integer size. On
   vLLM 0.31.0 no prefix-cacheable state group has a positive
-  `prefill_checkpoint_blocks`. On vLLM 0.32.0 every prefix-cacheable state
-  group records `prefill_checkpoint_blocks`, with one count and one alignment
-  across state groups, and a state group with a checkpoint block has the
-  smallest block of the prefix-cacheable groups. On every modeled version no
+  `prefill_checkpoint_blocks`. On vLLM 0.32.0 and 0.33.0, which replay checks
+  the same way, every prefix-cacheable state group records
+  `prefill_checkpoint_blocks`, and all of them record one count, 0 or 1. With
+  a count of 1 they record one `prefill_checkpoint_alignment`, and each of
+  them has the smallest block of the prefix-cacheable groups. With a count of
+  0 no group has an alignment. On
+  vLLM 0.33.0 `prefill_schedule_interval` is 1. On every modeled version no
   `state` group with `prefix_cacheable: false` has a positive
   `prefill_checkpoint_blocks`. `max_model_len` is set, and the pool holds one prompt of
   `max_model_len` plus the state blocks of one request. `preemption_mode` is
@@ -1093,8 +1110,15 @@ sub-block matching without an explicit full-state scratch count.
   does not check the probe evidence there, that `prefix_match_unit` equals
   `hash_block_size_tokens`, or the multiples of 4 of GLM-5.3-Flash.
 
+  Replay also assumes vLLM settings that it has no field for. The scheduling
+  policy is FCFS. No aux-output connector and no HiSparse placement are in
+  use. Requests are text requests without a LoRA adapter. Replay has no gate
+  for these assumptions, and a deployment that differs in one of them is not
+  modeled.
+
   Replay then follows the rules of the vLLM version in
-  `engine.backend_version`:
+  `engine.backend_version`. For the cases that replay models, vLLM 0.33.0 has
+  the rules of vLLM 0.32.0:
 
   - Replay hashes prompts in blocks of the profile's `hash_block_size_tokens`.
     vLLM allows hits inside a block under two conditions. A prefix-cacheable
@@ -1109,7 +1133,7 @@ sub-block matching without an explicit full-state scratch count.
     block for the whole request and never hits. An attention group with
     `prefix_cacheable: false` and no `sliding_window` takes no part in hits
     and takes blocks for the whole prompt. No full-attention cache spec of
-    vLLM 0.31.0 or 0.32.0 opts out of prefix caching.
+    vLLM 0.31.0, 0.32.0 or 0.33.0 opts out of prefix caching.
   - A request that resumes from a cached state on a block boundary holds the
     cached block and its running block during its first step. It releases the
     cached block at its next step, as vLLM does at the request's next
@@ -1121,7 +1145,11 @@ sub-block matching without an explicit full-state scratch count.
     vLLM v0.32.0
     [`kv_cache_manager.py:555-559`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/kv_cache_manager.py#L555-L559)
     and
-    [`single_type_kv_cache_manager.py:1592-1611`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/single_type_kv_cache_manager.py#L1592-L1611).
+    [`single_type_kv_cache_manager.py:1592-1611`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/single_type_kv_cache_manager.py#L1592-L1611),
+    and vLLM v0.33.0
+    [`kv_cache_manager.py:564-568`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/kv_cache_manager.py#L564-L568)
+    and
+    [`single_type_kv_cache_manager.py:1608-1627`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/single_type_kv_cache_manager.py#L1608-L1627).
     A hit inside a block of a full-attention or `state` group copies the
     cached block in its first step, and the copy replaces the cached block in
     the request. As in vLLM, the cached block stays in use until the
@@ -1134,7 +1162,11 @@ sub-block matching without an explicit full-state scratch count.
     vLLM v0.32.0
     [`single_type_kv_cache_manager.py:454-474`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/single_type_kv_cache_manager.py#L454-L474)
     and
-    [`scheduler.py:1474-1482`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/sched/scheduler.py#L1474-L1482).
+    [`scheduler.py:1474-1482`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/sched/scheduler.py#L1474-L1482),
+    and vLLM v0.33.0
+    [`single_type_kv_cache_manager.py:455-475`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/single_type_kv_cache_manager.py#L455-L475)
+    and
+    [`scheduler.py:1698-1706`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/sched/scheduler.py#L1698-L1706).
   - Prefill chunks end on block boundaries, so that the state there can be
     cached. Some chunks end inside a block. The final chunk ends at the end of
     the prompt. If one block is larger than `max_batched_tokens`, chunks
@@ -1144,9 +1176,9 @@ sub-block matching without an explicit full-state scratch count.
     As in vLLM, this align split applies only to a rank with a
     prefix-cacheable `state` group. A rank with only full-attention and
     sliding-window groups is not split.
-  - On vLLM 0.32.0 a prefix-cacheable `state` group can carry a prefill
-    checkpoint block, such as the FlashKDA block of a KDA group. The request
-    takes that block in the chunk that reaches the end of its prefill and
+  - On vLLM 0.32.0 and 0.33.0 a prefix-cacheable `state` group can carry a
+    prefill checkpoint block, such as the FlashKDA block of a KDA group. The
+    request takes that block in the chunk that reaches the end of its prefill and
     releases it at its next step. As in vLLM, the prefill of a request that
     resumes after a preemption ends one token before its last known token,
     so it covers the output tokens too. The block stays cached until eviction
@@ -1161,9 +1193,9 @@ sub-block matching without an explicit full-state scratch count.
   - Replay holds the previous state block after a block boundary, the cached
     block after a hit on a block boundary and the checkpoint block after the
     final prefill chunk for one scheduler step, and it releases the blocks of
-    a sliding-window group once they leave the window. vLLM 0.31.0 and 0.32.0
-    turn async scheduling on by default and then hold these blocks for one
-    more step. Replay models async scheduling in the arrival rule, in the
+    a sliding-window group once they leave the window. vLLM 0.31.0, 0.32.0 and
+    0.33.0 turn async scheduling on by default and then hold these blocks for
+    one more step. Replay models async scheduling in the arrival rule, in the
     admission cap of a sliding-window group and in the blocks of a finished
     request, which it frees after it has formed the next pass (see
     [vLLM async scheduling](workers.md#vllm-async-scheduling)). It does not
@@ -1189,7 +1221,16 @@ sub-block matching without an explicit full-state scratch count.
     request took in that step. The request gets the shorter
     hit and can start in that step. vLLM keeps the request, and the requests
     queued behind it, waiting for that step, and gives it the longer hit in
-    the next step.
+    the next step. vLLM 0.32.0 also holds such a request in the step or steps
+    after the publishing step, when the next cache step of the publishing
+    request marks the same block again. Replay does not model that. vLLM
+    0.33.0 does not mark a block that already has its key, so it does not
+    hold the request there. See vLLM v0.32.0
+    [`single_type_kv_cache_manager.py:1977-1982`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/single_type_kv_cache_manager.py#L1977-L1982)
+    and
+    [`:1688-1696`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/single_type_kv_cache_manager.py#L1688-L1696),
+    and vLLM v0.33.0
+    [`single_type_kv_cache_manager.py:2112-2115`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/single_type_kv_cache_manager.py#L2112-L2115).
   - vLLM looks up prefix-cacheable groups together only when their cache specs
     are equal in every field. The profile records only a group's kind, block
     size, window and checkpoint setting, so replay looks up groups that agree
@@ -1243,27 +1284,33 @@ sub-block matching without an explicit full-state scratch count.
     request's next allocation, where vLLM frees it at the end of the
     scheduling pass that took the copy. So the block count can be higher by
     one block per state group until then.
-  - With hits inside a block and a prefill checkpoint block, vLLM 0.32.0 can
-    give a later request a longer hit than replay. The case needs a request
-    whose state hit ends inside a block, while its full-attention groups match
-    at least one block boundary further. That boundary is the end of the
-    shared prefix. With a checkpoint block the request's first chunk does not
-    stop at that boundary. vLLM still gives the key of that boundary to the
-    request's state block that ends at it. By a reading of vLLM's code, that
-    block holds the state of a shorter prefix: the copy of the cached state,
-    or the state at the place inside the block where an earlier chunk stopped.
-    A later request with the same prefix then hits at the boundary in vLLM and
-    continues from that state. Replay publishes a state key only where a chunk
-    ended, so the later request hits the shorter prefix and computes the
-    tokens up to the boundary again. Replay does not copy this behavior of
-    vLLM, and it accepts the configuration. Without a checkpoint block a chunk
-    stops at the boundary in vLLM and in replay, and the two agree. See vLLM
-    v0.32.0
+  - With hits inside a block and a prefill checkpoint block, vLLM 0.32.0 and
+    0.33.0 can give a later request a longer hit than replay. The case needs a
+    request whose state hit ends inside a block, while its full-attention
+    groups match at least one block boundary further. That boundary is the end
+    of the shared prefix. With a checkpoint block the request's first chunk
+    does not stop at that boundary. vLLM still gives the key of that boundary
+    to the request's state block that ends at it. By a reading of vLLM's code,
+    that block holds the state of a shorter prefix: the copy of the cached
+    state, or the state at the place inside the block where an earlier chunk
+    stopped. A later request with the same prefix then hits at the boundary in
+    vLLM and continues from that state. Replay publishes a state key only
+    where a chunk ended, so the later request hits the shorter prefix and
+    computes the tokens up to the boundary again. Replay does not copy this
+    behavior of vLLM, and it accepts the configuration. Without a checkpoint
+    block a chunk stops at the boundary in vLLM and in replay, and the two
+    agree. See vLLM v0.32.0
     [`scheduler.py:526-543`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/sched/scheduler.py#L526-L543),
     [`single_type_kv_cache_manager.py:510-511`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/single_type_kv_cache_manager.py#L510-L511),
     [`:1584-1588`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/single_type_kv_cache_manager.py#L1584-L1588)
     and
-    [`block_pool.py:277-280`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/block_pool.py#L277-L280).
+    [`block_pool.py:277-280`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/block_pool.py#L277-L280),
+    and vLLM v0.33.0
+    [`scheduler.py:632-649`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/sched/scheduler.py#L632-L649),
+    [`single_type_kv_cache_manager.py:512-513`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/single_type_kv_cache_manager.py#L512-L513),
+    [`:1600-1604`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/single_type_kv_cache_manager.py#L1600-L1604)
+    and
+    [`block_pool.py:281-284`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/block_pool.py#L281-L284).
 
 - **Belady eviction.** The native ReplaySpec field
   `engine.kv_eviction_policy: belady` evicts the block whose next use in the

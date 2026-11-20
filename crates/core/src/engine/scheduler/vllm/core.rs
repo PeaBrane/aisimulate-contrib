@@ -6,8 +6,9 @@
 // async-scheduling batch queue, of the v0.29.0
 // (98dff2a81d747d1dba01a47f939f48c3526d4206) align-mode prefill split, of the
 // v0.30.0 (ced6857afa0ea7b2e3f0846a62e1394e90f15607) async block frees and of
-// the v0.31.0 (db9527a46873454610df6dbedf79a36d6bf1a7f6) and v0.32.0
-// (5df63a7203cdb9328d824a27b682e77c7b9928be) grouped KV rules;
+// the v0.31.0 (db9527a46873454610df6dbedf79a36d6bf1a7f6), v0.32.0
+// (5df63a7203cdb9328d824a27b682e77c7b9928be) and v0.33.0
+// (4ba787ec9959e566d3b587a796dff07673324da5) grouped KV rules;
 // immutable sources and license: THIRD_PARTY_NOTICES.md.
 // MTP/G2 semantics additionally adapted from vLLM v0.32.0, commit
 // 5df63a7203cdb9328d824a27b682e77c7b9928be, vllm/v1/core/sched/scheduler.py
@@ -2994,7 +2995,8 @@ impl VllmCore {
         // vLLM keeps the copy sources of a prefix hit inside a block in use
         // until the end of `schedule()`, so no later request of the step can
         // take them (vllm/v1/core/sched/scheduler.py v0.31.0 1434-1442,
-        // v0.32.0 1474-1482). Replay releases them here, once per pass.
+        // v0.32.0 1474-1482, v0.33.0 1698-1706). Replay releases them here,
+        // once per pass.
         self.kv_manager.release_grouped_copy_sources();
 
         if !defer_prefills && !preempted_any {

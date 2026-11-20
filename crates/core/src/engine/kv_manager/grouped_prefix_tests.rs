@@ -2,10 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Rule and coordinator cases of the grouped prefix cache, with the vLLM
-//! 0.31.0 and 0.32.0 literals re-derived from the pinned trees. Some cases
-//! are ported from the vLLM tests at `db9527a46873454610df6dbedf79a36d6bf1a7f6`
-//! and `5df63a7203cdb9328d824a27b682e77c7b9928be`. Copyright contributors to
-//! the vLLM project. See THIRD_PARTY_NOTICES.md. Apache-2.0.
+//! 0.31.0, 0.32.0 and 0.33.0 literals re-derived from the pinned trees, the
+//! 0.33.0 ones at `4ba787ec9959e566d3b587a796dff07673324da5`. Some cases are
+//! ported from the vLLM tests at `db9527a46873454610df6dbedf79a36d6bf1a7f6` and
+//! `5df63a7203cdb9328d824a27b682e77c7b9928be`. Copyright contributors to the
+//! vLLM project. See THIRD_PARTY_NOTICES.md. Apache-2.0.
 //!
 //! - https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/tests/v1/core/prefix_cache/test_partial_prefix_cache_hits.py
 //! - https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/tests/v1/core/prefix_cache/test_partial_prefix_cache_hits.py
@@ -63,7 +64,7 @@ fn state(name: &str, block: u32, cacheable: bool, checkpoint: bool) -> FpmCacheG
 /// probe records (fixture `glm53flash_vllm_0330_probe`): MLA attention and
 /// four KDA `MambaSpec` states with 2,176-token blocks, and a 4-token
 /// `CircularBufferSpec` ring. The tests use them as hand-made profiles of
-/// vLLM 0.31.0 and 0.32.0, the versions that the rule table holds. The
+/// vLLM 0.31.0, 0.32.0 and 0.33.0, the versions that the rule table holds. The
 /// helper lists them as MLA, ring, KDA. The record lists the four Mamba
 /// groups first, then MLA, then the ring. With `checkpoint`, G2 to G5
 /// carry `prefill_checkpoint_blocks: Some(1)` and alignment 16.
@@ -245,7 +246,130 @@ fn version_rows_differ_in_the_last_cacheable_stop_and_the_partial_tail() {
         Some(VllmRuleVersion::V0_32_0)
     );
     assert_eq!(VllmRuleVersion::parse("0.30.0"), None);
-    assert_eq!(VllmRuleVersion::parse("0.33.0"), None);
+}
+
+#[test]
+fn vllm_0330_row_takes_the_0320_arm_in_every_version_branch() {
+    assert_eq!(
+        VllmRuleVersion::parse("0.33.0"),
+        Some(VllmRuleVersion::V0_33_0)
+    );
+    assert_eq!(VllmRuleVersion::parse("0.33.1"), None);
+    assert_eq!(VllmRuleVersion::V0_31_0.label(), "0.31.0");
+    assert_eq!(VllmRuleVersion::V0_32_0.label(), "0.32.0");
+    assert_eq!(VllmRuleVersion::V0_33_0.label(), "0.33.0");
+    // v0.33 sched:579-584 with iface:1169-1186: `(n - max(1, L)) // B * B`.
+    // The hash lookahead L is 0 without speculative decoding (v0.33
+    // `vllm/config/vllm.py:677-692`), which grouped execution refuses.
+    let v32 = rules_glm(VllmRuleVersion::V0_32_0, false);
+    let v33 = rules_glm(VllmRuleVersion::V0_33_0, false);
+    for (n, stop) in [(9000, 8704), (8704, 6528), (0, 0)] {
+        assert_eq!(v33.last_cacheable_stop(n), stop);
+        assert_eq!(v32.last_cacheable_stop(n), stop);
+    }
+    // v0.33 sched:622-631: `(prompt - 1) // hash * hash`.
+    let fine = rules_glm_hash(VllmRuleVersion::V0_33_0, false, 4);
+    assert_eq!(fine.partial_tail(9000), 8996);
+    assert_eq!(fine.partial_tail(4356), 4352);
+    // v0.33 sched:437-449: checkpoint mode only when every Mamba group has
+    // a positive count.
+    assert!(v33.checkpoint.is_none());
+    let ckpt = rules_glm(VllmRuleVersion::V0_33_0, true);
+    assert_eq!(ckpt.checkpoint, Some(CheckpointRule { alignment: 16 }));
+    // The align split (v0.33 sched:546-662, iface:1189-1210).
+    assert_eq!(split(&v33, 0, 9000, 9000, 8192, 0), 6528);
+    assert_eq!(split(&v33, 6528, 9000, 9000, 2472, 0), 2176);
+    assert_eq!(split(&v33, 4352, 8704, 8704, 4352, 0), 2176);
+    assert_eq!(ckpt.checkpoint_position(9000), 8704);
+    assert!(ckpt.checkpoint_valid(6528, 9000, 8704));
+    assert_eq!(split(&ckpt, 6528, 9000, 9000, 2472, 0), 2472);
+    assert_eq!(split(&ckpt, 4352, 8704, 8704, 4352, 0), 4352);
+}
+
+#[test]
+fn vllm_0330_row_refuses_checkpoint_fields_with_its_own_texts() {
+    let refusal = |groups: &[FpmCacheGroup], hash: usize| {
+        GroupedPrefixRules::new(groups, hash, VllmRuleVersion::V0_33_0)
+            .unwrap_err()
+            .to_string()
+    };
+    let mut groups = groups_glm(false);
+    groups[2].prefill_checkpoint_blocks = None;
+    assert_eq!(
+        refusal(&groups, 2176),
+        "kv_cache_groups with vllm_version=0.33.0 require prefill_checkpoint_blocks on every prefix-cacheable state group; set the field (0 or 1) on each such group"
+    );
+    let mut groups = groups_glm(true);
+    groups[3].prefill_checkpoint_blocks = Some(0);
+    groups[3].prefill_checkpoint_alignment = None;
+    assert_eq!(
+        refusal(&groups, 2176),
+        "kv_cache_groups with vllm_version=0.33.0 require the same prefill_checkpoint_blocks across state groups"
+    );
+    let mut groups = groups_glm(true);
+    groups[3].prefill_checkpoint_alignment = Some(32);
+    assert_eq!(
+        refusal(&groups, 2176),
+        "kv_cache_groups with vllm_version=0.33.0 require one prefill_checkpoint_alignment across state groups"
+    );
+    let small_attention = [attention("full", 16, None), state("s", 64, true, true)];
+    assert_eq!(
+        refusal(&small_attention, 16),
+        "kv_cache_groups with vllm_version=0.33.0 require every state group with prefill checkpoint blocks to have the smallest block_size_tokens of the prefix_cacheable groups"
+    );
+}
+
+#[test]
+fn second_cache_step_of_a_keyed_state_block_defers_no_waiting_request_on_vllm_0330() {
+    // vLLM 0.33.0 does not publish again a state block that already has the
+    // key of its position (v0.33 single:2112-2115), so the key does not go
+    // into the set of the step (v0.33 single:1994-1999) and a request that
+    // hits it does not wait (v0.33 single:1704-1712). Replay publishes a
+    // state key once, so the second cache step of the producer marks nothing.
+    let groups = [attention("full", 16, None), state("s", 16, true, false)];
+    let hash = 16;
+    let rules = GroupedPrefixRules::new(&groups, hash, VllmRuleVersion::V0_33_0).unwrap();
+    let mut coordinator = with_limits(rules);
+    let mut kv = kv_pool(&groups, 64);
+    let pool = kv.block_pool_mut().unwrap();
+    let producer = lease(40, hash);
+    let hit = coordinator.find_longest_hit(pool, &producer, 40);
+    let mut block_lease = coordinator.new_lease();
+    // Step 1: the chunk ends at the last cacheable stop (40 - 1) / 16 * 16.
+    coordinator.begin_step();
+    assert_eq!(
+        coordinator
+            .rules()
+            .align_split(0, 40, 40, BUDGET, 0, BUDGET),
+        32
+    );
+    assert!(coordinator.allocate(pool, &mut block_lease, 40, 0, 32, 1));
+    coordinator.finalize(pool, &mut block_lease, &producer, 40, 32, &hit, 1);
+    // In the publishing step the key at 32 is no hit.
+    assert_eq!(
+        coordinator
+            .find_longest_hit(pool, &lease(48, hash), 48)
+            .tokens,
+        0
+    );
+    // Step 2: the producer computes 32..40. Its cache step is still in the
+    // block that ends at 32.
+    coordinator.begin_step();
+    assert_eq!(
+        coordinator
+            .rules()
+            .align_split(32, 40, 40, BUDGET, 0, BUDGET),
+        8
+    );
+    assert!(coordinator.allocate(pool, &mut block_lease, 40, 32, 40, 2));
+    coordinator.finalize(pool, &mut block_lease, &producer, 40, 40, &hit, 2);
+    // A request that waits in step 2 gets the hit of 32 tokens in step 2.
+    assert_eq!(
+        coordinator
+            .find_longest_hit(pool, &lease(48, hash), 48)
+            .tokens,
+        32
+    );
 }
 
 #[test]
@@ -299,9 +423,14 @@ fn rules_refuse_unsupported_checkpoint_fields() {
 #[test]
 fn rules_refuse_a_checkpoint_block_on_a_ring() {
     // The count is a field of `MambaSpec` alone (v0.31 iface:1049-1050,
-    // v0.32 iface:1042-1043). A ring that declares a block is refused on
-    // both rows. A ring with no count or a zero count stays a ring.
-    for version in [VllmRuleVersion::V0_31_0, VllmRuleVersion::V0_32_0] {
+    // v0.32 iface:1042-1043, v0.33 iface:1101-1102). A ring that declares a
+    // block is refused on every row. A ring with no count or a zero count
+    // stays a ring.
+    for version in [
+        VllmRuleVersion::V0_31_0,
+        VllmRuleVersion::V0_32_0,
+        VllmRuleVersion::V0_33_0,
+    ] {
         let mut groups = vec![attention("full", 16, None), state("ring", 4, false, false)];
         for count in [None, Some(0)] {
             groups[1].prefill_checkpoint_blocks = count;
@@ -324,7 +453,11 @@ fn rules_refuse_a_checkpoint_block_on_a_ring() {
 
 #[test]
 fn rules_refuse_missing_prefix_cacheability() {
-    for version in [VllmRuleVersion::V0_31_0, VllmRuleVersion::V0_32_0] {
+    for version in [
+        VllmRuleVersion::V0_31_0,
+        VllmRuleVersion::V0_32_0,
+        VllmRuleVersion::V0_33_0,
+    ] {
         for missing in 0..2 {
             let mut groups = [attention("full", 16, None), state("s", 16, true, false)];
             groups[missing].prefix_cacheable = None;
@@ -347,10 +480,14 @@ fn rules_refuse_a_non_cacheable_sliding_window_group() {
     // The window specs that opt out of prefix caching: the v0.31 ring
     // `KpoolTailSpec` (iface:1015-1038), which GLM-5.3-Flash builds with
     // `block_size=ring` and `sliding_window=ring`
-    // (glm5next/common/attention.py:205-212; v0.32 has no such spec), and
-    // a bounded replay window (`SlidingWindowMLASpec`, v0.31
-    // iface:949-955, v0.32 :968-970).
-    for version in [VllmRuleVersion::V0_31_0, VllmRuleVersion::V0_32_0] {
+    // (glm5next/common/attention.py:205-212; v0.32 and v0.33 have no such
+    // spec), and a bounded replay window (`SlidingWindowMLASpec`, v0.31
+    // iface:949-955, v0.32 :968-970, v0.33 :1027-1029).
+    for version in [
+        VllmRuleVersion::V0_31_0,
+        VllmRuleVersion::V0_32_0,
+        VllmRuleVersion::V0_33_0,
+    ] {
         let mut groups = [
             attention("full", 16, None),
             attention("other", 16, Some(17)),
@@ -375,13 +512,18 @@ fn non_cacheable_full_attention_group_takes_no_part_in_the_hit() {
     // Two full-attention groups of block 16, the second with
     // `prefix_cacheable: false`. vLLM's hybrid coordinator skips a group
     // that opts out of prefix caching in the lookup, so its slot of the
-    // hit stays empty (v0.31 coord:743-749, v0.32 coord:713-720). Its
-    // manager then counts `cdiv(17, 16) = 2` new blocks with no computed
-    // block (v0.31 single:216-268, v0.32 single:213-265). The first group
-    // hits 16 tokens and needs one new block and its inactive hit block.
+    // hit stays empty (v0.31 coord:743-749, v0.32 coord:713-720, v0.33
+    // coord:723-730). Its manager then counts `cdiv(17, 16) = 2` new blocks
+    // with no computed block (v0.31 single:216-268, v0.32 single:213-265,
+    // v0.33 single:214-266). The first group hits 16 tokens and needs one
+    // new block and its inactive hit block.
     let mut groups = [attention("full", 16, None), attention("other", 16, None)];
     groups[1].prefix_cacheable = Some(false);
-    for version in [VllmRuleVersion::V0_31_0, VllmRuleVersion::V0_32_0] {
+    for version in [
+        VllmRuleVersion::V0_31_0,
+        VllmRuleVersion::V0_32_0,
+        VllmRuleVersion::V0_33_0,
+    ] {
         let mut coordinator = with_limits(GroupedPrefixRules::new(&groups, 16, version).unwrap());
         let mut kv = kv_pool(&groups, 8);
         let pool = kv.block_pool_mut().unwrap();
@@ -406,7 +548,11 @@ fn rules_refuse_convolution_groups() {
     // A convolution group keeps a window, and the table has no rule for it.
     let mut convolution = attention("convolution", 4, Some(4));
     convolution.kind = FpmCacheKind::Convolution;
-    for version in [VllmRuleVersion::V0_31_0, VllmRuleVersion::V0_32_0] {
+    for version in [
+        VllmRuleVersion::V0_31_0,
+        VllmRuleVersion::V0_32_0,
+        VllmRuleVersion::V0_33_0,
+    ] {
         for groups in [
             vec![convolution.clone()],
             vec![attention("full", 4, None), convolution.clone()],
@@ -490,7 +636,11 @@ fn alignment_is_the_hash_block_only_with_fine_grained_hits() {
 fn full_attention_hit_is_capped_below_the_prompt() {
     // mgr:289-295 caps the lookup at `num_tokens - 1`.
     let groups = [attention("full", 16, None)];
-    for version in [VllmRuleVersion::V0_31_0, VllmRuleVersion::V0_32_0] {
+    for version in [
+        VllmRuleVersion::V0_31_0,
+        VllmRuleVersion::V0_32_0,
+        VllmRuleVersion::V0_33_0,
+    ] {
         let coordinator = with_limits(GroupedPrefixRules::new(&groups, 16, version).unwrap());
         let mut kv = kv_pool(&groups, 16);
         let pool = kv.block_pool_mut().unwrap();
@@ -513,7 +663,11 @@ fn sliding_window_hits_need_a_contiguous_run_before_an_aligned_end() {
         attention("full", 16, None),
         attention("window", 16, Some(33)),
     ];
-    for version in [VllmRuleVersion::V0_31_0, VllmRuleVersion::V0_32_0] {
+    for version in [
+        VllmRuleVersion::V0_31_0,
+        VllmRuleVersion::V0_32_0,
+        VllmRuleVersion::V0_33_0,
+    ] {
         let r = GroupedPrefixRules::new(&groups, 16, version).unwrap();
         assert_eq!(r.alignment, 16);
         let coordinator = with_limits(r);
@@ -552,7 +706,11 @@ fn one_token_window_hits_only_at_a_cached_block() {
     // after it finds the block cached, so a hit still needs the cached
     // block at its end (v0.31 single:1021-1044, v0.32 :1003-1026).
     let groups = [attention("window", 4, Some(1))];
-    for version in [VllmRuleVersion::V0_31_0, VllmRuleVersion::V0_32_0] {
+    for version in [
+        VllmRuleVersion::V0_31_0,
+        VllmRuleVersion::V0_32_0,
+        VllmRuleVersion::V0_33_0,
+    ] {
         let coordinator = with_limits(GroupedPrefixRules::new(&groups, 4, version).unwrap());
         let mut kv = kv_pool(&groups, 32);
         let pool = kv.block_pool_mut().unwrap();
@@ -629,21 +787,23 @@ fn sliding_window_admission_reserves_the_window_plus_the_in_flight_tokens() {
 
 #[test]
 fn sliding_window_admission_after_a_hit_is_vllms_whole_prompt_count() {
-    // vLLM's whole-prompt test (v0.31 mgr:519-536, v0.32 mgr:522-539)
-    // for a sliding-window group (v0.31 single:216-268, v0.32
-    // single:213-265):
+    // vLLM's whole-prompt test (v0.31 mgr:519-536, v0.32 mgr:522-539,
+    // v0.33 mgr:531-548) for a sliding-window group (v0.31
+    // single:216-268, v0.32 single:213-265, v0.33 single:214-266):
     //   required = min(cdiv(prompt, B), cap), with
     //   cap = cdiv(min(window - 1 + in_flight, max_model_len), B) + 1
-    //         (v0.31 iface:859-866, v0.32 iface:878-885);
+    //         (v0.31 iface:859-866, v0.32 iface:878-885, v0.33
+    //         iface:937-944);
     //   skipped = max(0, hit - window + 1) // B
-    //         (v0.31 single:1185-1188, v0.32 single:1167-1170);
+    //         (v0.31 single:1185-1188, v0.32 single:1167-1170, v0.33
+    //         single:1180-1183);
     //   new = max(required - max(skipped, len(hit blocks)), 0);
     //   plus the hit blocks from `skipped` on that no request holds.
     // The hit list has one entry per hit block, null blocks included.
     // vLLM compares the capped count with absolute block indices, so a
     // long hit gives no new block here. vLLM's second test, on the first
-    // chunk and without the cap (v0.31 mgr:558-576, v0.32 mgr:561-579),
-    // is a separate count.
+    // chunk and without the cap (v0.31 mgr:558-576, v0.32 mgr:561-579,
+    // v0.33 mgr:570-588), is a separate count.
     //
     // C1, window 8, block 4, in flight 8, model length 200, prompt 108,
     // hit 96: cap = cdiv(min(7 + 8, 200), 4) + 1 = 5; required =
@@ -669,7 +829,11 @@ fn sliding_window_admission_after_a_hit_is_vllms_whole_prompt_count() {
     ];
     for (window, block, in_flight, model_len, prompt, hit_tokens, run, idle, held) in cases {
         let groups = [attention("window", block, Some(window))];
-        for version in [VllmRuleVersion::V0_31_0, VllmRuleVersion::V0_32_0] {
+        for version in [
+            VllmRuleVersion::V0_31_0,
+            VllmRuleVersion::V0_32_0,
+            VllmRuleVersion::V0_33_0,
+        ] {
             let coordinator = GroupedPrefixCoordinator::new(
                 GroupedPrefixRules::new(&groups, block as usize, version).unwrap(),
                 AdmissionLimits {
@@ -707,7 +871,11 @@ fn state_group_hits_only_at_a_kept_boundary() {
     // single:1487-1564 scans aligned ends right to left for one cached
     // state block. pool:198-224: every group of the spec group must hold
     // the key.
-    for version in [VllmRuleVersion::V0_31_0, VllmRuleVersion::V0_32_0] {
+    for version in [
+        VllmRuleVersion::V0_31_0,
+        VllmRuleVersion::V0_32_0,
+        VllmRuleVersion::V0_33_0,
+    ] {
         let groups = groups_glm(false);
         let coordinator = with_limits(rules_glm(version, false));
         let hash = 2176;
@@ -748,7 +916,11 @@ fn state_group_hits_only_at_a_kept_boundary() {
 fn ring_group_never_hits_and_holds_one_block() {
     // single:1214-1230 claims one block per request; single:498-499
     // caches nothing for a group that is not prefix cacheable.
-    for version in [VllmRuleVersion::V0_31_0, VllmRuleVersion::V0_32_0] {
+    for version in [
+        VllmRuleVersion::V0_31_0,
+        VllmRuleVersion::V0_32_0,
+        VllmRuleVersion::V0_33_0,
+    ] {
         let groups = groups_glm(false);
         let mut coordinator = with_limits(rules_glm(version, false));
         let hash = 2176;
@@ -796,7 +968,11 @@ fn ring_copy(lease: &GroupedBlockLease) -> crate::engine::cache::vllm_block_pool
 fn hybrid_hit_is_the_longest_prefix_every_cacheable_group_serves() {
     // coord:842-977: the fixed point shortens to 4,352; coord:970-977
     // reports the uncached common prefix.
-    for version in [VllmRuleVersion::V0_31_0, VllmRuleVersion::V0_32_0] {
+    for version in [
+        VllmRuleVersion::V0_31_0,
+        VllmRuleVersion::V0_32_0,
+        VllmRuleVersion::V0_33_0,
+    ] {
         let groups = groups_glm(false);
         let coordinator = with_limits(rules_glm(version, false));
         let hash = 2176;
@@ -816,7 +992,11 @@ fn hybrid_partial_hash_truncates_full_attention_hit_length() {
     // Ported from v0.31 partial_test:1596. Values hand-derived: the
     // fine-grained probe of single:806-825 extends the two full blocks to
     // the partial entry at 4,356, and the state hit there keeps it.
-    for version in [VllmRuleVersion::V0_31_0, VllmRuleVersion::V0_32_0] {
+    for version in [
+        VllmRuleVersion::V0_31_0,
+        VllmRuleVersion::V0_32_0,
+        VllmRuleVersion::V0_33_0,
+    ] {
         let groups = groups_glm(false);
         let coordinator = with_limits(rules_glm_hash(version, false, 4));
         let hash = 4;
@@ -865,7 +1045,11 @@ fn groups_of_one_spec_hit_jointly_and_set_the_junction_together() {
     // lookup (coord:947, :970-977). Group a holds 192 tokens, group b 64 and
     // the state group the state at 64, so vLLM hits 64 with no junction.
     let groups = two_full_groups_and_a_state();
-    for version in [VllmRuleVersion::V0_31_0, VllmRuleVersion::V0_32_0] {
+    for version in [
+        VllmRuleVersion::V0_31_0,
+        VllmRuleVersion::V0_32_0,
+        VllmRuleVersion::V0_33_0,
+    ] {
         let coordinator = with_limits(GroupedPrefixRules::new(&groups, 64, version).unwrap());
         let mut kv = kv_pool(&groups, 16);
         let pool = kv.block_pool_mut().unwrap();
@@ -905,7 +1089,11 @@ fn groups_of_one_spec_hit_inside_a_block_only_jointly() {
     // two full blocks, group b one full block and the partial entry at 96.
     // No boundary inside the second block is cached in both, so vLLM hits 64.
     let groups = two_full_groups_and_a_state();
-    for version in [VllmRuleVersion::V0_31_0, VllmRuleVersion::V0_32_0] {
+    for version in [
+        VllmRuleVersion::V0_31_0,
+        VllmRuleVersion::V0_32_0,
+        VllmRuleVersion::V0_33_0,
+    ] {
         let rules = GroupedPrefixRules::new(&groups, 16, version).unwrap();
         assert_eq!(rules.alignment, 16);
         let coordinator = with_limits(rules);
@@ -942,7 +1130,11 @@ fn state_groups_of_one_spec_hit_jointly() {
         state("state_b", 64, true, false),
         attention("window", 64, Some(65)),
     ];
-    for version in [VllmRuleVersion::V0_31_0, VllmRuleVersion::V0_32_0] {
+    for version in [
+        VllmRuleVersion::V0_31_0,
+        VllmRuleVersion::V0_32_0,
+        VllmRuleVersion::V0_33_0,
+    ] {
         let coordinator = with_limits(GroupedPrefixRules::new(&groups, 64, version).unwrap());
         let mut kv = kv_pool(&groups, 16);
         let pool = kv.block_pool_mut().unwrap();
@@ -964,7 +1156,11 @@ fn state_groups_of_one_spec_hit_jointly() {
     // full-attention spec first in any group order (`coord:775-779`), so
     // its hit sets the junction. The extra state of G2 at 8,704 changes
     // nothing, and the four KDA groups hit 4,352 together.
-    for version in [VllmRuleVersion::V0_31_0, VllmRuleVersion::V0_32_0] {
+    for version in [
+        VllmRuleVersion::V0_31_0,
+        VllmRuleVersion::V0_32_0,
+        VllmRuleVersion::V0_33_0,
+    ] {
         let groups = groups_glm(false);
         let coordinator = with_limits(rules_glm(version, false));
         let hash = 2176;
@@ -993,7 +1189,11 @@ fn admission_counts_inactive_hits_and_state_copies() {
     // single:216-268 counts inactive hit blocks again. The keys are seeded
     // directly, because a finished request of 4,352 tokens keeps its state
     // key only at its replay boundary, 2,176.
-    for version in [VllmRuleVersion::V0_31_0, VllmRuleVersion::V0_32_0] {
+    for version in [
+        VllmRuleVersion::V0_31_0,
+        VllmRuleVersion::V0_32_0,
+        VllmRuleVersion::V0_33_0,
+    ] {
         let groups = groups_glm(false);
         let coordinator = with_limits(rules_glm(version, false));
         let hash = 2176;
@@ -1215,14 +1415,15 @@ fn partial_hit_takes_a_copy_block_for_the_shared_block() {
 
 #[test]
 fn admission_counts_vllms_whole_prompt_blocks_without_the_producer_copy() {
-    // vLLM's whole-prompt test (v0.31 mgr:519-536, v0.32 mgr:522-539)
-    // counts an attention group as `cdiv(prompt, A)` less its hit blocks,
-    // plus the hit blocks that no request holds and a copy block for a
-    // hit inside a block (v0.31 single:216-268, v0.32 single:213-265).
-    // It counts a state group as `cdiv(prompt, S) - len(computed)`, plus
-    // one for a hit inside a block that the request consumes, capped at
-    // `1 + partial hit + checkpoint` (v0.31 single:1762-1777,
-    // :1806-1811; v0.32 single:1724-1739, :1768-1773). A new request is
+    // vLLM's whole-prompt test (v0.31 mgr:519-536, v0.32 mgr:522-539,
+    // v0.33 mgr:531-548) counts an attention group as `cdiv(prompt, A)`
+    // less its hit blocks, plus the hit blocks that no request holds and a
+    // copy block for a hit inside a block (v0.31 single:216-268, v0.32
+    // single:213-265, v0.33 single:214-266). It counts a state group as
+    // `cdiv(prompt, S) - len(computed)`, plus one for a hit inside a block
+    // that the request consumes, capped at `1 + partial hit + checkpoint`
+    // (v0.31 single:1762-1777, :1806-1811; v0.32 single:1724-1739,
+    // :1768-1773; v0.33 single:1740-1755, :1785-1790). A new request is
     // not yet the producer of a tail, so the copy that its own published
     // tail takes later is not counted.
     // (attention block, hash, prompt, checkpoint, vLLM's count)
@@ -1243,7 +1444,11 @@ fn admission_counts_vllms_whole_prompt_blocks_without_the_producer_copy() {
         (4, 4, 64, false, 16 + 1),
     ];
     for (attention_block, hash, prompt, checkpoint, count) in cold {
-        for version in [VllmRuleVersion::V0_31_0, VllmRuleVersion::V0_32_0] {
+        for version in [
+            VllmRuleVersion::V0_31_0,
+            VllmRuleVersion::V0_32_0,
+            VllmRuleVersion::V0_33_0,
+        ] {
             if checkpoint && version == VllmRuleVersion::V0_31_0 {
                 continue;
             }
@@ -1267,7 +1472,11 @@ fn admission_counts_vllms_whole_prompt_blocks_without_the_producer_copy() {
     // block per group, and the two hit blocks when no request holds
     // them: 4, else 2.
     let groups = [attention("full", 64, None), state("s", 64, true, false)];
-    for version in [VllmRuleVersion::V0_31_0, VllmRuleVersion::V0_32_0] {
+    for version in [
+        VllmRuleVersion::V0_31_0,
+        VllmRuleVersion::V0_32_0,
+        VllmRuleVersion::V0_33_0,
+    ] {
         for hit_tokens in [32, 48] {
             for held in [false, true] {
                 let coordinator =
@@ -1304,15 +1513,20 @@ fn producer_copy_needs_a_block_that_admission_does_not_count() {
     // Blocks of 64, a hash block of 4, a cold prompt of 50 tokens. The
     // split stops at the tail 48, and the write 48..50 takes the copy.
     // vLLM's admission counts 2 blocks; the allocation of the copy then
-    // needs a third (v0.31 single:1891-1936, v0.32 single:1855-1900).
-    // When it does not fit, vLLM preempts the last running request, the
-    // request itself included, and tries again (v0.31 sched:745-813,
-    // v0.32 sched:776-844). vLLM counts the pending copy in the blocks
-    // that a prefill in flight still needs (v0.31 sched:3003-3017, v0.32
-    // sched:3060-3076, with single:1770-1777 and v0.32 :1732-1739); that
-    // count is not part of this coordinator.
+    // needs a third (v0.31 single:1891-1936, v0.32 single:1855-1900,
+    // v0.33 single:1872-1917). When it does not fit, vLLM preempts the
+    // last running request, the request itself included, and tries again
+    // (v0.31 sched:745-813, v0.32 sched:776-844, v0.33 sched:912-980).
+    // vLLM counts the pending copy in the blocks that a prefill in flight
+    // still needs (v0.31 sched:3003-3017, v0.32 sched:3060-3076, v0.33
+    // sched:3404-3420, with single:1770-1777, v0.32 :1732-1739 and v0.33
+    // :1748-1755); that count is not part of this coordinator.
     let groups = [attention("full", 64, None), state("s", 64, true, false)];
-    for version in [VllmRuleVersion::V0_31_0, VllmRuleVersion::V0_32_0] {
+    for version in [
+        VllmRuleVersion::V0_31_0,
+        VllmRuleVersion::V0_32_0,
+        VllmRuleVersion::V0_33_0,
+    ] {
         for pool_blocks in [2, 3] {
             let mut coordinator =
                 with_limits(GroupedPrefixRules::new(&groups, 4, version).unwrap());
@@ -1345,10 +1559,15 @@ fn producer_copy_needs_a_block_that_admission_does_not_count() {
 
 #[test]
 fn producer_partial_state_keeps_separate_capacity_until_eviction() {
-    // Producer-tail CoW: v0.31 single:1903-1936 and v0.32
-    // single:1867-1900 preserve the cached boundary before another write.
+    // Producer-tail CoW: v0.31 single:1903-1936, v0.32 single:1867-1900
+    // and v0.33 single:1884-1917 preserve the cached boundary before
+    // another write.
     let groups = [attention("full", 32, None), state("s", 32, true, false)];
-    for version in [VllmRuleVersion::V0_31_0, VllmRuleVersion::V0_32_0] {
+    for version in [
+        VllmRuleVersion::V0_31_0,
+        VllmRuleVersion::V0_32_0,
+        VllmRuleVersion::V0_33_0,
+    ] {
         let mut coordinator = with_limits(GroupedPrefixRules::new(&groups, 4, version).unwrap());
         let mut kv = kv_pool(&groups, 5);
         let pool = kv.block_pool_mut().unwrap();
@@ -1390,13 +1609,16 @@ fn producer_copy_is_taken_only_with_hits_inside_a_block() {
     // partial tail inside a state block publishes the running block, and
     // the next allocation takes a fresh block and keeps the published
     // copy (v0.31 single:2094-2147, :1891-1936; v0.32 single:2067-2112,
-    // :1855-1900). With checkpoint blocks, a final chunk without a valid
-    // checkpoint follows the same rule (v0.32 single:2019-2066). The
+    // :1855-1900; v0.33 single:2085-2135, :1872-1917). With checkpoint
+    // blocks, a final chunk without a valid checkpoint follows the same
+    // rule (v0.32 single:2019-2066, v0.33 single:2036-2084). The
     // chunk 48..50 cannot export the checkpoint at 48.
     for (version, checkpoint) in [
         (VllmRuleVersion::V0_31_0, false),
         (VllmRuleVersion::V0_32_0, false),
         (VllmRuleVersion::V0_32_0, true),
+        (VllmRuleVersion::V0_33_0, false),
+        (VllmRuleVersion::V0_33_0, true),
     ] {
         let groups = [
             attention("full", 32, None),
@@ -1424,15 +1646,17 @@ fn producer_copy_is_taken_only_with_hits_inside_a_block() {
     }
     // With them off, vLLM rounds the cached length down to the scheduler
     // block before the state manager sees it (v0.31 coord:796-806,
-    // :808-840; v0.32 coord:767-794, :354-377). The rounded length is a
-    // multiple of the state block, so vLLM registers no tail and takes no
-    // copy (v0.31 single:2096-2097; v0.32 single:2101). A window group of
+    // :808-840; v0.32 coord:767-794, :354-377; v0.33 coord:777-804,
+    // :358-381). The rounded length is a multiple of the state block, so
+    // vLLM registers no tail and takes no copy (v0.31 single:2096-2097;
+    // v0.32 single:2101; v0.33 single:2124). A window group of
     // block 8 has no sub-block lookup, so the alignment is 8 at a hash
     // block of 4. A budget of 4 makes a chunk end at the tail 12: the
-    // prompt end on v0.31, one token before it on v0.32.
+    // prompt end on v0.31, one token before it on v0.32 and v0.33.
     for (version, prompt) in [
         (VllmRuleVersion::V0_31_0, 12),
         (VllmRuleVersion::V0_32_0, 13),
+        (VllmRuleVersion::V0_33_0, 13),
     ] {
         let groups = [attention("window", 8, Some(8)), state("s", 8, true, false)];
         let mut coordinator = with_limits(GroupedPrefixRules::new(&groups, 4, version).unwrap());
@@ -1459,8 +1683,8 @@ fn producer_copy_is_taken_only_with_hits_inside_a_block() {
         }
         assert!(hit_exists(pool, 1, 4, 8), "{version:?}");
         assert!(!hit_exists(pool, 1, 4, 12), "{version:?}");
-        // The write 12..13, the last prompt token on v0.32 or the first
-        // decode token on v0.31, stays on the running state block: two
+        // The write 12..13, the last prompt token on v0.32 and v0.33 or the
+        // first decode token on v0.31, stays on the running state block: two
         // window blocks and one state block.
         assert_eq!(pool.active_blocks(), 2 + 1, "{version:?}");
         assert!(state_lease(&block_lease, 1).previous.is_none());
@@ -1473,9 +1697,14 @@ fn producer_copy_defers_hits_on_its_state_in_the_step_of_the_copy() {
     // vLLM moves the cache entry of the published state to the copy block
     // and adds its key to the keys of the step, so a waiting request hits
     // it only from the next step on (v0.31 single:1931-1934, v0.32
-    // single:1895-1898). Replay keeps the key on the published block and
-    // hides it for the rest of the step of the copy.
-    for version in [VllmRuleVersion::V0_31_0, VllmRuleVersion::V0_32_0] {
+    // single:1895-1898, v0.33 single:1912-1915). Replay keeps the key on
+    // the published block and hides it for the rest of the step of the
+    // copy.
+    for version in [
+        VllmRuleVersion::V0_31_0,
+        VllmRuleVersion::V0_32_0,
+        VllmRuleVersion::V0_33_0,
+    ] {
         let groups = [attention("full", 32, None), state("s", 32, true, false)];
         let mut coordinator = with_limits(GroupedPrefixRules::new(&groups, 4, version).unwrap());
         let mut kv = kv_pool(&groups, 8);
@@ -1581,18 +1810,17 @@ fn glm_groups_at_the_hash_block_keep_their_counts() {
         vec![8704, 0, 15, 10880, 14, 12000, 15, 12001, 11, 13],
         vec![0, 6528, 9, 6528, 8, 8704, 13, 8705, 14, 21],
     ];
-    let expected: [(VllmRuleVersion, bool, Vec<Vec<usize>>); 3] = [
+    let checkpoint = vec![
+        vec![0, 0, 14, 6528, 8, 9000, 18, 9001, 10, 8],
+        vec![8704, 0, 19, 12000, 19, 12001, 11, 13],
+        vec![0, 6528, 13, 6528, 8, 8704, 13, 8705, 14, 21],
+    ];
+    let expected: [(VllmRuleVersion, bool, Vec<Vec<usize>>); 5] = [
         (VllmRuleVersion::V0_31_0, false, no_checkpoint.clone()),
-        (VllmRuleVersion::V0_32_0, false, no_checkpoint),
-        (
-            VllmRuleVersion::V0_32_0,
-            true,
-            vec![
-                vec![0, 0, 14, 6528, 8, 9000, 18, 9001, 10, 8],
-                vec![8704, 0, 19, 12000, 19, 12001, 11, 13],
-                vec![0, 6528, 13, 6528, 8, 8704, 13, 8705, 14, 21],
-            ],
-        ),
+        (VllmRuleVersion::V0_32_0, false, no_checkpoint.clone()),
+        (VllmRuleVersion::V0_32_0, true, checkpoint.clone()),
+        (VllmRuleVersion::V0_33_0, false, no_checkpoint),
+        (VllmRuleVersion::V0_33_0, true, checkpoint),
     ];
     for (version, checkpoint, rows) in expected {
         assert_eq!(
@@ -1753,12 +1981,16 @@ fn align_split_with_a_checkpoint_block_ports_vllm_0320() {
 fn align_split_needs_a_mamba_state_group() {
     // vLLM splits only with Mamba layers in align mode (v0.31 `sched:354-356`,
     // `:695-697`, v0.32 `sched:377-379`, `:724-726`). Without a state rule
-    // every chunk is the desired count, on both rows.
+    // every chunk is the desired count, on every row.
     let full = [attention("full", 64, None)];
     let windowed = [attention("full", 64, None), attention("swa", 64, Some(128))];
     // A tail ring, such as the GLM `KpoolTailSpec`, is not a MambaSpec.
     let ring = [attention("full", 64, None), state("ring", 4, false, false)];
-    for version in [VllmRuleVersion::V0_31_0, VllmRuleVersion::V0_32_0] {
+    for version in [
+        VllmRuleVersion::V0_31_0,
+        VllmRuleVersion::V0_32_0,
+        VllmRuleVersion::V0_33_0,
+    ] {
         for groups in [&full[..], &windowed[..], &ring[..]] {
             let r = GroupedPrefixRules::new(groups, 64, version).unwrap();
             // The last block boundary of the prompt is no stop.
@@ -1788,6 +2020,7 @@ fn partial_tail_moves_one_unit_down_on_vllm_0320() {
     let hash = 4;
     for (version, expected_ends, expected_hit) in [
         (VllmRuleVersion::V0_32_0, vec![6528, 8704, 8996, 9000], 8996),
+        (VllmRuleVersion::V0_33_0, vec![6528, 8704, 8996, 9000], 8996),
         (VllmRuleVersion::V0_31_0, vec![6528, 8704, 9000], 8704),
     ] {
         let mut coordinator = with_limits(rules_glm_hash(version, false, hash));
@@ -1806,7 +2039,7 @@ fn partial_tail_moves_one_unit_down_on_vllm_0320() {
             BUDGET,
         );
         assert_eq!(ends, expected_ends, "{version:?}");
-        if version == VllmRuleVersion::V0_32_0 {
+        if version != VllmRuleVersion::V0_31_0 {
             for group in GLM_STATES {
                 assert!(hit_exists(pool, group, hash, 8704));
                 assert!(hit_exists(pool, group, hash, 8996));
@@ -2063,7 +2296,11 @@ fn release_frees_groups_in_profile_order_each_tail_first() {
     // the profile lists first is evicted before the attention blocks.
     let groups = [state("s", 64, true, false), attention("full", 64, None)];
     let hash = 64;
-    for version in [VllmRuleVersion::V0_31_0, VllmRuleVersion::V0_32_0] {
+    for version in [
+        VllmRuleVersion::V0_31_0,
+        VllmRuleVersion::V0_32_0,
+        VllmRuleVersion::V0_33_0,
+    ] {
         let mut coordinator = with_limits(GroupedPrefixRules::new(&groups, hash, version).unwrap());
         let mut kv = kv_pool(&groups, 6);
         let pool = kv.block_pool_mut().unwrap();
@@ -2116,9 +2353,13 @@ fn checkpoint_rule_needs_state_groups_at_the_smallest_cacheable_block() {
         err,
         "kv_cache_groups with vllm_version=0.32.0 require every state group with prefill checkpoint blocks to have the smallest block_size_tokens of the prefix_cacheable groups"
     );
-    // Without checkpoint blocks the same shape is modeled on both rows.
+    // Without checkpoint blocks the same shape is modeled on every row.
     let no_checkpoint = [attention("full", 16, None), state("s", 64, true, false)];
-    for version in [VllmRuleVersion::V0_31_0, VllmRuleVersion::V0_32_0] {
+    for version in [
+        VllmRuleVersion::V0_31_0,
+        VllmRuleVersion::V0_32_0,
+        VllmRuleVersion::V0_33_0,
+    ] {
         assert!(GroupedPrefixRules::new(&no_checkpoint, 16, version).is_ok());
     }
     // A larger attention block keeps the state block the smallest. The
@@ -2139,7 +2380,11 @@ fn retired_window_blocks_are_released_tail_first() {
     // tail block of the range is evicted first.
     let groups = [attention("window", 4, Some(8))];
     let hash = 4;
-    for version in [VllmRuleVersion::V0_31_0, VllmRuleVersion::V0_32_0] {
+    for version in [
+        VllmRuleVersion::V0_31_0,
+        VllmRuleVersion::V0_32_0,
+        VllmRuleVersion::V0_33_0,
+    ] {
         let mut coordinator = with_limits(GroupedPrefixRules::new(&groups, hash, version).unwrap());
         let mut kv = kv_pool(&groups, 8);
         let pool = kv.block_pool_mut().unwrap();
@@ -2647,10 +2892,14 @@ fn a_published_checkpoint_state_key_ends_the_reuse_of_a_stored_hit() {
 fn a_moved_producer_state_key_ends_the_reuse_of_a_stored_hit() {
     // The copy of a state that the request published inside its running
     // block hides the key for the rest of the step (v0.31
-    // single:1931-1934, v0.32 single:1895-1898). The residency of every key
-    // stays the same, so only the published set tells the waiting request
-    // that its hit changed.
-    for version in [VllmRuleVersion::V0_31_0, VllmRuleVersion::V0_32_0] {
+    // single:1931-1934, v0.32 single:1895-1898, v0.33 single:1912-1915).
+    // The residency of every key stays the same, so only the published set
+    // tells the waiting request that its hit changed.
+    for version in [
+        VllmRuleVersion::V0_31_0,
+        VllmRuleVersion::V0_32_0,
+        VllmRuleVersion::V0_33_0,
+    ] {
         let groups = [attention("full", 32, None), state("s", 32, true, false)];
         let mut coordinator = with_limits(GroupedPrefixRules::new(&groups, 4, version).unwrap());
         let mut kv = kv_pool(&groups, 8);
@@ -2747,14 +2996,19 @@ fn key_state(
 #[test]
 fn copy_sources_of_a_hit_inside_a_block_stay_pinned_until_the_pass_ends() {
     // A hit inside a block copies the cached block of the full-attention
-    // group (v0.31 and v0.32 single:387-397, `_apply_cow` at :454-474)
-    // and the hit block of each state group (v0.31 single:1935-1937,
-    // v0.32 :1899-1901). Each source keeps the reference that `touch`
-    // gave it (v0.31 single:307, v0.32 :304) until `schedule()` frees the
-    // copy endpoints at its end (v0.31 sched:1434-1442, v0.32
-    // :1474-1482). Until then a later request of the same step cannot
+    // group (v0.31 and v0.32 single:387-397, `_apply_cow` at :454-474,
+    // v0.33 :388-398, :455-475) and the hit block of each state group
+    // (v0.31 single:1935-1937, v0.32 :1899-1901, v0.33 :1916-1918). Each
+    // source keeps the reference that `touch` gave it (v0.31 single:307,
+    // v0.32 :304, v0.33 :305) until `schedule()` frees the copy endpoints
+    // at its end (v0.31 sched:1434-1442, v0.32 :1474-1482, v0.33
+    // :1698-1706). Until then a later request of the same step cannot
     // take or evict it.
-    for version in [VllmRuleVersion::V0_31_0, VllmRuleVersion::V0_32_0] {
+    for version in [
+        VllmRuleVersion::V0_31_0,
+        VllmRuleVersion::V0_32_0,
+        VllmRuleVersion::V0_33_0,
+    ] {
         let mut coordinator = with_limits(rules_glm_hash(version, false, FINE));
         let mut kv = kv_pool(&groups_glm(false), 32);
         let pool = kv.block_pool_mut().unwrap();
@@ -3229,54 +3483,57 @@ fn admit_with_a_checkpoint_block(
 #[test]
 fn the_checkpoint_block_leaves_before_the_boundary_hit_block_of_its_group() {
     // vLLM frees the skipped blocks manager by manager, in group order (v0.32
-    // kv_cache_coordinator.py:447-450), and the blocks of a state group in
-    // descending index order (v0.32 single_type_kv_cache_manager.py:1604-1608).
-    // So the checkpoint block of group 2 enters the free queue first, then its
-    // hit block, then the blocks of group 3.
-    let version = VllmRuleVersion::V0_32_0;
-    let mut coordinator = with_limits(rules_glm(version, true));
-    let mut kv = kv_pool(&groups_glm(true), 64);
-    let pool = kv.block_pool_mut().unwrap();
-    let mut block_lease = admit_with_a_checkpoint_block(&mut coordinator, pool, version);
-    coordinator.begin_step();
-    assert!(coordinator.allocate(pool, &mut block_lease, 13000, 13000, 13001, 2));
-    // The 4 hit and the 4 checkpoint blocks are cached now.
-    assert_eq!(pool.active_blocks(), 11, "{version:?}");
-    assert_eq!(pool.inactive_cached_blocks(), 8, "{version:?}");
-    evict_one(pool);
-    assert!(!hit_exists(pool, 2, 2176, 10880), "{version:?}");
-    assert!(hit_exists(pool, 2, 2176, 8704), "{version:?}");
-    evict_one(pool);
-    assert!(!hit_exists(pool, 2, 2176, 8704), "{version:?}");
-    assert!(hit_exists(pool, 3, 2176, 10880), "{version:?}");
-    coordinator.release_request(pool, &mut block_lease);
+    // kv_cache_coordinator.py:447-450, v0.33 :451-454), and the blocks of a
+    // state group in descending index order (v0.32
+    // single_type_kv_cache_manager.py:1604-1608, v0.33 :1620-1624). So the
+    // checkpoint block of group 2 enters the free queue first, then its hit
+    // block, then the blocks of group 3.
+    for version in [VllmRuleVersion::V0_32_0, VllmRuleVersion::V0_33_0] {
+        let mut coordinator = with_limits(rules_glm(version, true));
+        let mut kv = kv_pool(&groups_glm(true), 64);
+        let pool = kv.block_pool_mut().unwrap();
+        let mut block_lease = admit_with_a_checkpoint_block(&mut coordinator, pool, version);
+        coordinator.begin_step();
+        assert!(coordinator.allocate(pool, &mut block_lease, 13000, 13000, 13001, 2));
+        // The 4 hit and the 4 checkpoint blocks are cached now.
+        assert_eq!(pool.active_blocks(), 11, "{version:?}");
+        assert_eq!(pool.inactive_cached_blocks(), 8, "{version:?}");
+        evict_one(pool);
+        assert!(!hit_exists(pool, 2, 2176, 10880), "{version:?}");
+        assert!(hit_exists(pool, 2, 2176, 8704), "{version:?}");
+        evict_one(pool);
+        assert!(!hit_exists(pool, 2, 2176, 8704), "{version:?}");
+        assert!(hit_exists(pool, 3, 2176, 10880), "{version:?}");
+        coordinator.release_request(pool, &mut block_lease);
+    }
 }
 
 #[test]
 fn a_request_that_ends_first_frees_its_checkpoint_block_before_its_boundary_hit_block() {
     // A request that ends frees its blocks manager by manager, in group order
-    // (v0.32 kv_cache_coordinator.py:407-408), and each group's table in
-    // reverse order (v0.32 single_type_kv_cache_manager.py:581-589): in a state
-    // group the running block, the checkpoint block, then the hit block, and
-    // then the next group.
-    let version = VllmRuleVersion::V0_32_0;
-    let mut coordinator = with_limits(rules_glm(version, true));
-    let mut kv = kv_pool(&groups_glm(true), 64);
-    let pool = kv.block_pool_mut().unwrap();
-    let mut block_lease = admit_with_a_checkpoint_block(&mut coordinator, pool, version);
-    coordinator.release_request(pool, &mut block_lease);
-    assert_eq!(pool.active_blocks(), 0, "{version:?}");
-    // The five cached full-attention blocks go first, then the
-    // checkpoint block of group 2.
-    for _ in 0..6 {
+    // (v0.32 kv_cache_coordinator.py:407-408, v0.33 :411-412), and each group's
+    // table in reverse order (v0.32 single_type_kv_cache_manager.py:581-589,
+    // v0.33 :591-599): in a state group the running block, the checkpoint
+    // block, then the hit block, and then the next group.
+    for version in [VllmRuleVersion::V0_32_0, VllmRuleVersion::V0_33_0] {
+        let mut coordinator = with_limits(rules_glm(version, true));
+        let mut kv = kv_pool(&groups_glm(true), 64);
+        let pool = kv.block_pool_mut().unwrap();
+        let mut block_lease = admit_with_a_checkpoint_block(&mut coordinator, pool, version);
+        coordinator.release_request(pool, &mut block_lease);
+        assert_eq!(pool.active_blocks(), 0, "{version:?}");
+        // The five cached full-attention blocks go first, then the
+        // checkpoint block of group 2.
+        for _ in 0..6 {
+            evict_one(pool);
+        }
+        assert!(!hit_exists(pool, 2, 2176, 10880), "{version:?}");
+        assert!(hit_exists(pool, 2, 2176, 8704), "{version:?}");
+        // Then the hit block of group 2, before the blocks of group 3.
         evict_one(pool);
+        assert!(!hit_exists(pool, 2, 2176, 8704), "{version:?}");
+        assert!(hit_exists(pool, 3, 2176, 10880), "{version:?}");
     }
-    assert!(!hit_exists(pool, 2, 2176, 10880), "{version:?}");
-    assert!(hit_exists(pool, 2, 2176, 8704), "{version:?}");
-    // Then the hit block of group 2, before the blocks of group 3.
-    evict_one(pool);
-    assert!(!hit_exists(pool, 2, 2176, 8704), "{version:?}");
-    assert!(hit_exists(pool, 3, 2176, 10880), "{version:?}");
 }
 
 #[test]

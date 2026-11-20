@@ -180,7 +180,7 @@ fn grouped_prefix_cache_replay_reports_reuse() {
     // The hand-made page of the attention layers. The byte values below are
     // multiples of it, not the 13,516,800-byte block row of a vLLM 0.32.0 pool.
     const GLM_PAGE: u64 = 13_045_120;
-    for (version, checkpoint) in [("0.31.0", None), ("0.32.0", Some(0))] {
+    for (version, checkpoint) in [("0.31.0", None), ("0.32.0", Some(0)), ("0.33.0", Some(0))] {
         let samples = Arc::new(Mutex::new(Vec::new()));
         let turn_one: Vec<u32> = (0..9000).collect();
         let mut turn_two = turn_one.clone();
@@ -258,6 +258,52 @@ fn grouped_prefix_cache_replay_reports_reuse() {
 }
 
 #[test]
+fn grouped_prefix_cache_replays_the_vllm_0330_probe_groups() {
+    // The cache groups that the import of the live GLM-5.3-Flash TP 4 record
+    // of vLLM 0.33.0 writes (fixture `glm53flash_vllm_0330_probe`), in the
+    // order of the record: four KDA state groups with one prefill checkpoint
+    // block at alignment 16, the MLA attention group and the ring. One pool
+    // block is 13,516,800 bytes, the pool holds 13,696 blocks and
+    // max_model_len is 1,048,576.
+    const PAGE: u64 = 13_516_800;
+    let turn_one: Vec<u32> = (0..9000).collect();
+    let mut turn_two = turn_one.clone();
+    turn_two.extend(100_000..104_000);
+    let mut first = request("turn-1", 0.0, turn_one.len(), 4);
+    first.input_token_ids = Some(turn_one);
+    let mut second = request("turn-2", 1_000.0, turn_two.len(), 4);
+    second.input_token_ids = Some(turn_two);
+    let mut spec = aggregated_spec(Backend::Vllm, 1, 0.0, vec![first, second]);
+    let rank = &mut spec.engine["rank"];
+    rank["enable_prefix_caching"] = true.into();
+    rank["prefix_match_unit"] = 2176.into();
+    rank["vllm_version"] = "0.33.0".into();
+    rank["max_model_len"] = 1_048_576.into();
+    rank["max_num_batched_tokens"] = 8192.into();
+    rank["kv_cache_capacity_bytes"] = (13_696 * PAGE).into();
+    let mut groups = Vec::new();
+    for (index, layers) in [9, 9, 8, 8].into_iter().enumerate() {
+        groups.push(serde_json::json!({"name": format!("runtime_group_{index}"), "kind": "state", "num_layers": layers, "block_size_tokens": 2176, "page_size_bytes": PAGE, "blocks_per_request": 1, "prefix_cacheable": true, "prefill_checkpoint_blocks": 1, "prefill_checkpoint_alignment": 16}));
+    }
+    groups.push(serde_json::json!({"name": "runtime_group_4", "kind": "attention", "num_layers": 22, "block_size_tokens": 2176, "page_size_bytes": PAGE, "prefix_cacheable": true}));
+    groups.push(serde_json::json!({"name": "runtime_group_5", "kind": "state", "num_layers": 11, "block_size_tokens": 4, "page_size_bytes": PAGE, "blocks_per_request": 1, "prefix_cacheable": false}));
+    rank["kv_cache_groups"] = serde_json::Value::Array(groups);
+    let report = Replayer::new(spec, ReplayEngineFactory::new())
+        .unwrap()
+        .run()
+        .unwrap();
+    assert_eq!(report.request_counts.completed_requests, 2);
+    // Turn one keeps its checkpoint at (9000 - 1) / 2176 * 2176 = 8704, and
+    // turn two reuses those 8,704 of its 13,000 prompt tokens.
+    let expected_ratio = 8704.0 / (9000.0 + 13_000.0);
+    assert!(
+        (report.prefix_cache_reused_ratio - expected_ratio).abs() < 1e-9,
+        "{}",
+        report.prefix_cache_reused_ratio
+    );
+}
+
+#[test]
 fn grouped_prefix_hit_above_the_pool_is_a_livelock() {
     // The geometry of grouped_prefix_hit_that_needs_more_blocks_than_the_pool_waits
     // in grouped_tests.rs. vLLM's startup check counts no block of a hit
@@ -265,7 +311,7 @@ fn grouped_prefix_hit_above_the_pool_is_a_livelock() {
     // second prompt hits 12 tokens inside a block and then needs seven
     // blocks. vLLM keeps it waiting, and with nothing running nothing evicts
     // the hit blocks. Replay reports the livelock and drops no request.
-    for (version, checkpoint) in [("0.31.0", None), ("0.32.0", Some(0))] {
+    for (version, checkpoint) in [("0.31.0", None), ("0.32.0", Some(0)), ("0.33.0", Some(0))] {
         let mut first = request("first", 0.0, 13, 1);
         first.input_token_ids = Some((0..13).collect());
         let mut second = request("second", 1_000.0, 33, 1);

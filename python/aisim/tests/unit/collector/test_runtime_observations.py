@@ -3762,6 +3762,60 @@ def test_import_records_the_vllm_version_of_the_cache_group_evidence(tmp_path):
     assert "runtime_framework_version" not in linear["runtime_memory"]
 
 
+def test_the_live_glm53flash_record_of_vllm_0330_passes_the_grouped_prefix_caching_gate(tmp_path):
+    from types import SimpleNamespace
+
+    from aisim.config.engine import grouped_prefix_caching_requirements
+
+    resources = _import(_campaign_from_fixture(tmp_path, FIXTURES / "glm53flash_vllm_0330_probe"))["resources"]
+    # The groups of the native replay test grouped_prefix_cache_replays_the_vllm_0330_probe_groups.
+    assert [
+        (
+            group["name"],
+            group["kind"],
+            group["num_layers"],
+            group["block_size_tokens"],
+            group["page_size_bytes"],
+            group.get("blocks_per_request"),
+            group.get("prefill_checkpoint_blocks"),
+            group.get("prefill_checkpoint_alignment"),
+            group["prefix_cacheable"],
+        )
+        for group in resources["cache_groups"]
+    ] == [
+        ("runtime_group_0", "state", 9, 2176, 13_516_800, 1, 1, 16, True),
+        ("runtime_group_1", "state", 9, 2176, 13_516_800, 1, 1, 16, True),
+        ("runtime_group_2", "state", 8, 2176, 13_516_800, 1, 1, 16, True),
+        ("runtime_group_3", "state", 8, 2176, 13_516_800, 1, 1, 16, True),
+        ("runtime_group_4", "attention", 22, 2176, 13_516_800, None, None, None, True),
+        ("runtime_group_5", "state", 11, 4, 13_516_800, 1, None, None, False),
+    ]
+    memory = resources["runtime_memory"]
+    assert (memory["kv_cache_bytes"], memory["max_model_len"]) == (13_696 * 13_516_800, 1_048_576)
+    assert (memory["enable_prefix_caching"], memory["mamba_cache_mode"], memory["hash_block_size_tokens"]) == (
+        True,
+        "align",
+        2176,
+    )
+    assert memory["runtime_framework_version"] == "0.33.0"
+
+    def gate(label):
+        deployment = SimpleNamespace(resources=FpmResourceProfile.model_validate(resources), backend_version=label)
+        return grouped_prefix_caching_requirements(
+            deployment,
+            backend_version=label,
+            architecture="Glm5NextForConditionalGeneration",
+            prefix_match_unit=None,
+            max_batched_tokens=8192,
+        )
+
+    # The label of the probe passes and gives the hash block. Another label does not take the evidence.
+    assert gate("0.33.0") == 2176
+    error = r"runtime_framework_version \(0.33.0\) to equal the deployment's backend_version \(0.32.0\)"
+    with pytest.raises(ValueError, match=error):
+        gate("0.32.0")
+
+
 def test_import_writes_no_transfer_bytes_for_a_record_of_vllm_0330(tmp_path):
     groups = _import(_campaign_from_fixture(tmp_path, FIXTURES / "glm53flash_vllm_0330_probe"))["resources"][
         "cache_groups"

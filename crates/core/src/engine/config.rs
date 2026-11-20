@@ -12,8 +12,9 @@
 // Source: https://github.com/LPhgh/aisimulate/tree/af56328c4ba7ffa1b8c42c8375244568c2e7bb8c
 // Copyright contributors to the vLLM project.
 // Modified Rust simulation of the vLLM v0.31.0
-// (db9527a46873454610df6dbedf79a36d6bf1a7f6) and v0.32.0
-// (5df63a7203cdb9328d824a27b682e77c7b9928be) grouped KV rules.
+// (db9527a46873454610df6dbedf79a36d6bf1a7f6), v0.32.0
+// (5df63a7203cdb9328d824a27b682e77c7b9928be) and v0.33.0
+// (4ba787ec9959e566d3b587a796dff07673324da5) grouped KV rules.
 // Immutable sources and license: THIRD_PARTY_NOTICES.md.
 
 //! Serializable engine configuration.
@@ -1311,8 +1312,9 @@ pub struct EngineConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kv_cache_capacity_bytes: Option<u64>,
     /// vLLM release whose grouped-cache rules this rank follows. A rank with
-    /// `kv_cache_groups` and `enable_prefix_caching` must set it to `0.31.0`
-    /// or `0.32.0`. A grouped rank with prefix caching off does not read it.
+    /// `kv_cache_groups` and `enable_prefix_caching` must set it to `0.31.0`,
+    /// `0.32.0` or `0.33.0`. A grouped rank with prefix caching off does not
+    /// read it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vllm_version: Option<String>,
     /// Optional framework-native host-offload simulation.
@@ -1684,10 +1686,12 @@ impl EngineConfig {
     /// version are set, the rule table accepts the groups, and the pool
     /// holds the full prompt of `max_model_len` plus the state blocks of one
     /// request, summed per group as vLLM's startup check does (v0.31
-    /// `kv_cache_utils.py:938-942`, v0.32 `:1043-1047`). The preemption order
-    /// is vLLM's: under the `fcfs` policy the victim is the last running
-    /// request (v0.31 `scheduler.py:771`, `:803`, v0.32 `:802`, `:834`), and
-    /// no vLLM policy takes the first running request by position.
+    /// `kv_cache_utils.py:938-942`, v0.32 `:1043-1047`, v0.33
+    /// `kv_cache_planning.py:90-94`). The preemption order is vLLM's: under
+    /// the `fcfs` policy the victim is the last running request (v0.31
+    /// `scheduler.py:771`, `:803`, v0.32 `:802`, `:834`, v0.33 `:938`,
+    /// `:970`), and no vLLM policy takes the first running request by
+    /// position.
     fn validate_grouped_prefix_caching(&self) -> Result<()> {
         ensure!(
             self.preemption_mode == PreemptionMode::Lifo,
@@ -1720,9 +1724,16 @@ impl EngineConfig {
             .and_then(VllmRuleVersion::parse)
         else {
             bail!(
-                "kv_cache_groups with enable_prefix_caching=true require vllm_version 0.31.0 or 0.32.0"
+                "kv_cache_groups with enable_prefix_caching=true require vllm_version 0.31.0, 0.32.0 or 0.33.0"
             );
         };
+        // vLLM 0.33.0 applies the interval without data parallelism (v0.33
+        // `sched/scheduler.py:396-425`, `:780-791`). Replay applies it only
+        // for an attention DP size above 1.
+        ensure!(
+            version != VllmRuleVersion::V0_33_0 || self.prefill_schedule_interval == 1,
+            "grouped prefix caching on vLLM 0.33.0 requires prefill_schedule_interval=1; vLLM 0.33.0 holds prefills at attention DP size 1 too, and replay does not model that"
+        );
         let rules = GroupedPrefixRules::new(groups, unit, version)?;
         // vLLM always sizes the pool with a model length.
         let Some(max_model_len) = self.max_model_len else {
@@ -3118,13 +3129,13 @@ mod tests {
     const GLM_PAGE: u64 = 13_045_120;
 
     /// Six GLM-5.3-Flash TP 4 cache groups as a hand-made profile of vLLM
-    /// 0.31.0 or 0.32.0, the versions that the rule table holds. Their kinds
-    /// and blocks are those that the vLLM 0.33.0 runtime probe records
+    /// 0.31.0, 0.32.0 or 0.33.0, the versions that the rule table holds. Their
+    /// kinds and blocks are those that the vLLM 0.33.0 runtime probe records
     /// (fixture `glm53flash_vllm_0330_probe`): MLA attention and four KDA
     /// `MambaSpec` states with 2,176-token blocks, and a 4-token
     /// `CircularBufferSpec` ring. The layer counts and the one page size are
-    /// hand-made. `checkpoint` is the `prefill_checkpoint_blocks` of G2 to
-    /// G5, with alignment 16 for 1.
+    /// hand-made. `checkpoint` is the `prefill_checkpoint_blocks` of G2 to G5,
+    /// with alignment 16 for 1.
     /// The page is the sum of the pages of the attention layers, 13,045,120 bytes,
     /// the block row of vLLM 0.31.0. vLLM 0.32.0 rounds the row up to the least
     /// common multiple of the block-stride alignments of all layers (v0.32.0
@@ -3207,16 +3218,23 @@ mod tests {
         // The version rules.
         assert!(
             validation_error(glm_prefix_wire(None, None))
-                .contains("require vllm_version 0.31.0 or 0.32.0")
+                .contains("require vllm_version 0.31.0, 0.32.0 or 0.33.0")
         );
         assert!(
             validation_error(glm_prefix_wire(Some("0.30.0"), None))
-                .contains("require vllm_version 0.31.0 or 0.32.0")
+                .contains("require vllm_version 0.31.0, 0.32.0 or 0.33.0")
         );
-        // The rule table models no vLLM 0.33.0 profile.
+        // The 0.33.0 row needs the checkpoint field, as the 0.32.0 row does.
+        validates(glm_prefix_wire(Some("0.33.0"), Some(0)));
+        validates(glm_prefix_wire(Some("0.33.0"), Some(1)));
+        assert_eq!(
+            validation_error(glm_prefix_wire(Some("0.33.0"), None)),
+            "kv_cache_groups with vllm_version=0.33.0 require prefill_checkpoint_blocks on every prefix-cacheable state group; set the field (0 or 1) on each such group"
+        );
+        // The gate compares the exact version text.
         assert!(
-            validation_error(glm_prefix_wire(Some("0.33.0"), None))
-                .contains("require vllm_version 0.31.0 or 0.32.0")
+            validation_error(glm_prefix_wire(Some("0.33.1"), Some(0)))
+                .contains("require vllm_version 0.31.0, 0.32.0 or 0.33.0")
         );
         validates(glm_prefix_wire(Some("0.32.0"), Some(0)));
         assert!(
@@ -3229,7 +3247,12 @@ mod tests {
         );
 
         // The capacity rule: cdiv(131072, 2176) + (2 + checkpoint) * 4 + 1.
-        for (version, checkpoint, bound) in [("0.31.0", Some(0), 70), ("0.32.0", Some(1), 74)] {
+        for (version, checkpoint, bound) in [
+            ("0.31.0", Some(0), 70),
+            ("0.32.0", Some(1), 74),
+            ("0.33.0", Some(0), 70),
+            ("0.33.0", Some(1), 74),
+        ] {
             let mut wire = glm_prefix_wire(Some(version), checkpoint);
             wire["kv_cache_capacity_bytes"] = ((bound - 1) * GLM_PAGE).into();
             assert!(
@@ -3284,7 +3307,7 @@ mod tests {
         // Host offload stays refused with prefix caching on, under every
         // connector name and pool scope. Only a sliding-window state_cache
         // of a linear pool offloads its checkpoints.
-        for version in ["0.31.0", "0.32.0"] {
+        for version in ["0.31.0", "0.32.0", "0.33.0"] {
             for host in [
                 serde_json::json!({"num_host_blocks": 64}),
                 serde_json::json!({"num_host_blocks": 64, "connector": "offloading_v0_32"}),
@@ -3373,7 +3396,7 @@ mod tests {
     fn grouped_prefix_caching_refuses_fifo_preemption() {
         // Only grouped prefix caching follows vLLM's preemption order. A
         // grouped rank without prefix caching and a linear rank keep `fifo`.
-        for version in ["0.31.0", "0.32.0"] {
+        for version in ["0.31.0", "0.32.0", "0.33.0"] {
             let mut fifo = glm_prefix_wire(Some(version), Some(0));
             fifo["preemption_mode"] = "fifo".into();
             assert_eq!(
@@ -3422,7 +3445,7 @@ mod tests {
             }
             wire
         };
-        for version in ["0.31.0", "0.32.0"] {
+        for version in ["0.31.0", "0.32.0", "0.33.0"] {
             for pages in [8, 32] {
                 assert_eq!(
                     validation_error(wire(true, version, pages)),
@@ -3461,7 +3484,7 @@ mod tests {
                 }, other],
             })
         };
-        for version in ["0.31.0", "0.32.0"] {
+        for version in ["0.31.0", "0.32.0", "0.33.0"] {
             assert_eq!(
                 validation_error(wire(version, Some(17))),
                 "kv_cache_groups with enable_prefix_caching=true do not model a sliding-window attention group with prefix_cacheable=false; describe a ring buffer as a state group with blocks_per_request: 1 and prefix_cacheable: false, and turn prefix caching off for a bounded replay window, which replay does not model",
@@ -3469,6 +3492,33 @@ mod tests {
             );
             validates(wire(version, None));
         }
+    }
+
+    #[test]
+    fn grouped_prefix_caching_on_vllm_0330_refuses_a_prefill_schedule_interval_above_one() {
+        // vLLM 0.33.0 applies the interval without data parallelism (v0.33
+        // sched:396-425, :780-791). Replay applies it only for an attention
+        // DP size above 1.
+        let mut wire = glm_prefix_wire(Some("0.33.0"), Some(1));
+        wire["prefill_schedule_interval"] = 2.into();
+        assert_eq!(
+            validation_error(wire.clone()),
+            "grouped prefix caching on vLLM 0.33.0 requires prefill_schedule_interval=1; vLLM 0.33.0 holds prefills at attention DP size 1 too, and replay does not model that"
+        );
+        wire["prefill_schedule_interval"] = 1.into();
+        validates(wire);
+        // The rows of 0.31.0 and 0.32.0 keep the interval.
+        for version in ["0.31.0", "0.32.0"] {
+            let mut wire = glm_prefix_wire(Some(version), Some(0));
+            wire["prefill_schedule_interval"] = 2.into();
+            validates(wire);
+        }
+        // A grouped rank with prefix caching off does not read the version.
+        let mut off = glm_prefix_wire(Some("0.33.0"), Some(1));
+        off["enable_prefix_caching"] = false.into();
+        off.as_object_mut().unwrap().remove("prefix_match_unit");
+        off["prefill_schedule_interval"] = 2.into();
+        validates(off);
     }
 
     #[test]

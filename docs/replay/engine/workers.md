@@ -303,7 +303,13 @@ release, so waiting sources may be blocked even when no prefill is running.
 `prefill_schedule_interval: N` admits prefill work only on every `N`-th pass of
 an attention-DP group. It mirrors vLLM's `prefill_schedule_interval`, which
 keeps decode steps balanced across DP ranks. It has an effect only when
-`attention_data` is above 1.
+`attention_data` is above 1. vLLM 0.33.0 also applies the interval without
+data parallelism, and it gives a dense DP rank its own cadence; see vLLM
+v0.33.0 [`scheduler.py:396-425`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/sched/scheduler.py#L396-L425)
+and [`:780-791`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/sched/scheduler.py#L780-L791).
+Replay does not model that. A grouped FPM cache with prefix caching on vLLM
+0.33.0 refuses an interval above 1. Where replay accepts the interval, it
+applies it only for `attention_data` above 1.
 
 ```yaml
 engine:

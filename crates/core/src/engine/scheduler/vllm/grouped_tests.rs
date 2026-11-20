@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright contributors to the vLLM project.
 // Tests of a modified Rust simulation of the vLLM v0.31.0
-// (db9527a46873454610df6dbedf79a36d6bf1a7f6) and v0.32.0
-// (5df63a7203cdb9328d824a27b682e77c7b9928be) grouped KV rules.
+// (db9527a46873454610df6dbedf79a36d6bf1a7f6), v0.32.0
+// (5df63a7203cdb9328d824a27b682e77c7b9928be) and v0.33.0
+// (4ba787ec9959e566d3b587a796dff07673324da5) grouped KV rules.
 // Immutable sources and license: THIRD_PARTY_NOTICES.md.
 
 use std::sync::{Arc, Mutex};
@@ -142,13 +143,13 @@ fn glm_state(name: &str, block: u32, cacheable: bool, checkpoint: bool) -> FpmCa
     }
 }
 
-/// Six GLM-5.3-Flash TP 4 cache groups as a hand-made profile of vLLM
-/// 0.31.0 or 0.32.0, at one page size. Their kinds and blocks are those that
+/// Six GLM-5.3-Flash TP 4 cache groups as a hand-made profile of vLLM 0.31.0,
+/// 0.32.0 or 0.33.0, at one page size. Their kinds and blocks are those that
 /// the vLLM 0.33.0 runtime probe records (fixture
-/// `glm53flash_vllm_0330_probe`): MLA attention and four KDA `MambaSpec`
-/// states with 2,176-token blocks, and a 4-token `CircularBufferSpec` ring.
-/// The layer counts and the page size are hand-made. With `checkpoint`, G2
-/// to G5 carry one FlashKDA checkpoint block at alignment 16.
+/// `glm53flash_vllm_0330_probe`): MLA attention and four KDA `MambaSpec` states
+/// with 2,176-token blocks, and a 4-token `CircularBufferSpec` ring. The layer
+/// counts and the page size are hand-made. With `checkpoint`, G2 to G5 carry
+/// one FlashKDA checkpoint block at alignment 16.
 /// The page is the sum of the pages of the attention layers, 13,045,120 bytes,
 /// the block row of vLLM 0.31.0. vLLM 0.32.0 rounds the row up to the least
 /// common multiple of the block-stride alignments of all layers (v0.32.0
@@ -169,9 +170,16 @@ fn glm_groups(checkpoint: bool) -> Vec<FpmCacheGroup> {
     groups
 }
 
-/// Three GLM cores: vLLM 0.31.0, and vLLM 0.32.0 without and with checkpoint
-/// blocks, which GLM-5.3-Flash takes only under the FlashKDA prefill backend.
-const GLM_CORES: [(&str, bool); 3] = [("0.31.0", false), ("0.32.0", false), ("0.32.0", true)];
+/// Five GLM cores: vLLM 0.31.0, and vLLM 0.32.0 and 0.33.0 each without and
+/// with checkpoint blocks, which GLM-5.3-Flash takes only under the FlashKDA
+/// prefill backend.
+const GLM_CORES: [(&str, bool); 5] = [
+    ("0.31.0", false),
+    ("0.32.0", false),
+    ("0.32.0", true),
+    ("0.33.0", false),
+    ("0.33.0", true),
+];
 
 fn prefix_core(
     groups: Vec<FpmCacheGroup>,
@@ -698,9 +706,10 @@ fn grouped_glm_shaped_multi_turn_replay_reports_hit_tokens_and_block_counts() {
         );
         // During the first step: G0 holds the four pinned blocks and the fresh
         // ones of the chunk, the ring one, each KDA group the cached and the
-        // running block, plus the checkpoint block on the third core. The
-        // cached state blocks stay until the request's next allocation, as
-        // in vLLM (v0.31 kv_cache_manager.py:552-556, v0.32 :555-559).
+        // running block, plus the checkpoint block on the cores with checkpoint
+        // blocks. The cached state blocks stay until the request's next
+        // allocation, as in vLLM (v0.31 kv_cache_manager.py:552-556, v0.32
+        // :555-559, v0.33 :564-568).
         let (peak, after) = if checkpoint { (19, 19) } else { (14, 14) };
         assert_eq!(
             block_pool(&core).peak_active_blocks(),
@@ -810,7 +819,7 @@ fn grouped_prefix_admission_tests_the_whole_prompt() {
     for (version, checkpoint) in GLM_CORES {
         // A prompt of 40,000 tokens needs 19 G0 blocks, 1 ring block and one
         // running block per KDA group, plus one checkpoint block each on the
-        // third core: 24 or 28, above the 20-block pool.
+        // cores with checkpoint blocks: 24 or 28, above the 20-block pool.
         let mut core = prefix_core(glm_groups(checkpoint), 20 * GLM_PAGE, 8192, 2176, version);
         let id = submit(&mut core, 601, 40_000, 2);
         let request = &core.state.requests[&id].sequence;
@@ -931,7 +940,7 @@ fn grouped_prefix_waiting_request_keeps_fifo() {
 fn grouped_prefix_waiting_hit_waits_when_its_first_chunk_does_not_fit() {
     // One sliding-window group of 4-token blocks with an 8-token window, a
     // 9-block pool and a step budget of 8 tokens.
-    for version in ["0.31.0", "0.32.0"] {
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
         let mut window = group("window", 4, 8, Some(8));
         window.prefix_cacheable = Some(true);
         let mut core = prefix_core(vec![window], 9 * 8, 8, 4, version);
@@ -992,7 +1001,7 @@ fn grouped_prefix_waiting_hit_keeps_its_lru_place_when_its_first_chunk_does_not_
             .key_hit(0, lease.prefix_hash_at(end).unwrap())
             .is_some()
     };
-    for version in ["0.31.0", "0.32.0"] {
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
         let mut window = group("window", 4, 8, Some(8));
         window.prefix_cacheable = Some(true);
         let mut core = prefix_core(vec![window], 9 * 8, 8, 4, version);
@@ -1046,7 +1055,7 @@ fn grouped_prefix_without_chunked_prefill_budgets_the_uncached_tokens() {
     // :1160-1167), as the linear pool does. Two running requests decode one
     // token each and leave 14 of the 16 tokens. A prompt of 15 tokens with 12
     // cached tokens needs 3 of them.
-    for version in ["0.31.0", "0.32.0"] {
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
         let args = || {
             MockEngineArgs::builder()
                 .block_size(4)
@@ -1101,7 +1110,7 @@ fn fine_grained_core(version: &str) -> VllmCore {
     let mut state = state("state", 8, 1);
     state.block_size_tokens = 16;
     state.prefix_cacheable = Some(true);
-    state.prefill_checkpoint_blocks = (version == "0.32.0").then_some(0);
+    state.prefill_checkpoint_blocks = (version != "0.31.0").then_some(0);
     VllmCore::new(
         MockEngineArgs::builder()
             .block_size(4)
@@ -1130,7 +1139,7 @@ fn grouped_prefix_hit_that_needs_more_blocks_than_the_pool_waits() {
     // (single:1716-1816). Cold the prompt needs 4 of the 5 blocks. vLLM keeps
     // such a request waiting and searches its hit again at the next step
     // (v0.31 sched:930-937, :1223-1230, v0.32 sched:960-967, :1275-1282).
-    for version in ["0.31.0", "0.32.0"] {
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
         // With nothing running, nothing changes the cache, so the request
         // waits in every pass. The replay reports that as a livelock
         // (runtime_contract.rs grouped_prefix_hit_above_the_pool_is_a_livelock).
@@ -1314,13 +1323,14 @@ fn grouped_prefix_copy_sources_block_a_later_admission_of_the_pass() {
     // RC's hit inside a block copies the cached full-attention block and the
     // hit block of each of the four state groups. vLLM keeps these 5 sources
     // in use until the end of `schedule()` (v0.31 sched:1434-1442, v0.32
-    // sched:1474-1482). So RC holds 12 blocks in its step: 2 full-attention
-    // blocks, the ring block, 4 running state blocks and the 5 sources. RN
-    // needs 6 blocks. On a pool of 15 blocks vLLM refused RN in RC's step and
-    // admitted it in the next one. Replay releases the sources at the end of
-    // the pass, so RN waits one pass on pools of 13 to 17 blocks. On 18
-    // blocks both fit in one pass. On 12 blocks RN waits until RC ends.
-    for version in ["0.31.0", "0.32.0"] {
+    // sched:1474-1482, v0.33 sched:1698-1706). So RC holds 12 blocks in its
+    // step: 2 full-attention blocks, the ring block, 4 running state blocks
+    // and the 5 sources. RN needs 6 blocks. On a pool of 15 blocks vLLM
+    // refused RN in RC's step and admitted it in the next one. Replay
+    // releases the sources at the end of the pass, so RN waits one pass on
+    // pools of 13 to 17 blocks. On 18 blocks both fit in one pass. On 12
+    // blocks RN waits until RC ends.
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
         for blocks in 12..=18 {
             let expected = match blocks {
                 12 => (0, 4, vec![7, 7, 7, 0, 6, 6, 6, 0], 12),
@@ -1343,13 +1353,14 @@ fn grouped_prefix_boundary_hit_holds_its_state_blocks_until_the_next_pass() {
     // hit block of each state group in RC's table until RC's next
     // `allocate_slots` (v0.31 kv_cache_manager.py:552-556,
     // single_type_kv_cache_manager.py:1626-1645, v0.32 :555-559,
-    // :1592-1611). So RC holds 12 blocks in its step: 3 full-attention
-    // blocks, the ring block, and a hit block and a running block in each
-    // state group. RN needs 6 blocks. Run on vLLM's cache manager, this case
-    // refuses RN in RC's step and admits it in the next one on pools of 14 to
-    // 17 blocks. Replay does the same. On 18 blocks both fit in one pass. On
-    // 12 and 13 blocks RN waits until RC ends.
-    for version in ["0.31.0", "0.32.0"] {
+    // :1592-1611, v0.33 :564-568, :1608-1627). So RC holds 12 blocks in its
+    // step: 3 full-attention blocks, the ring block, and a hit block and a
+    // running block in each state group. RN needs 6 blocks. Run on vLLM's
+    // cache manager, this case refuses RN in RC's step and admits it in the
+    // next one on pools of 14 to 17 blocks. Replay does the same. On 18
+    // blocks both fit in one pass. On 12 and 13 blocks RN waits until RC
+    // ends.
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
         for blocks in 12..=18 {
             let expected = match blocks {
                 12 | 13 => (0, 4, vec![12, 8, 8, 0, 6, 6, 6, 0], 12),
@@ -1370,28 +1381,31 @@ fn grouped_prefix_copy_sources_leave_in_group_order_at_the_end_of_the_pass() {
     // Two consumers with hits inside a block in one pass. vLLM frees their
     // copy sources at the end of `schedule()`, manager by manager in group
     // order (v0.31 kv_cache_manager.py:894-909, sched:1434-1442, v0.32
-    // kv_cache_manager.py:854-869, sched:1474-1482), and each cached source
+    // kv_cache_manager.py:854-869, sched:1474-1482, v0.33
+    // kv_cache_manager.py:863-878, sched:1698-1706), and each cached source
     // goes to the tail of the free queue (v0.31 block_pool.py:777-808, v0.32
-    // :774-805). So the full-attention sources of both consumers enter the
-    // LRU first, then the sources of group 2 of both, and so on. A cold
-    // request X then evicts the oldest cached blocks, and a later request on
-    // either prefix finds the same hit. After the consumers end, 22 blocks
-    // are cached: the 8 producer states at 2,176, the 10 sources, and the 4
-    // full-attention blocks of the consumers, whose copies keep the key of
-    // 3,264. 18 blocks are free. On the 0.31.0 rules X (26 blocks) computes
-    // its whole prompt in one chunk, since its last cacheable stop is its
-    // length: 26 + 1 + 4 = 31 blocks, 13 evictions. They take the 8 states,
-    // both full-attention sources, both sources of group 2 and one of group
-    // 3, so neither prefix hits. X ends in that pass, and its 26
-    // full-attention blocks join the 9 cached blocks left: 35. On the 0.32.0
-    // rules the first chunk of X (24 blocks) stops at (52,224 - 1) / 2,176 *
-    // 2,176 = 50,048: 23 + 1 + 4 = 28 blocks, 10 evictions. They end with
-    // both full-attention sources, every state source stays, both prefixes
-    // hit 3,264, and 12 blocks stay cached.
+    // :774-805, v0.33 :816-849). So the full-attention sources of both
+    // consumers enter the LRU first, then the sources of group 2 of both, and
+    // so on. A cold request X then evicts the oldest cached blocks, and a
+    // later request on either prefix finds the same hit. After the consumers
+    // end, 22 blocks are cached: the 8 producer states at 2,176, the 10
+    // sources, and the 4 full-attention blocks of the consumers, whose copies
+    // keep the key of 3,264. 18 blocks are free. On the 0.31.0 rules X (26
+    // blocks) computes its whole prompt in one chunk, since its last
+    // cacheable stop is its length: 26 + 1 + 4 = 31 blocks, 13 evictions.
+    // They take the 8 states, both full-attention sources, both sources of
+    // group 2 and one of group 3, so neither prefix hits. X ends in that
+    // pass, and its 26 full-attention blocks join the 9 cached blocks left:
+    // 35. On the 0.32.0 and 0.33.0 rules the first chunk of X (24 blocks)
+    // stops at (52,224 - 1) / 2,176 * 2,176 = 50,048: 23 + 1 + 4 = 28 blocks,
+    // 10 evictions. They end with both full-attention sources, every state
+    // source stays, both prefixes hit 3,264, and 12 blocks stay cached.
     // (version, X's blocks, inactive blocks after X's pass, the two hits)
-    for (version, x_blocks, inactive_after_x, hits) in
-        [("0.31.0", 26, 35, (0, 0)), ("0.32.0", 24, 12, (3264, 3264))]
-    {
+    for (version, x_blocks, inactive_after_x, hits) in [
+        ("0.31.0", 26, 35, (0, 0)),
+        ("0.32.0", 24, 12, (3264, 3264)),
+        ("0.33.0", 24, 12, (3264, 3264)),
+    ] {
         let mut core = VllmCore::new(
             MockEngineArgs::builder()
                 .block_size(4)
@@ -1549,20 +1563,22 @@ fn grouped_prefix_blocks_of_a_finished_request_first_serve_pass_k_plus_2_with_as
     // and 1 and finishes in pass 1 with 5 attention blocks and 2 state blocks.
     // W (21 tokens) needs 7 blocks of the 12 and fits only in R's blocks.
     // vLLM frees R's blocks when it processes the outputs of step 1 (v0.31
-    // sched:2171, :2650-2679, v0.32 sched:2230, :2714-2744). Without async
-    // scheduling that comes before the scheduling of step 2, so W starts in
-    // step 2. With async scheduling the engine schedules step 2 before it
-    // processes the outputs of step 1 (v0.31 engine/core.py:697, :740-755,
-    // v0.32 engine/core.py:725, :768-783), so W starts in step 3. The block
-    // counts are replay's. After R's last pass X holds 2 attention blocks, its
+    // sched:2171, :2650-2679, v0.32 sched:2230, :2714-2744, v0.33
+    // sched:2476, :3031-3062). Without async scheduling that comes before the
+    // scheduling of step 2, so W starts in step 2. With async scheduling the
+    // engine schedules step 2 before it processes the outputs of step 1 (v0.31
+    // engine/core.py:697, :740-755, v0.32 engine/core.py:725, :768-783, v0.33
+    // engine/core.py:735, :778-793), so W starts in step 3. The block counts
+    // are replay's. After R's last pass X holds 2 attention blocks, its
     // running state block and the previous state block of its crossing at 4:
     // 4 blocks, and 11 with async scheduling, where R still holds its 7. Pass
     // 2 releases X's previous state block: 3 left with async scheduling.
     // Without async scheduling pass 2 also admits W, whose first chunk of 20
     // tokens takes 5 attention blocks and 1 state block: 9. With async
     // scheduling vLLM also holds X's previous state block for one more step
-    // (v0.31 mgr:552-556, v0.32 mgr:555-559), a known difference.
-    for version in ["0.31.0", "0.32.0"] {
+    // (v0.31 mgr:552-556, v0.32 mgr:555-559, v0.33 mgr:564-568), a known
+    // difference.
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
         for (max_concurrent_batches, admitting_pass, after_finish, after_next) in
             [(1, 2, 4, 9), (2, 3, 11, 3)]
         {
@@ -1618,12 +1634,14 @@ fn grouped_prefix_async_scheduling_frees_a_finished_request_after_a_running_requ
     // F's tokens 0 against 8.
     // By a reading of vLLM, F goes first in both modes. vLLM frees F when it
     // processes the outputs of step 1 (v0.31 sched:2171, :2650-2679, v0.32
-    // sched:2230, :2714-2744). It frees G's block in `allocate_slots` on the
-    // processed-token basis (v0.31 mgr:552-556, v0.32 mgr:555-559), through
-    // the base path of `MambaManager.remove_skipped_blocks` (v0.31
-    // single:1647-1675, base path :1655-1657, :687-725, :1626-1645,
-    // :1990-1995; v0.32 single:1613-1641, base path :1621-1623, :672-710,
-    // :1592-1611, :1954-1959). With async scheduling the tokens of the step
+    // sched:2230, :2714-2744, v0.33 sched:2476, :3031-3062). It frees G's
+    // block in `allocate_slots` on the processed-token basis (v0.31
+    // mgr:552-556, v0.32 mgr:555-559, v0.33 mgr:564-568), through the base
+    // path of `MambaManager.remove_skipped_blocks` (v0.31 single:1647-1675,
+    // base path :1655-1657, :687-725, :1626-1645, :1990-1995; v0.32
+    // single:1613-1641, base path :1621-1623, :672-710, :1592-1611,
+    // :1954-1959; v0.33 single:1629-1657, base path :1637-1639, :682-720,
+    // :1608-1627, :1971-1976). With async scheduling the tokens of the step
     // in flight do not count, so vLLM frees G's block in the scheduling of
     // step 3, one step later than replay. So the outcome without async
     // scheduling equals vLLM's, and the outcome with async scheduling is
@@ -1635,7 +1653,7 @@ fn grouped_prefix_async_scheduling_frees_a_finished_request_after_a_running_requ
             .key_hit(group, lease.prefix_hash_at(end).unwrap())
             .is_some()
     };
-    for version in ["0.31.0", "0.32.0"] {
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
         for max_concurrent_batches in [1usize, 2] {
             let mut core = async_prefix_core(version, 11, max_concurrent_batches);
             let mut now = 0.0;
@@ -1714,12 +1732,13 @@ fn grouped_prefix_async_scheduling_frees_a_finished_request_after_a_running_requ
 fn grouped_prefix_copy_sources_leave_at_the_end_of_the_pass_with_async_scheduling() {
     // The tight-pool case with async scheduling. Without a KV connector in a
     // consumer role vLLM does not defer its block frees (v0.31
-    // sched:156, :175-181, v0.32 sched:167, :186-192), so the copy sources
-    // still leave at the end of `schedule()` (v0.31 sched:1434-1442, v0.32
-    // sched:1474-1482). RN waits one pass on pools of 13 to 17 blocks, as
+    // sched:156, :175-181, v0.32 sched:167, :186-192, v0.33 sched:169,
+    // :189-195), so the copy sources still leave at the end of `schedule()`
+    // (v0.31 sched:1434-1442, v0.32 sched:1474-1482, v0.33 sched:1698-1706).
+    // RN waits one pass on pools of 13 to 17 blocks, as
     // with one batch. RC's blocks leave one pass later, so on 12 blocks RN
     // starts one pass later than with one batch.
-    for version in ["0.31.0", "0.32.0"] {
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
         for blocks in 12..=18 {
             let expected = match blocks {
                 12 => (0, 5, vec![7, 7, 7, 7, 0, 6, 6, 6, 0], 12),
@@ -1741,10 +1760,10 @@ fn grouped_prefix_boundary_hit_holds_its_state_blocks_until_the_next_pass_with_a
     // blocks until RC's next allocation, one pass, as with one batch. vLLM
     // frees them on the processed token count, so with a step in flight it
     // holds them one more step (v0.31 kv_cache_manager.py:552-556, v0.32
-    // :555-559). Replay does not model that step. RC's blocks leave
-    // one pass later than with one batch, so on 12 and 13 blocks RN starts
-    // one pass later.
-    for version in ["0.31.0", "0.32.0"] {
+    // :555-559, v0.33 :564-568). Replay does not model that step. RC's
+    // blocks leave one pass later than with one batch, so on 12 and 13 blocks
+    // RN starts one pass later.
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
         for blocks in 12..=18 {
             let expected = match blocks {
                 12 | 13 => (0, 5, vec![12, 8, 8, 8, 0, 6, 6, 6, 0], 12),
@@ -1826,7 +1845,7 @@ fn grouped_prefix_waiting_hit_follows_keys_that_enter_and_leave_the_pool() {
     // waiting request of 16 tokens is looked up in every step. Its hit must
     // follow the pool: none, then the keys of a finished equal request, then
     // none again once a long request evicts them.
-    for version in ["0.31.0", "0.32.0"] {
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
         let mut full = group("full", 4, 8, None);
         full.prefix_cacheable = Some(true);
         let mut core = prefix_core(vec![full], 16 * 8, 64, 4, version);
@@ -1855,7 +1874,7 @@ fn grouped_prefix_waiting_hit_follows_the_state_keys_published_in_the_step() {
     // and the next step its state lookup misses at 12, so it hits nothing.
     // The next step clears the set, and the same request hits 12 tokens with
     // no change of the resident keys.
-    for version in ["0.31.0", "0.32.0"] {
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
         let mut core = fine_grained_core(version);
         let mut trace = TraceCollector::default();
         let mut probe = waiting_probe(&core, 2101, (0..33).collect());
@@ -1874,7 +1893,7 @@ fn grouped_prefix_waiting_hit_follows_the_token_count_of_the_request() {
     // The hit stops below the last known token (mgr:289-295). A waiting
     // request of 8 tokens hits 4 of a cached 16-token prefix; one more token
     // lifts the cap, and the same pool gives 8.
-    for version in ["0.31.0", "0.32.0"] {
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
         let mut full = group("full", 4, 8, None);
         full.prefix_cacheable = Some(true);
         let mut core = prefix_core(vec![full], 16 * 8, 64, 4, version);
@@ -1895,7 +1914,7 @@ fn grouped_prefix_waiting_hit_follows_new_prefix_hashes_of_the_request() {
     // The prefix hashes are an input of the search. A waiting request that
     // hits 12 tokens of a cached prefix hits nothing once its hashes are set
     // from other tokens, with no change of the pool.
-    for version in ["0.31.0", "0.32.0"] {
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
         let mut full = group("full", 4, 8, None);
         full.prefix_cacheable = Some(true);
         let mut core = prefix_core(vec![full], 16 * 8, 64, 4, version);
@@ -1960,10 +1979,10 @@ fn single_group_cores(version: &str) -> (VllmCore, VllmCore) {
 
 #[test]
 fn single_full_attention_group_matches_the_linear_pool() {
-    // Both rule rows. One full-attention group at the hash block leaves every
+    // Every rule row. One full-attention group at the hash block leaves every
     // row difference inert (the last cacheable stop, the partial tail and the
-    // checkpoint block), so both rows match the linear pool.
-    for version in ["0.31.0", "0.32.0"] {
+    // checkpoint block), so every row matches the linear pool.
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
         let (mut linear, mut grouped) = single_group_cores(version);
         let mut linear_trace = TraceCollector::default();
         let mut grouped_trace = TraceCollector::default();

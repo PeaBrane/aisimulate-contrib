@@ -143,11 +143,12 @@ evidence of the probe's settings. Selection and sizing do not read them.
 Grouped prefix caching needs `enable_prefix_caching: true` and
 `hash_block_size_tokens`, and a prefix-cacheable `state` group also needs
 `mamba_cache_mode: align`. Replay then hashes prompts in blocks of
-`hash_block_size_tokens`. Grouped prefix caching is modeled for vLLM 0.31.0
-and 0.32.0 only, and the version of the evidence, `runtime_framework_version`
+`hash_block_size_tokens`. Grouped prefix caching is modeled for vLLM 0.31.0,
+0.32.0 and 0.33.0, and the version of the evidence, `runtime_framework_version`
 below, must equal the deployment's `backend_version`. So the plan of a profile
-that records vLLM 0.33.0 evidence replays cold, and a configuration that turns
-prefix caching on for it is refused. [Grouped caches](../replay/engine/kv-cache.md#other-cache-modes)
+that records vLLM 0.33.0 evidence under the label `0.33.0` can replay with
+prefix caching, and a configuration that turns prefix caching on for such evidence
+under another label is refused. [Grouped caches](../replay/engine/kv-cache.md#other-cache-modes)
 also gives the case of a dataset label that differs from the probed vLLM
 version and of a profile imported before that field existed. For a linear profile, the simulated deployment decides prefix
 caching. The vLLM 0.33.0 runtime
@@ -213,7 +214,7 @@ A `state` group can also hold two optional fields from the runtime probe
 import. A profile imported before these fields existed has neither of them, and
 an absent field is left out of the serialized group. Sizing and replay with
 prefix caching off do not read them. Grouped prefix caching on vLLM 0.32.0
-reads them for a prefix-cacheable `state` group, and on vLLM 0.31.0 it refuses
+and 0.33.0 reads them for a prefix-cacheable `state` group, and on vLLM 0.31.0 it refuses
 a positive `prefill_checkpoint_blocks`. On every modeled version it refuses a
 positive `prefill_checkpoint_blocks` on a `state` group with
 `prefix_cacheable: false`.
@@ -358,12 +359,13 @@ keep their budget calculation and serialized shape.
 
 Grouped native execution supports aggregated vLLM, PP1/CP1, HBM-only cache and
 non-speculative decoding, cold or with prefix caching. Grouped prefix caching
-follows the rules of vLLM 0.31.0 and 0.32.0 only. It needs a profile deployment whose
+follows the rules of vLLM 0.31.0, 0.32.0 and 0.33.0. It needs a profile deployment whose
 `backend_version` is one of these versions, with prefix-caching evidence and
 equal `page_size_bytes` across groups, whose recorded evidence version, when
 present, is that version too. The probe import takes prefix-caching evidence
 only from a vLLM 0.33.0 record and records that version, so the plan of a
-profile from the runtime probe replays cold. [Replay KV cache](../replay/engine/kv-cache.md#other-cache-modes)
+profile from the runtime probe with the label `0.33.0` replays with prefix
+caching when it meets the conditions. [Replay KV cache](../replay/engine/kv-cache.md#other-cache-modes)
 gives the case of a profile imported before the version was recorded.
 [Replay KV cache](../replay/engine/kv-cache.md#other-cache-modes) lists the conditions. Host/G3
 offload, disaggregation and fixed scalar cache capacity are rejected. With
@@ -383,21 +385,39 @@ With prefix caching on, replay keeps the blocks of all groups in one block pool:
 - Every group has the same `page_size_bytes`, so one block of any group takes
   one pool block. The pool holds `kv_cache_capacity_bytes / page_size_bytes`
   blocks, rounded down.
-- A hand-made profile of vLLM 0.32.0 with a block-outermost KV cache layout
+- A hand-made profile of vLLM 0.32.0 or 0.33.0 with a block-outermost KV cache layout
   states the block row of the shared pool as the page of every group: the
   largest sum of the layer pages of one group, rounded up to the least common
   multiple of the block-stride alignments of all layers. See vLLM v0.32.0
-  [`kv_cache_utils.py:1520-1551`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/kv_cache_utils.py#L1520-L1551).
+  [`kv_cache_utils.py:1520-1551`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/kv_cache_utils.py#L1520-L1551)
+  and vLLM v0.33.0
+  [`kv_cache_planning.py:574-605`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/kv_cache_planning.py#L574-L605).
   vLLM logs the layout at start, for example `Using BLHNC KV cache layout`. A
   layout name that starts with `B` is block-outermost.
 - A native rank with `kv_cache_groups` and `enable_prefix_caching` also needs
   `prefix_match_unit` (the profile's `hash_block_size_tokens`), `vllm_version`
-  (`0.31.0` or `0.32.0`) and `max_model_len`. Prediction and recommendation set
-  all three. Every `state` group needs a `blocks_per_request` of 1.
+  (`0.31.0`, `0.32.0` or `0.33.0`) and `max_model_len`. Prediction and
+  recommendation set all three. With `vllm_version` `0.33.0`, the rank's
+  `prefill_schedule_interval` is 1. Every `state` group needs a `blocks_per_request` of 1.
 - The pool must hold the blocks of one request of `max_model_len` tokens, as
   vLLM's startup check counts them. That is
-  `ceil(max_model_len / block_size_tokens)` blocks for full attention and
-  vLLM's admission cap for a sliding window. It is 2 blocks for a
+  `ceil(max_model_len / block_size_tokens)` blocks for full attention. For a
+  sliding window it is vLLM's admission cap,
+  `ceil(min(sliding_window - 1 + in-flight tokens, max_model_len) / block_size_tokens) + 1`.
+  With `async_scheduling` on, the default, the in-flight tokens are
+  `max_num_batched_tokens` (`scheduler.max_batched_tokens` in the engine
+  YAML) times 2. With it off they are `max_num_batched_tokens`. This is the
+  same on every modeled version. vLLM v0.31.0
+  [`kv_cache_interface.py:840-866`](https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/kv_cache_interface.py#L840-L866),
+  v0.32.0
+  [`:859-885`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/kv_cache_interface.py#L859-L885)
+  and v0.33.0
+  [`:918-944`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/kv_cache_interface.py#L918-L944)
+  use the same formula. They also add `extra_retained_tokens`. vLLM sets it on
+  every sliding-window spec to `max(0, num_prefill_lookahead_tokens - 1)`,
+  which is above 0 only with multi-module speculative decoding. A rank with
+  `kv_cache_groups` refuses speculative decoding, so replay leaves the term
+  out. The count is 2 blocks for a
   prefix-cacheable `state` group, 3 with a checkpoint block, and 1 block for a
   ring.
 - Replay admits a waiting request only with room for the blocks of its whole

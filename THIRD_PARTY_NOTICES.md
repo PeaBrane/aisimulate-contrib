@@ -618,8 +618,9 @@ The repository-root files `crates/core/src/engine/kv_manager/grouped_prefix.rs`,
 `crates/core/src/engine/kv_manager/grouped_prefix_tests.rs` (its test module,
 with cases ported from the upstream tests) and
 `crates/core/src/engine/kv_manager/grouped.rs` adapt rules of vLLM v0.31.0,
-immutable commit `db9527a46873454610df6dbedf79a36d6bf1a7f6`, and of vLLM
-v0.32.0, immutable commit `5df63a7203cdb9328d824a27b682e77c7b9928be`.
+immutable commit `db9527a46873454610df6dbedf79a36d6bf1a7f6`, of vLLM
+v0.32.0, immutable commit `5df63a7203cdb9328d824a27b682e77c7b9928be`, and of
+vLLM v0.33.0, immutable commit `4ba787ec9959e566d3b587a796dff07673324da5`.
 From `kv_cache_coordinator.py`, `block_pool.py` and
 `single_type_kv_cache_manager.py`, the block mode of `grouped.rs` adapts the one
 block pool of all groups, the capacity cost of a cached hit block that leaves
@@ -627,7 +628,9 @@ the free queue, the tail-first free order of a request's cached blocks and the
 blocks that a request holds in a state group: the running block, a hit block,
 the previous running block, the copy block of a partial hit and the prefill
 checkpoint block of v0.32.0.
-In `grouped_prefix.rs`, one rule table keyed by the vLLM version holds both rows.
+In `grouped_prefix.rs`, one rule table keyed by the vLLM version holds the three
+rows. The v0.33.0 row follows the rules of v0.32.0, which the listed v0.33.0
+files keep for a cache without speculative decoding.
 From `kv_cache_coordinator.py`, `grouped_prefix.rs` adapts the hybrid cache-hit
 lookup over the spec groups, the hit alignment, the scheduler block, the pinning
 of the hit blocks before an allocation and the release of the groups in group
@@ -648,7 +651,7 @@ it adapts the block of the align split, which is the smallest block of the
 prefix-cacheable groups. From `config/vllm.py`, it adapts the bound on in-flight
 tokens that the admission cap uses. The test module ports cases from the
 upstream tests listed below.
-From the same two revisions, `crates/core/src/engine/kv_manager/vllm_backend.rs`
+From v0.31.0 and v0.32.0, `crates/core/src/engine/kv_manager/vllm_backend.rs`
 adapts, from `kv_cache_manager.py`, the whole-prompt admission cost of
 `allocate_slots`, its test of the first chunk before the hit blocks are
 pinned and the prefill end of a request that resumes after a preemption, and
@@ -666,6 +669,10 @@ tests of these rules.
 check of `kv_cache_utils.py` that the pool holds one request of `max_model_len`
 tokens, with the size of each group from `kv_cache_interface.py`, summed per
 group.
+In v0.33.0 that check is in `kv_cache_planning.py`. `config.rs` also refuses
+`prefill_schedule_interval` above 1 on the v0.33.0 row, because
+`sched/scheduler.py` of v0.33.0 applies that interval without data parallelism
+and the simulation does not.
 From `sched/scheduler.py` and `kv_cache_interface.py`, `grouped_prefix.rs` also
 adapts the rule that only a rank with a Mamba layer in align mode splits its
 prefill.
@@ -691,10 +698,21 @@ prefill.
 - https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/config/vllm.py
 - https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/tests/v1/core/prefix_cache/test_partial_prefix_cache_hits.py
 - https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/tests/v1/core/test_mamba_align_chunk_split.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/kv_cache_coordinator.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/single_type_kv_cache_manager.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/kv_cache_manager.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/sched/scheduler.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/kv_cache_interface.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/kv_cache_utils.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/kv_cache_planning.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/block_pool.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/engine/core.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/config/vllm.py
 
 Copyright contributors to the vLLM project. Licensed under Apache-2.0:
 https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/LICENSE
 https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/LICENSE
+https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/LICENSE
 
 These are modified Rust simulation adaptations, restricted to no speculative
 decoding, no EAGLE and the default retention only. The identified upstream
