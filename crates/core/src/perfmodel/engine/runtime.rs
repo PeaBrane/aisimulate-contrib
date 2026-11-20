@@ -318,7 +318,8 @@ impl PerOpSlotFold {
         if let Some(entry) = self.entries.get_mut(slot) {
             entry.0 += latency_ms;
             entry.1 += energy_wms;
-            if entry.2 != source {
+            // Equal labels are nearly always one static string: try its address.
+            if !std::ptr::eq(entry.2, source) && entry.2 != source {
                 entry.2 = "mixed";
             }
         } else if slot == self.entries.len() {
@@ -710,6 +711,28 @@ impl ChildQuerySlots {
     }
 }
 
+/// How a DSv4.1 staged walk runs a child, which its name decides.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChildRole {
+    /// Attention of its op list's phase, at its own prefill or decode shape.
+    Attention,
+    /// The logits projection ([`Op::is_logits_gemm`]): one row per request.
+    LogitsGemm,
+    Other,
+}
+
+impl ChildRole {
+    fn of(op: &Op, attention: bool) -> Self {
+        if attention {
+            Self::Attention
+        } else if op.is_logits_gemm() {
+            Self::LogitsGemm
+        } else {
+            Self::Other
+        }
+    }
+}
+
 /// Results of one staged walk pass by [`ChildQuerySlots`] slot. A
 /// context-attention child has one entry per prefill scope (`lane`). Each
 /// entry keeps the runtime context it was priced at and is lent only at an
@@ -1068,6 +1091,9 @@ pub struct Engine {
     /// Query slots of a DSv4.1 staged walk's three passes; built on first
     /// use. See [`Self::dsv41_mixed_workload`].
     stage_queries: OnceLock<[ChildQuerySlots; 3]>,
+    /// Role of each generation and each context child of a DSv4.1 staged
+    /// walk; built on first use.
+    stage_roles: OnceLock<[Vec<ChildRole>; 2]>,
     /// Ranks priced without diagnostics or lookup coverage, by workload;
     /// allocated on first use. See [`Self::rank_pricing`].
     rank_memo: OnceLock<Memo<RankKey, Arc<RankPricing>>>,
@@ -1248,6 +1274,7 @@ impl Engine {
             mix_plan: MixStepPlan::new(&spec.context_ops, &spec.generation_ops),
             stage_plan: StageWalkPlan::new(&spec.context_ops, &spec.generation_ops),
             stage_queries: OnceLock::new(),
+            stage_roles: OnceLock::new(),
             rank_memo: OnceLock::new(),
             op_memo: OnceLock::new(),
             shared_names: Mutex::default(),
@@ -2672,12 +2699,25 @@ impl Engine {
                 ChildQuerySlots::new(generation().filter(|op| op.is_generation_attention())),
             ]
         });
+        // Each generation and context child's role, so that a walk reads no name.
+        let [generation_role, context_role] = self.stage_roles.get_or_init(|| {
+            [
+                stage_children(&self.generation_ops)
+                    .map(|op| ChildRole::of(op, op.is_generation_attention()))
+                    .collect(),
+                stage_children(&self.context_ops)
+                    .map(|op| ChildRole::of(op, op.is_context_attention()))
+                    .collect(),
+            ]
+        });
         let mut totals = [0.0; 4];
         if prefills.is_empty() {
             if decode_batch > 0 {
                 // Generation can fuse or overlap children differently from
                 // prefill. Preserve that graph when no prefill is scheduled.
                 let mut memo = StageQueryMemo::new(generation, 1);
+                let runtime =
+                    generation_op_runtime(decode_batch, 1, decode_kv, generation_scale, 0, None);
                 let mut index = 0;
                 for outer in &self.generation_ops {
                     let children: &[Op] = match outer {
@@ -2685,17 +2725,9 @@ impl Engine {
                         _ => std::slice::from_ref(outer),
                     };
                     for child in children {
-                        let runtime = generation_op_runtime(
-                            decode_batch,
-                            1,
-                            decode_kv,
-                            generation_scale,
-                            0,
-                            None,
-                        );
                         let result =
                             memo.query(index, 0, &runtime, || child.query(&self.db, &runtime))?;
-                        let (bucket, pass) = if child.is_generation_attention() {
+                        let (bucket, pass) = if generation_role[index] == ChildRole::Attention {
                             (3, MixedPass::DecodeAttention)
                         } else {
                             (1, MixedPass::SharedNonAttention)
@@ -2734,8 +2766,15 @@ impl Engine {
                 .ok_or_else(|| {
                     AicError::InvalidEngineConfig("V4.1 mixed token count overflow".into())
                 })?;
+            // The stage's token-major children run at its fused token count;
+            // its logits projection at one row per request. An explicit count
+            // makes the op argument unused.
+            let fused = |x| context_op_runtime(outer, 1, tokens, 0, context_scale, Some(x));
+            let shared = fused(tokens);
+            let logits = fused(prefill_requests.saturating_add(decode_batch));
             for child in children {
-                if child.is_context_attention() {
+                let role = context_role[index];
+                if role == ChildRole::Attention {
                     for (lane, &(batch, s, prefix)) in scopes.iter().enumerate() {
                         if batch == 0 || s == 0 {
                             continue;
@@ -2748,49 +2787,30 @@ impl Engine {
                         on_op(MixedPass::ContextAttention, index, child, &runtime, result);
                     }
                 } else if tokens > 0 {
-                    let x = if child.is_logits_gemm() {
-                        prefill_requests.saturating_add(decode_batch)
+                    let runtime = if role == ChildRole::LogitsGemm {
+                        &logits
                     } else {
-                        tokens
+                        &shared
                     };
-                    let runtime = context_op_runtime(child, 1, tokens, 0, context_scale, Some(x));
                     let result =
-                        memo.query(index, 0, &runtime, || child.query(&self.db, &runtime))?;
+                        memo.query(index, 0, runtime, || child.query(&self.db, runtime))?;
                     totals[1] += result.latency_ms;
-                    on_op(
-                        MixedPass::SharedNonAttention,
-                        index,
-                        child,
-                        &runtime,
-                        result,
-                    );
+                    on_op(MixedPass::SharedNonAttention, index, child, runtime, result);
                 }
                 index += 1;
             }
         }
         if decode_batch > 0 {
             let mut memo = StageQueryMemo::new(decode_attention, 1);
-            let mut index = 0;
-            for outer in &self.generation_ops {
-                let children: &[Op] = match outer {
-                    Op::Dsv41Stage(stage) => &stage.children,
-                    _ => std::slice::from_ref(outer),
-                };
-                for child in children.iter().filter(|op| op.is_generation_attention()) {
-                    let runtime = generation_op_runtime(
-                        decode_batch,
-                        1,
-                        decode_kv,
-                        generation_scale,
-                        0,
-                        None,
-                    );
-                    let result =
-                        memo.query(index, 0, &runtime, || child.query(&self.db, &runtime))?;
-                    totals[3] += result.latency_ms;
-                    on_op(MixedPass::DecodeAttention, index, child, &runtime, result);
-                    index += 1;
-                }
+            let runtime =
+                generation_op_runtime(decode_batch, 1, decode_kv, generation_scale, 0, None);
+            let attention = stage_children(&self.generation_ops)
+                .zip(generation_role)
+                .filter(|(_, role)| **role == ChildRole::Attention);
+            for (index, (child, _)) in attention.enumerate() {
+                let result = memo.query(index, 0, &runtime, || child.query(&self.db, &runtime))?;
+                totals[3] += result.latency_ms;
+                on_op(MixedPass::DecodeAttention, index, child, &runtime, result);
             }
         }
         totals[0] = totals[1] + totals[2] + totals[3];
@@ -6503,6 +6523,46 @@ pub(crate) mod tests {
         metrics.scheduled_requests.sum_decode_kv_tokens = 1536;
         let result = engine.forward_pass_time_ms(&[metrics]).unwrap();
         assert!((result / unit - 4.0 * 260.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn dsv41_staged_walk_runs_each_child_at_its_roles_runtime() {
+        // A logits projection after the stages, as in the model's op list.
+        let mut engine = dsv41_probe_engine(false);
+        let logits = GemmOp::new("logits_gemm", 64, 64, GemmQuantMode::Bfloat16);
+        engine.context_ops.push(Op::Gemm(logits));
+        // Each visit's pass, child index and token count, with 3 decodes.
+        let walk = |prefills: &[(u32, u32, u32)]| {
+            let mut seen = Vec::new();
+            engine
+                .dsv41_mixed_workload(prefills, 3, 1024, 1.0, 1.0, |pass, index, _, runtime, _| {
+                    seen.push((pass, index, runtime.num_tokens))
+                })
+                .unwrap();
+            seen
+        };
+        let (shared, context, decode) = (
+            MixedPass::SharedNonAttention,
+            MixedPass::ContextAttention,
+            MixedPass::DecodeAttention,
+        );
+        // Two 256-token prefills fuse with the decodes.
+        assert_eq!(
+            walk(&[(2, 256, 0)]),
+            [
+                (shared, 0, 515),
+                (context, 1, 512),
+                (shared, 2, 515),
+                (context, 3, 512),
+                // One row per request: 2 prefills and 3 decodes.
+                (shared, 4, 5),
+                (decode, 0, 3),
+                (decode, 1, 3),
+            ]
+        );
+        // Decode only: every generation child, attention in its own pass.
+        let passes: Vec<_> = walk(&[]).iter().map(|visit| visit.0).collect();
+        assert_eq!(passes, [shared, decode, shared, decode]);
     }
 
     #[test]
