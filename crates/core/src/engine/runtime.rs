@@ -103,6 +103,10 @@ impl EngineFactory {
 
     /// Build one scheduler/KV/timing rank with an explicit identity.
     pub fn build_rank(&self, identity: RankIdentity) -> Result<SchedulerRank> {
+        anyhow::ensure!(
+            self.config.sglang.mamba_cache.is_none() || identity.dp_size.get() == 1,
+            "sglang.mamba_cache currently requires dp_size=1"
+        );
         let seed_offset = engine_seed_offset(identity)?;
         let mut rank = SchedulerRank::new_with_g2(
             identity,
@@ -119,6 +123,10 @@ impl EngineFactory {
 
     /// Build a single-rank or attention-DP logical engine.
     pub fn build(&self, identity: EngineIdentity, dp_size: NonZeroU32) -> Result<Engine> {
+        anyhow::ensure!(
+            self.config.sglang.mamba_cache.is_none() || dp_size.get() == 1,
+            "sglang.mamba_cache currently requires dp_size=1"
+        );
         GeneralizedMockerEngine::new_with_rank_factory(identity, dp_size, |rank_identity| {
             self.build_rank(rank_identity)
         })
@@ -129,6 +137,50 @@ impl EngineFactory {
 mod tests {
     use super::*;
     use crate::engine::TimingModelConfig;
+
+    #[test]
+    fn mamba_cache_dp_size_validation_covers_both_factory_entry_points() {
+        for cache_enabled in [false, true] {
+            let mut config: EngineConfig = serde_json::from_value(serde_json::json!({
+                "backend": "sglang",
+                "block_size": 64,
+                "enable_prefix_caching": true
+            }))
+            .unwrap();
+            if cache_enabled {
+                config.sglang.mamba_cache = Some(crate::engine::SglangMambaCacheConfig {
+                    prefill_checkpoint_interval: 64,
+                    decode_checkpoint_interval: 256,
+                    max_states: 16,
+                });
+            }
+            let factory = EngineFactory::new(config).unwrap();
+            for size in [1, 2] {
+                let dp_size = NonZeroU32::new(size).unwrap();
+                let identity = EngineIdentity::new(0);
+                let engine = factory.build(identity, dp_size);
+                if cache_enabled && size > 1 {
+                    assert_eq!(
+                        engine.err().unwrap().to_string(),
+                        "sglang.mamba_cache currently requires dp_size=1"
+                    );
+                } else {
+                    assert!(engine.is_ok());
+                }
+                for dp_rank in 0..size {
+                    let rank = factory.build_rank(identity.rank(dp_rank, dp_size));
+                    if cache_enabled && size > 1 {
+                        assert_eq!(
+                            rank.err().unwrap().to_string(),
+                            "sglang.mamba_cache currently requires dp_size=1"
+                        );
+                    } else {
+                        assert!(rank.is_ok());
+                    }
+                }
+            }
+        }
+    }
 
     fn afd_declaration(window: Option<usize>) -> EngineConfig {
         serde_json::from_value(serde_json::json!({

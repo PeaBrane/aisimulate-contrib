@@ -76,6 +76,12 @@ do not support image workloads. AFD workers themselves do not accept these field
 A backend-specific scheduler field set to a non-default value on another
 backend fails validation.
 
+SGLang's checkpoint-aware `sglang.mamba_cache` is a separate
+[native Replay option](kv-cache.md#native-sglang-mamba-checkpoints), not a field
+under this Python worker schema. It requires an aggregated worker with
+attention DP, prefill context parallelism and pipeline parallelism all equal
+to one. Python prediction YAML and deployment generation do not enable it.
+
 ## Context limits
 
 Each worker's `context_length` overrides `engine.context_length` for that role.
@@ -297,7 +303,13 @@ release, so waiting sources may be blocked even when no prefill is running.
 `prefill_schedule_interval: N` admits prefill work only on every `N`-th pass of
 an attention-DP group. It mirrors vLLM's `prefill_schedule_interval`, which
 keeps decode steps balanced across DP ranks. It has an effect only when
-`attention_data` is above 1.
+`attention_data` is above 1. vLLM 0.33.0 also applies the interval without
+data parallelism, and it gives a dense DP rank its own cadence; see vLLM
+v0.33.0 [`scheduler.py:396-425`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/sched/scheduler.py#L396-L425)
+and [`:780-791`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/sched/scheduler.py#L780-L791).
+Replay does not model that. A grouped FPM cache with prefix caching on vLLM
+0.33.0 refuses an interval above 1. Where replay accepts the interval, it
+applies it only for `attention_data` above 1.
 
 ```yaml
 engine:

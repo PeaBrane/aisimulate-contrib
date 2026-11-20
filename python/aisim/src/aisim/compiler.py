@@ -33,6 +33,7 @@ from .config.engine import (
     HostWorkerPredictionConfig,
     VisionPredictionConfig,
     WorkerPredictionConfig,
+    fpm_profile_deployment,
     has_afd,
     is_afd_worker,
     resolve_block_size,
@@ -957,6 +958,18 @@ def _worker_engine_args(
         payload["max_model_len"] = effective_context_length
     if cache.prefix_match_unit is not None:
         payload["prefix_match_unit"] = cache.prefix_match_unit
+    deployment = (
+        fpm_profile_deployment(engine, worker, role)
+        if engine.fpm_profile is not None and cache.prefix_caching
+        else None
+    )
+    if deployment is not None and deployment.resources.cache_layout == "grouped":
+        # The rank hashes at the profile's hash_block_size_tokens and follows the grouped rules of the deployment's
+        # backend_version.
+        payload["prefix_match_unit"] = (
+            cache.prefix_match_unit or deployment.resources.runtime_memory.hash_block_size_tokens
+        )
+        payload["vllm_version"] = deployment.backend_version
     if cache.state_cache is not None:
         payload["state_cache"] = {"bytes_per_request": cache.state_cache.bytes_per_request}
         if (window := cache.state_cache.resolved_sliding_window()) is not None:

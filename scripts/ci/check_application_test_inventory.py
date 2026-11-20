@@ -20,15 +20,15 @@ def assignment(path: str, markers: set[str], manual_suites: dict[str, str]) -> t
     for prefix, shard in (
         ("tests/unit/", "unit"),
         ("tests/golden/", "unit"),
-        ("tests/integration/", "integration"),
+        ("tests/integration/", "integration-build"),
         ("tests/cross_package/", "contracts"),
     ):
         if path.startswith(prefix):
             return shard, "entire directory"
     for prefix, shard in (
         ("tests/e2e/cli/", "cli-build"),
-        ("tests/e2e/support_matrix/", "support-matrix"),
-        ("tests/e2e/tools/", "tools-build"),
+        ("tests/e2e/support_matrix/", "integration-build"),
+        ("tests/e2e/tools/", "integration-build"),
     ):
         if path.startswith(prefix) and "build" in markers:
             return shard, "build marker"

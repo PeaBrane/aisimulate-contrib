@@ -13,6 +13,7 @@ SPDX-License-Identifier: Apache-2.0
 | G2 | Host (CPU) memory | `host_offload` |
 | G3 | Storage shared by workers | `g3_offload` |
 | G2 peer fetch (KVCR) | Another rank's G2 | `kvcr` |
+| KVCR-owned memory | Host memory KVCR owns, behind each rank's G2 | `kvcr.local_g2` |
 
 Recurrent-state models also use `state_cache`; see
 [state cache](#state-cache).
@@ -43,7 +44,7 @@ All paths below are under `engine.workers.<role>.kv_cache`.
 | Knob | Default | Recommend | Rules |
 |---|---|---|---|
 | `block_size` | vLLM `64`, SGLang `1`, TensorRT-LLM `32` | Searchable; fixed by default | Tokens per block. vLLM and TensorRT-LLM require at least 2. |
-| `prefix_caching` | `true` | fixed | Keep completed prompt blocks for reuse by later requests. |
+| `prefix_caching` | `true` | fixed | Keep completed prompt blocks for reuse by later requests. A grouped FPM cache can turn it on only under the conditions of [grouped caches](#other-cache-modes). |
 | `swa_prefix_tails` | `auto` | fixed | SGLang only. Sequence tails per attention-DP rank that keep their DeepSeek-V4 sliding-window KV; `null` turns it off. `auto` uses four per running request for a DeepSeek-V4 checkpoint and is off for other models. See [DeepSeek-V4 SWA prefix reuse](#deepseek-v4-swa-prefix-reuse). |
 | `decode_radix_cache` | `false` | fixed | SGLang `decode` only. Enables the decode worker's radix cache (`--disaggregation-decode-enable-radix-cache`); requires `prefix_caching: true` and no speculative decoding. See [SGLang decode radix cache](#sglang-decode-radix-cache). |
 | `bytes_per_token` | `auto` | fixed | KV bytes per token on one TP shard. `auto` derives it from the model, KV precision and this role's parallelism. |
@@ -57,7 +58,7 @@ All paths below are under `engine.workers.<role>.kv_cache`.
 | `g3_offload` | Unset (off) | Rejected | G3 block; see [G3 offload](#g3-offload). |
 | `kvcr` | Unset (off) | Rejected | KVCR block; see [KVCR peer fetch](#kvcr-peer-fetch). |
 | `state_cache` | Unset (off) | Rejected | Recurrent-state block; see [state cache](#state-cache). |
-| `prefix_match_unit` | Unset | Rejected | Prefix-matching granularity with `state_cache`. |
+| `prefix_match_unit` | Unset | Rejected | Prefix-matching granularity with `state_cache`. For a grouped FPM cache with prefix caching, it is the profile's `hash_block_size_tokens`: unset uses it, and a set value must equal it. See [grouped caches](#other-cache-modes). |
 
 The block-size defaults above are simulation defaults. When a Sweeper candidate's
 role block size is absent or `null`, the deployment generator omits `--block-size`
@@ -119,6 +120,71 @@ prefill or promise completion-sized page-list capacity. In ordinary decode the
 radix cache receives the prompt at running admission and the output at terminal
 cleanup, rather than extending a leaf after every token. These host allocation
 choices do not reserve simulated GPU pages or change predicted serving times.
+
+### Native SGLang Mamba checkpoints
+
+The Rust `EngineConfig.sglang.mamba_cache` option models the non-speculative
+SGLang `extra_buffer` checkpoint cache. It is an opt-in **native Replay**
+configuration, available in a Rust `ReplaySpec.engine.rank` or the equivalent
+`run_replay_json` payload. The Python `KvCachePredictionConfig`, prediction YAML,
+compiler and deployment generator do not expose or forward this option. The
+native-only scope is deliberate: state-slot capacity must come from the measured
+deployment, and automatic Python capacity inference is not qualified here.
+This option is separate from the Python `kv_cache.state_cache` configuration.
+
+All paths in this table are relative to native `EngineConfig`:
+
+| Field | Default | Rules |
+| --- | --- | --- |
+| `sglang.mamba_cache` | Absent (off) | Optional `SglangMambaCacheConfig`; native aggregated SGLang Replay only. |
+| `sglang.mamba_cache.prefill_checkpoint_interval` | `64` | Positive tokens; must be a multiple of `block_size`. |
+| `sglang.mamba_cache.decode_checkpoint_interval` | `256` | Positive tokens; must be a multiple of `prefill_checkpoint_interval`. |
+| `sglang.mamba_cache.max_states` | Required | Effective native `max_mamba_cache_size` in state slots, at least `4`; includes live state, retained waiting copies and resident checkpoints. |
+
+For example, merge this fragment into the native rank descriptor:
+
+```json
+{
+  "backend": "sglang",
+  "block_size": 64,
+  "enable_prefix_caching": true,
+  "sglang": {
+    "chunked_prefill_size": 16384,
+    "mamba_cache": {
+      "prefill_checkpoint_interval": 64,
+      "decode_checkpoint_interval": 256,
+      "max_states": 994
+    }
+  }
+}
+```
+
+`994` is an example measured state-pool size, not a default. The native chunk
+size must be divisible by `block_size`. The supported scope requires
+`worker_type: aggregated`, prefix caching enabled, attention DP 1, prefill
+context parallelism 1 and pipeline parallelism 1. Speculative decoding, KV
+events, HiCache, native host/G3 offload, SWA prefix tails and Belady eviction
+are rejected. Tensor parallelism may shard the worker normally.
+
+A token prefix is reusable only at a resident recurrent-state checkpoint.
+Splitting a radix edge does not create a checkpoint. Prefill selects an aligned
+branch checkpoint when available, otherwise the last complete checkpoint
+interval in the chunk; a short final chunk does not create a new checkpoint.
+Decode tracks the configured decode interval. With `host_loop: true`, prefill
+publication waits until its producing forward is observed, including
+one-output completion. A matched waiting request retains one private state
+copy across admission retries; admission transfers that reservation into the
+active request's three state slots, and cancellation releases it.
+
+Checkpoint eviction and state-pool reclamation under pressure are not modeled.
+Exceeding `max_states` or requiring KV eviction returns an explicit runtime
+error rather than an optimistic hit or an idle pass with stranded work. Choose
+capacity sufficient for the whole replay; increasing the token pool alone does
+not increase `max_states`.
+
+The [historical Qwen diagnostic receipt](../../../benchmarks/evidence/sglang-mamba-cache/README.md)
+records input requirements, scoring commands and accuracy limits. It does not
+qualify automatic memory sizing or current-head end-to-end serving accuracy.
 
 ### SGLang decode radix cache
 
@@ -456,7 +522,8 @@ caching and any `attention_data`. It also keeps the states of a
 [state cache](#state-cache): a recurrent state on a v0.32.0 profile, see
 [hybrid models](#hybrid-g2), and a sliding-window state under either offloading
 connector name. G2
-is rejected with SGLang, TensorRT-LLM, ngram speculation and Belady eviction.
+is rejected with SGLang, TensorRT-LLM, ngram speculation, Belady eviction
+and a [grouped FPM cache](#other-cache-modes).
 
 Canonical `engine.speculation.kind: mtp` can combine with G2 on aggregated and
 disaggregated vLLM workers, with any `attention_data`, prefix caching and no
@@ -561,23 +628,31 @@ the request recomputes the missing part instead. Each time this happens
 
 KVCR (KV Cache Runner) lets a rank pull a prompt prefix it is missing from
 another rank's G2 over the network, instead of recomputing it. A router attaches
-a hint naming the source rank; without hints KVCR does nothing. It requires
+a hint naming the source rank; without hints KVCR pulls nothing. With
+`local_g2` it also keeps blocks in memory of its own on each rank and restores
+them without a hint. It requires
 private G2 (`host_offload` with the default `scope: dp_rank_local`). Add it next
 to `host_offload` in the [host offload example](#host-offload-g2):
 
 ```yaml
 kvcr:
   latency_to_first_byte_ms: 1.0
-  bandwidth_gbps: 50.0
+  bandwidth_gbps: 32.0
+  # local_g2: {num_blocks: 4096}   # optional KVCR-owned memory per rank
 ```
 
 | Knob (under `kvcr`) | Default | Rules |
 |---|---|---|
 | `latency_to_first_byte_ms` | `1.0` | Fixed delay before each pull moves bytes, for the control round trip and the source pin. |
-| `bandwidth_gbps` | `50.0` | Per source rank (one attention-DP rank of a worker), decimal GB/s (a 400 Gb/s NIC is `50`). All GPUs of the rank share it, and so do concurrent pulls from it, equally. `0` means unlimited. |
+| `bandwidth_gbps` | `32.0` | Per source rank (one attention-DP rank of a worker), decimal GB/s (a 400 Gb/s NIC is `50`). All GPUs of the rank share it, and so do concurrent pulls from it, equally. `0` means unlimited. |
+| `local_g2` | Unset (off) | Host memory KVCR owns on each rank; see [KVCR-owned memory](#kvcr-owned-memory). |
+| `local_g2.num_blocks` | Required | Capacity of each rank, in the rank's G2 blocks (vLLM `secondary_g2_slots`). Integer from 1 through 2^64 − 1; omit `local_g2` to turn it off. |
+| `local_g2.policy` | `lru` | `lru` or `fifo`, the block to drop when the memory is full. |
+| `local_g2.copy_bandwidth_gbps` | `6.0` | Rate of the copies between a rank's G2 and its KVCR-owned memory, decimal GB/s. `0` means the copies take no time. |
 
-`kvcr: {}` uses the defaults. These defaults are modeling assumptions, not
-measured values.
+`kvcr: {}` uses the defaults. The default `bandwidth_gbps` approximates pulls
+over RDMA between B200 nodes; set the rate of your transport.
+`latency_to_first_byte_ms` is a modeling assumption.
 
 ### How KVCR behaves
 
@@ -600,15 +675,17 @@ The model simplifies KVCR:
 
 - The rank sees the source's G2 contents when it looks up the prefix. The
   source's blocks are then protected from eviction until the rank takes the
-  landed pull: as soon as it lands if the rank's worker is idle, otherwise when
-  that worker's current pass ends. The pulled blocks become usable in the
-  rank's G2 at the same point.
+  completed peer transfer: as soon as it lands if the rank's worker is idle,
+  otherwise when that worker's current pass ends. For a standalone pull, the
+  pulled blocks become usable in the rank's G2 at the same point. A pull joined
+  with a local promotion can still be waiting for the local copy after this
+  source protection ends.
 - The rank reserves G2 slots only for the blocks the source holds, all in one
   reservation per pull. A pull never evicts from the rank's G2 a block of the
   hinted prompt that the rank's G1 does not hold; it stops at the first block
   it has no other room for. G2 copies of prompt blocks already in G1 stay
   evictable, since the request does not load them.
-- While its pull is in flight, a request is not looked up again, as vLLM skips
+- While its pull is in flight a request is not looked up again, as vLLM skips
   a request that waits for remote KV.
 - Pulls do not fail or time out, and the first pull between two ranks has no
   connection setup cost.
@@ -639,6 +716,65 @@ bookkeeping still queries shared pool state from per-rank calls. Large worker
 or attention-DP pools can substantially increase replay wall time. Further
 overhead reductions are deferred; they must preserve CanonicalV1 replay output bytes.
 
+<a id="kvcr-owned-memory"></a>
+
+### KVCR-owned memory
+
+With `kvcr.local_g2`, each rank has a second host cache that KVCR owns, behind
+the rank's own G2 (vLLM `secondary_g2_slots`). The capacity `num_blocks` must
+fit a positive unsigned 64-bit integer. Only G2 exchanges blocks with
+the GPU, so the two caches work as a chain:
+
+- **Store.** When a G2 store completes, its blocks are copied into KVCR-owned
+  memory and are readable there once the copy ends. A block already there is
+  skipped. If the memory is full and no block can be dropped, the new block is
+  not copied.
+- **Evict and order.** The two caches evict independently. `lru` drops the
+  block used least recently: a request's stores, promotion and finish and a
+  peer's read count as use, lookups do not. `fifo` drops the block stored
+  longest ago; a promotion queues its blocks again. A block being copied or
+  read by a peer is never dropped.
+- **Promote.** A lookup that misses a block in G2 checks KVCR-owned memory
+  next, before the hinted peer and without needing a hint. A block found there
+  is copied back into G2, which can evict another G2 block, and then loads to
+  G1 like any G2 hit, so copy and load time add to TTFT.
+- **Peer pulls.** A source serves a pull from both of its caches. If its
+  KVCR-owned memory holds every block the rank asks for, the pull starts when
+  it is requested; otherwise it waits for the source's pass as before. Pulled
+  blocks land in the target's G2 only.
+- **Router events.** A block is published as `HostPinned` when it enters
+  either cache and removed when it has left both.
+
+A copy between the two caches takes its bytes, a block's KV for every GPU of
+the rank, divided by `copy_bandwidth_gbps`. Each direction runs a rank's
+copies one after another. The default approximates copies on a B200 node
+without RDMA; set the rate of your transport. Promotions count toward the
+1,024-round limit above.
+
+The model simplifies KVCR-owned memory:
+
+- Copies do not fail or time out.
+- G2 cannot evict a store's blocks until their copy into KVCR-owned memory
+  ends, and then ranks them as most recently used.
+- A promotion never evicts a G2 block of the same prompt and stops at the
+  first block it has no other room for.
+
+Under `lru`, the order can differ from vLLM's in corner cases, such
+as a pull that lands without a promotion.
+
+With `local_g2` the `kvcr` summary gains a `local_g2` section of block counts:
+`stored_blocks` (counted when the copy into KVCR-owned memory completes),
+`dropped_blocks` (not copied for lack of room),
+`evicted_blocks`, `promoted_blocks` and `loaded_blocks` (promoted blocks,
+counted when their first load into G1 starts).
+
+A joined promotion and peer pull become readable in G2 together. The pull's
+delivery counters update only then, and `remote_deliver_ms` includes any wait
+for the local copy. Its source blocks are released when the target takes the
+completed peer transfer, even if the local copy has not finished.
+
+KVCR's G3 spill, Guard ownership and custom policies are not modeled.
+
 ### Supported
 
 KVCR supports vLLM aggregated workers with any `attention_data`, and pulls
@@ -654,8 +790,8 @@ Hints come from the placement policy (see
 from `kv_hints` on native ReplaySpec requests (see
 [Rust API](../api/rust.md#serializable-spec)). Replay ignores a hint that names
 the receiving rank. CLI traffic carries no hints, so
-`aisim predict --stack engine` runs KVCR idle: apart from the `kvcr`
-section, the results equal G2 alone.
+`aisim predict --stack engine` runs peer fetch idle: without `local_g2`, the
+results equal G2 alone apart from the `kvcr` section.
 
 For a complete CLI example with router-generated hints, follow
 [Simulate KVCR peer reuse](../dynamo.md#simulate-kvcr-peer-reuse). It uses
@@ -877,9 +1013,305 @@ sub-block matching without an explicit full-state scratch count.
 - **Grouped caches.** Some whole-forward (FPM) profiles describe several KV
   groups, such as sliding-window and full attention, sharing one byte budget.
   Replay then allocates each group separately. A `state` group holds a fixed
-  number of blocks for each running request. Grouped caches require cold
-  aggregated vLLM with `prefix_caching: false`, no offload, no P/D and default
-  capacity. See [memory accounting](../../perf-model/memory.md).
+  number of blocks for each running request. Grouped caches require aggregated
+  vLLM, no offload, no P/D and default capacity. They run cold with
+  `prefix_caching: false`. No offload means no `host_offload`, `g3_offload` or
+  `kvcr`, with prefix caching on or off. A `sliding_window` group or a `state`
+  group of a grouped cache is not the sliding-window [state cache](#state-cache)
+  whose checkpoints [G2](#host-offload-g2) keeps. See
+  [memory accounting](../../perf-model/memory.md).
+
+  Grouped caches run with prefix caching on only under these conditions,
+  which prediction, recommendation and planning check. Planning tests the
+  vLLM version of the evidence, as the next paragraph says. The profile
+  deployment's `backend_version` is `0.31.0`, `0.32.0` or `0.33.0`, and its
+  runtime memory records `enable_prefix_caching: true` and
+  `hash_block_size_tokens`.
+  Every group declares `prefix_cacheable`. No group is a `convolution` group,
+  because grouped prefix caching does not support convolution groups yet. No
+  attention group with a `sliding_window` has `prefix_cacheable: false`: a
+  ring must be a `state` group with `blocks_per_request: 1` and
+  `prefix_cacheable: false`, and replay does not model a bounded replay window,
+  so turn prefix caching off for it. All
+  groups have the same `page_size_bytes`. A prefix-cacheable `state` group
+  also needs `mamba_cache_mode: align` in the runtime memory. When the
+  runtime memory records `runtime_framework_version`, the vLLM version of its
+  evidence, that version equals the `backend_version`. A set
+  `prefix_match_unit` equals `hash_block_size_tokens`. For GLM-5.3-Flash, the
+  hash block and `max_batched_tokens` are multiples of 4. On vLLM 0.33.0,
+  `scheduler.prefill_schedule_interval` is 1. vLLM 0.33.0 holds prefills at
+  attention DP size 1 too, and replay does not model that; see
+  [vLLM prefill schedule interval](workers.md#vllm-prefill-schedule-interval).
+  A recommendation and an onboarding plan run with 1. A prediction or a native
+  rank that you write by hand and that sets another value is refused.
+
+  The runtime probe import takes prefix-caching evidence only from a vLLM
+  0.33.0 record, and it records that version as
+  `runtime_memory.runtime_framework_version`. `aisim onboard plan` and
+  `aisim onboard finalize` test the vLLM version of the evidence: that field,
+  else the request's `runtime_framework_version`, else the `backend_version`.
+  They turn prefix caching on only when that version has grouped rules and
+  equals the `backend_version`. So the plan of a profile from the runtime
+  probe with the label `0.33.0` sets `prefix_caching: true` when the profile
+  meets the conditions above, also when `onboard init --fpm-profile` reuses
+  the profile. Under another label the plan sets `prefix_caching: false`.
+  When the probe ran with prefix caching and the version of the evidence has
+  no grouped rules or differs from the label, these commands print a note
+  that names that version and, when it has grouped rules, the label. A
+  prediction or recommendation that turns prefix caching on for a profile
+  whose recorded version differs from its label is refused before replay.
+  `onboard probe-runtime` keeps an explicit dataset label that differs from the
+  observed runtime; keep the label equal to the probed version. A plan that
+  was saved while replay had no grouped rules for vLLM 0.33.0 holds
+  `prefix_caching: false`. The commands that verify a saved plan still accept
+  it and keep its files. `aisim onboard plan --overwrite` writes the plan again
+  with prefix caching on, and `aisim onboard finalize` writes the plan of the
+  resolved profile with prefix caching on. A profile
+  imported before the version was recorded holds no `prefix_cacheable` marks
+  either, because the import writes the marks and the version together, so
+  its plan is cold and a prediction or recommendation with prefix caching is
+  refused. If you set the marks of such a profile by hand, also set
+  `runtime_memory.runtime_framework_version` to the version that the probe ran
+  on. With the marks and without the version, a label of `0.31.0` or `0.32.0`
+  on vLLM 0.33.0 evidence can plan prefix caching on and passes these
+  conditions, and native replay applies the rules of the label to that
+  evidence, after the startup checks below. That use is not modeled. A
+  hand-made profile of `backend_version`
+  0.31.0, 0.32.0 or 0.33.0 with prefix-caching evidence, without a recorded
+  version or with that version, can turn grouped prefix caching on, also in
+  its plan.
+
+  Native replay checks more at startup and refuses the rank otherwise. Every
+  state group holds one block per request. At least one group is
+  prefix-cacheable. The hash block divides the block of every
+  prefix-cacheable group, and the scheduler block is a multiple of it. The
+  scheduler block, the least common multiple of the group blocks, fits in
+  the machine's unsigned integer size. On
+  vLLM 0.31.0 no prefix-cacheable state group has a positive
+  `prefill_checkpoint_blocks`. On vLLM 0.32.0 and 0.33.0, which replay checks
+  the same way, every prefix-cacheable state group records
+  `prefill_checkpoint_blocks`, and all of them record one count, 0 or 1. With
+  a count of 1 they record one `prefill_checkpoint_alignment`, and each of
+  them has the smallest block of the prefix-cacheable groups. With a count of
+  0 no group has an alignment. On
+  vLLM 0.33.0 `prefill_schedule_interval` is 1. On every modeled version no
+  `state` group with `prefix_cacheable: false` has a positive
+  `prefill_checkpoint_blocks`. `max_model_len` is set, and the pool holds one prompt of
+  `max_model_len` plus the state blocks of one request. `preemption_mode` is
+  `lifo`, the default, which is vLLM's order: it preempts the last running
+  request. Planning runs only the
+  conditions above, so a profile that fails a native check plans prefix
+  caching on and is refused at replay. The native rank does not hold the
+  Mamba cache mode, so native replay does not check align mode. It does not
+  hold the profile's `runtime_framework_version` either: a replay spec or a
+  native rank that you write by hand states `vllm_version` itself, and native
+  replay does not check it against the version that the profile records.
+  A native rank does not hold the runtime memory either, so native replay
+  does not check the probe evidence there, that `prefix_match_unit` equals
+  `hash_block_size_tokens`, or the multiples of 4 of GLM-5.3-Flash.
+
+  Replay also assumes vLLM settings that it has no field for. The scheduling
+  policy is FCFS. No aux-output connector and no HiSparse placement are in
+  use. Requests are text requests without a LoRA adapter. Replay has no gate
+  for these assumptions, and a deployment that differs in one of them is not
+  modeled.
+
+  Replay then follows the rules of the vLLM version in
+  `engine.backend_version`. For the cases that replay models, vLLM 0.33.0 has
+  the rules of vLLM 0.32.0:
+
+  - Replay hashes prompts in blocks of the profile's `hash_block_size_tokens`.
+    vLLM allows hits inside a block under two conditions. A prefix-cacheable
+    `state` group has a block larger than the hash block. Every
+    prefix-cacheable sliding-window group has a block equal to the hash
+    block. A hit then ends on a multiple of the hash block. Otherwise it ends
+    on a multiple of the least common multiple of the group block sizes.
+  - State groups resume only at the boundaries that vLLM keeps under its
+    default `prefix_cache_retention_interval` of 0, such as the last block
+    boundary before the end of a prompt. A `state` group with
+    `prefix_cacheable: false` is a ring, such as an indexer tail. It holds one
+    block for the whole request and never hits. An attention group with
+    `prefix_cacheable: false` and no `sliding_window` takes no part in hits
+    and takes blocks for the whole prompt. No full-attention cache spec of
+    vLLM 0.31.0, 0.32.0 or 0.33.0 opts out of prefix caching.
+  - A request that resumes from a cached state on a block boundary holds the
+    cached block and its running block during its first step. It releases the
+    cached block at its next step, as vLLM does at the request's next
+    allocation with `async_scheduling: false`. The block stays cached until
+    eviction. See vLLM v0.31.0
+    [`kv_cache_manager.py:552-556`](https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/core/kv_cache_manager.py#L552-L556)
+    and
+    [`single_type_kv_cache_manager.py:1626-1645`](https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/core/single_type_kv_cache_manager.py#L1626-L1645),
+    vLLM v0.32.0
+    [`kv_cache_manager.py:555-559`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/kv_cache_manager.py#L555-L559)
+    and
+    [`single_type_kv_cache_manager.py:1592-1611`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/single_type_kv_cache_manager.py#L1592-L1611),
+    and vLLM v0.33.0
+    [`kv_cache_manager.py:564-568`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/kv_cache_manager.py#L564-L568)
+    and
+    [`single_type_kv_cache_manager.py:1608-1627`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/single_type_kv_cache_manager.py#L1608-L1627).
+    A hit inside a block of a full-attention or `state` group copies the
+    cached block in its first step, and the copy replaces the cached block in
+    the request. As in vLLM, the cached block stays in use until the
+    scheduling pass ends, so that the copy can read it. A request that the
+    same pass admits later cannot take it. Replay then releases these blocks
+    group by group, in the order of the admissions. See vLLM v0.31.0
+    [`single_type_kv_cache_manager.py:454-474`](https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/core/single_type_kv_cache_manager.py#L454-L474)
+    and
+    [`scheduler.py:1434-1442`](https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/core/sched/scheduler.py#L1434-L1442),
+    vLLM v0.32.0
+    [`single_type_kv_cache_manager.py:454-474`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/single_type_kv_cache_manager.py#L454-L474)
+    and
+    [`scheduler.py:1474-1482`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/sched/scheduler.py#L1474-L1482),
+    and vLLM v0.33.0
+    [`single_type_kv_cache_manager.py:455-475`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/single_type_kv_cache_manager.py#L455-L475)
+    and
+    [`scheduler.py:1698-1706`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/sched/scheduler.py#L1698-L1706).
+  - Prefill chunks end on block boundaries, so that the state there can be
+    cached. Some chunks end inside a block. The final chunk ends at the end of
+    the prompt. If one block is larger than `max_batched_tokens`, chunks
+    advance by up to that budget until they reach the next block boundary.
+    With hits inside a block, a chunk can also stop at a hash boundary inside
+    the last block of the prompt, so that a later hit can resume there.
+    As in vLLM, this align split applies only to a rank with a
+    prefix-cacheable `state` group. A rank with only full-attention and
+    sliding-window groups is not split.
+  - On vLLM 0.32.0 and 0.33.0 a prefix-cacheable `state` group can carry a
+    prefill checkpoint block, such as the FlashKDA block of a KDA group. The
+    request takes that block in the chunk that reaches the end of its prefill and
+    releases it at its next step. As in vLLM, the prefill of a request that
+    resumes after a preemption ends one token before its last known token,
+    so it covers the output tokens too. The block stays cached until eviction
+    when it holds the prompt's checkpoint, the last position before the end
+    of the prompt where a hit can end, or the end of a shared prefix where
+    the request's hit stopped short. vLLM drops any other
+    checkpoint under its default retention of 0. Only a resumed request takes
+    such a checkpoint.
+
+  Replay differs from vLLM in these known ways:
+
+  - Replay holds the previous state block after a block boundary, the cached
+    block after a hit on a block boundary and the checkpoint block after the
+    final prefill chunk for one scheduler step, and it releases the blocks of
+    a sliding-window group once they leave the window. vLLM 0.31.0, 0.32.0 and
+    0.33.0 turn async scheduling on by default and then hold these blocks for
+    one more step. Replay models async scheduling in the arrival rule, in the
+    admission cap of a sliding-window group and in the blocks of a finished
+    request, which it frees after it has formed the next pass (see
+    [vLLM async scheduling](workers.md#vllm-async-scheduling)). It does not
+    model it in these holds. So block counts and admission can be optimistic
+    for one step, by one block per state group and held block and by the
+    window blocks that left the window. A held block, or a block of a
+    sliding-window group that left the window, also enters the eviction order
+    one step early: before the blocks of a request that finished in the pass
+    before, where vLLM frees it after them. When the pool evicts, a different
+    cached block can then go first, and a later hit can be shorter or longer
+    than in vLLM. With `async_scheduling: false` these blocks are held for one
+    step in vLLM too.
+  - Replay caches blocks of prompt tokens only. vLLM also caches the
+    full-attention blocks that output tokens fill. A request's hit is at most
+    the shortest hit over its prefix-cacheable groups. Under the default
+    retention, a state or sliding-window group keeps no output-token position.
+    So when every prefix-cacheable group is full attention, a next turn that
+    repeats recorded output tokens hits fewer tokens than in vLLM. With a state
+    or sliding-window group, the difference changes only which blocks are cached
+    and the eviction order.
+  - Replay does not let a waiting request hit a state block that another
+    request cached in the same scheduler step, or a state whose copy another
+    request took in that step. The request gets the shorter
+    hit and can start in that step. vLLM keeps the request, and the requests
+    queued behind it, waiting for that step, and gives it the longer hit in
+    the next step. vLLM 0.32.0 also holds such a request in the step or steps
+    after the publishing step, when the next cache step of the publishing
+    request marks the same block again. Replay does not model that. vLLM
+    0.33.0 does not mark a block that already has its key, so it does not
+    hold the request there. See vLLM v0.32.0
+    [`single_type_kv_cache_manager.py:1977-1982`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/single_type_kv_cache_manager.py#L1977-L1982)
+    and
+    [`:1688-1696`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/single_type_kv_cache_manager.py#L1688-L1696),
+    and vLLM v0.33.0
+    [`single_type_kv_cache_manager.py:2112-2115`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/single_type_kv_cache_manager.py#L2112-L2115).
+  - vLLM looks up prefix-cacheable groups together only when their cache specs
+    are equal in every field. The profile records only a group's kind, block
+    size, window and checkpoint setting, so replay looks up groups that agree
+    on these together, also when vLLM keeps them apart because another field
+    differs, such as the head size, the data type or the state shape. Replay
+    can then miss a prefill stop where vLLM saves an extra state, and with hits
+    inside a block it can give a shorter hit. The profile does not record which
+    groups share a spec.
+  - When the hash block is smaller than a full-attention block, vLLM 0.32.0
+    and 0.33.0 can give a cached block two keys: the key of its block
+    boundary and the key of the last hash boundary before the end of a
+    prompt, inside the block. Replay gives the block one key, the key that it
+    got first. vLLM 0.31.0 puts that key at the last hash boundary at or
+    before the end of the prompt, in a block that prompt tokens do not fill,
+    so it has no such case. The difference shows in two ways. With hits
+    inside a block and a prefill checkpoint block, one chunk can end at the
+    end of a prompt whose length is a multiple of the full-attention block.
+    The last block then gets its full key only, and the state group has a key
+    only at the checkpoint inside that block. A later request with the same
+    tokens and a length inside the last hash block of that prompt, such as a
+    repeat of the prompt, gets an older state or no hit. vLLM hits the prompt
+    length less one hash block. With blocks of 32 tokens, a hash block of 4
+    and a prompt of 64 tokens, a repeat hits 0 tokens in replay and 60 in
+    vLLM. A longer prompt, or a prompt whose length is not a multiple of the
+    block, is not affected. The other way needs no hits inside a block:
+    every prefix-cacheable group is full attention. The hash block is then
+    smaller than a block when the blocks differ, where it is their greatest
+    common divisor by default, or when `prefix_match_unit` sets a smaller
+    one. A block that gets the
+    key of the last hash boundary first gets no full key when a later chunk
+    fills it. A later, longer prompt can then hit one least common multiple
+    of the group block sizes less than in vLLM. With blocks of 64 and 16
+    tokens, a prompt of 128 tokens computed in chunks that end at 120 and 128
+    makes a later prompt of 200 tokens hit 64 tokens in replay and 128 in
+    vLLM. With hits inside a block this order gives the same hit as in vLLM,
+    because the state group has its key at the same hash boundary. The
+    published GLM-5.3-Flash profiles reach neither case, because they are
+    vLLM 0.31.0 profiles. GLM-5.3-Flash at default serving reaches neither,
+    because its hash block then equals its block. See vLLM v0.32.0
+    [`single_type_kv_cache_manager.py:838-884`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/single_type_kv_cache_manager.py#L838-L884),
+    [`block_pool.py:286-299`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/block_pool.py#L286-L299),
+    [`:502-523`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/block_pool.py#L502-L523)
+    and
+    [`:626-646`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/block_pool.py#L626-L646).
+  - With hits inside a block and a state group whose block is larger than the
+    hash block, a request can write past a state that it published inside a
+    block. Replay then takes a new block and keeps the published block
+    cached, as vLLM does. As in vLLM, the admission count does not include
+    that block, so this write can find no free block, and the last running
+    request is preempted. Replay holds the published block until the
+    request's next allocation, where vLLM frees it at the end of the
+    scheduling pass that took the copy. So the block count can be higher by
+    one block per state group until then.
+  - With hits inside a block and a prefill checkpoint block, vLLM 0.32.0 and
+    0.33.0 can give a later request a longer hit than replay. The case needs a
+    request whose state hit ends inside a block, while its full-attention
+    groups match at least one block boundary further. That boundary is the end
+    of the shared prefix. With a checkpoint block the request's first chunk
+    does not stop at that boundary. vLLM still gives the key of that boundary
+    to the request's state block that ends at it. By a reading of vLLM's code,
+    that block holds the state of a shorter prefix: the copy of the cached
+    state, or the state at the place inside the block where an earlier chunk
+    stopped. A later request with the same prefix then hits at the boundary in
+    vLLM and continues from that state. Replay publishes a state key only
+    where a chunk ended, so the later request hits the shorter prefix and
+    computes the tokens up to the boundary again. Replay does not copy this
+    behavior of vLLM, and it accepts the configuration. Without a checkpoint
+    block a chunk stops at the boundary in vLLM and in replay, and the two
+    agree. See vLLM v0.32.0
+    [`scheduler.py:526-543`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/sched/scheduler.py#L526-L543),
+    [`single_type_kv_cache_manager.py:510-511`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/single_type_kv_cache_manager.py#L510-L511),
+    [`:1584-1588`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/single_type_kv_cache_manager.py#L1584-L1588)
+    and
+    [`block_pool.py:277-280`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/block_pool.py#L277-L280),
+    and vLLM v0.33.0
+    [`scheduler.py:632-649`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/sched/scheduler.py#L632-L649),
+    [`single_type_kv_cache_manager.py:512-513`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/single_type_kv_cache_manager.py#L512-L513),
+    [`:1600-1604`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/single_type_kv_cache_manager.py#L1600-L1604)
+    and
+    [`block_pool.py:281-284`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/block_pool.py#L281-L284).
+
 - **Belady eviction.** The native ReplaySpec field
   `engine.kv_eviction_policy: belady` evicts the block whose next use in the
   trace is farthest away. It is not available in `predict` YAML. It requires an

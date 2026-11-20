@@ -1235,13 +1235,9 @@ def test_mooncake_traces_bound_compact_arrays_and_observe_their_peak(tmp_path, t
     assert estimate.allocation_model == resources.OBSERVED_TRACE_MODEL
     assert estimate.estimated_peak_bytes is None  # Measured from a completed replay instead.
     assert estimate.request_count == 5
-    if trace_format == "mooncake":
-        # Rows convert u64 source hashes one at a time, so only the compact
-        # hashes, planned outputs and one expanded prompt are unavoidable.
-        assert estimate.lower_bound_bytes == max(4 * (11 + 50), 4 * 192)
-    else:
-        # Delta setup synthesizes every prompt and plans every output.
-        assert estimate.lower_bound_bytes == 4 * (4 * 100 + 192 + 50)
+    # Rows convert u64 source hashes one at a time, so only the compact
+    # hashes, planned outputs and one expanded prompt are unavoidable.
+    assert estimate.lower_bound_bytes == max(4 * (11 + 50), 4 * 192)
 
 
 def test_applied_compute_counts_turns_and_responses(tmp_path):

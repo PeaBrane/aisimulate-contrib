@@ -52,17 +52,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _cache_key(database: PerfDatabase) -> tuple:
-    """Shared cache key — same shape as every other migrated op family."""
-    return (
-        database.systems_root,
-        database.system,
-        database.backend,
-        database.version,
-        database.enable_shared_layer,
-    )
-
-
 # Per-quant achieved-util LEVEL e(q) for MoE, keyed by the (memory, compute) profile
 # (which encodes (weight, activation) precision: memory∈{2,1,0.5}↔w{16,8,4},
 # compute∈{1,2,4}↔a{16,8,4}). Used ONLY by the cross-PROFILE transfer tier: when the
@@ -132,10 +121,6 @@ class MoE(_core.MoE, OpShellKit):
     # ------------------------------------------------------------------
     # Data ownership
     # ------------------------------------------------------------------
-
-    @classmethod
-    def _cache_key(cls, database: PerfDatabase) -> tuple:
-        return _cache_key(database)
 
     @classmethod
     def load_data(cls, database: PerfDatabase) -> None:
@@ -250,10 +235,6 @@ class MoEDispatch(_core.MoEDispatch, OpShellKit):
     # ------------------------------------------------------------------
     # Data ownership
     # ------------------------------------------------------------------
-
-    @classmethod
-    def _cache_key(cls, database: PerfDatabase) -> tuple:
-        return _cache_key(database)
 
     @classmethod
     def load_data(cls, database: PerfDatabase) -> None:

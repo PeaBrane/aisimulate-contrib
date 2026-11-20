@@ -44,24 +44,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _cache_key(database: PerfDatabase) -> tuple:
-    """Shared cache key — same shape as every other migrated op family.
-
-    TODO: hoist to ``operations/base.py`` once Phase 3 settles (7 op
-    families duplicating this helper now).
-    """
-    return (
-        database.systems_root,
-        database.system,
-        database.backend,
-        database.version,
-        database.enable_shared_layer,
-    )
-
-
-# fmt: on
-
-
 class ContextMLA(_core.ContextMLA, OpShellKit):
     """
     Context MLA operation. Owns ``_context_mla_data``.
@@ -72,10 +54,6 @@ class ContextMLA(_core.ContextMLA, OpShellKit):
     # ------------------------------------------------------------------
     # Data ownership
     # ------------------------------------------------------------------
-
-    @classmethod
-    def _cache_key(cls, database: PerfDatabase) -> tuple:
-        return _cache_key(database)
 
     @classmethod
     def load_data(cls, database: PerfDatabase) -> None:
@@ -96,14 +74,6 @@ class ContextMLA(_core.ContextMLA, OpShellKit):
     def clear_cache(cls) -> None:
         cls._data_cache.clear()
 
-    # ------------------------------------------------------------------
-    # Query table (formerly PerfDatabase.query_context_mla)
-    # ------------------------------------------------------------------
-
-    # ------------------------------------------------------------------
-    # Op contract
-    # ------------------------------------------------------------------
-
 
 class GenerationMLA(_core.GenerationMLA, OpShellKit):
     """
@@ -115,10 +85,6 @@ class GenerationMLA(_core.GenerationMLA, OpShellKit):
     # ------------------------------------------------------------------
     # Data ownership
     # ------------------------------------------------------------------
-
-    @classmethod
-    def _cache_key(cls, database: PerfDatabase) -> tuple:
-        return _cache_key(database)
 
     @classmethod
     def load_data(cls, database: PerfDatabase) -> None:
@@ -139,14 +105,6 @@ class GenerationMLA(_core.GenerationMLA, OpShellKit):
     def clear_cache(cls) -> None:
         cls._data_cache.clear()
 
-    # ------------------------------------------------------------------
-    # Query table (formerly PerfDatabase.query_generation_mla)
-    # ------------------------------------------------------------------
-
-    # ------------------------------------------------------------------
-    # Op contract
-    # ------------------------------------------------------------------
-
 
 class MLABmm(_core.MLABmm, OpShellKit):
     """
@@ -160,10 +118,6 @@ class MLABmm(_core.MLABmm, OpShellKit):
     # ------------------------------------------------------------------
     # Data ownership
     # ------------------------------------------------------------------
-
-    @classmethod
-    def _cache_key(cls, database: PerfDatabase) -> tuple:
-        return _cache_key(database)
 
     @classmethod
     def load_data(cls, database: PerfDatabase) -> None:
@@ -225,10 +179,6 @@ class MLAModule(_core.MLAModule, OpShellKit):
     # ------------------------------------------------------------------
 
     @classmethod
-    def _cache_key(cls, database: PerfDatabase) -> tuple:
-        return _cache_key(database)
-
-    @classmethod
     def load_data(cls, database: PerfDatabase) -> None:
         """Idempotent. Fetches BOTH the engine's context and generation
         module table views, binds ``database._context_mla_module_data`` and
@@ -263,10 +213,6 @@ class MLAModule(_core.MLAModule, OpShellKit):
     # query_generation_mla_module)
     # ------------------------------------------------------------------
 
-    # ------------------------------------------------------------------
-    # Op contract
-    # ------------------------------------------------------------------
-
 
 class WideEPGenerationMLA(_core.WideEPGenerationMLA, OpShellKit):
     """
@@ -279,10 +225,6 @@ class WideEPGenerationMLA(_core.WideEPGenerationMLA, OpShellKit):
     # ------------------------------------------------------------------
     # Data ownership
     # ------------------------------------------------------------------
-
-    @classmethod
-    def _cache_key(cls, database: PerfDatabase) -> tuple:
-        return _cache_key(database)
 
     @classmethod
     def load_data(cls, database: PerfDatabase) -> None:
@@ -311,14 +253,6 @@ class WideEPGenerationMLA(_core.WideEPGenerationMLA, OpShellKit):
     def clear_cache(cls) -> None:
         cls._data_cache.clear()
 
-    # ------------------------------------------------------------------
-    # Query table (formerly PerfDatabase.query_wideep_generation_mla)
-    # ------------------------------------------------------------------
-
-    # ------------------------------------------------------------------
-    # Op contract
-    # ------------------------------------------------------------------
-
 
 class WideEPContextMLA(_core.WideEPContextMLA, OpShellKit):
     """
@@ -331,10 +265,6 @@ class WideEPContextMLA(_core.WideEPContextMLA, OpShellKit):
     # ------------------------------------------------------------------
     # Data ownership
     # ------------------------------------------------------------------
-
-    @classmethod
-    def _cache_key(cls, database: PerfDatabase) -> tuple:
-        return _cache_key(database)
 
     @classmethod
     def load_data(cls, database: PerfDatabase) -> None:
@@ -359,11 +289,3 @@ class WideEPContextMLA(_core.WideEPContextMLA, OpShellKit):
     @classmethod
     def clear_cache(cls) -> None:
         cls._data_cache.clear()
-
-    # ------------------------------------------------------------------
-    # Query table (formerly PerfDatabase.query_wideep_context_mla)
-    # ------------------------------------------------------------------
-
-    # ------------------------------------------------------------------
-    # Op contract
-    # ------------------------------------------------------------------

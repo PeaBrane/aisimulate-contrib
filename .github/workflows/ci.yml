@@ -274,20 +274,15 @@ jobs:
       matrix:
         include:
           - arch: amd64
-            runner: prod-aisim-default-amd64-v1
+            runner: ubuntu-24.04
             cargo_deny_target: x86_64-unknown-linux-musl
             cargo_deny_sha256: 0e8c2aa59128612c90d9e09c02204e912f29a5b8d9a64671b94608cbe09e064f
           - arch: arm64
-            runner: prod-aisim-default-arm64-v1
+            runner: ubuntu-24.04-arm
             cargo_deny_target: aarch64-unknown-linux-musl
             cargo_deny_sha256: 2b3567a60b7491c159d1cef8b7d8479d1ad2a31e29ef49462634ad4552fcc77d
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 10
-    container:
-      image: ${{ vars.CI_JOB_CONTAINER_IMAGE }}
-      env:
-        HOME: /__w/aisim/aisim
-        USER: runner
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -322,13 +317,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        arch: [amd64, arm64]
-    runs-on: prod-aisim-default-${{ matrix.arch }}-v1
-    container:
-      image: ${{ vars.CI_JOB_CONTAINER_IMAGE }}
-      env:
-        HOME: /__w/aisim/aisim
-        USER: runner
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -342,15 +337,10 @@ jobs:
     name: Rust feature modes
     needs: [fast-ci, select-full-ci]
     if: ${{ needs.select-full-ci.outputs.rust_feature_modes == 'true' }}
-    runs-on: prod-aisim-default-amd64-v1
-    timeout-minutes: 15
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target-feature-tests
-    container:
-      image: ${{ vars.CI_JOB_CONTAINER_IMAGE }}
-      env:
-        HOME: /__w/aisim/aisim
-        USER: runner
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -387,13 +377,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        arch: [amd64, arm64]
-    runs-on: prod-aisim-default-${{ matrix.arch }}-v1
-    container:
-      image: ${{ vars.CI_JOB_CONTAINER_IMAGE }}
-      env:
-        HOME: /__w/aisim/aisim
-        USER: runner
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -674,19 +664,16 @@ jobs:
       fail-fast: false
       matrix:
         arch: [amd64, arm64]
+        # Every leg pays runner start-up, checkout and install, so short
+        # suites share one. Keep each leg shorter than `contracts`.
         shard:
           - {suite: contracts, group: 1, groups: 1}
           - {suite: unit, group: 1, groups: 4}
           - {suite: unit, group: 2, groups: 4}
           - {suite: unit, group: 3, groups: 4}
           - {suite: unit, group: 4, groups: 4}
-          - {suite: integration, group: 1, groups: 1}
-          - {suite: cli-build, group: 1, groups: 4}
-          - {suite: cli-build, group: 2, groups: 4}
-          - {suite: cli-build, group: 3, groups: 4}
-          - {suite: cli-build, group: 4, groups: 4}
-          - {suite: support-matrix, group: 1, groups: 1}
-          - {suite: tools-build, group: 1, groups: 1}
+          - {suite: integration-build, group: 1, groups: 1}
+          - {suite: cli-build, group: 1, groups: 1}
     runs-on: prod-aisim-default-${{ matrix.arch }}-v1
     timeout-minutes: 15
     container:
@@ -697,7 +684,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          fetch-depth: 0
+          # Only the repository contracts read Git history. The operands are
+          # ordered this way because `&& 0 || 1` always yields 1 (0 is falsy).
+          fetch-depth: ${{ matrix.shard.suite != 'contracts' && 1 || 0 }}
           persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
@@ -715,6 +704,7 @@ jobs:
           repo: ${{ vars.WHEEL_STORAGE_REPO }}
           token: ${{ secrets.ARTIFACTORY_TOKEN }}
       - name: Install the prebuilt application and test dependencies
+        id: install
         shell: bash
         run: |
           set -euo pipefail
@@ -761,16 +751,10 @@ jobs:
         if: matrix.shard.suite == 'cli-build' && matrix.shard.group == 1
         run: python -m pytest -q tests/e2e/cli/test_cli_recommend.py --timeout=180
         working-directory: python/aisim
-      - name: Run migrated integration tests against the installed wheel
-        if: matrix.shard.suite == 'integration'
-        run: >-
-          python -m pytest -q -ra
-          tests/integration
-          -n 2
-          --timeout=600
-        working-directory: python/aisim
+      # A leg's later suites still run and report after an earlier one fails;
+      # they skip when the installation failed or the job was cancelled.
       - name: Run remaining CLI build tests
-        if: matrix.shard.suite == 'cli-build'
+        if: ${{ !cancelled() && steps.install.outcome == 'success' && matrix.shard.suite == 'cli-build' }}
         run: >-
           python -m pytest -q
           tests/e2e/cli
@@ -781,8 +765,16 @@ jobs:
           -n 4
           --timeout=180
         working-directory: python/aisim
+      - name: Run migrated integration tests against the installed wheel
+        if: ${{ !cancelled() && steps.install.outcome == 'success' && matrix.shard.suite == 'integration-build' }}
+        run: >-
+          python -m pytest -q -ra
+          tests/integration
+          -n 2
+          --timeout=600
+        working-directory: python/aisim
       - name: Run support-matrix build tests
-        if: matrix.shard.suite == 'support-matrix'
+        if: ${{ !cancelled() && steps.install.outcome == 'success' && matrix.shard.suite == 'integration-build' }}
         run: >-
           python -m pytest -q
           tests/e2e/support_matrix
@@ -791,7 +783,7 @@ jobs:
           --timeout=180
         working-directory: python/aisim
       - name: Run tool build tests
-        if: matrix.shard.suite == 'tools-build'
+        if: ${{ !cancelled() && steps.install.outcome == 'success' && matrix.shard.suite == 'integration-build' }}
         run: >-
           python -m pytest -q
           tests/e2e/tools
@@ -813,13 +805,8 @@ jobs:
         needs.fast-ci.result == 'success' &&
         needs.select-full-ci.result == 'success'
       }}
-    runs-on: prod-aisim-default-amd64-v1
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
-    container:
-      image: ${{ vars.CI_JOB_CONTAINER_IMAGE }}
-      env:
-        HOME: /__w/aisim/aisim
-        USER: runner
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -935,17 +922,12 @@ jobs:
     name: Python ${{ matrix.python-version }} compatibility
     needs: [fast-ci, select-full-ci]
     if: ${{ needs.select-full-ci.outputs.python_compatibility == 'true' }}
-    runs-on: prod-aisim-default-amd64-v1
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.11", "3.13"]
-    container:
-      image: ${{ vars.CI_JOB_CONTAINER_IMAGE }}
-      env:
-        HOME: /__w/aisim/aisim
-        USER: runner
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:

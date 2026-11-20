@@ -76,6 +76,14 @@ If you are using VS Code or one of its forks (e.g. Cursor), you can install the 
 
 ## Development Workflow
 
+### Coding agent instructions
+
+The root [AGENTS.md](AGENTS.md) holds repository guidance. The
+[scheduler](crates/core/src/engine/scheduler/vllm/AGENTS.md) and
+[replay](crates/core/src/replay/AGENTS.md) add rules for those directories.
+Each `CLAUDE.md` imports the `AGENTS.md` beside it for Claude Code.
+Edit the shared instructions in `AGENTS.md`.
+
 ### Code Style and Linting
 
 This project uses [Ruff](https://github.com/astral-sh/ruff) for linting and formatting.
@@ -124,7 +132,9 @@ python scripts/ci/check_documentation_links.py
 
 It checks inline/image links and reference definitions in the root README,
 development/contribution guides, `docs/`, the application README, and
-`python/aisim/docs/`. It uses Markdown parsing to ignore code examples and HTML
+`python/aisim/docs/`. It also checks `REVIEW.md`, scoped `AGENTS.md` and
+`CLAUDE.md` files, and Markdown in the project and package skill directories
+and package Claude rules. It uses Markdown parsing to ignore code examples and HTML
 comments. Diagnostics point to the containing Markdown block. Remote URLs,
 heading anchors, and HTML links require separate review. Run the actual
 documented commands when their behavior changes; link checks do not validate
@@ -145,6 +155,9 @@ python -m pytest -c python/aisim/pytest.ini \
 The [CI guide](docs/ci/README.md) explains the Fast/Full/Nightly workflows, code review,
 the complete application test inventory, and manual coverage exceptions. The
 local marker subset above does not reproduce all Full CI validation.
+
+On macOS, pass `-p no:timeout` if pytest-timeout's `SIGALRM` triggers a crash
+reporter dialog. Keep the timeout enabled when running CI.
 
 ## Data Collection (Advanced)
 

@@ -1512,7 +1512,11 @@ def _completed_runtime_collection(
             "cell_id": cell.cell_id,
             "plan_sha256": plan.sha256,
             "attempt_id": f"native-{cell.workload_kind}",
-            "runtime": {"backend": "vllm", "backend_version": request.identity.framework_version},
+            # The collector reports the vLLM version that it observed, which a dataset label does not replace.
+            "runtime": {
+                "backend": "vllm",
+                "backend_version": request.identity.runtime_framework_version or request.identity.framework_version,
+            },
         }
         _write(raw / "collector-provenance.json", provenance)
         _write(raw / "benchmark.json", _native(cell.workload_kind))
@@ -1582,6 +1586,200 @@ def test_finalized_linear_runtime_profile_keeps_the_measured_block_size(tmp_path
         worker = yaml.safe_load((target / name).read_text())["engine"]["workers"]["aggregated"]
         assert worker["kv_cache"]["block_size"] == 256
     check_plan(resolved, target)
+
+
+def test_finalized_grouped_vllm_0330_profile_with_prefix_caching_evidence_plans_and_recommends_with_prefix_caching(
+    tmp_path, capsys
+):
+    import yaml
+
+    from aisim.compiler import prediction_to_replay_spec
+    from aisim.config import CorePredictionConfig
+    from aisim.support.plan import prefix_caching_note
+    from aisim.sweeper import SweepResult
+    from aisim.sweeper.result import CandidateStatus
+
+    # The vLLM 0.33.0 records of the hybrid probe ran with prefix caching in align mode, and the import marks
+    # every cache group. Finalization keeps that evidence. Replay models grouped prefix caching for vLLM 0.33.0, so
+    # the plan and the plan of the resolved profile turn prefix caching on, and `onboard finalize` prints no note.
+    _, _, files, root = _completed_runtime_collection(tmp_path, capsys, layout="mamba_hybrid")
+    target = tmp_path / "finalized"
+    command = ["onboard", "finalize", "--config", files["request"], "--output-dir", str(root)]
+    assert cli.main([*command, "--resolved-output-dir", str(target)]) == 0
+    stderr = capsys.readouterr().err
+    finalized = SupportRequest.from_yaml(target / "request.yaml")
+    deployment = finalized.profile_deployment()
+    resources = deployment.resources
+    assert deployment.backend_version == "0.33.0"
+    assert (resources.cache_layout, resources.runtime_memory.enable_prefix_caching) == ("grouped", True)
+    assert resources.runtime_memory.runtime_framework_version == "0.33.0"
+    assert all(group.prefix_cacheable is not None for group in resources.cache_groups)
+    assert prefix_caching_note(finalized) is None
+    assert stderr.strip() == ""
+    for plan in (root, target):
+        for name in ("predict/pilot.yaml", "recommend/pilot.yaml"):
+            worker = yaml.safe_load((plan / name).read_text())["engine"]["workers"]["aggregated"]
+            assert worker["kv_cache"]["prefix_caching"] is True
+    # The rank of the planned prediction hashes at the probe's hash block and follows the rules of vLLM 0.33.0.
+    pilot = yaml.safe_load((target / "predict/pilot.yaml").read_text())
+    args = prediction_to_replay_spec(CorePredictionConfig.model_validate(pilot)).backend_deployment.agg_engine_args
+    assert (args["enable_prefix_caching"], args["prefix_match_unit"], args["vllm_version"]) == (True, 64, "0.33.0")
+    # The synthetic timings measure 16-token prefills and decodes that read 8 or 32 tokens, so the pilot runs its
+    # planned engine with a request that they cover.
+    pilot = yaml.safe_load((target / "recommend/pilot.yaml").read_text())
+    pilot["traffic"]["source"].update(input_tokens=16, output_tokens=4)
+    path = tmp_path / "recommend-pilot.yaml"
+    path.write_text(yaml.safe_dump(pilot))
+    output = tmp_path / "recommendation"
+    assert cli.main(["recommend", "--config", str(path), "--output-dir", str(output), "--format", "json"]) == 0
+    capsys.readouterr()
+    # The candidate rank carries the probe's hash block and the vLLM version, and the Rust gate admits it.
+    result = SweepResult.from_json((output / "recommendation.json").read_text())
+    assert result.candidates
+    assert all(candidate.status is CandidateStatus.FEASIBLE for candidate in result.candidates)
+
+
+def test_a_session_planned_cold_before_vllm_0330_rules_still_finalizes(tmp_path, capsys, monkeypatch):
+    import yaml
+
+    from aisim.support import plan as support_plan
+
+    def prefix_caching(plan, name):
+        worker = yaml.safe_load((plan / name).read_text())["engine"]["workers"]["aggregated"]
+        return worker["kv_cache"]["prefix_caching"]
+
+    def refuse(*_args, **_kwargs):
+        raise ValueError("no grouped rules for vLLM 0.33.0")
+
+    # `onboard plan` writes the plan as it did while replay had no grouped rules for vLLM 0.33.0: the grouped
+    # prefix-caching requirements refused the profile, so the plan is cold.
+    with monkeypatch.context() as before:
+        before.setattr(support_plan, "grouped_prefix_caching_requirements", refuse)
+        _, request, files, root = _completed_runtime_collection(tmp_path, capsys, layout="mamba_hybrid")
+    saved = (root / "support-plan.json").read_bytes()
+    assert not prefix_caching(root, "predict/pilot.yaml")
+    # The cold plan and the plan with prefix caching on differ only in the two pilots and the plan manifest, so the
+    # collection inputs of the saved session are those of the new plan too.
+    _, cold = support_plan._plan_documents(request, root, grouped_cold=True)
+    _, warm = support_plan._plan_documents(request, root)
+    assert sorted(str(path) for path in cold if cold[path] != warm.get(path)) == [
+        "predict/pilot.yaml",
+        "recommend/pilot.yaml",
+        "support-plan.json",
+    ]
+    assert cold.keys() == warm.keys()
+    target = tmp_path / "finalized"
+    command = ["onboard", "finalize", "--config", files["request"], "--output-dir", str(root)]
+    assert cli.main([*command, "--resolved-output-dir", str(target)]) == 0
+    assert capsys.readouterr().err.strip() == ""
+    # `finalize` verifies the saved cold plan and keeps its bytes. The plan of the resolved profile is a new plan,
+    # which turns prefix caching on.
+    assert (root / "support-plan.json").read_bytes() == saved
+    assert not prefix_caching(root, "predict/pilot.yaml")
+    for name in ("predict/pilot.yaml", "recommend/pilot.yaml"):
+        assert prefix_caching(target, name) is True
+    support_plan.check_plan(SupportRequest.from_yaml(target / "request.yaml"), target)
+
+
+@pytest.mark.parametrize("label", ["0.31.0", "0.32.0", "custom-vllm"])
+def test_grouped_profile_under_another_label_plans_and_finalizes_cold(tmp_path, capsys, monkeypatch, label):
+    import sys
+
+    import yaml
+
+    from aisim.support.plan import prefix_caching_note
+
+    module = sys.modules[__name__]
+    original = module.observation_fixture
+
+    def labeled(*args, **kwargs):
+        index, launches = original(*args, **kwargs)
+        identity = launches["tp2"]["identity"]
+        # What `onboard probe-runtime --execute` writes for an explicit dataset label that differs from the vLLM
+        # version that it observes: the label stays, and the observed version becomes runtime_framework_version.
+        identity.update(framework_version=label, runtime_framework_version=identity["framework_version"])
+        return index, launches
+
+    monkeypatch.setattr(module, "observation_fixture", labeled)
+    _, request, files, root = _completed_runtime_collection(tmp_path, capsys, layout="mamba_hybrid")
+    assert (request.identity.framework_version, request.identity.runtime_framework_version) == (label, "0.33.0")
+    assert request.profile_deployment().backend_version == label
+    # The evidence is that of vLLM 0.33.0, which has grouped rules, but replay would take the rules of the label. So
+    # the plan and the plan of the resolved profile stay cold, and the note names both versions.
+    assert prefix_caching_note(request) == (
+        f"The evidence of this profile comes from vLLM 0.33.0, but its label is {label}, and replay takes the grouped "
+        "prefix-caching rules from the label, so the plan of this profile runs without prefix caching, although its "
+        "runtime memory records prefix caching on."
+    )
+    target = tmp_path / "finalized"
+    command = ["onboard", "finalize", "--config", files["request"], "--output-dir", str(root)]
+    assert cli.main([*command, "--resolved-output-dir", str(target)]) == 0
+    stderr = capsys.readouterr().err
+    finalized = SupportRequest.from_yaml(target / "request.yaml")
+    assert finalized.profile_deployment().backend_version == label
+    assert stderr.strip() == prefix_caching_note(finalized) == prefix_caching_note(request)
+    for plan in (root, target):
+        for name in ("predict/pilot.yaml", "recommend/pilot.yaml"):
+            worker = yaml.safe_load((plan / name).read_text())["engine"]["workers"]["aggregated"]
+            assert worker["kv_cache"]["prefix_caching"] is False
+
+
+@pytest.mark.parametrize("label", ["0.31.0", "0.32.0"])
+def test_a_reused_profile_under_another_label_plans_cold(tmp_path, capsys, monkeypatch, label):
+    import sys
+
+    import yaml
+
+    from aisim.support.plan import prefix_caching_note
+
+    module = sys.modules[__name__]
+    original = module.observation_fixture
+
+    def labeled(*args, **kwargs):
+        index, launches = original(*args, **kwargs)
+        identity = launches["tp2"]["identity"]
+        identity.update(framework_version=label, runtime_framework_version=identity["framework_version"])
+        return index, launches
+
+    monkeypatch.setattr(module, "observation_fixture", labeled)
+    _, _, files, root = _completed_runtime_collection(tmp_path, capsys, layout="mamba_hybrid")
+    target = tmp_path / "finalized"
+    command = ["onboard", "finalize", "--config", files["request"], "--output-dir", str(root)]
+    assert cli.main([*command, "--resolved-output-dir", str(target)]) == 0
+    capsys.readouterr()
+    finalized = SupportRequest.from_yaml(target / "request.yaml")
+    assert finalized.profile_deployment().resources.runtime_memory.runtime_framework_version == "0.33.0"
+    # The documented reuse of an observed profile builds a new request around the profile file. That request holds no
+    # observed version, but the profile holds the version of its evidence, which differs from the label, so the plan
+    # stays cold.
+    profile = tmp_path / "profile.json"
+    profile.write_text(json.dumps(finalized.fpm_profile.model_dump(mode="json")))
+    identity = finalized.identity
+    reused = tmp_path / "reuse-request.yaml"
+    init = [
+        "onboard",
+        "init",
+        *("--model", identity.model, "--model-revision", identity.model_revision),
+        *("--model-kind", identity.model_kind, "--gpu", identity.gpu, "--interconnect", identity.interconnect),
+        *("--fpm-profile", str(profile), "--tensor-parallel", str(finalized.search.tensor_parallel)),
+        *("--input-tokens", "16", "--output-tokens", "4", "--output", str(reused)),
+    ]
+    assert cli.main(init) == 0
+    capsys.readouterr()
+    request = SupportRequest.from_yaml(reused)
+    assert (request.identity.framework_version, request.identity.runtime_framework_version) == (label, None)
+    plan = tmp_path / "reuse-plan"
+    assert cli.main(["onboard", "plan", "--config", str(reused), "--output-dir", str(plan)]) == 0
+    stderr = capsys.readouterr().err
+    assert stderr.strip() == prefix_caching_note(request)
+    assert prefix_caching_note(request) == (
+        f"The evidence of this profile comes from vLLM 0.33.0, but its label is {label}, and replay takes the grouped "
+        "prefix-caching rules from the label, so the plan of this profile runs without prefix caching, although its "
+        "runtime memory records prefix caching on."
+    )
+    for name in ("predict/pilot.yaml", "recommend/pilot.yaml"):
+        worker = yaml.safe_load((plan / name).read_text())["engine"]["workers"]["aggregated"]
+        assert worker["kv_cache"]["prefix_caching"] is False
 
 
 @pytest.mark.parametrize(

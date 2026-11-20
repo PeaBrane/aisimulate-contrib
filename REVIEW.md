@@ -157,7 +157,8 @@ Full CI contains the expensive multi-architecture dependency, Rust, Python,
 public-API, feature-mode, engine-golden, platform-wheel, collector-data,
 prediction-regression, build, and release-artifact tests. The FPE support
 matrix remains a scheduled/manual product-support audit. Full CI's support-matrix
-shard also exercises the required nightly FPE sentinels against its prebuilt wheel,
+tests, in the integration-build shard, also exercise the required nightly FPE
+sentinels against its prebuilt wheel,
 including all four phases and the release qualifier, to catch stale baselines and
 native probe regressions before merge.
 `Full CI Success` is required for every admitted PR, but trusted
@@ -205,7 +206,9 @@ verifying those conditions, supplying the reviewed full commit SHA through the
 required `expected_sha` input. For manual validation, dispatch standalone Fast CI
 with the same ref and SHA first, then dispatch Full CI. Trusted copy-pr-bot
 `pull-request/*` branches also run Full CI automatically as a temporary coverage backstop while the `main`
-ruleset does not require the exact-SHA checks; treat such a run as PR evidence
+ruleset does not require the exact-SHA checks. The bot copies only ready PRs
+automatically; a draft is copied when it is marked ready or on `/ok to test <sha>`.
+Treat such a run as PR evidence
 only after confirming that its copied SHA equals the PR head. Automatic runs on
 `main` and `release/*` remain lifecycle validation outside the pre-merge
 sequence. Do not remove the copy-branch backstop until the ruleset enforces the
@@ -217,8 +220,9 @@ For an admitted PR, no second Full CI launch is needed after Fast CI. The
 trusted `pull-request/*` push starts standalone Fast CI and Full CI automatically,
 and every expensive component waits for the exact-branch/SHA Fast CI prerequisite
 and scope selector to pass before it can acquire a protected runner. Application
-tests additionally build one wheel per architecture and then fan out contracts, unit, integration, CLI-build,
-support-matrix, and tool-build shards. Admission itself remains the maintainer security gate;
+tests additionally build one wheel per architecture and then fan out contracts, unit, CLI-build,
+and integration-build shards; integration-build runs the integration, support-matrix,
+and tool-build suites. Admission itself remains the maintainer security gate;
 do not replace it with PR-authored credentials or a `pull_request_target`
 workflow.
 

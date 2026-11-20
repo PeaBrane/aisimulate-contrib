@@ -266,6 +266,7 @@ def _patch_literal(source: str, site: LiteralSite, struct_fields: dict) -> tuple
             "chat_template": ((True, "Option<WekaChatTemplate>"), "None"),
         },
         "SglangConfig": {
+            "mamba_cache": ((True, "Option<SglangMambaCacheConfig>"), "None"),
             "hicache": ((True, "Option<SglangHiCacheConfig>"), "None"),
             "host_loop": ((True, "bool"), "false"),
             "vlm_cache_bytes": ((True, "u64"), "SglangConfig::default().vlm_cache_bytes"),

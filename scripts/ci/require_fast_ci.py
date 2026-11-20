@@ -19,7 +19,7 @@ from pathlib import Path
 from urllib.parse import urlencode
 
 WORKFLOW = ".github/workflows/fast-ci.yml"
-REQUIRED_JOBS = {"Repository Policy", "Python Static Checks", "Rust Format", "Fast CI Success"}
+REQUIRED_JOBS = {"codeowners", "Python Static Checks", "Rust Format", "Fast CI Success"}
 
 
 class GateError(RuntimeError):

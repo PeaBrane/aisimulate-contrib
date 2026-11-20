@@ -1,33 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""DeepSeek-V4 family (ISSUE-11 / AIC-1095).
-
-Four op classes migrate from ``_legacy.py`` into ``operations/dsv4.py``:
-
-- ``DeepSeekV4MHCModule`` — manifold-constrained hyper-connection pre/post.
-  Owns ``_mhc_module_data``. Delegates to
-  ``PerfDatabase.query_mhc_module`` which becomes a one-line forward.
-- ``_BaseDeepSeekV4AttentionModule`` — shared weight metadata; not
-  instantiated directly. Holds the shared SOL helper used by both
-  context and generation phases.
-- ``ContextDeepSeekV4AttentionModule`` — context-phase SWA/CSA/HCA. Owns
-  ``_context_deepseek_v4_attention_module_data`` (merged from csa+hca
-  split files), ``_raw_context_deepseek_v4_attention_module_data``
-  (deepcopy used for topk piecewise lookup), and the
-  ``_dsv4_sparse_kernel_data`` sidecar dict (paged_mqa_logits)
-  used for prefix kernel-Δ correction.
-- ``GenerationDeepSeekV4AttentionModule`` — decode-phase. Owns
-  ``_generation_deepseek_v4_attention_module_data`` (merged from
-  csa+hca split files).
-
-No SOL clamping in the legacy ``_correct_data`` for DSV4 (the per-attn
-SOL formula runs inside the query path). No grid extrapolation either —
-Interpolation/fallback is handled by the engine's interpolation at query time.
-
-Cache key matches every other migrated op:
-``(systems_root, system, backend, version, enable_shared_layer)``.
-"""
+"""Python table bindings for the native DeepSeek-V4 MHC, attention and MegaMoE operations."""
 
 from __future__ import annotations
 
@@ -44,17 +18,6 @@ if TYPE_CHECKING:
     from aisim_core.sdk.perf_database import PerfDatabase
 
 
-def _cache_key(database: PerfDatabase) -> tuple:
-    """Shared cache key — same shape as every other migrated op family."""
-    return (
-        database.systems_root,
-        database.system,
-        database.backend,
-        database.version,
-        database.enable_shared_layer,
-    )
-
-
 # ───────────────────────────────────────────────────────────────────────
 # DeepSeekV4MHCModule
 # ───────────────────────────────────────────────────────────────────────
@@ -68,10 +31,6 @@ class DeepSeekV4MHCModule(_core.DeepSeekV4MHCModule, OpShellKit):
     # ------------------------------------------------------------------
     # Data ownership
     # ------------------------------------------------------------------
-
-    @classmethod
-    def _cache_key(cls, database: PerfDatabase) -> tuple:
-        return _cache_key(database)
 
     @classmethod
     def load_data(cls, database: PerfDatabase) -> None:
@@ -92,19 +51,6 @@ class DeepSeekV4MHCModule(_core.DeepSeekV4MHCModule, OpShellKit):
     def clear_cache(cls) -> None:
         cls._data_cache.clear()
 
-    # ------------------------------------------------------------------
-    # Query table (formerly PerfDatabase.query_mhc_module)
-    # ------------------------------------------------------------------
-
-    # ------------------------------------------------------------------
-    # Op contract
-    # ------------------------------------------------------------------
-
-
-# ───────────────────────────────────────────────────────────────────────
-# _BaseDeepSeekV4AttentionModule (shared metadata)
-# ───────────────────────────────────────────────────────────────────────
-
 
 # ───────────────────────────────────────────────────────────────────────
 # ContextDeepSeekV4AttentionModule
@@ -116,9 +62,7 @@ class ContextDeepSeekV4AttentionModule(_core.ContextDeepSeekV4AttentionModule, O
 
     Owns three class-level caches:
     - ``_data_cache`` — merged ctx table (csa + hca split files combined)
-    - ``_raw_data_cache`` — deepcopy of the merged table, kept untouched
-      so the topk-piecewise lookup can consult the original
-      compress_ratio==4 rows for boundary correctness.
+    - ``_raw_data_cache`` — compatibility alias for the same merged table.
     - ``_sparse_kernel_cache`` — dict ``{"paged_mqa_logits"}``
       of ``LoadedOpData`` used for prefix kernel-Δ correction.
     """
@@ -130,10 +74,6 @@ class ContextDeepSeekV4AttentionModule(_core.ContextDeepSeekV4AttentionModule, O
     # ------------------------------------------------------------------
     # Data ownership
     # ------------------------------------------------------------------
-
-    @classmethod
-    def _cache_key(cls, database: PerfDatabase) -> tuple:
-        return _cache_key(database)
 
     @classmethod
     def load_data(cls, database: PerfDatabase) -> None:
@@ -205,18 +145,6 @@ class ContextDeepSeekV4AttentionModule(_core.ContextDeepSeekV4AttentionModule, O
         cls._sparse_kernel_cache.clear()
 
     # ------------------------------------------------------------------
-    # Sparse-kernel lookup helper (formerly PerfDatabase._lookup_dsv4_sparse_kernel)
-    # ------------------------------------------------------------------
-
-    # ------------------------------------------------------------------
-    # Query table (formerly PerfDatabase.query_context_deepseek_v4_attention_module)
-    # ------------------------------------------------------------------
-
-    # ------------------------------------------------------------------
-    # Op contract
-    # ------------------------------------------------------------------
-
-    # ------------------------------------------------------------------
     # NOTE(#1357 PR-5): the Python CP prefill model and chunked-mqa
     # decomposition that lived here retired with the per-call query stack;
     # their oracle is the compiled engine (operators/dsv4.rs).
@@ -239,10 +167,6 @@ class GenerationDeepSeekV4AttentionModule(_core.GenerationDeepSeekV4AttentionMod
     # ------------------------------------------------------------------
     # Data ownership
     # ------------------------------------------------------------------
-
-    @classmethod
-    def _cache_key(cls, database: PerfDatabase) -> tuple:
-        return _cache_key(database)
 
     @classmethod
     def load_data(cls, database: PerfDatabase) -> None:
@@ -280,14 +204,6 @@ class GenerationDeepSeekV4AttentionModule(_core.GenerationDeepSeekV4AttentionMod
     def clear_cache(cls) -> None:
         cls._data_cache.clear()
 
-    # ------------------------------------------------------------------
-    # Query table (formerly PerfDatabase.query_generation_deepseek_v4_attention_module)
-    # ------------------------------------------------------------------
-
-    # ------------------------------------------------------------------
-    # Op contract
-    # ------------------------------------------------------------------
-
 
 class DeepSeekV4MegaMoEModule(_core.DeepSeekV4MegaMoEModule, OpShellKit):
     """
@@ -301,10 +217,6 @@ class DeepSeekV4MegaMoEModule(_core.DeepSeekV4MegaMoEModule, OpShellKit):
     """
 
     _data_cache: ClassVar[dict] = {}
-
-    @classmethod
-    def _cache_key(cls, database: PerfDatabase) -> tuple:
-        return _cache_key(database)
 
     @classmethod
     def load_data(cls, database: PerfDatabase) -> None:

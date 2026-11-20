@@ -42,23 +42,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _cache_key(database: PerfDatabase) -> tuple:
-    """Shared cache key — same shape as GEMM and Attention.
-
-    TODO: hoist to ``operations/base.py`` once Phase 3 lands and there
-    are 4-5 op families duplicating this helper. Two callers (GEMM,
-    Attention) was below the abstraction threshold; with Communication
-    + DSA + MLA + Mamba + DSV4 coming, the threshold is now crossed.
-    """
-    return (
-        database.systems_root,
-        database.system,
-        database.backend,
-        database.version,
-        database.enable_shared_layer,
-    )
-
-
 class CustomAllReduce(_core.CustomAllReduce, OpShellKit):
     """
     Custom AllReduce operation with power tracking.
@@ -71,10 +54,6 @@ class CustomAllReduce(_core.CustomAllReduce, OpShellKit):
     # ------------------------------------------------------------------
     # Data ownership
     # ------------------------------------------------------------------
-
-    @classmethod
-    def _cache_key(cls, database: PerfDatabase) -> tuple:
-        return _cache_key(database)
 
     @classmethod
     def load_data(cls, database: PerfDatabase) -> None:
@@ -95,14 +74,6 @@ class CustomAllReduce(_core.CustomAllReduce, OpShellKit):
     def clear_cache(cls) -> None:
         cls._data_cache.clear()
 
-    # ------------------------------------------------------------------
-    # Query table (formerly PerfDatabase.query_custom_allreduce)
-    # ------------------------------------------------------------------
-
-    # ------------------------------------------------------------------
-    # Op contract
-    # ------------------------------------------------------------------
-
 
 class NCCL(_core.NCCL, OpShellKit):
     """
@@ -120,10 +91,6 @@ class NCCL(_core.NCCL, OpShellKit):
     # ------------------------------------------------------------------
     # Data ownership
     # ------------------------------------------------------------------
-
-    @classmethod
-    def _cache_key(cls, database: PerfDatabase) -> tuple:
-        return _cache_key(database)
 
     @classmethod
     def load_data(cls, database: PerfDatabase) -> None:
@@ -185,14 +152,6 @@ class NCCL(_core.NCCL, OpShellKit):
         cls._data_cache.clear()
         cls._oneccl_data_cache.clear()
 
-    # ------------------------------------------------------------------
-    # Query table (formerly PerfDatabase.query_nccl)
-    # ------------------------------------------------------------------
-
-    # ------------------------------------------------------------------
-    # Op contract
-    # ------------------------------------------------------------------
-
 
 class P2P(_core.P2P, OpShellKit):
     """
@@ -202,11 +161,3 @@ class P2P(_core.P2P, OpShellKit):
     no-op default handles the missing perf table (the retired per-call lookup was factored
     out only for parity with the other migrated ops.
     """
-
-    # ------------------------------------------------------------------
-    # Query table (formerly PerfDatabase.query_p2p)
-    # ------------------------------------------------------------------
-
-    # ------------------------------------------------------------------
-    # Op contract
-    # ------------------------------------------------------------------

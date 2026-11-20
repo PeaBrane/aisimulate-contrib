@@ -186,7 +186,7 @@ detail = "Host memory pool across workers"
 doc = "replay/engine/kv-cache.md#g2-scope"
 # KVCR shares G2 through peer fetch; it rejects the cluster_shared pool scope.
 cells = ["limited", "not_supported", "not_supported", "limited:peer fetch", "na", "na"]
-note = "A shared pool needs matching geometry on every role. With canonical MTP, only prefill and decode workers take a shared pool. KVCR needs router hints (idle on CLI traffic), aggregated or P/D prefill pools, no G3."
+note = "A shared pool needs matching geometry on every role. With canonical MTP, only prefill and decode workers take a shared pool. KVCR pulls need router hints (CLI traffic has none; KVCR-owned memory, kvcr.local_g2, works without), aggregated or P/D prefill pools, no G3."
 
 [[sections.rows]]
 name = "G3 local"
@@ -281,7 +281,7 @@ note = "Static workers of any count and attention DP, local or shared pool; cano
 name = "G3 offload, KVCR"
 doc = "replay/engine/kv-cache.md#agentic-g2"
 cells = ["not_supported", "not_supported", "not_supported"]
-note = "G3 is rejected; KVCR stays idle without router hints."
+note = "G3 is rejected; KVCR pulls nothing without router hints, and KVCR-owned memory (kvcr.local_g2) is not qualified here."
 
 [[sections.rows]]
 name = "Speculative decoding"

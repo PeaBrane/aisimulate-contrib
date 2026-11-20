@@ -1,6 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-FileCopyrightText: Copyright 2023-2026 SGLang Team
 // SPDX-License-Identifier: Apache-2.0
+// Hybrid checkpoint contract adapted and modified from SGLang (Apache-2.0).
+// Copyright 2023-2024 SGLang Team and contributors.
+// Source: https://github.com/sgl-project/sglang/blob/94602c9c2b7cbdb8efd5c52802dac6a1c180089e/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
+// See THIRD_PARTY_NOTICES.md for the complete source list and modification scope.
 // Modified behavioral adaptation of SGLang v0.5.22; see THIRD_PARTY_NOTICES.md.
 // Source: https://github.com/sgl-project/sglang/tree/baa9befa381511cd4d56f83980951e5a45fffc6d
 // SWA prefix reuse adapts v0.5.21 (e00930c5489053f26d86b179cee0d087f846acbb); see THIRD_PARTY_NOTICES.md.
@@ -161,14 +165,21 @@ fn materialize_through(
 /// (`maybe_cache_unfinished_req`), so the commit is recorded, not applied. A
 /// request's cached prefix only grows until then, so a commit that adds no page
 /// now adds none when observed and is not recorded.
-fn commit_materialized_prefix(
+pub(super) fn commit_materialized_prefix(
     req: &mut SglangRequest,
     kv_manager: &mut SglangKvManager,
     config: &SglangConfig,
     deferred: &mut Vec<(Uuid, usize)>,
 ) {
     if config.host_loop {
-        if uncached_aligned_prefix(req, config, req.materialized_tokens).is_some()
+        if config.mamba_cache.is_some() {
+            if let Some(checkpoint) = uncached_aligned_prefix(req, config, req.materialized_tokens)
+            {
+                // A later chunk may replace the lease's selected checkpoint before
+                // this forward is observed. Preserve this forward's exact endpoint.
+                deferred.push((req.uuid, checkpoint));
+            }
+        } else if uncached_aligned_prefix(req, config, req.materialized_tokens).is_some()
             || kv_manager.needs_host_insert(&req.kv_lease, req.materialized_tokens)
         {
             deferred.push((req.uuid, req.materialized_tokens));
@@ -225,6 +236,16 @@ pub(super) fn cache_prefix_through(
     config: &SglangConfig,
     tokens: usize,
 ) {
+    if config.mamba_cache.is_some() {
+        // `tokens` is the checkpoint captured with the observed forward, not
+        // the current (possibly newer) chunk's checkpoint selection.
+        let end = tokens.min(req.materialized_tokens);
+        if end > req.cached_tokens() {
+            kv_manager.extend_cached_prefix(&req.sequence_tokens[..end], &mut req.kv_lease);
+        }
+        req.debug_assert_invariants(config.block_size);
+        return;
+    }
     cache_prefix_through_ready(req, kv_manager, config, tokens, true);
 }
 
@@ -249,8 +270,13 @@ fn cache_prefix_through_ready(
         );
     }
 
-    // The unaligned forward end tells the backend which SWA pages the insert leaves cached.
-    let forward_end = tokens.min(req.materialized_tokens);
+    // Mamba publishes only the selected recurrent-state endpoint. SWA needs
+    // the unaligned forward end to determine which sliding-window pages remain.
+    let forward_end = if config.mamba_cache.is_some() {
+        aligned_tokens
+    } else {
+        tokens.min(req.materialized_tokens)
+    };
     kv_manager.extend_cached_prefix(&req.sequence_tokens[..forward_end], &mut req.kv_lease);
     if backup_ready {
         kv_manager.backup_cached_prefix(&mut req.kv_lease, aligned_tokens);
@@ -268,6 +294,11 @@ fn uncached_aligned_prefix(
     if !config.enable_prefix_caching {
         return None;
     }
+    let tokens = if config.mamba_cache.is_some() {
+        req.kv_lease.prefill_checkpoint()?.min(tokens)
+    } else {
+        tokens
+    };
     let aligned_tokens = floor_to_block(tokens.min(req.materialized_tokens), config.block_size);
     (aligned_tokens > req.cached_tokens()).then_some(aligned_tokens)
 }
@@ -432,7 +463,11 @@ fn prefill_first_tokens(
 
     // Prefill computes the prompt's KV and samples one output without computing its KV.
     for (idx, req) in running.iter_mut().enumerate() {
-        commit_materialized_prefix(req, kv_manager, config, &mut cache_commits);
+        // A one-output request donates its existing tracked state at finish;
+        // it never allocates an unfinished-request replacement checkpoint.
+        if config.mamba_cache.is_none() || req.remaining_output_tokens() > 1 {
+            commit_materialized_prefix(req, kv_manager, config, &mut cache_commits);
+        }
         if req.pending_terminal {
             continue;
         }

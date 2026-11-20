@@ -1,13 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Direct tests for ``GEMM`` ownership of CSV-backed perf data.
-
-These tests cover the Stage-2 migration of ISSUE-05: GEMM now owns its
-three CSV tables (gemm / compute_scale / scale_matrix), SOL correction,
-and grid extrapolation. ``PerfDatabase.query_gemm`` etc. are one-line
-delegations to ``GEMM._query_*_table``.
-"""
+"""GEMM table caching and per-dtype throughput lookup."""
 
 from __future__ import annotations
 
@@ -27,17 +21,13 @@ class TestGEMMCacheStructure:
         assert isinstance(GEMM._scale_matrix_cache, dict)
 
     def test_cache_key_includes_systems_root_and_shared_layer(self, stub_perf_db):
-        """Cache key components must include systems_root + enable_shared_layer
-        so test fixtures with separate tmp_paths and HYBRID/SILICON loads
-        get distinct entries."""
-        key = GEMM._cache_key(stub_perf_db)
-        # Order: (systems_root, system, backend, version, enable_shared_layer)
-        assert len(key) == 5
-        assert key[0] == stub_perf_db.systems_root
-        assert key[1] == stub_perf_db.system
-        assert key[2] == stub_perf_db.backend
-        assert key[3] == stub_perf_db.version
-        assert key[4] == stub_perf_db.enable_shared_layer
+        assert GEMM._cache_key(stub_perf_db) == (
+            stub_perf_db.systems_root,
+            stub_perf_db.system,
+            stub_perf_db.backend,
+            stub_perf_db.version,
+            stub_perf_db.enable_shared_layer,
+        )
 
 
 class TestStaticHelpers:

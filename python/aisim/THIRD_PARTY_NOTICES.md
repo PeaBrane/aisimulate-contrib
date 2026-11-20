@@ -614,10 +614,13 @@ These are modified Rust and Python simulations of the behavior: a retained
 boundary is one whole-state copy, and no upstream source file is vendored.
 
 
-The repository-root files `crates/core/src/engine/kv_manager/grouped_prefix.rs`
-and `crates/core/src/engine/kv_manager/grouped.rs` adapt rules of vLLM v0.31.0,
-immutable commit `db9527a46873454610df6dbedf79a36d6bf1a7f6`, and of vLLM
-v0.32.0, immutable commit `5df63a7203cdb9328d824a27b682e77c7b9928be`.
+The repository-root files `crates/core/src/engine/kv_manager/grouped_prefix.rs`,
+`crates/core/src/engine/kv_manager/grouped_prefix_tests.rs` (its test module,
+with cases ported from the upstream tests) and
+`crates/core/src/engine/kv_manager/grouped.rs` adapt rules of vLLM v0.31.0,
+immutable commit `db9527a46873454610df6dbedf79a36d6bf1a7f6`, of vLLM
+v0.32.0, immutable commit `5df63a7203cdb9328d824a27b682e77c7b9928be`, and of
+vLLM v0.33.0, immutable commit `4ba787ec9959e566d3b587a796dff07673324da5`.
 From `kv_cache_coordinator.py`, `block_pool.py` and
 `single_type_kv_cache_manager.py`, the block mode of `grouped.rs` adapts the one
 block pool of all groups, the capacity cost of a cached hit block that leaves
@@ -625,7 +628,9 @@ the free queue, the tail-first free order of a request's cached blocks and the
 blocks that a request holds in a state group: the running block, a hit block,
 the previous running block, the copy block of a partial hit and the prefill
 checkpoint block of v0.32.0.
-In `grouped_prefix.rs`, one rule table keyed by the vLLM version holds both rows.
+In `grouped_prefix.rs`, one rule table keyed by the vLLM version holds the three
+rows. The v0.33.0 row follows the rules of v0.32.0, which the listed v0.33.0
+files keep for a cache without speculative decoding.
 From `kv_cache_coordinator.py`, `grouped_prefix.rs` adapts the hybrid cache-hit
 lookup over the spec groups, the hit alignment, the scheduler block, the pinning
 of the hit blocks before an allocation and the release of the groups in group
@@ -646,6 +651,31 @@ it adapts the block of the align split, which is the smallest block of the
 prefix-cacheable groups. From `config/vllm.py`, it adapts the bound on in-flight
 tokens that the admission cap uses. The test module ports cases from the
 upstream tests listed below.
+From v0.31.0 and v0.32.0, `crates/core/src/engine/kv_manager/vllm_backend.rs`
+adapts, from `kv_cache_manager.py`, the whole-prompt admission cost of
+`allocate_slots`, its test of the first chunk before the hit blocks are
+pinned and the prefill end of a request that resumes after a preemption, and
+`grouped_prefix.rs` counts the blocks of that first chunk.
+`crates/core/src/engine/scheduler/vllm/policy.rs` adapts the whole-prompt test
+of `allocate_slots` and, from `sched/scheduler.py`, the token budget of a prompt
+without chunked prefill and the stop of the waiting loop at a request that does
+not fit, whose hit is searched again at the next step.
+`crates/core/src/engine/scheduler/vllm/core.rs` adapts, from
+`sched/scheduler.py`, the point where the copied hit blocks of a scheduling
+pass are released: after the waiting loop, at the end of the pass.
+`crates/core/src/engine/scheduler/vllm/grouped_tests.rs` holds the scheduler
+tests of these rules.
+`crates/core/src/engine/config.rs` and `grouped_prefix.rs` adapt the startup
+check of `kv_cache_utils.py` that the pool holds one request of `max_model_len`
+tokens, with the size of each group from `kv_cache_interface.py`, summed per
+group.
+In v0.33.0 that check is in `kv_cache_planning.py`. `config.rs` also refuses
+`prefill_schedule_interval` above 1 on the v0.33.0 row, because
+`sched/scheduler.py` of v0.33.0 applies that interval without data parallelism
+and the simulation does not.
+From `sched/scheduler.py` and `kv_cache_interface.py`, `grouped_prefix.rs` also
+adapts the rule that only a rank with a Mamba layer in align mode splits its
+prefill.
 
 - https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/core/kv_cache_coordinator.py
 - https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/core/single_type_kv_cache_manager.py
@@ -668,10 +698,21 @@ upstream tests listed below.
 - https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/config/vllm.py
 - https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/tests/v1/core/prefix_cache/test_partial_prefix_cache_hits.py
 - https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/tests/v1/core/test_mamba_align_chunk_split.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/kv_cache_coordinator.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/single_type_kv_cache_manager.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/kv_cache_manager.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/sched/scheduler.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/kv_cache_interface.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/kv_cache_utils.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/kv_cache_planning.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/block_pool.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/engine/core.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/config/vllm.py
 
 Copyright contributors to the vLLM project. Licensed under Apache-2.0:
 https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/LICENSE
 https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/LICENSE
+https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/LICENSE
 
 These are modified Rust simulation adaptations, restricted to no speculative
 decoding, no EAGLE and the default retention only. The identified upstream
@@ -707,6 +748,47 @@ The upstream project is copyright contributors to the vLLM project and licensed
 under Apache-2.0. These repository-root-relative files adapt behavioral contracts;
 no upstream method bodies are copied. The Rust implementation and fixtures are
 modified for simulation and do not reproduce native filesystem timing.
+
+The KVCR model in these repository-root files is an independently written,
+modified Rust simulation adaptation of behavioral contracts of vLLM and KVCR:
+
+- `crates/core/src/engine/kvcr.rs`
+- `crates/core/src/engine/scheduler/vllm/kvcr.rs`
+- the KVCR call sites in `crates/core/src/engine/scheduler/vllm/host_offload.rs`
+- their tests in those files and in `crates/core/tests/kvcr_replay.rs`
+- the KVCR sections of `docs/replay/engine/kv-cache.md`
+
+vLLM at commit `68e478651a20e3d23bf939912c38883d511ac3ee`:
+
+- https://github.com/vllm-project/vllm/blob/68e478651a20e3d23bf939912c38883d511ac3ee/vllm/v1/kv_offload/tiering/kvcr/manager.py
+- https://github.com/vllm-project/vllm/blob/68e478651a20e3d23bf939912c38883d511ac3ee/vllm/v1/kv_offload/tiering/manager.py
+- https://github.com/vllm-project/vllm/blob/68e478651a20e3d23bf939912c38883d511ac3ee/vllm/v1/kv_offload/base.py
+- https://github.com/vllm-project/vllm/blob/68e478651a20e3d23bf939912c38883d511ac3ee/vllm/v1/kv_offload/cpu/manager.py
+- https://github.com/vllm-project/vllm/blob/68e478651a20e3d23bf939912c38883d511ac3ee/vllm/v1/kv_offload/cpu/policies/lru.py
+- https://github.com/vllm-project/vllm/blob/68e478651a20e3d23bf939912c38883d511ac3ee/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+- https://github.com/vllm-project/vllm/blob/68e478651a20e3d23bf939912c38883d511ac3ee/vllm/distributed/kv_transfer/kv_connector/v1/offloading/state.py
+
+Copyright contributors to the vLLM project. Licensed under Apache-2.0:
+https://github.com/vllm-project/vllm/blob/68e478651a20e3d23bf939912c38883d511ac3ee/LICENSE
+
+KVCR at commit `ca61ea0cb1cdbaa86dc6b33ab9007be3e9276f71`:
+
+- https://github.com/ai-dynamo/kvcr/blob/ca61ea0cb1cdbaa86dc6b33ab9007be3e9276f71/src/kvcr/runtime/core.py
+- https://github.com/ai-dynamo/kvcr/blob/ca61ea0cb1cdbaa86dc6b33ab9007be3e9276f71/src/kvcr/runtime/policy_runtime.py
+- https://github.com/ai-dynamo/kvcr/blob/ca61ea0cb1cdbaa86dc6b33ab9007be3e9276f71/src/kvcr/policy.py
+- https://github.com/ai-dynamo/kvcr/blob/ca61ea0cb1cdbaa86dc6b33ab9007be3e9276f71/src/kvcr/backends/local_dram.py
+- https://github.com/ai-dynamo/kvcr/blob/ca61ea0cb1cdbaa86dc6b33ab9007be3e9276f71/src/kvcr/backends/local_dram_pools.py
+- https://github.com/ai-dynamo/kvcr/blob/ca61ea0cb1cdbaa86dc6b33ab9007be3e9276f71/src/kvcr/backends/remote_fw_dram.py
+- https://github.com/ai-dynamo/kvcr/blob/ca61ea0cb1cdbaa86dc6b33ab9007be3e9276f71/src/kvcr/backends/remote_sources.py
+
+Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. Licensed under Apache-2.0:
+https://github.com/ai-dynamo/kvcr/blob/ca61ea0cb1cdbaa86dc6b33ab9007be3e9276f71/LICENSE
+
+No upstream method bodies or test fixtures are copied. The adaptation models
+which blocks a rank pulls from a hinted peer and when the pull starts and
+lands, which blocks KVCR-owned memory stores, evicts and promotes, the order
+its LRU and FIFO policies keep, and how long each operation protects the
+blocks it reads.
 
 The `offloading_v0_32` and `simple_cpu_v0_32` G2 connector profiles in
 repository-root files `crates/core/src/engine/host_offload/tier.rs` and
@@ -2590,6 +2672,25 @@ https://github.com/vllm-project/vllm/blob/43b4aaea3e40e20ef53ce2bfecfa1b72060bf2
 
 These are modified Rust simulation adaptations; no upstream source file is
 vendored.
+
+
+## SGLang extra-buffer hybrid prefix checkpoints
+
+Modified checkpoint ownership/tracking contracts in repository-root
+`crates/core/src/engine/cache/radix_cache.rs`, `engine/kv_manager/sglang_backend.rs`,
+`engine/scheduler/sglang/{config,core,decode,prefill,tests}.rs`, and their configuration
+plumbing (`engine/{config,mod}.rs`, `engine/common/protocols.rs`, `engine/scheduler/rank.rs`;
+all abbreviated engine paths are under `crates/core/src/`) derive from SGLang
+commit `94602c9c2b7cbdb8efd5c52802dac6a1c180089e`.
+Original paths under `python/sglang/srt/`: `mem_cache/{mamba_radix_cache,memory_pool}.py`,
+`runtime_context.py`, `managers/{schedule_batch,scheduler}.py`, and
+`managers/scheduler_components/batch_result_processor.py`.
+Source: https://github.com/sgl-project/sglang/tree/94602c9c2b7cbdb8efd5c52802dac6a1c180089e/python/sglang/srt
+Copyright 2023-2024 SGLang Team and contributors; `runtime_context.py` is
+Copyright 2023-2026 SGLang Team. Apache-2.0 (included in `LICENSE`).
+Upstream license: https://github.com/sgl-project/sglang/blob/94602c9c2b7cbdb8efd5c52802dac6a1c180089e/LICENSE
+The simulation adaptation rejects state/KV eviction pressure; no upstream GPU
+allocator, production prompts, or external trace fixtures are included.
 
 ## AIConfigurator PR #1613 migration
 

@@ -140,8 +140,9 @@ The default per-process timeout is 120 seconds.
 trusted `pull-request/<N>` branch, like the forward-performance workflow. Its
 selector uses the complete PR change set. Runtime, model data, dependency, and
 benchmark changes select the gate; unrelated and documentation-only changes skip
-it. No repository enable variable is required. The selector verifies that the
-trusted copy matches the current PR head.
+it. Pushes for draft PRs and PRs whose base is not `main` or `release/*` also
+skip; manual dispatch still compares them. No repository enable variable is
+required. The selector verifies that the trusted copy matches the current PR head.
 
 Revision and protocol checks run in the hosted selection job. A two-entry build
 matrix builds base and head in parallel with the same container, Python, Rust,

@@ -172,56 +172,11 @@ or required notice is unclear, stop and request maintainer or Open Source Review
 Board guidance before committing the derived content. This is a required gate,
 not optional documentation.
 
-## Cursor Cloud specific instructions
+## Development and validation
 
-### Project overview
-
-AISim is a Python and Rust CLI/SDK for predicting LLM serving behavior and
-optimizing inference deployment configurations. See `README.md` for details.
-
-### Environment setup
-
-Python dependencies are managed via `uv` with the
-`python/aisim/uv.lock` lockfile. The project environment lives at
-`python/aisim/.venv/`.
-
-- **Install/refresh deps:**
-  `uv sync --project python/aisim --extra dev`
-- **Performance data:** Current op profiles are parquet files under
-  `python/aisim/src/aisim_core/systems/data/<system>/<family>/<backend>/<version>/`
-  and are checked in directly. Legacy `*.txt` perf files, when present, use Git
-  LFS; run `git lfs pull` only when working with those legacy assets.
-
-### Lint / Test / Run
-
-- **Lint:** `python/aisim/.venv/bin/ruff check --config python/aisim/pyproject.toml python/aisim tests`
-  and `python/aisim/.venv/bin/ruff format --check --config python/aisim/pyproject.toml python/aisim tests`
-  (see `DEVELOPMENT.md`)
-- **Unit tests:** `python/aisim/.venv/bin/pytest -c python/aisim/pytest.ini python/aisim/tests -m unit`
-  (no external deps or LFS data needed)
-- **Build tests (PR subset):** `python/aisim/.venv/bin/pytest -c python/aisim/pytest.ini python/aisim/tests -m "unit or build"`
-  (requires LFS data for the `build`-marked tests)
-- **CLI:** `aiconfigurator cli generate --model-path Qwen/Qwen3-32B-FP8 --total-gpus 8 --system h200_sxm` (works without LFS data)
-### Known environment caveats
-
-1. **Legacy LFS data:** `github-cloud.githubusercontent.com` may be blocked by
-   network egress restrictions. If `git lfs pull` fails, tests that explicitly
-   exercise legacy text assets may fail; current parquet-backed workflows do
-   not depend on those legacy files.
-2. **TTY tests:** 4 tests in
-   `python/aisim/tests/unit/cli/test_plain_output.py` may fail because the
-   agent runs in a non-TTY environment.
-3. **Rust tests:**
-   `python/aisim/tests/unit/sdk/test_rust_engine_step.py` requires `cargo`
-   with network access to `crates.io`. It will fail if that domain is blocked.
-4. **macOS pytest-timeout crash dialogs:** The `timeout = 120` setting in
-   `python/aisim/pytest.ini` uses SIGALRM by default, which triggers
-   "Python unexpectedly quit" crash reporter popups on macOS. Pass
-   `-p no:timeout` to disable it locally.
-5. **torch-dependent tests:**
-   `python/aisim/tests/unit/sdk/database/test_moe_dispatch.py` requires
-   `torch` (not installed in the default dev venv). Ignore it with
-   `--ignore=python/aisim/tests/unit/sdk/database/test_moe_dispatch.py`.
+Use [the development guide](DEVELOPMENT.md) for setup, lint and test commands,
+and [the quickstart](docs/getting-started/quickstart.md) for a prediction.
+For Cursor Cloud setup, see the [bootstrap script](.cursor/cloud-agent-install.sh).
 
 ## CODEOWNERS
 
@@ -230,5 +185,5 @@ hand-edit it; CI fails on drift. Repository rules must require the `codeowners`
 check to make failures merge-blocking. If the check fails on a new directory,
 claim it in `areas.yaml`, regenerate with
 `.github/codeowners/emit_codeowners.py`, and commit every changed source and
-generated artifact together. The `aic-codeowners` skill covers all flows (who
-reviews a change, gate failures, routing changes, external contributor grants).
+generated artifact together. See the [CODEOWNERS guide](.github/codeowners/README.md)
+for review routing and ownership checks.

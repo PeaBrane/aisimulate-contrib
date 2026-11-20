@@ -27,7 +27,6 @@ from .config.cli import (
 from .config.common import split_config_sections
 from .config_adapter import (
     ConfigAdapterResolutionError,
-    PredictionAdapterContext,
     SimulationConfigAdapter,
     resolve_config_adapters,
 )
@@ -56,7 +55,7 @@ from .output_adapter import (
 )
 from .perf_model_cli import run_perf_model_command
 from .power import normalize_power_summary
-from .predict import PredictionExecutionError, run_prediction
+from .predict import PredictionExecutionError, compile_prediction_adapters, run_prediction
 from .replay.dashboard import write_replay_dashboard
 from .resource_worker import _exception_message
 from .resources import (
@@ -68,7 +67,6 @@ from .resources import (
 )
 from .stack import StackResolutionError, resolve_runner_factory
 from .support.cli import run_support_command
-from .sweeper.provider import AdapterReplaySpec
 from .sweeper.replay import ReplayOutputRequirements
 
 
@@ -136,31 +134,6 @@ def _resolve_section_adapters(sections: dict[str, dict[str, Any]], stack: str) -
         if adapter.section not in sections:
             raise ConfigAdapterResolutionError(f"config adapter {name!r} does not match a configured section")
     return adapters
-
-
-def _prediction_adapter_context(
-    config: CorePredictionConfig,
-) -> PredictionAdapterContext:
-    return PredictionAdapterContext(
-        engine=config.engine.model_dump(mode="json", exclude_none=True),
-        traffic=config.traffic.model_dump(mode="json", exclude_none=True),
-        evaluation=config.evaluation.model_dump(mode="json", exclude_none=True),
-    )
-
-
-def _compile_prediction_adapters(
-    configs: dict[str, dict[str, Any]],
-    adapters: dict[str, SimulationConfigAdapter],
-    *,
-    stack: str,
-    context: PredictionAdapterContext,
-) -> dict[str, AdapterReplaySpec]:
-    compiled: dict[str, AdapterReplaySpec] = {}
-    for section, raw in configs.items():
-        name = f"{stack}.{section}"
-        adapter = adapters[name]
-        compiled[name] = adapter.compile_prediction(raw, context)
-    return compiled
 
 
 def _predict(args: argparse.Namespace, raw: dict[str, Any], factory) -> int:
@@ -348,12 +321,7 @@ def _recommend(args: argparse.Namespace, raw: dict[str, Any], factory) -> int:
         unknown_sections = set(candidate_adapters) - set(adapter_raw)
         if unknown_sections:
             raise RuntimeError(f"recommendation produced unconfigured adapter sections {sorted(unknown_sections)}")
-        compiled_adapters = _compile_prediction_adapters(
-            candidate_adapters,
-            adapters,
-            stack=args.stack,
-            context=_prediction_adapter_context(prediction),
-        )
+        compiled_adapters = compile_prediction_adapters(prediction, candidate_adapters, adapters, stack=args.stack)
         concrete = prediction_mapping(
             prediction,
             {adapters[name].section: spec.config for name, spec in compiled_adapters.items()},

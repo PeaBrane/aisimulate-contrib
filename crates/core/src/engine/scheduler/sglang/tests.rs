@@ -84,6 +84,197 @@ fn direct_request(tokens: Vec<u32>, max_output_tokens: usize) -> DirectRequest {
     }
 }
 
+mod mamba_tests {
+    use super::*;
+    use crate::engine::SglangMambaCacheConfig;
+
+    fn core(host_loop: bool, chunk: usize, max_states: usize) -> SglangCore {
+        let mut args = test_args(4096, 1, chunk);
+        let sglang = args.sglang.as_mut().unwrap();
+        sglang.host_loop = host_loop;
+        sglang.mamba_cache = Some(SglangMambaCacheConfig {
+            prefill_checkpoint_interval: 256,
+            decode_checkpoint_interval: 256,
+            max_states,
+        });
+        SglangCore::new_with_kv_capture(args, 0)
+    }
+
+    fn checkpoint(core: &SglangCore, tokens: &[u32]) -> usize {
+        let hashes = crate::engine::common::hashing::block_hashes_with_salt(tokens, 1, None)
+            .map(crate::engine::common::hashing::LocalBlockHash)
+            .collect::<Vec<_>>();
+        core.kv_manager.cache().mamba_prefix_match(&hashes).0
+    }
+
+    #[rstest::rstest]
+    fn mamba_prefill_publication_and_cold_to_warm_reuse(
+        #[values(false, true)] host_loop: bool,
+        #[values(256, 1024)] chunk: usize,
+        #[values(1, 3)] outputs: usize,
+    ) {
+        let mut core = core(host_loop, chunk, 32);
+        let prompt: Vec<u32> = (0..300).collect();
+        let first = core.receive(direct_request(prompt.clone(), outputs));
+        assert_eq!(checkpoint(&core, &prompt), 0);
+        let mut now = 0.0;
+        let mut published = false;
+        let mut follower = None;
+        let mut warm_admitted = false;
+        let mut completed = std::collections::HashSet::new();
+        for pass_index in 0..32 {
+            let pass = core.execute_hidden_pass(now);
+            now = pass.end_ms;
+            for admission in pass.admissions {
+                if admission.uuid == first {
+                    assert_eq!(admission.reused_input_tokens, 0);
+                } else {
+                    assert_eq!(Some(admission.uuid), follower);
+                    assert_eq!(admission.reused_input_tokens, 256);
+                    warm_admitted = true;
+                }
+            }
+            for signal in pass.output_signals {
+                if signal.completed {
+                    completed.insert(signal.uuid);
+                }
+            }
+            let end = checkpoint(&core, &prompt);
+            assert!(
+                end == 0 || end == 256,
+                "short final chunks cannot publish token 300"
+            );
+            if host_loop {
+                if pass_index == 0 {
+                    assert_eq!(
+                        end, 0,
+                        "a checkpoint waits for its producing forward to be observed"
+                    );
+                } else if pass_index == 1 {
+                    assert_eq!(end, 256, "the second iteration observes the first forward");
+                }
+            }
+            if end == 256 && !published {
+                published = true;
+                follower = Some(core.receive(direct_request(prompt.clone(), 1)));
+            }
+            if core.is_drained() {
+                break;
+            }
+        }
+        assert!(published && warm_admitted && core.is_drained());
+        assert!(completed.contains(&first));
+        assert!(completed.contains(&follower.unwrap()));
+    }
+
+    #[test]
+    fn mamba_observing_a_chunk_preserves_the_next_terminal_checkpoint() {
+        let mut core = core(true, 256, 16);
+        let prompt: Vec<u32> = (0..512).collect();
+        core.receive(direct_request(prompt.clone(), 1));
+        let first = core.execute_hidden_pass(0.0);
+        assert_eq!(checkpoint(&core, &prompt), 0);
+        let second = core.execute_hidden_pass(first.end_ms);
+        assert_eq!(checkpoint(&core, &prompt), 256);
+        let mut now = second.end_ms;
+        for _ in 0..8 {
+            if core.is_drained() {
+                break;
+            }
+            now = core.execute_hidden_pass(now).end_ms;
+        }
+        assert!(core.is_drained());
+        assert_eq!(checkpoint(&core, &prompt), 512);
+        assert_eq!(core.kv_manager.cache().mamba_checkpoint_count(), 2);
+    }
+
+    #[rstest::rstest]
+    fn mamba_one_output_donates_state_without_a_replacement(
+        #[values(false, true)] host_loop: bool,
+    ) {
+        let mut core = core(host_loop, 1024, 4);
+        let seed: Vec<u32> = (1000..1256).collect();
+        core.receive(direct_request(seed, 1));
+        let mut now = 0.0;
+        for _ in 0..8 {
+            now = core.execute_hidden_pass(now).end_ms;
+            if core.is_drained() {
+                break;
+            }
+        }
+        assert!(core.is_drained());
+        let prompt: Vec<u32> = (0..300).collect();
+        core.receive(direct_request(prompt.clone(), 1));
+        for _ in 0..8 {
+            now = core.try_execute_hidden_pass(now).unwrap().end_ms;
+            if core.is_drained() {
+                break;
+            }
+        }
+        assert!(core.is_drained());
+        assert_eq!(checkpoint(&core, &prompt), 256);
+        assert_eq!(core.kv_manager.cache().mamba_checkpoint_count(), 2);
+    }
+
+    #[test]
+    fn mamba_decode_checkpoint_is_donated_at_its_materialized_endpoint() {
+        let mut core = core(false, 1024, 16);
+        core.config
+            .mamba_cache
+            .as_mut()
+            .unwrap()
+            .prefill_checkpoint_interval = 64;
+        core.kv_manager
+            .enable_mamba_cache(core.config.mamba_cache.unwrap());
+        let mut sequence: Vec<u32> = (0..192).collect();
+        let outputs: Vec<u32> = (1000..1065).collect();
+        core.receive(DirectRequest {
+            output_token_ids: Some(outputs.clone()),
+            ..direct_request(sequence.clone(), outputs.len())
+        });
+        let first = core.execute_hidden_pass(0.0);
+        assert_eq!(checkpoint(&core, &sequence), 192);
+        let mut now = first.end_ms;
+        for _ in 0..70 {
+            if core.is_drained() {
+                break;
+            }
+            now = core.execute_hidden_pass(now).end_ms;
+        }
+        sequence.extend(outputs);
+        assert!(core.is_drained());
+        assert_eq!(checkpoint(&core, &sequence), 256);
+        core.receive(direct_request(sequence, 1));
+        assert_eq!(
+            core.execute_hidden_pass(now).admissions[0].reused_input_tokens,
+            256
+        );
+    }
+
+    #[rstest::rstest]
+    fn mamba_state_pressure_returns_an_error_instead_of_an_idle_pass(
+        #[values(false, true)] host_loop: bool,
+    ) {
+        let mut core = core(host_loop, 1024, 4);
+        core.receive(direct_request((0..300).collect(), 3));
+        core.receive(direct_request((1000..1300).collect(), 3));
+        let mut now = 0.0;
+        for _ in 0..4 {
+            match core.try_execute_hidden_pass(now) {
+                Ok(pass) => now = pass.end_ms,
+                Err(error) => {
+                    assert!(
+                        error.to_string().contains("Mamba state pressure"),
+                        "{error}"
+                    );
+                    return;
+                }
+            }
+        }
+        panic!("unsupported state pressure must not leave queued work without a wakeup");
+    }
+}
+
 mod hicache_tests {
     use std::sync::Arc;
 
@@ -5754,6 +5945,74 @@ mod forward_pass_metrics {
             let pass = core.execute_hidden_pass(10.0);
             assert!(pass.fpm.is_some(), "FPM should always be present");
         }
+    }
+    const BLOCK_SIZE: usize = 4;
+
+    #[test]
+    fn second_identical_multichunk_prompt_reuses_cache_beyond_first_chunk() {
+        let mut core = SglangCore::new(fpm_args_with_chunked_prefill(16, 32));
+        let prompt: Vec<u32> = (0..40).collect();
+
+        let prefill_per_pass_until_output =
+            |core: &mut SglangCore, uuid: Uuid, start_ms: f64| -> (Vec<u64>, f64) {
+                let mut collector = crate::engine::trace::TraceCollector::default();
+                let mut prefill_per_pass = Vec::new();
+                let mut now_ms = start_ms;
+                for _ in 0..64 {
+                    let pass = core.execute_pass(&mut collector, now_ms);
+                    prefill_per_pass
+                        .push(pass.fpm.as_ref().map(|f| f.sum_prefill_tokens).unwrap_or(0));
+                    now_ms = pass.end_ms;
+                    if pass.output_signals.iter().any(|s| s.uuid == uuid) {
+                        return (prefill_per_pass, now_ms);
+                    }
+                }
+                panic!("request {uuid} emitted no output within 64 passes");
+            };
+
+        let first = Uuid::from_u128(1);
+        core.receive(DirectRequest {
+            uuid: Some(first),
+            ..direct_request(prompt.clone(), 1)
+        });
+        let (cold_passes, end_ms) = prefill_per_pass_until_output(&mut core, first, 0.0);
+        assert_eq!(
+            cold_passes,
+            [16, 16, 8],
+            "cold request must compute every prompt token in three chunks and emit output only after the last chunk"
+        );
+
+        let second = Uuid::from_u128(2);
+        core.receive(DirectRequest {
+            uuid: Some(second),
+            ..direct_request(prompt.clone(), 1)
+        });
+        let (warm_passes, _) = prefill_per_pass_until_output(&mut core, second, end_ms);
+        let warm_prefill: u64 = warm_passes.iter().sum();
+
+        assert!(
+            (1..=BLOCK_SIZE as u64).contains(&warm_prefill),
+            "warm identical prompt must compute 1 through {BLOCK_SIZE} tokens using the cache across chunks: computed {warm_prefill} tokens"
+        );
+    }
+
+    fn fpm_args_with_chunked_prefill(
+        chunked_prefill_size: usize,
+        num_gpu_blocks: usize,
+    ) -> MockEngineArgs {
+        MockEngineArgs::builder()
+            .engine_type(EngineType::Sglang)
+            .block_size(BLOCK_SIZE)
+            .num_gpu_blocks(num_gpu_blocks)
+            .max_num_seqs(Some(4))
+            .speedup_ratio(0.0)
+            .sglang(Some(SglangArgs {
+                page_size: Some(BLOCK_SIZE),
+                chunked_prefill_size: Some(chunked_prefill_size),
+                ..Default::default()
+            }))
+            .build()
+            .unwrap()
     }
 }
 

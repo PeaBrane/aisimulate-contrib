@@ -250,28 +250,6 @@ def resolved_lane_order_for_op(
         return ["default"]
 
 
-# Extrapolation target grids — lifted verbatim from the legacy blocks in
-# ``PerfDatabase.__init__`` so behavior stays bit-identical.
-
-# fmt: on
-
-
-def _cache_key(database: PerfDatabase) -> tuple:
-    """Shared cache key — same shape as GEMM's, used by both Attention ops.
-
-    TODO: hoist to ``operations/base.py`` once a third op family (Phase 3
-    NCCL / MLA / Mamba) lands and needs the same key shape — preferring
-    duplication over premature abstraction with only two callers.
-    """
-    return (
-        database.systems_root,
-        database.system,
-        database.backend,
-        database.version,
-        database.enable_shared_layer,
-    )
-
-
 class ContextAttention(_core.ContextAttention, OpShellKit):
     """
     Context (prefill) attention operation.
@@ -286,10 +264,6 @@ class ContextAttention(_core.ContextAttention, OpShellKit):
     # ------------------------------------------------------------------
     # Data ownership
     # ------------------------------------------------------------------
-
-    @classmethod
-    def _cache_key(cls, database: PerfDatabase) -> tuple:
-        return _cache_key(database)
 
     @classmethod
     def load_data(cls, database: PerfDatabase) -> None:
@@ -312,14 +286,6 @@ class ContextAttention(_core.ContextAttention, OpShellKit):
     def clear_cache(cls) -> None:
         cls._data_cache.clear()
 
-    # ------------------------------------------------------------------
-    # Query table (formerly PerfDatabase.query_context_attention)
-    # ------------------------------------------------------------------
-
-    # ------------------------------------------------------------------
-    # Op contract: query() + get_weights()
-    # ------------------------------------------------------------------
-
 
 class GenerationAttention(_core.GenerationAttention, OpShellKit):
     """
@@ -336,10 +302,6 @@ class GenerationAttention(_core.GenerationAttention, OpShellKit):
     # ------------------------------------------------------------------
     # Data ownership
     # ------------------------------------------------------------------
-
-    @classmethod
-    def _cache_key(cls, database: PerfDatabase) -> tuple:
-        return _cache_key(database)
 
     @classmethod
     def load_data(cls, database: PerfDatabase) -> None:
@@ -378,14 +340,6 @@ class GenerationAttention(_core.GenerationAttention, OpShellKit):
     # to its own load (see perf_database/attention.rs), so QUERY values stay
     # SOL-floored via the single oracle.
 
-    # ------------------------------------------------------------------
-    # Query table (formerly PerfDatabase.query_generation_attention)
-    # ------------------------------------------------------------------
-
-    # ------------------------------------------------------------------
-    # Op contract: query() + get_weights()
-    # ------------------------------------------------------------------
-
 
 class EncoderAttention(_core.EncoderAttention, OpShellKit):
     """
@@ -411,10 +365,6 @@ class EncoderAttention(_core.EncoderAttention, OpShellKit):
     # ------------------------------------------------------------------
 
     @classmethod
-    def _cache_key(cls, database: PerfDatabase) -> tuple:
-        return _cache_key(database)
-
-    @classmethod
     def load_data(cls, database: PerfDatabase) -> None:
         """Idempotent. Fetches the engine's encoder_attention table view
         (raw rows), binds ``database._encoder_attention_data``.
@@ -434,11 +384,3 @@ class EncoderAttention(_core.EncoderAttention, OpShellKit):
     @classmethod
     def clear_cache(cls) -> None:
         cls._data_cache.clear()
-
-    # ------------------------------------------------------------------
-    # Query table (formerly PerfDatabase.query_encoder_attention)
-    # ------------------------------------------------------------------
-
-    # ------------------------------------------------------------------
-    # Op contract: query() + get_weights()
-    # ------------------------------------------------------------------
