@@ -406,11 +406,14 @@ struct TurnRuntime {
     deterministic_request_id: Option<Uuid>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 struct InFlightTurn {
     session_index: usize,
     turn_index: usize,
     emitted_output_tokens: usize,
+    // A delta turn's plan moves here at dispatch so each output token is
+    // checked from this entry alone. Full-prompt turns leave it empty.
+    planned_output_tokens: Vec<u32>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3038,6 +3041,13 @@ impl WorkloadDriver {
                     (request, replay_hashes)
                 }
             };
+            let planned_output_tokens = match self.prompt_mode {
+                PromptMode::Full => Vec::new(),
+                PromptMode::DeltaCumulative => turn
+                    .output_token_ids
+                    .take()
+                    .expect("delta turns must have planned output tokens"),
+            };
             session.in_flight = Some(request_uuid);
             session.next_ready_at_ms = None;
             self.in_flight.insert(
@@ -3046,6 +3056,7 @@ impl WorkloadDriver {
                     session_index,
                     turn_index,
                     emitted_output_tokens: 0,
+                    planned_output_tokens,
                 },
             );
             let ready = CompactReadyTurn {
@@ -3120,15 +3131,10 @@ impl WorkloadDriver {
         }
         let in_flight = self
             .in_flight
-            .get(&request_uuid)
-            .copied()
+            .get_mut(&request_uuid)
             .ok_or_else(|| anyhow!("unknown workload request output for {request_uuid}"))?;
 
-        let turn = &self.sessions[in_flight.session_index].turns[in_flight.turn_index];
-        let planned_output_tokens = turn
-            .output_token_ids
-            .as_ref()
-            .expect("delta turns must have planned output tokens");
+        let planned_output_tokens = &in_flight.planned_output_tokens;
         let expected_token = planned_output_tokens
             .get(in_flight.emitted_output_tokens)
             .ok_or_else(|| {
@@ -3145,10 +3151,6 @@ impl WorkloadDriver {
             );
         }
 
-        let in_flight = self
-            .in_flight
-            .get_mut(&request_uuid)
-            .expect("validated in-flight request must still exist");
         in_flight.emitted_output_tokens = in_flight
             .emitted_output_tokens
             .checked_add(1)
@@ -3432,8 +3434,8 @@ impl WorkloadDriver {
         &self,
         request_uuid: Uuid,
         outcome: TurnOutcome,
-    ) -> Result<Option<InFlightTurn>> {
-        let Some(in_flight) = self.in_flight.get(&request_uuid).copied() else {
+    ) -> Result<Option<&InFlightTurn>> {
+        let Some(in_flight) = self.in_flight.get(&request_uuid) else {
             return match outcome {
                 TurnOutcome::Completed | TurnOutcome::Rejected | TurnOutcome::Failed => Err(
                     anyhow!("unknown workload request completion for {request_uuid}"),
@@ -3494,16 +3496,6 @@ impl WorkloadDriver {
             return Ok(None);
         };
         let session = &self.sessions[in_flight.session_index];
-        let turn = &session.turns[in_flight.turn_index];
-        let completed_output_tokens = (outcome == TurnOutcome::Completed
-            && self.prompt_mode == PromptMode::DeltaCumulative)
-            .then(|| {
-                let planned_output_tokens = turn
-                    .output_token_ids
-                    .as_ref()
-                    .expect("delta turns must have planned output tokens");
-                planned_output_tokens[..in_flight.emitted_output_tokens].to_vec()
-            });
         let (next_turn_index, next_ready_at_ms, session_ended) = match outcome {
             TurnOutcome::Completed | TurnOutcome::Rejected => {
                 let next_turn_index = in_flight
@@ -3519,7 +3511,8 @@ impl WorkloadDriver {
             TurnOutcome::Cancelled | TurnOutcome::Failed => (session.turns.len(), None, true),
         };
 
-        self.in_flight
+        let in_flight = self
+            .in_flight
             .remove(&request_uuid)
             .expect("validated in-flight request must still exist");
         let session = &mut self.sessions[in_flight.session_index];
@@ -3530,9 +3523,12 @@ impl WorkloadDriver {
             session.cumulative_tokens = Vec::new();
         }
         if next_ready_at_ms.is_some()
-            && let Some(output_tokens) = completed_output_tokens
+            && outcome == TurnOutcome::Completed
+            && self.prompt_mode == PromptMode::DeltaCumulative
         {
-            session.cumulative_tokens.extend(output_tokens);
+            session.cumulative_tokens.extend_from_slice(
+                &in_flight.planned_output_tokens[..in_flight.emitted_output_tokens],
+            );
         }
         if let Some(ready_at_ms) = next_ready_at_ms {
             self.ready_sessions.push(ReadySession {
@@ -4561,8 +4557,13 @@ mod tests {
         assert_eq!(first[0].request.output_token_ids, Some(vec![20, 21]));
         assert_eq!(first[0].request.priority, 3);
         assert_eq!(first[0].request.strict_priority, 4);
+        let request_uuid = first[0].request_uuid;
+        let error = driver.on_output_token(request_uuid, 21).unwrap_err();
+        assert!(error.to_string().contains("at position 0, expected 20"));
         driver.on_output_token(first[0].request_uuid, 20).unwrap();
         driver.on_output_token(first[0].request_uuid, 21).unwrap();
+        let error = driver.on_output_token(request_uuid, 22).unwrap_err();
+        assert!(error.to_string().contains("more than 2 planned"));
         driver.on_complete(first[0].request_uuid, 10.0).unwrap();
 
         let second = driver.pop_ready(15.0, usize::MAX);
