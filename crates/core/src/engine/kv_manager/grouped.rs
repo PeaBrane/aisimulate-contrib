@@ -10,16 +10,15 @@
 //! Request-owned cache groups sharing one rank-local physical budget. Byte
 //! mode replays them cold. Block mode keeps the blocks of every group in one
 //! block pool, so that cached blocks stay until eviction.
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the scheduler does not use block mode yet")
-)]
 
 use crate::engine::cache::vllm_block_pool::{
     BlockCopyId, BlockReservation, CacheKey, PrefixHit, VllmBlockPool,
 };
 use crate::engine::common::hashing::SequenceHash;
 use crate::perfmodel::{FpmCacheGroup, FpmCacheKind};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_POOL_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct GroupedLease {
@@ -131,6 +130,9 @@ pub(crate) struct GroupStateLease {
     pub(crate) copy: Option<BlockCopyId>,
     /// A vLLM 0.32.0 prefill checkpoint block, and its token position.
     pub(crate) checkpoint: Option<(BlockCopyId, usize)>,
+    /// The key of a state that the request published inside its running
+    /// block. The next allocation keeps that block and takes a fresh one.
+    pub(crate) published: Option<CacheKey>,
 }
 
 /// The block pool of block mode. Every group takes blocks of one page size
@@ -138,11 +140,41 @@ pub(crate) struct GroupStateLease {
 pub(crate) struct GroupedBlockPool {
     pool: VllmBlockPool,
     page_size_bytes: u64,
+    /// Unique among the pools of the process, so that a residency stamp of
+    /// one pool never matches another pool.
+    id: u64,
+    /// The most active blocks seen since the last reset, for tests that
+    /// observe a step's peak after the step.
+    #[cfg(test)]
+    peak_active_blocks: std::cell::Cell<usize>,
 }
 
 impl GroupedBlockPool {
+    /// The pool and the generation of its resident keys. Two equal values
+    /// mean the same pool with the same set of resident keys, so every
+    /// `key_hit(..).is_some()` gives the same answer.
+    pub(crate) fn residency(&self) -> (u64, u64) {
+        (self.id, self.pool.grouped_key_generation())
+    }
+
     pub(crate) fn capacity_blocks(&self) -> usize {
         self.pool.capacity()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn peak_active_blocks(&self) -> usize {
+        self.peak_active_blocks.get()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_peak_active_blocks(&self) {
+        self.peak_active_blocks.set(self.pool.num_active());
+    }
+
+    fn note_peak(&self) {
+        #[cfg(test)]
+        self.peak_active_blocks
+            .set(self.peak_active_blocks.get().max(self.pool.num_active()));
     }
 
     pub(crate) fn key_hit(&self, group: u16, hash: SequenceHash) -> Option<PrefixHit> {
@@ -161,14 +193,19 @@ impl GroupedBlockPool {
     /// Turn the pinned hits into request references. The copies follow the
     /// order of `hits`.
     pub(crate) fn activate(&mut self, reservation: &mut BlockReservation) -> Vec<BlockCopyId> {
-        self.pool
+        let copies = self
+            .pool
             .activate_keys(reservation)
             .map(|(_, id)| id)
-            .collect()
+            .collect();
+        self.note_peak();
+        copies
     }
 
     pub(crate) fn take_private(&mut self, reservation: &mut BlockReservation) -> BlockCopyId {
-        self.pool.allocate_private(reservation)
+        let id = self.pool.allocate_private(reservation);
+        self.note_peak();
+        id
     }
 
     /// Publish a private block. Returns whether `key` became visible.
@@ -216,7 +253,10 @@ impl GroupedBlockPool {
 }
 
 /// Byte mode backs `required_bytes`, `fixed_request_bytes`, `allocate` and
-/// `release`. Block mode does not use them. Its callers work on `block_pool`.
+/// `release`, which assert the mode in debug builds. Block mode keeps the
+/// blocks of every request in `block_pool`. The two modes share
+/// `projected_blocks` and `fixed_request_blocks`, the test that one forward
+/// fits the whole pool.
 pub(crate) enum GroupedMode {
     Bytes,
     Blocks(GroupedBlockPool),
@@ -253,9 +293,11 @@ impl GroupedKvPool {
     }
 
     /// Block mode for prefix caching. The caller checks that every group has
-    /// pages of `page_size_bytes`. Block mode reads neither the attention
-    /// groups nor the state charge that byte mode keeps: its caller holds
-    /// every group, state groups included, in one block lease.
+    /// pages of `page_size_bytes`. Its caller holds every group, state groups
+    /// included, in one block lease, and admits and allocates blocks of the
+    /// block pool only. The attention groups and the state charge that byte
+    /// mode keeps are read only by `projected_blocks` and
+    /// `fixed_request_blocks`, which count each state group once.
     pub(crate) fn with_prefix_cache(
         groups: Vec<FpmCacheGroup>,
         capacity_bytes: u64,
@@ -272,9 +314,36 @@ impl GroupedKvPool {
             mode: GroupedMode::Blocks(GroupedBlockPool {
                 pool,
                 page_size_bytes,
+                id: NEXT_POOL_ID.fetch_add(1, Ordering::Relaxed),
+                #[cfg(test)]
+                peak_active_blocks: std::cell::Cell::new(0),
             }),
             ..Self::new(groups, capacity_bytes)
         }
+    }
+
+    fn debug_assert_byte_mode(&self) {
+        debug_assert!(
+            matches!(self.mode, GroupedMode::Bytes),
+            "the byte-mode API is not called in block mode"
+        );
+    }
+
+    /// Pool blocks that the groups hold for a forward over
+    /// `computed_before..computed_after`, in either mode.
+    pub(crate) fn projected_blocks(
+        &self,
+        computed_before: usize,
+        computed_after: usize,
+    ) -> Option<usize> {
+        self.project(computed_before, computed_after)
+            .map(|lease| lease.blocks())
+    }
+
+    /// Pool blocks that the state groups hold for one running request: the
+    /// blocks of the state charge, or `usize::MAX` when its bytes overflow.
+    pub(crate) fn fixed_request_blocks(&self) -> usize {
+        self.state.as_ref().map_or(usize::MAX, GroupedLease::blocks)
     }
 
     fn project(&self, computed_before: usize, computed_after: usize) -> Option<GroupedLease> {
@@ -294,6 +363,7 @@ impl GroupedKvPool {
         computed_before: usize,
         computed_after: usize,
     ) -> Option<u64> {
+        self.debug_assert_byte_mode();
         self.project(computed_before, computed_after)
             .map(|lease| lease.bytes)
     }
@@ -302,6 +372,7 @@ impl GroupedKvPool {
     /// its context length: the state charge computed when the pool is built,
     /// or `u64::MAX` when those bytes overflow.
     pub(crate) fn fixed_request_bytes(&self) -> u64 {
+        self.debug_assert_byte_mode();
         self.state.as_ref().map_or(u64::MAX, |state| state.bytes)
     }
 
@@ -313,6 +384,7 @@ impl GroupedKvPool {
         computed_before: usize,
         computed_after: usize,
     ) -> bool {
+        self.debug_assert_byte_mode();
         let Some(projected) = self.project(computed_before, computed_after) else {
             return false;
         };
@@ -329,6 +401,7 @@ impl GroupedKvPool {
     }
 
     pub(crate) fn release(&mut self, lease: &mut Option<GroupedLease>) {
+        self.debug_assert_byte_mode();
         if let Some(lease) = lease.take() {
             self.used_bytes -= lease.bytes;
             self.active_blocks -= lease.blocks();
@@ -662,6 +735,7 @@ mod tests {
                         previous: Some((ids[5], 2)),
                         copy: Some(ids[6]),
                         checkpoint: Some((ids[7], 8)),
+                        published: None,
                     }),
                 ],
                 allocated: true,
@@ -707,5 +781,25 @@ mod tests {
             assert_eq!(pool.required_bytes(0, 1), None);
             assert!(!pool.allocate(&mut None, 0, 1));
         }
+    }
+
+    #[test]
+    fn block_mode_forward_test_counts_each_state_group_once() {
+        // The full-attention group, then the ring and the KDA state with one
+        // block each. A forward to 10 tokens holds 3 attention blocks and 2
+        // state blocks in either mode.
+        let bytes = GroupedKvPool::new(three_groups(), 12 * 8);
+        let blocks = GroupedKvPool::with_prefix_cache(three_groups(), 12 * 8, 8);
+        for pool in [&bytes, &blocks] {
+            assert_eq!(pool.projected_blocks(0, 0), Some(0));
+            assert_eq!(pool.projected_blocks(0, 10), Some(5));
+            assert_eq!(pool.projected_blocks(0, 4), Some(3));
+            assert_eq!(pool.fixed_request_blocks(), 2);
+        }
+        assert_eq!(bytes.required_bytes(0, 10), Some(5 * 8));
+        assert_eq!(bytes.fixed_request_bytes(), 2 * 8);
+        // The block pool is untouched by the test.
+        assert_eq!(blocks.active_blocks(), 0);
+        assert_eq!(blocks.block_pool().unwrap().capacity_blocks(), 12);
     }
 }

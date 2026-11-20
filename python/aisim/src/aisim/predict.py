@@ -59,23 +59,20 @@ class PredictionResult:
     report: ReplayReport
 
 
-def _prediction_adapter_context(config: CorePredictionConfig) -> PredictionAdapterContext:
-    return PredictionAdapterContext(
+def compile_prediction_adapters(
+    config: CorePredictionConfig,
+    adapter_configs: Mapping[str, Mapping[str, Any]],
+    adapters: Mapping[str, SimulationConfigAdapter],
+    *,
+    stack: str,
+) -> dict[str, AdapterReplaySpec]:
+    context = PredictionAdapterContext(
         engine=config.engine.model_dump(mode="json", exclude_none=True),
         traffic=config.traffic.model_dump(mode="json", exclude_none=True),
         evaluation=config.evaluation.model_dump(mode="json", exclude_none=True),
     )
-
-
-def _compile_prediction_adapters(
-    configs: Mapping[str, Mapping[str, Any]],
-    adapters: Mapping[str, SimulationConfigAdapter],
-    *,
-    stack: str,
-    context: PredictionAdapterContext,
-) -> dict[str, AdapterReplaySpec]:
     compiled: dict[str, AdapterReplaySpec] = {}
-    for section, raw in configs.items():
+    for section, raw in adapter_configs.items():
         name = f"{stack}.{section}"
         adapter = adapters[name]
         compiled[name] = adapter.compile_prediction(raw, context)
@@ -121,12 +118,7 @@ def run_prediction(
     providers = dict(providers or {})
     encoder = config.engine.workers.encoder
     analytical_epd = encoder is not None and encoder.mode == "analytical"
-    adapter_specs = _compile_prediction_adapters(
-        adapter_configs,
-        providers,
-        stack=stack,
-        context=_prediction_adapter_context(config),
-    )
+    adapter_specs = compile_prediction_adapters(config, adapter_configs, providers, stack=stack)
     spec = prediction_to_replay_spec(
         config,
         adapter_specs=adapter_specs,

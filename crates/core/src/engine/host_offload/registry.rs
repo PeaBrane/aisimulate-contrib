@@ -289,7 +289,6 @@ impl HostTierHandle {
         self.0.lock().unwrap()
     }
 
-    #[cfg(test)]
     pub(crate) fn new(tier: HostTier) -> Self {
         Self(Pool::new(tier))
     }

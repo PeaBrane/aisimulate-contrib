@@ -444,9 +444,8 @@ keeps its source, locked dependencies, wheel, and inventory unchanged.
 | `collector-check.yml` | Source install can build a local wheel | Disposable install wheel; cross-backend `.md`/`.json` reports only |
 | `readme-checks.yml` | Source/development/release/macOS profiles keep isolated workspaces without a storage environment; the separate Dynamo job builds or reuses a verified matching pinned RC wheel set in `pr-wheel-staging` | Artifactory `readme-rc-wheels-<build-input-hash>` for the three RC wheels and build-input record; Actions retains only its completion manifest and command/provenance reports; every README command runs afresh |
 | `accuracy-digest.yml` | No product wheel generation; consumes qualified accuracy data | Actions preview, report, and delivery-state data only |
-| `fast-ci.yml` | No product wheel producer; dependency installs/tests may create temporary fixture wheels | Actions source provenance only; fixtures are disposable |
+| `fast-ci.yml` | No product wheel producer; dependency installs and policy/ownership tests may create temporary fixture wheels | Actions source provenance only; fixtures are disposable |
 | `pages.yml` | No product wheel producer; dependencies/tests and allowlisted site packaging | Pages/site and validation data only |
-| `codeowners.yml` | No wheel generation | No wheel handoff |
 | `slack-review-digest.yml` | No wheel generation | No wheel handoff |
 
 The platform Dockerfile's legacy `aiconfigurator` migration-fixture wheel remains inside the local test build stage. The shared manylinux builder's unrepaired wheel is temporary; only its repaired caller-selected output enters a retained handoff. Simulation transfers include every wheel in the bundle, not just the AISim filename. No exported Actions or BuildKit cache is used as a wheel handoff; ordinary dependency-install caches do not change the producer/consumer storage contract.

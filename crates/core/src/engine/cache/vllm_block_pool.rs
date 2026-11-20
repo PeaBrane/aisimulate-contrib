@@ -452,6 +452,10 @@ pub(crate) struct VllmBlockPool {
     token_aliases: Option<Box<FxHashMap<BlockCopyId, Vec<SequenceHash>>>>,
     state_index: Option<Box<StateIndex>>,
     grouped_index: Option<Box<GroupedIndex>>,
+    /// Raised when a grouped key gains its first indexed copy or loses its
+    /// last one, the only changes of `key_hit(..).is_some()` for a grouped
+    /// key. Equal values mean the same set of resident grouped keys.
+    grouped_key_generation: u64,
     /// See [`Self::state_visibility_epoch`].
     state_visibility_epoch: u64,
     /// Intrusive ordinary LRU: head is evicted first, tail was released last.
@@ -484,6 +488,7 @@ impl VllmBlockPool {
             token_aliases: None,
             state_index: None,
             grouped_index: None,
+            grouped_key_generation: 0,
             state_visibility_epoch: 0,
             inactive_head: None,
             inactive_tail: None,
@@ -542,6 +547,11 @@ impl VllmBlockPool {
             // A held source is referenced by its transfer, not evictable.
             is_active: *refs > 0 || *pins > 0 || self.holds_source(id),
         })
+    }
+
+    /// See the field `grouped_key_generation`.
+    pub(crate) fn grouped_key_generation(&self) -> u64 {
+        self.grouped_key_generation
     }
 
     /// Counts the state keys that became visible. While it stands still, no
@@ -949,7 +959,10 @@ impl VllmBlockPool {
                     index.by_copy.insert(id, group).is_none(),
                     "private copy retains a grouped key"
                 );
-                Self::index_copy(&mut index.by_key, (group, hash), id)
+                let (became_visible, became_redundant) =
+                    Self::index_copy(&mut index.by_key, (group, hash), id);
+                self.grouped_key_generation += u64::from(became_visible);
+                (became_visible, became_redundant)
             }
         };
         if became_redundant {
@@ -1400,7 +1413,9 @@ impl VllmBlockPool {
                     Some(group),
                     "grouped identity changed"
                 );
-                Self::remove_from_index(&mut index.by_key, (group, hash), id)
+                let removed = Self::remove_from_index(&mut index.by_key, (group, hash), id);
+                self.grouped_key_generation += u64::from(removed);
+                removed
             }
         };
         if !removed && self.belady.is_some() && !self.key_has_duplicates(hash) {

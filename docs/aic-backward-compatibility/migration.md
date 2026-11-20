@@ -711,6 +711,20 @@ explains the retained workload routing and feature mathematics.
   replay do not read the field, so such a session does not need it. A new
   import of the same observations, as for `prefix_cacheable` above, also
   writes it.
+- A profile imported before these fields existed holds no `prefix_cacheable`
+  marks either, so its plan is cold and a configuration with prefix caching is
+  refused. If you set the marks by hand, also set
+  `runtime_memory.runtime_framework_version` to the version that the probe ran
+  on. With the marks and without the version, a label of `0.31.0` or `0.32.0`
+  on vLLM 0.33.0 evidence can plan grouped prefix caching on, which is not
+  modeled.
+- An onboarding plan that an earlier AISim saved for a grouped profile holds
+  `prefix_caching: false`, because that AISim planned every grouped profile
+  cold. The commands that verify a saved plan still accept it, and it keeps
+  prefix caching off until `aisim onboard plan --overwrite` writes the plan
+  again. A profile of `backend_version` 0.31.0 or 0.32.0 with prefix-caching
+  evidence of that version then plans prefix caching on. `aisim onboard
+  finalize` plans the resolved profile with the current rule.
 - `FpmRuntimeMemoryConfig` literals must supply `enable_prefix_caching`,
   `mamba_cache_mode`, `hash_block_size_tokens` and `runtime_framework_version`
   as `None`. Serialized records that omit these fields still deserialize, and

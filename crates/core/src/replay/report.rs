@@ -781,24 +781,29 @@ impl TtftMilestoneTimes {
     }
 }
 
-#[derive(Debug)]
-enum TokenTimeline {
-    Recording(Vec<f64>),
-    Finalized(FinalizedTokenTimeline),
-}
-
-impl Default for TokenTimeline {
-    fn default() -> Self {
-        Self::Recording(Vec::new())
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct FinalizedTokenTimeline {
+/// Running fold of a request's output-token timestamps. Reports read only the
+/// first, second and last timestamp and the count, so each token updates those
+/// in place instead of being retained.
+#[derive(Debug, Default)]
+struct TokenTimeline {
     first_ms: f64,
-    second_ms: Option<f64>,
+    second_ms: f64,
     last_ms: f64,
     len: usize,
+    /// A finalized timeline ignores further tokens.
+    finalized: bool,
+}
+
+impl TokenTimeline {
+    fn push(&mut self, token_time_ms: f64) {
+        match self.len {
+            0 => self.first_ms = token_time_ms,
+            1 => self.second_ms = token_time_ms,
+            _ => {}
+        }
+        self.last_ms = token_time_ms;
+        self.len += 1;
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1133,8 +1138,8 @@ pub struct TraceCollector {
     /// time. Warmed reports rebase measured request and play outcome timestamps
     /// to the profile barrier when building the report.
     report_start_ms: f64,
-    /// Keep completed token timelines until `finish()` instead of folding them
-    /// synchronously in `on_terminal`.
+    /// Keep completed token timelines open until `finish()` instead of
+    /// finalizing them in `on_terminal`.
     defer_token_timeline_finalization: bool,
     /// When `true`, `finish()` populates `ReplayReport::per_request`.
     /// Default `false` to skip the ~100ms terminal pass + ~30MB allocation
@@ -1177,24 +1182,15 @@ pub struct TraceCollector {
 
 impl TraceRequestStats {
     fn first_token_ms(&self) -> Option<f64> {
-        match &self.token_timeline {
-            TokenTimeline::Recording(times) => times.first().copied(),
-            TokenTimeline::Finalized(summary) => Some(summary.first_ms),
-        }
+        (self.token_timeline.len > 0).then_some(self.token_timeline.first_ms)
     }
 
     fn last_token_ms(&self) -> Option<f64> {
-        match &self.token_timeline {
-            TokenTimeline::Recording(times) => times.last().copied(),
-            TokenTimeline::Finalized(summary) => Some(summary.last_ms),
-        }
+        (self.token_timeline.len > 0).then_some(self.token_timeline.last_ms)
     }
 
     fn actual_output_length(&self) -> usize {
-        match &self.token_timeline {
-            TokenTimeline::Recording(times) => times.len(),
-            TokenTimeline::Finalized(summary) => summary.len,
-        }
+        self.token_timeline.len
     }
 
     fn mean_tpot_ms(&self) -> Option<f64> {
@@ -1209,35 +1205,8 @@ impl TraceRequestStats {
     }
 
     fn ttst_ms(&self) -> Option<f64> {
-        let (first_token_ms, second_token_ms) = match &self.token_timeline {
-            TokenTimeline::Recording(times) => {
-                let [first_token_ms, second_token_ms, ..] = times.as_slice() else {
-                    return None;
-                };
-                (*first_token_ms, *second_token_ms)
-            }
-            TokenTimeline::Finalized(summary) => (summary.first_ms, summary.second_ms?),
-        };
-        Some((second_token_ms - first_token_ms).max(0.0))
-    }
-
-    /// Completed requests no longer retain one timestamp per emitted token.
-    fn finalize_token_timeline(&mut self) {
-        let TokenTimeline::Recording(times) = &self.token_timeline else {
-            return;
-        };
-
-        let Some(first_ms) = times.first().copied() else {
-            self.token_timeline = TokenTimeline::default();
-            return;
-        };
-        let summary = FinalizedTokenTimeline {
-            first_ms,
-            second_ms: times.get(1).copied(),
-            last_ms: times.last().copied().unwrap_or(first_ms),
-            len: times.len(),
-        };
-        self.token_timeline = TokenTimeline::Finalized(summary);
+        let timeline = &self.token_timeline;
+        (timeline.len >= 2).then(|| (timeline.second_ms - timeline.first_ms).max(0.0))
     }
 }
 
@@ -1293,8 +1262,7 @@ impl TraceCollector {
         let Some(mut summary) = self.bounded_summary.take() else {
             return Ok(());
         };
-        for (_, mut stats) in self.requests.drain() {
-            stats.finalize_token_timeline();
+        for (_, stats) in self.requests.drain() {
             summary.add(&stats, self.sla).map_err(|error| {
                 crate::replay::ReplayError::ResourceLimited(format!("report storage: {error:#}"))
             })?;
@@ -1318,7 +1286,7 @@ impl TraceCollector {
         self.requests.contains_key(&uuid)
     }
 
-    /// Defer token-timeline folding until the entire replay has ended.
+    /// Defer token-timeline finalization until the entire replay has ended.
     pub fn set_defer_token_timeline_finalization(&mut self, value: bool) {
         self.defer_token_timeline_finalization = value;
     }
@@ -1872,7 +1840,8 @@ impl TraceCollector {
                 completed_to_retire.push(uuid);
             }
             if !*defer_token_timeline_finalization {
-                stats.finalize_token_timeline();
+                // A request that ends before its first token keeps recording.
+                stats.token_timeline.finalized = stats.token_timeline.len > 0;
             }
         }
     }
@@ -1886,9 +1855,9 @@ impl TraceCollector {
 
     pub fn on_token(&mut self, uuid: Uuid, token_time_ms: f64) {
         if let Some(stats) = self.requests.get_mut(&uuid)
-            && let TokenTimeline::Recording(times) = &mut stats.token_timeline
+            && !stats.token_timeline.finalized
         {
-            times.push(token_time_ms);
+            stats.token_timeline.push(token_time_ms);
         }
     }
 
@@ -1896,15 +1865,15 @@ impl TraceCollector {
     /// received at `received_ms` after detokenization.
     pub(crate) fn on_detokenized_token(&mut self, uuid: Uuid, emitted_ms: f64, received_ms: f64) {
         if let Some(stats) = self.requests.get_mut(&uuid)
-            && let TokenTimeline::Recording(times) = &mut stats.token_timeline
+            && !stats.token_timeline.finalized
         {
-            if times.is_empty() {
+            if stats.token_timeline.len == 0 {
                 stats
                     .ttft_milestones
                     .first_token_emitted_ms
                     .get_or_insert(emitted_ms);
             }
-            times.push(received_ms);
+            stats.token_timeline.push(received_ms);
         }
     }
 
@@ -1985,14 +1954,6 @@ impl TraceCollector {
             keys.sort_unstable();
             keys.into_iter().map(|(.., uuid)| uuid).collect::<Vec<_>>()
         };
-
-        for uuid in &request_order {
-            let stats = self
-                .requests
-                .get_mut(uuid)
-                .expect("request order must reference retained request");
-            stats.finalize_token_timeline();
-        }
 
         // Build per-request records before we move `self.requests` into the
         // summary aggregation below. Gated on `capture_per_request` — the
@@ -2410,17 +2371,6 @@ impl TraceCollector {
                 first_admission_reused_input_tokens: stats.first_admission_reused_input_tokens,
             })
             .collect()
-    }
-
-    #[cfg(test)]
-    fn retained_token_timestamps(&self) -> usize {
-        self.requests
-            .values()
-            .map(|stats| match &stats.token_timeline {
-                TokenTimeline::Recording(times) => times.len(),
-                TokenTimeline::Finalized(_) => 0,
-            })
-            .sum()
     }
 }
 
@@ -3105,14 +3055,12 @@ mod tests {
         )))
         .unwrap();
         let cases = fixture["cases"].as_array().unwrap();
-        // Eager and deferred timeline finalization fold the same request samples.
-        for (case, deferred) in cases.iter().flat_map(|case| [(case, false), (case, true)]) {
+        for case in cases {
             // Replay models a one-token first chunk, AIPerf's default divisor.
             if case["per_chunk_usage"].as_bool().unwrap() {
                 continue;
             }
             let mut collector = TraceCollector::default();
-            collector.set_defer_token_timeline_finalization(deferred);
             for (index, row) in case["rows"].as_array().unwrap().iter().enumerate() {
                 let uuid = Uuid::from_u128(index as u128 + 1);
                 let output = row[2].as_u64().unwrap() as usize;
@@ -3732,49 +3680,21 @@ mod tests {
     }
 
     #[test]
-    fn terminal_request_releases_per_token_timestamps() {
-        let uuid = Uuid::from_u128(7);
-        let mut collector = TraceCollector::default();
-        collector.on_arrival(uuid, 0.0, 128, 100_000);
-        collector.on_admit(uuid, 1.0, 0);
-        for token_index in 0..100_000 {
-            collector.on_token(uuid, token_index as f64 + 10.0);
+    fn token_after_terminal_is_recorded_only_if_deferred_or_first() {
+        // (deferred, tokens before the terminal, tokens once one more has arrived)
+        for (deferred, before, after) in [(false, 3, 3), (true, 3, 4), (false, 0, 1)] {
+            let uuid = Uuid::from_u128(7);
+            let mut collector = TraceCollector::default();
+            collector.set_defer_token_timeline_finalization(deferred);
+            collector.on_arrival(uuid, 0.0, 128, 3);
+            for token in 0..before {
+                collector.on_token(uuid, 10.0 + token as f64);
+            }
+            collector.on_terminal(uuid, 15.0, ReplayTerminalStatus::Completed);
+            collector.on_token(uuid, 22.0);
+
+            let recorded = collector.snapshot(uuid).unwrap().output_length;
+            assert_eq!(recorded, after, "deferred={deferred}, before={before}");
         }
-        assert_eq!(collector.retained_token_timestamps(), 100_000);
-
-        collector.on_terminal(uuid, 100_009.0, ReplayTerminalStatus::Completed);
-
-        assert_eq!(collector.retained_token_timestamps(), 0);
-        let snapshot = collector
-            .snapshot(uuid)
-            .expect("request must remain summarized");
-        assert_eq!(snapshot.output_length, 100_000);
-        assert_eq!(snapshot.first_token_ms, Some(10.0));
-        assert_eq!(snapshot.last_token_ms, Some(100_009.0));
-        let report = collector.finish();
-        assert_eq!(report.latency.itl.distribution.mean_ms, 1.0);
-        assert_eq!(report.latency.itl.distribution.min_ms, 1.0);
-        assert_eq!(report.latency.itl.distribution.max_ms, 1.0);
-    }
-
-    #[test]
-    fn deferred_token_timeline_finalization_folds_at_finish() {
-        let uuid = Uuid::from_u128(8);
-        let mut collector = TraceCollector::default();
-        collector.set_defer_token_timeline_finalization(true);
-        collector.on_arrival(uuid, 0.0, 128, 3);
-        collector.on_admit(uuid, 1.0, 0);
-        collector.on_token(uuid, 10.0);
-        collector.on_token(uuid, 12.0);
-        collector.on_token(uuid, 15.0);
-        collector.on_terminal(uuid, 15.0, ReplayTerminalStatus::Completed);
-
-        assert_eq!(collector.retained_token_timestamps(), 3);
-
-        let report = collector.finish();
-        // One per-request ITL sample, (15 - 10) / 2.
-        assert_eq!(report.latency.itl.distribution.mean_ms, 2.5);
-        assert_eq!(report.latency.itl.distribution.min_ms, 2.5);
-        assert_eq!(report.latency.itl.distribution.max_ms, 2.5);
     }
 }

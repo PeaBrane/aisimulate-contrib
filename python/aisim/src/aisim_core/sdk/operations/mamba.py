@@ -33,21 +33,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _cache_key(database: PerfDatabase) -> tuple:
-    """Shared cache key — same shape as every other migrated op.
-
-    TODO: hoist to ``operations/base.py`` once Phase 3 settles (6 op
-    families duplicating this helper now).
-    """
-    return (
-        database.systems_root,
-        database.system,
-        database.backend,
-        database.version,
-        database.enable_shared_layer,
-    )
-
-
 class Mamba2Kernel(_core.Mamba2Kernel, OpShellKit):
     """
     Single Mamba2 kernel op (Conv1D or SSM) using collected mamba2_perf data.
@@ -69,10 +54,6 @@ class Mamba2Kernel(_core.Mamba2Kernel, OpShellKit):
     # ------------------------------------------------------------------
 
     @classmethod
-    def _cache_key(cls, database: PerfDatabase) -> tuple:
-        return _cache_key(database)
-
-    @classmethod
     def load_data(cls, database: PerfDatabase) -> None:
         """Idempotent. Fetches the engine's mamba2_perf table view and binds
         ``database._mamba2_data``. No extrapolation (data is keyed by
@@ -91,14 +72,6 @@ class Mamba2Kernel(_core.Mamba2Kernel, OpShellKit):
     @classmethod
     def clear_cache(cls) -> None:
         cls._data_cache.clear()
-
-    # ------------------------------------------------------------------
-    # Query table (formerly PerfDatabase.query_mamba2)
-    # ------------------------------------------------------------------
-
-    # ------------------------------------------------------------------
-    # Op contract
-    # ------------------------------------------------------------------
 
 
 class GDNKernel(_core.GDNKernel, OpShellKit):
@@ -126,10 +99,6 @@ class GDNKernel(_core.GDNKernel, OpShellKit):
     # ------------------------------------------------------------------
 
     @classmethod
-    def _cache_key(cls, database: PerfDatabase) -> tuple:
-        return _cache_key(database)
-
-    @classmethod
     def load_data(cls, database: PerfDatabase) -> None:
         """Idempotent. Fetches the engine's gdn_perf table view and binds
         ``database._gdn_data``."""
@@ -147,14 +116,6 @@ class GDNKernel(_core.GDNKernel, OpShellKit):
     @classmethod
     def clear_cache(cls) -> None:
         cls._data_cache.clear()
-
-    # ------------------------------------------------------------------
-    # Query table (formerly PerfDatabase.query_gdn)
-    # ------------------------------------------------------------------
-
-    # ------------------------------------------------------------------
-    # Op contract
-    # ------------------------------------------------------------------
 
 
 class KDAKernel(_core.KDAKernel, OpShellKit):
@@ -182,12 +143,6 @@ class KDAKernel(_core.KDAKernel, OpShellKit):
     """
 
     _data_cache: ClassVar[dict] = {}
-
-    @classmethod
-    def _cache_key(cls, database: PerfDatabase) -> tuple:
-        # Formerly inherited from the Python GDNKernel base; the Rust-backed
-        # shells are siblings, so the key lives here explicitly.
-        return _cache_key(database)
 
     @classmethod
     def load_data(cls, database: PerfDatabase) -> None:

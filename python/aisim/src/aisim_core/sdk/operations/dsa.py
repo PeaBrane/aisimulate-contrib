@@ -88,35 +88,9 @@ def _normalize_projection_quant_modes(overrides, gemm_quant_mode) -> dict:
     return {**dict.fromkeys(_DSA_PROJECTION_GROUPS, gemm_quant_mode), **overrides}
 
 
-# Extrapolation grids — lifted verbatim from the legacy blocks in
-# ``PerfDatabase.__init__``.
-
-# fmt: on
-
-
-def _cache_key(database: PerfDatabase) -> tuple:
-    """Shared cache key — same shape as GEMM, Attention, and Communication.
-
-    Still local to ``operations/dsa.py`` (Phase 3 has 5 duplicate copies
-    so far); the cleanup PR hoists this to ``operations/base.py`` once
-    Phase 3 settles.
-    """
-    return (
-        database.systems_root,
-        database.system,
-        database.backend,
-        database.version,
-        database.enable_shared_layer,
-    )
-
-
 class ContextDSAModule(_core.ContextDSAModule, OpShellKit):
     """
     Context phase DSA (DeepSeek Sparse Attention) module-level operation.
-
-    Owns ``_data_cache`` (extrapolated context_dsa_module CSV) AND
-    ``_raw_data_cache`` (the same CSV pre-extrapolation, used by the
-    topk-boundary piecewise interpolation path).
 
     Models the full DSA attention block including:
     - kv_a_proj_with_mqa GEMM (includes indexer K projection)
@@ -135,10 +109,6 @@ class ContextDSAModule(_core.ContextDSAModule, OpShellKit):
     # ------------------------------------------------------------------
     # Data ownership
     # ------------------------------------------------------------------
-
-    @classmethod
-    def _cache_key(cls, database: PerfDatabase) -> tuple:
-        return _cache_key(database)
 
     @classmethod
     def load_data(cls, database: PerfDatabase) -> None:
@@ -189,14 +159,6 @@ class ContextDSAModule(_core.ContextDSAModule, OpShellKit):
         cls._raw_skip_data_cache.clear()
 
     # ------------------------------------------------------------------
-    # Query table (formerly PerfDatabase.query_context_dsa_module)
-    # ------------------------------------------------------------------
-
-    # ------------------------------------------------------------------
-    # Op contract
-    # ------------------------------------------------------------------
-
-    # ------------------------------------------------------------------
     # Context-Parallel (CP) prefill model — GLM-5 DSA only.
     # See docs/CONTEXT_PARALLEL_DSA_MODELING.md. Per-card =
     #   base dsa_module(isl/cp, bf16-KV row)
@@ -210,10 +172,6 @@ class ContextDSAModule(_core.ContextDSAModule, OpShellKit):
 class GenerationDSAModule(_core.GenerationDSAModule, OpShellKit):
     """
     Generation phase DSA (DeepSeek Sparse Attention) module-level operation.
-
-    Owns both an extrapolated working cache and the original measured rows.
-    The raw view supplies trustworthy boundary utilization when a sequence
-    query falls outside a collected curve.
 
     Models the full DSA attention block during decode:
     - Same components as ContextDSAModule
@@ -229,10 +187,6 @@ class GenerationDSAModule(_core.GenerationDSAModule, OpShellKit):
     # ------------------------------------------------------------------
     # Data ownership
     # ------------------------------------------------------------------
-
-    @classmethod
-    def _cache_key(cls, database: PerfDatabase) -> tuple:
-        return _cache_key(database)
 
     @classmethod
     def load_data(cls, database: PerfDatabase) -> None:
@@ -279,10 +233,6 @@ class GenerationDSAModule(_core.GenerationDSAModule, OpShellKit):
         cls._raw_data_cache.clear()
         cls._skip_data_cache.clear()
         cls._raw_skip_data_cache.clear()
-
-    # ------------------------------------------------------------------
-    # Query table (formerly PerfDatabase.query_generation_dsa_module)
-    # ------------------------------------------------------------------
 
     # ------------------------------------------------------------------
     # Op contract

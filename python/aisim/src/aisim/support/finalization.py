@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import shutil
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -17,7 +18,7 @@ from typing import Any
 from aisim.fpm_profile import FpmResourceProfile
 
 from .config_profile import _linear_layout_gap, linear_runtime_resources
-from .plan import _plan_documents, check_plan, plan_lock, request_id
+from .plan import _plan_documents, check_plan, plan_lock, prefix_caching_note, request_id
 from .schema import FPMDeployment, SupportRequest
 
 _SCHEMA = "aisimulate-onboarding-finalization/v1"
@@ -647,6 +648,9 @@ def run_finalization(args: argparse.Namespace) -> int:
         memory_config=args.memory_config,
         collection_report=args.collection_report,
     )
+    note = prefix_caching_note(SupportRequest.from_yaml(result["request"]))
+    if note is not None:
+        print(note, file=sys.stderr)
     print(json.dumps(result, indent=2, sort_keys=True))
     print("Runtime memory resolved. Review the new profile before accepting it in the onboarding checkpoint.")
     return 0

@@ -1,6 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-FileCopyrightText: Copyright 2023-2026 SGLang Team
 // SPDX-License-Identifier: Apache-2.0
+// Hybrid checkpoint contract adapted and modified from SGLang (Apache-2.0).
+// Copyright 2023-2026 SGLang Team.
+// Source: https://github.com/sgl-project/sglang/blob/94602c9c2b7cbdb8efd5c52802dac6a1c180089e/python/sglang/srt/runtime_context.py
+// See THIRD_PARTY_NOTICES.md for the complete source list and modification scope.
 // Modified behavioral adaptation of SGLang v0.5.22; see THIRD_PARTY_NOTICES.md.
 // Source: https://github.com/sgl-project/sglang/tree/baa9befa381511cd4d56f83980951e5a45fffc6d
 
@@ -112,13 +116,15 @@ impl SchedulerRank {
     }
 
     /// Pull hinted prefixes from peer ranks' G2. Returns this rank's own G2,
-    /// or `None` for an engine without KVCR.
+    /// or `None` for an engine without KVCR. A G2 block holds the KV of one
+    /// of the rank's `gpus_per_rank` GPUs.
     pub(crate) fn set_kvcr(
         &mut self,
         registry: crate::engine::kvcr::SharedKvcrRegistry,
         rank: KvHintSource,
-    ) -> Option<HostTierHandle> {
-        self.core.set_kvcr(registry, rank)
+        gpus_per_rank: usize,
+    ) -> Option<anyhow::Result<HostTierHandle>> {
+        self.core.set_kvcr(registry, rank, gpus_per_rank)
     }
 
     pub(crate) fn set_host_offload_observer(&mut self, observer: Arc<dyn HostOffloadObserver>) {
@@ -665,6 +671,7 @@ fn core_args(config: &EngineConfig, timing: Arc<dyn TimingModel>) -> MockEngineA
         kv_cache_bytes_per_token: config.kv_cache_bytes_per_token,
         kv_cache_groups: config.kv_cache_groups.clone(),
         kv_cache_capacity_bytes: config.kv_cache_capacity_bytes,
+        vllm_version: config.vllm_version.clone(),
         native_host_offload: config.resolved_host_offload(),
         state_cache: config.state_cache,
         prefix_match_unit: config.prefix_match_unit,
@@ -678,6 +685,7 @@ fn core_args(config: &EngineConfig, timing: Arc<dyn TimingModel>) -> MockEngineA
             PreemptionMode::Fifo => CorePreemptionMode::Fifo,
         },
         sglang: Some(SglangArgs {
+            mamba_cache: config.sglang.mamba_cache,
             hicache: config.sglang.hicache,
             schedule_policy: Some(
                 match config.sglang.schedule_policy {
@@ -838,6 +846,7 @@ fn map_metrics(metrics: MockerMetrics) -> Metrics {
         total_blocks: metrics.total_blocks,
         kv_cache_used_bytes: metrics.kv_cache_used_bytes,
         kv_cache_capacity_bytes: metrics.kv_cache_capacity_bytes,
+        kv_cache_cached_bytes: metrics.kv_cache_cached_bytes,
         cache_usage: metrics.gpu_cache_usage_perc,
         physical_cache_usage: metrics.physical_gpu_cache_usage_perc,
         running_requests: metrics.running_requests,

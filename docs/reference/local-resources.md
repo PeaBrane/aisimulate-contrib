@@ -133,8 +133,8 @@ use the same reservation rule; wave admission also deducts live child RSS.
 
 For synthetic workloads, the built-in native-engine planning model,
 `engine-session-metadata-v2`, charges every turn 4,096 bytes plus 32 bytes per
-input and output token of that turn. This covers the turn's eagerly stored
-prompt delta or hash IDs, planned output IDs, its share of the session
+input and output token of that turn. This covers the turn's
+hash IDs, planned output IDs, its share of the session
 transcript, and a prefix-cache index with one-token blocks. A turn retains only
 its own tokens. The 32-byte token allowance is multiplied by the number of
 independent worker/attention-DP caches, capped at the number of turns per pool
@@ -159,7 +159,7 @@ storage. A verified newer adapter can supply its own estimate; AISim does
 not import Dynamo or assume that installing a core lazy-source API automatically
 changes the adapter's allocation behavior. Ordinary finite Agentic Mooncake,
 Weka, and agentic-Dynamo replay use the shared workload driver with deferred
-prompts on both stacks; they do not use the synthetic eager-prompt estimate.
+prompts on both stacks; they do not use the synthetic estimate.
 
 An estimate is a planning heuristic, not a hard RSS limit. An unavoidable lower
 bound can prove a candidate does not fit; it cannot prove that execution fits.
@@ -238,8 +238,7 @@ The counters follow each format's loader:
   provenance. Mooncake-family loaders convert source hashes row by row, so their
   bound omits the source-hash term. A Mooncake or Mooncake-delta row without
   an input length is sized as its hash count times the configured block size,
-  as the loader does. Mooncake-delta setup synthesizes every turn's prompt, so
-  its bound counts 4 bytes per input token of every row with the planned outputs.
+  as the loader does.
 - Applied-compute agentic counts `num_turns + 1` requests per session and its
   assistant and final response lengths. Each turn's prompt adds the previous
   response and tool output, so the final cumulative prompt is the largest. The

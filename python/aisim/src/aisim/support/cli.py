@@ -36,7 +36,13 @@ from .config_profile import (
     validate_overrides,
 )
 from .fpm import run_fpm
-from .plan import MEMORY_OBSERVATION_VERSIONS, audited_memory_release, create_plan, request_id
+from .plan import (
+    MEMORY_OBSERVATION_VERSIONS,
+    audited_memory_release,
+    create_plan,
+    prefix_caching_note,
+    request_id,
+)
 from .schema import (
     AGENTX_REFERENCE_CONTEXT,
     CUDAGRAPH_MODES,
@@ -1381,6 +1387,9 @@ def _plan(args: argparse.Namespace) -> int:
     request = SupportRequest.from_yaml(args.config)
     root = Path(args.output_dir).expanduser().resolve()
     plan = create_plan(request, root, overwrite=args.overwrite)
+    note = prefix_caching_note(request)
+    if note is not None:
+        print(note, file=sys.stderr)
     _print(
         {
             "request_id": plan["request_id"],

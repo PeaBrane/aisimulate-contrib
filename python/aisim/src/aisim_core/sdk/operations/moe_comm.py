@@ -41,17 +41,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _cache_key(database: PerfDatabase) -> tuple:
-    """Shared cache key — same shape as every other migrated op family."""
-    return (
-        database.systems_root,
-        database.system,
-        database.backend,
-        database.version,
-        database.enable_shared_layer,
-    )
-
-
 @dataclass(frozen=True)
 class MoECommBackendSpec:
     """Static description of one MoE all-to-all comm backend."""
@@ -255,10 +244,6 @@ class MoEAllToAll(_core.MoEAllToAll, OpShellKit):
     # ------------------------------------------------------------------
 
     @classmethod
-    def _cache_key(cls, database: PerfDatabase) -> tuple:
-        return _cache_key(database)
-
-    @classmethod
     def load_data(cls, database: PerfDatabase) -> None:
         """Idempotent. Fetches the engine's unified moe_a2a table view (new
         schema + legacy adapters, merged engine-side) on the three inference
@@ -354,10 +339,6 @@ class MoEExpertCompute(_core.MoEExpertCompute, OpShellKit):
     # ------------------------------------------------------------------
 
     @classmethod
-    def _cache_key(cls, database: PerfDatabase) -> tuple:
-        return _cache_key(database)
-
-    @classmethod
     def load_data(cls, database: PerfDatabase) -> None:
         """Idempotent. Fetches the engine's unified moe_ep table view (new
         schema + legacy adapters, merged engine-side) on the three inference
@@ -395,7 +376,3 @@ class MoEExpertCompute(_core.MoEExpertCompute, OpShellKit):
     def clear_cache(cls) -> None:
         cls._data_cache.clear()
         cls._wideep_compute_data_cache.clear()
-
-    # ------------------------------------------------------------------
-    # Op contract
-    # ------------------------------------------------------------------

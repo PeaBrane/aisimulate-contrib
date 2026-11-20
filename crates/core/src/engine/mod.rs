@@ -1,5 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
+// Hybrid checkpoint contract adapted and modified from SGLang (Apache-2.0).
+// Copyright 2023-2026 SGLang Team.
+// Source: https://github.com/sgl-project/sglang/blob/94602c9c2b7cbdb8efd5c52802dac6a1c180089e/python/sglang/srt/runtime_context.py
+// See THIRD_PARTY_NOTICES.md for the complete source list and modification scope.
 
 //! Runtime-neutral mock inference schedulers and attention-DP composition.
 
@@ -43,9 +47,10 @@ pub use common::speculative::normalize_conditional_accept_rates;
 pub use config::{AfdAPoolConfig, AfdEngineConfig, AfdFPoolConfig};
 pub use config::{
     Backend, EngineConfig, FrontendConfig, FrontendStage, G2Connector, G2Scope, G3OffloadConfig,
-    G3Scope, KvcrConfig, NativeHostOffloadConfig, PassLaunchConfig, PreemptionMode, SglangConfig,
-    SglangHiCacheConfig, SglangHiCacheWritePolicy, SglangSchedulePolicy, SlidingWindowStateConfig,
-    StateCacheConfig, TrtllmCapacityPolicy, TrtllmConfig, WorkerType,
+    G3Scope, KvcrConfig, KvcrLocalG2Config, KvcrLocalG2Policy, NativeHostOffloadConfig,
+    PassLaunchConfig, PreemptionMode, SglangConfig, SglangHiCacheConfig, SglangHiCacheWritePolicy,
+    SglangMambaCacheConfig, SglangSchedulePolicy, SlidingWindowStateConfig, StateCacheConfig,
+    TrtllmCapacityPolicy, TrtllmConfig, WorkerType,
 };
 pub(crate) use config::{MAX_PIPELINE_FILL_PASSES, afd_total_gpus};
 pub use fitted_timing::FittedIterationTiming;
@@ -54,7 +59,7 @@ pub use handoff::{
     HandoffId, HandoffTransferTiming, TransferTimingMode, prefill_handoff_delay_ms,
     transfer_delay_ms,
 };
-pub use kvcr::{KvcrPullCounts, KvcrStats};
+pub use kvcr::{KvcrLocalG2Stats, KvcrPullCounts, KvcrStats};
 pub use protocol::{
     Admission, CacheTierAttribution, Command, CommandEffects, CommandResult, DecodeAcceptance,
     EncoderShape, ForwardPassMetrics, HostCacheMetrics, ImageSpec, KvBlock, KvEvent, KvEventData,

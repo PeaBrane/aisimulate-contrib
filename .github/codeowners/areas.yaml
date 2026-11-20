@@ -111,6 +111,7 @@ areas:
       - tests/test_aic_sync.py
       - tests/test_cloud_agent_install.py
       - tests/test_ci_workflow_contracts.py
+      - tests/test_fast_ci_policy.py
       - tests/test_full_ci_fail_fast.py
       - tests/test_artifactory_wheel_handoff.py
       - tests/test_ci_qualification.py
@@ -426,7 +427,7 @@ shared:
     owners: [infra, maintainers]
   - glob: .github/codeowners/
     owners: [infra, maintainers]
-  - glob: .github/workflows/codeowners.yml
+  - glob: .github/workflows/fast-ci.yml
     owners: [infra, maintainers]
   - glob: .github/workflows/request-nvskills-ci.yml
     owners: [infra, maintainers]

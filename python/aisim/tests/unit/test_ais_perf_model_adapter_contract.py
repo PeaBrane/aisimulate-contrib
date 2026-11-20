@@ -42,7 +42,7 @@ import pytest
 import aisim_core.systems
 from aisim.config import CorePredictionConfig, CoreRecommendationConfig
 from aisim.config_adapter import CONFIG_ADAPTER_API_VERSION, validate_config_adapter
-from aisim.predict import _compile_prediction_adapters, _prediction_adapter_context
+from aisim.predict import compile_prediction_adapters
 from aisim.recommend import _run_recommendation
 from aisim.sweeper.config import SearchSpace, SmartSearchConfig
 from aisim.sweeper.forward_pass_estimator import ForwardPassEstimatorResolver
@@ -413,11 +413,11 @@ def _recommend(raw: dict[str, Any]) -> dict[str, Any]:
 def _predict(raw: dict[str, Any]) -> dict[str, Any]:
     """Compile a prediction's adapter sections with the stub adapters and return what they saw and read."""
     adapters = _adapters()
-    replays = _compile_prediction_adapters(
+    replays = compile_prediction_adapters(
+        CorePredictionConfig.model_validate(raw),
         {"router": {}, "planner": {}},
         adapters,
         stack=STACK,
-        context=_prediction_adapter_context(CorePredictionConfig.model_validate(raw)),
     )
     router, planner = adapters.values()
     return {

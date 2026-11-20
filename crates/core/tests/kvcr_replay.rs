@@ -123,6 +123,88 @@ fn disaggregated(prefill: usize) -> Value {
 }
 
 #[test]
+fn a_lone_request_is_restored_from_kvcr_memory() {
+    // One rank: G1 of 16 blocks, G2 of 3, KVCR memory of 32. Five other
+    // prompts push PROMPT out of G1 and G2; the last request finds it only
+    // in KVCR-owned memory, with nothing else running, whether the copy back
+    // takes time or not.
+    for copy_gbps in [0.0, 6.0] {
+        let mut rank = rank(json!({"num_host_blocks": 3}));
+        rank["kvcr"] = json!({"local_g2": {"num_blocks": 32, "copy_bandwidth_gbps": copy_gbps}});
+        let mut requests = vec![request("r0", 0.0, &PROMPT)];
+        for other in 1..=5u32 {
+            let tokens = (0..13).map(|token| 100 * other + token).collect::<Vec<_>>();
+            requests.push(request(
+                &format!("r{other}"),
+                100.0 * f64::from(other),
+                &tokens,
+            ));
+        }
+        requests.push(request("r6", 1000.0, &PROMPT));
+        let engine = json!({"dp_size": 1, "rank": rank});
+        let report = run(aggregated(1), engine, requests).unwrap();
+        assert_eq!(host_reuse(&report).last(), Some(&Some(8)), "{copy_gbps}");
+        let local = report.kvcr.unwrap().local_g2.unwrap();
+        assert_eq!((local.promoted_blocks, local.loaded_blocks), (2, 2));
+    }
+}
+
+#[test]
+fn stores_wait_for_g2_room_while_copies_into_kvcr_memory_pin_it() {
+    // One rank with a G2 of 3 blocks. Six prompts of 3 complete blocks each
+    // arrive 2 ms apart. A 1 MB block takes 1 s to copy at 0.001 GB/s, so
+    // the first store pins G2 until all requests finish and later stores
+    // find no room; at 6 GB/s every store is copied.
+    let stored = |copy_gbps: f64, max_sim_time_ms: Option<f64>| {
+        let mut rank = rank(json!({"num_host_blocks": 3}));
+        rank["kvcr"] = json!({"local_g2": {"num_blocks": 32, "copy_bandwidth_gbps": copy_gbps}});
+        let requests = (0..6u32)
+            .map(|index| {
+                let tokens = (0..13).map(|token| 100 * index + token).collect::<Vec<_>>();
+                request(&format!("r{index}"), 2.0 * f64::from(index), &tokens)
+            })
+            .collect::<Vec<_>>();
+        let engine = json!({"dp_size": 1, "rank": rank});
+        let spec: ReplaySpec = serde_json::from_value(json!({
+            "version": 1, "topology": aggregated(1), "engine": engine,
+            "requests": requests, "record_per_request": true,
+            "max_sim_time_ms": max_sim_time_ms,
+        }))
+        .unwrap();
+        let report = Replayer::new(spec, ReplayEngineFactory::new())
+            .unwrap()
+            .run()
+            .unwrap();
+        assert_eq!(report.per_request.len(), 6);
+        assert_eq!(report.request_counts.completed_requests, 6);
+        report.kvcr.unwrap().local_g2.unwrap().stored_blocks
+    };
+    // Uncapped replay drains the slow copy after all requests finish.
+    assert_eq!((stored(0.001, None), stored(6.0, None)), (3, 18));
+    // A report before that copy's deadline must not count its pending blocks.
+    assert_eq!(
+        (stored(0.001, Some(50.0)), stored(6.0, Some(50.0))),
+        (0, 18)
+    );
+}
+
+#[test]
+fn a_parked_store_is_offered_again_when_a_copy_frees_g2() {
+    // One rank with a G2 of 3 blocks; a 1 MB block takes 1 ms to copy. r1's
+    // store finds G2 pinned by r0's copy; the copy ends while r1 decodes its
+    // 8 tokens, and its store goes through then.
+    let mut rank = rank(json!({"num_host_blocks": 3}));
+    rank["kvcr"] = json!({"local_g2": {"num_blocks": 32, "copy_bandwidth_gbps": 1.0}});
+    let prompt = |first: u32| (first..first + 13).collect::<Vec<_>>();
+    let mut r1 = request("r1", 2.0, &prompt(100));
+    r1["output_tokens"] = json!(8);
+    let requests = vec![request("r0", 0.0, &prompt(0)), r1];
+    let engine = json!({"dp_size": 1, "rank": rank});
+    let report = run(aggregated(1), engine, requests).unwrap();
+    assert_eq!(report.kvcr.unwrap().local_g2.unwrap().stored_blocks, 6);
+}
+
+#[test]
 fn a_hinted_request_pulls_its_prefix_from_a_peer_rank() {
     let engine = json!({
         "dp_size": 2,
@@ -141,6 +223,24 @@ fn a_hinted_request_pulls_its_prefix_from_a_peer_rank() {
     assert_eq!((kvcr.blocks, kvcr.loaded_blocks), (2, 2));
     // 1 ms latency + 2 blocks of 1 MB at 1 GB/s.
     assert_eq!(kvcr.remote_deliver_ms, 3.0);
+}
+
+#[test]
+fn local_g2_per_rank_block_bytes_overflow_is_a_setup_error() {
+    let mut rank = kvcr_rank(json!({"local_g2": {"num_blocks": 1}}));
+    rank["native_host_offload"] = json!({"num_host_blocks": 1});
+    // The host block size and one-block capacity fit usize. Multiplying
+    // that size by the two tensor-parallel GPUs does not.
+    rank["block_size"] = json!(2);
+    rank["kv_cache_bytes_per_token"] = json!(usize::MAX / 4 + 1);
+    let engine = json!({"dp_size": 1, "tensor_parallel_size": 2, "rank": rank});
+    let error = run(aggregated(1), engine, vec![request("r0", 0.0, &PROMPT)]).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("kvcr.local_g2 block bytes per rank overflow"),
+        "{error:#}"
+    );
 }
 
 #[test]
@@ -438,60 +538,69 @@ impl ReplayScalingPolicy for DrainWithQueuedHint {
 
 #[test]
 fn a_queued_hint_cannot_start_a_pull_after_its_source_starts_draining() {
-    let mut rank = kvcr_rank(json!({"latency_to_first_byte_ms": 1.0, "bandwidth_gbps": 1.0}));
-    rank["timing_model"] = json!({"type": "fixed", "prefill_ms": 50.0, "decode_ms": 1.0});
-    rank["native_host_offload"] =
-        json!({"num_host_blocks": 8, "d2h_bandwidth_gbps": 0.0, "h2d_bandwidth_gbps": 0.0});
-    rank["max_num_seqs"] = json!(1);
-    let engine = json!({"rank": rank});
-    // The hint reaches worker 0 before the drain mark at 102, but waits
-    // behind its [100, 150) pass. Source 1 stays busy until 151, so it is
-    // still registered when the queued request first looks up its prefix.
-    let requests = vec![
-        request("target_seed", 0.0, &OTHER),
-        request("source_seed", 1.0, &PROMPT),
-        request("target_busy", 100.0, &OTHER),
-        request("source_busy", 101.0, &OTHER),
-        hinted("queued", 101.5, &PROMPT, 1),
-    ];
-    let control = run(aggregated(2), engine.clone(), requests.clone()).unwrap();
-    assert_eq!(control.kvcr.unwrap().pulls.success, 1);
+    // The peer may now expose both G2 and KVCR-owned memory. Draining must
+    // hide both, while an active source still serves the control pull.
+    for local_g2 in [
+        Value::Null,
+        json!({"num_blocks": 32, "policy": "fifo", "copy_bandwidth_gbps": 0.0}),
+        json!({"num_blocks": 32, "policy": "lru", "copy_bandwidth_gbps": 0.0}),
+    ] {
+        let mut rank = kvcr_rank(json!({"latency_to_first_byte_ms": 1.0, "bandwidth_gbps": 1.0}));
+        rank["kvcr"]["local_g2"] = local_g2;
+        rank["timing_model"] = json!({"type": "fixed", "prefill_ms": 50.0, "decode_ms": 1.0});
+        rank["native_host_offload"] =
+            json!({"num_host_blocks": 8, "d2h_bandwidth_gbps": 0.0, "h2d_bandwidth_gbps": 0.0});
+        rank["max_num_seqs"] = json!(1);
+        let engine = json!({"rank": rank});
+        // The hint reaches worker 0 before the drain mark at 102, but waits
+        // behind its [100, 150) pass. Source 1 stays busy until 151, so it is
+        // still registered when the queued request first looks up its prefix.
+        let requests = vec![
+            request("target_seed", 0.0, &OTHER),
+            request("source_seed", 1.0, &PROMPT),
+            request("target_busy", 100.0, &OTHER),
+            request("source_busy", 101.0, &OTHER),
+            hinted("queued", 101.5, &PROMPT, 1),
+        ];
+        let control = run(aggregated(2), engine.clone(), requests.clone()).unwrap();
+        assert_eq!(control.kvcr.unwrap().pulls.success, 1);
 
-    let mut without_hint = requests.clone();
-    without_hint
-        .last_mut()
-        .unwrap()
-        .as_object_mut()
-        .unwrap()
-        .remove("kv_hints");
-    let baseline = DrainWithQueuedHint::default();
-    run_with(
-        baseline.clone(),
-        aggregated(2),
-        engine.clone(),
-        without_hint,
-    )
-    .unwrap();
-    assert_eq!(
-        *baseline.snapshots.lock().unwrap(),
-        vec![(102.0, false), (150.5, true), (151.0, false)]
-    );
-
-    let draining = DrainWithQueuedHint::default();
-    let report = run_with(draining.clone(), aggregated(2), engine, requests).unwrap();
-    assert_eq!(report.request_counts.completed_requests, 5);
-    assert_eq!(
-        *draining.snapshots.lock().unwrap(),
-        *baseline.snapshots.lock().unwrap(),
-        "a queued hint must not delay source removal"
-    );
-    assert_eq!(report.kvcr.unwrap().pulls, KvcrPullCounts::default());
-    let queued = report
-        .per_request
-        .iter()
-        .find(|record| record.request_id.as_deref() == Some("queued"))
+        let mut without_hint = requests.clone();
+        without_hint
+            .last_mut()
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove("kv_hints");
+        let baseline = DrainWithQueuedHint::default();
+        run_with(
+            baseline.clone(),
+            aggregated(2),
+            engine.clone(),
+            without_hint,
+        )
         .unwrap();
-    assert_eq!(queued.first_admission_host_reused_input_tokens, Some(0));
+        assert_eq!(
+            *baseline.snapshots.lock().unwrap(),
+            vec![(102.0, false), (150.5, true), (151.0, false)]
+        );
+
+        let draining = DrainWithQueuedHint::default();
+        let report = run_with(draining.clone(), aggregated(2), engine, requests).unwrap();
+        assert_eq!(report.request_counts.completed_requests, 5);
+        assert_eq!(
+            *draining.snapshots.lock().unwrap(),
+            *baseline.snapshots.lock().unwrap(),
+            "a queued hint must not delay source removal"
+        );
+        assert_eq!(report.kvcr.unwrap().pulls, KvcrPullCounts::default());
+        let queued = report
+            .per_request
+            .iter()
+            .find(|record| record.request_id.as_deref() == Some("queued"))
+            .unwrap();
+        assert_eq!(queued.first_admission_host_reused_input_tokens, Some(0));
+    }
 }
 
 #[test]

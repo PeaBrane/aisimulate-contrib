@@ -76,6 +76,12 @@ do not support image workloads. AFD workers themselves do not accept these field
 A backend-specific scheduler field set to a non-default value on another
 backend fails validation.
 
+SGLang's checkpoint-aware `sglang.mamba_cache` is a separate
+[native Replay option](kv-cache.md#native-sglang-mamba-checkpoints), not a field
+under this Python worker schema. It requires an aggregated worker with
+attention DP, prefill context parallelism and pipeline parallelism all equal
+to one. Python prediction YAML and deployment generation do not enable it.
+
 ## Context limits
 
 Each worker's `context_length` overrides `engine.context_length` for that role.

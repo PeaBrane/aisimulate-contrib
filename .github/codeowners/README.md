@@ -55,12 +55,19 @@ python -m pytest -c /dev/null .github/codeowners/test_*.py -q \
 
 ## How It Stays Correct
 
-The `codeowners` workflow runs on every pull request and main-branch push. It
-rejects shadow CODEOWNERS files, runs the shared and repository-specific tests,
-validates explicit path coverage, and fails when generated artifacts drift from
-their declarative sources.
+Fast CI's repository-policy job publishes the required `codeowners` check.
+It rejects shadow CODEOWNERS files, runs the shared and repository-specific
+tests, validates full-tree explicit path coverage, and fails when generated
+artifacts drift from their declarative sources. These commands are centralized
+in `scripts/ci/check_codeowners.sh`.
 
-The workflow makes policy problems visible. Repository rules must separately
+Every run checks the exact target revision. On pull requests, the job also
+checks GitHub's proposed merge whenever its contents differ from the PR head;
+identical trees reuse the passing head checks. This retains both validation
+contexts without a second ownership workflow. Infra and maintainer co-ownership
+protects the Fast CI workflow that now supplies this gate.
+
+The check makes policy problems visible. Repository rules must separately
 require the `codeowners` status check and code-owner review for those results to
 be merge-blocking.
 
