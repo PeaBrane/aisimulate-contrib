@@ -2140,6 +2140,8 @@ fn checkpoint_block_goes_at_the_next_step_and_stays_cached_until_eviction() {
     assert_eq!(ends, [6528, 9000]);
     // G0 5, ring 1, 4 x (running + previous + checkpoint).
     assert_eq!(pool.active_blocks(), 5 + 1 + 12);
+    // The next allocation releases blocks, so no step is quiet yet.
+    assert_eq!(block_lease.quiet_until, 0);
     // The prefill ran steps 1 and 2. Each decode step holds G0 5, the ring
     // and the four running blocks only, and a resend still hits the
     // checkpoint keys.
@@ -2154,6 +2156,8 @@ fn checkpoint_block_goes_at_the_next_step_and_stays_cached_until_eviction() {
             assert!(cached.is_some_and(|hit| !hit.is_active), "group {group}");
         }
         coordinator.finalize(pool, &mut block_lease, &request, 9000, target, &hit, step);
+        // Quiet up to the end of the fifth G0 block, which the request holds.
+        assert_eq!(block_lease.quiet_until, 10880, "step {step}");
         let resend = coordinator.find_longest_hit(pool, &lease(9000, hash), 9000);
         assert_eq!(resend.tokens, 8704, "step {step}");
     }

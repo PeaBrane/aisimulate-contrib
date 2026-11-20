@@ -460,6 +460,64 @@ impl GroupedPrefixRules {
         tokens / self.alignment * self.alignment / block * block
     }
 
+    /// The token count below which the steps after a finalization at
+    /// `computed_after` change nothing: an `allocate` from a count of at
+    /// least `computed_after` to a target below the result, and a `finalize`
+    /// at a count from `computed_after` up to the result, leave the lease and
+    /// the pool as they are. 0 when the next step can change them.
+    ///
+    /// `settled` is the larger of the prompt and the junction. Every position
+    /// that `finalize` publishes at (replay boundary, partial tail, prompt
+    /// checkpoint and junction) lies at or below it, so past it `finalize`
+    /// only counts the blocks that a step completes. `allocate` takes a
+    /// block when the target leaves the blocks that the request holds,
+    /// retires a window block every `block` tokens, and releases the blocks
+    /// that a state group holds beside a private running block. A checkpoint
+    /// block needs a chunk that spans two state blocks.
+    fn quiet_until(
+        &self,
+        pool: &GroupedBlockPool,
+        lease: &GroupedBlockLease,
+        settled: usize,
+        computed_after: usize,
+    ) -> usize {
+        if !lease.allocated || computed_after < settled {
+            return 0;
+        }
+        let mut until = usize::MAX;
+        for (rule, group) in self.groups.iter().zip(&lease.groups) {
+            let block = rule.block;
+            let end = match (rule.kind, group) {
+                (
+                    GroupRuleKind::FullAttention | GroupRuleKind::SlidingWindow { .. },
+                    GroupLease::Attention {
+                        copies, first_live, ..
+                    },
+                ) => {
+                    let mut end =
+                        ((computed_after / block + 1) * block).min(copies.len() * block + 1);
+                    if let GroupRuleKind::SlidingWindow { window } = rule.kind {
+                        end = end.min((first_live + 1) * block + window - 1);
+                    }
+                    end
+                }
+                (GroupRuleKind::State, GroupLease::State(state)) => {
+                    let running_alone = group.live_copies() == 1
+                        && state.running.is_some_and(|id| pool.is_private(id));
+                    if !running_alone {
+                        return 0;
+                    }
+                    computed_after.div_ceil(block) * block + 1
+                }
+                // An allocated lease holds its ring block until its release.
+                (GroupRuleKind::Ring, GroupLease::Ring { .. }) => usize::MAX,
+                (kind, group) => unreachable!("rule {kind:?} with lease {group:?}"),
+            };
+            until = until.min(end);
+        }
+        until
+    }
+
     /// Modified simulation of the align split (v0.31 `sched:414-527`, v0.32
     /// `sched:443-556`, v0.33 `sched:546-662`). `known` is the request's token
     /// count and `budget` the step budget. Without a State rule the split is
@@ -786,6 +844,7 @@ impl GroupedPrefixCoordinator {
                 })
                 .collect(),
             allocated: false,
+            quiet_until: 0,
         }
     }
 
@@ -1213,6 +1272,8 @@ impl GroupedPrefixCoordinator {
     ) -> bool {
         let rules = &self.rules;
         let first = !lease.allocated;
+        // The blocks can change here, so the step's `finalize` has to run.
+        lease.quiet_until = 0;
         let mut fresh = 0;
         let releases = &mut self.releases;
         releases.clear();
@@ -1564,6 +1625,12 @@ impl GroupedPrefixCoordinator {
                 (kind, group) => unreachable!("rule {kind:?} with lease {group:?}"),
             }
         }
+        lease.quiet_until = rules.quiet_until(
+            pool,
+            lease,
+            prompt.max(junction.unwrap_or(0)),
+            computed_after,
+        );
     }
 
     /// Release every block in group order, each group tail first, as vLLM
@@ -1605,6 +1672,7 @@ impl GroupedPrefixCoordinator {
         }
         pool.release_all(released);
         lease.allocated = false;
+        lease.quiet_until = 0;
     }
 }
 

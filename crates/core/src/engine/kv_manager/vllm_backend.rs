@@ -1025,6 +1025,20 @@ impl VllmKvManager {
         lease.debug_assert_owner(owner);
         if let Some(grouped) = &mut self.grouped {
             assert!(self.enable_prefix_caching || reusable_prefix_blocks == 0);
+            // Most decode steps stay inside the blocks the request holds, so
+            // the coordinator has nothing to release or take for them.
+            if lease
+                .grouped
+                .as_ref()
+                .and_then(|grouped| grouped.block_lease.as_ref())
+                .is_some_and(|block_lease| cumulative_tokens < block_lease.quiet_until)
+            {
+                lease.allocated_tokens = lease.allocated_tokens.max(cumulative_tokens);
+                return NativeAllocation::Ready {
+                    value: 0,
+                    dependencies: Vec::new(),
+                };
+            }
             let previous_blocks = lease.resident_block_count();
             if let Some(coordinator) = &mut self.grouped_prefix {
                 let pool = grouped.block_pool_mut().expect("block mode");
@@ -1781,21 +1795,45 @@ impl VllmKvManager {
             && publish_state
             && self.enable_prefix_caching
             && sequence.enable_prefix_caching()
-            && let Some(mut block_lease) = lease
-                .grouped
-                .as_mut()
-                .and_then(|grouped| grouped.block_lease.take())
+            // A step below the quiet position publishes and releases nothing.
+            // Debug builds run its walks and check that.
+            && let Some(mut block_lease) = lease.grouped.as_mut().and_then(|grouped| {
+                grouped.block_lease.take_if(|block_lease| {
+                    cfg!(debug_assertions) || computed_after >= block_lease.quiet_until
+                })
+            })
         {
             // The block lease leaves the request lease for the call, which
             // reads the request's prefix hashes.
             if block_lease.allocated {
+                // The quiet position counts on allocations that start at or
+                // above the finalized count.
+                debug_assert!(computed_after <= lease.allocated_tokens);
                 let hit = lease
                     .grouped_hit
                     .as_ref()
                     .map(StoredGroupedHit::hit)
                     .expect("a grouped prefill cost precedes the allocation");
+                let pool = grouped.block_pool_mut().expect("block mode");
+                // The `allocate` that `allocate_lease` skipped for the step.
+                #[cfg(debug_assertions)]
+                let quiet = (computed_after < block_lease.quiet_until).then(|| {
+                    let before = (block_lease.clone(), coordinator.hit_stamp(pool, 0));
+                    let prefill_end = lease
+                        .prompt_tokens
+                        .max(lease.grouped_known_tokens.saturating_sub(1));
+                    assert!(coordinator.allocate(
+                        pool,
+                        &mut block_lease,
+                        prefill_end,
+                        computed_before,
+                        computed_after,
+                        self.step,
+                    ));
+                    before
+                });
                 coordinator.finalize(
-                    grouped.block_pool_mut().expect("block mode"),
+                    pool,
                     &mut block_lease,
                     lease,
                     sequence.num_input_tokens(),
@@ -1803,6 +1841,14 @@ impl VllmKvManager {
                     hit,
                     self.step,
                 );
+                #[cfg(debug_assertions)]
+                if let Some(before) = quiet {
+                    let after = (block_lease.clone(), coordinator.hit_stamp(pool, 0));
+                    assert_eq!(
+                        after, before,
+                        "a step below the quiet position changed the lease or the pool"
+                    );
+                }
             }
             lease
                 .grouped

@@ -65,6 +65,11 @@ pub(crate) struct GroupedBlockLease {
     /// Whether the request has allocated once. The copy blocks of a partial
     /// hit come with the first allocation only.
     pub(crate) allocated: bool,
+    /// The token count below which a step of the request finds nothing to
+    /// allocate, publish or release, so that its `allocate` and `finalize`
+    /// can be skipped (see `GroupedPrefixRules::quiet_until`). 0 when the
+    /// next step has to run both.
+    pub(crate) quiet_until: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -90,7 +95,7 @@ pub(crate) enum GroupLease {
 }
 
 impl GroupLease {
-    fn live_copies(&self) -> usize {
+    pub(super) fn live_copies(&self) -> usize {
         match self {
             // The `None` copies lie exactly below `first_live`, so a count per
             // step does not scan the whole context.
@@ -739,6 +744,7 @@ mod tests {
                     }),
                 ],
                 allocated: true,
+                quiet_until: 0,
             }),
             ..GroupedLease::default()
         };
