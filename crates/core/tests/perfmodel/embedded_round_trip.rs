@@ -63,7 +63,7 @@ const TEST_MODEL: &str = "MiniMaxAI/MiniMax-M2.5";
 /// maturin-built `aisim_core`). Returns false otherwise so the test
 /// passes without running the assertions on a bare `cargo test`.
 fn python_engine_importable() -> bool {
-    Python::with_gil(|py| match py.import("aisim_core.sdk.engine") {
+    Python::attach(|py| match py.import("aisim_core.sdk.engine") {
         Ok(_) => true,
         Err(e) => {
             let exe: String = py

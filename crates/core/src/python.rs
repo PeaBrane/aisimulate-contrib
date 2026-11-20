@@ -1047,7 +1047,7 @@ impl AicTimingModel {
             use_fpm_decode_totals,
             config.decoder_replay,
         )?;
-        let engine = Python::with_gil(|py| -> PyResult<_> {
+        let engine = Python::attach(|py| -> PyResult<_> {
             Ok(Py::new(py, crate::AicEngine::from_shared_engine(native))?.into_any())
         })?;
         let fpm_decode_kv_ceiling = if use_fpm_decode_totals {
@@ -1111,7 +1111,7 @@ impl AicTimingModel {
         if speculation_kind == Some("mtp") {
             // Wait for scheme registration before canonical construction uses
             // the base module. Executor depth is checked only after loading.
-            Python::with_gil(|py| PyModule::import(py, "aisim_core.sdk.speculation").map(|_| ()))?;
+            Python::attach(|py| PyModule::import(py, "aisim_core.sdk.speculation").map(|_| ()))?;
         }
         Ok(())
     }
@@ -1122,7 +1122,7 @@ impl AicTimingModel {
     fn build_fitted(model: Arc<ForwardPassPerfModel>) -> Result<Self> {
         let fitted = FittedIterationTiming::from_model(model)?;
         Ok(Self {
-            engine: Python::with_gil(|py| py.None()),
+            engine: Python::attach(|py| py.None()),
             diagnostic_model: None,
             fpm_model: None,
             corrections: None,
@@ -1307,7 +1307,7 @@ impl AicTimingModel {
         prefix: u32,
         mode: &str,
     ) -> PyResult<(PythonPerOpEntries, PythonPerOpEntries)> {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let kwargs = PyDict::new(py);
             kwargs.set_item("batch_size", batch_size)?;
             kwargs.set_item("beam_width", 1)?;
@@ -1507,7 +1507,7 @@ impl AicTimingModel {
                 .map(|native| native * correction)
                 .context("AIC prefill prediction failed");
         }
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             self.engine
                 .bind(py)
                 .call_method1(
@@ -2327,7 +2327,7 @@ impl TimingModel for AicTimingModel {
                 .map(|native| native * correction)
                 .context("AIC prefill prediction failed");
         }
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             self.engine
                 .bind(py)
                 .call_method1(
@@ -2381,7 +2381,7 @@ impl TimingModel for AicTimingModel {
                     .map(|native| native * correction)
                     .context("AIC decode prediction failed");
             }
-            return Python::with_gil(|py| {
+            return Python::attach(|py| {
                 self.engine
                     .bind(py)
                     .call_method1(
@@ -2655,7 +2655,7 @@ fn aic_capacity_kwargs<'py>(
 }
 
 fn estimate_aic_num_gpu_blocks(config: &AicTimingConfig, role: &ReplayRoleConfig) -> Result<usize> {
-    Python::with_gil(|py| -> PyResult<usize> {
+    Python::attach(|py| -> PyResult<usize> {
         let memory = PyModule::import(py, "aisim_core.sdk.memory")?;
         let kwargs = aic_capacity_kwargs(py, config, role)?;
         memory
@@ -2677,7 +2677,7 @@ fn estimate_aic_grouped_budget(
     config: &AicTimingConfig,
     role: &ReplayRoleConfig,
 ) -> Result<crate::perfmodel::fpm::FpmCacheBudget> {
-    let serialized = Python::with_gil(|py| -> PyResult<String> {
+    let serialized = Python::attach(|py| -> PyResult<String> {
         let memory = PyModule::import(py, "aisim_core.sdk.memory")?;
         let kwargs = aic_capacity_kwargs(py, config, role)?;
         kwargs.del_item("scheduler_block_size")?;
@@ -3398,7 +3398,7 @@ fn check_afd_memory_fit_and_kv_budget_py(
         ForwardPassWorkerType::Decode => "decode",
         ForwardPassWorkerType::Aggregated => "both",
     };
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let module = py.import("aisim.sdk.afd_memory")?;
         let common = PyDict::new(py);
         common.set_item("model_path", &config.model)?;
@@ -3407,8 +3407,17 @@ fn check_afd_memory_fit_and_kv_budget_py(
         common.set_item("database_mode", config.estimator.database_mode.as_str())?;
         // Match the timing models' configuration-scoped roots. Empty means
         // the normal packaged/default discovery, rather than an empty search.
-        let systems_paths =
-            (!config.estimator.systems_paths.is_empty()).then_some(&config.estimator.systems_paths);
+        // The Python API takes `list[str]`. Pass `str`, not the `pathlib.Path`
+        // that pyo3 makes from a `PathBuf`: the memory check returns these
+        // paths, and its result goes through `json.dumps` below.
+        let systems_paths = (!config.estimator.systems_paths.is_empty()).then(|| {
+            config
+                .estimator
+                .systems_paths
+                .iter()
+                .map(|path| path.as_os_str())
+                .collect::<Vec<_>>()
+        });
         common.set_item("systems_paths", systems_paths)?;
         common.set_item("isl", isl)?;
         common.set_item("osl", osl)?;
@@ -3427,7 +3436,7 @@ fn check_afd_memory_fit_and_kv_budget_py(
         a_pool.set_item("a_tp_size", config.topology.a_pool.a_tp_size)?;
         a_pool.set_item("n_a_nodes", config.topology.a_pool.n_a_nodes)?;
         if let Some(root) = perf.pool_systems_root(true) {
-            a_pool.set_item("systems_paths", vec![root])?;
+            a_pool.set_item("systems_paths", vec![root.as_os_str()])?;
         }
         common.set_item("a_pool", a_pool)?;
         common.set_item("gpus_per_node", config.topology.gpus_per_node)?;
@@ -3498,13 +3507,13 @@ fn check_afd_memory_fit_and_kv_budget_py(
         common.set_item("max_seq_len", max_seq_len)?;
         common.set_item("phase", phase)?;
 
-        let check_kwargs = common.call_method0("copy")?.downcast_into::<PyDict>()?;
+        let check_kwargs = common.call_method0("copy")?.cast_into::<PyDict>()?;
         let f_pool = PyDict::new(py);
         f_pool.set_item("system", &config.topology.f_pool.system)?;
         f_pool.set_item("f_moe_ep_size", config.topology.f_pool.f_moe_ep_size)?;
         f_pool.set_item("n_f_nodes", config.topology.f_pool.n_f_nodes)?;
         if let Some(root) = perf.pool_systems_root(false) {
-            f_pool.set_item("systems_paths", vec![root])?;
+            f_pool.set_item("systems_paths", vec![root.as_os_str()])?;
         }
         check_kwargs.set_item("f_pool", f_pool)?;
         check_kwargs.set_item(
@@ -3541,7 +3550,7 @@ fn check_afd_memory_fit_and_kv_budget_py(
         let memory: serde_json::Value = serde_json::from_str(&memory_json)
             .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
 
-        let estimate_kwargs = common.call_method0("copy")?.downcast_into::<PyDict>()?;
+        let estimate_kwargs = common.call_method0("copy")?.cast_into::<PyDict>()?;
         estimate_kwargs.set_item("a_weight_gb", phase_weights(true)?)?;
         let budget: (f64, f64) = module
             .getattr("estimate_afd_kv_budget_bytes")?
@@ -5218,7 +5227,7 @@ fn replay_python_error(error: anyhow::Error) -> PyErr {
         PyRuntimeError::new_err(format!("{error:#}"))
     };
     if let Some(failure) = error.downcast_ref::<ReplayCoverageFailure>() {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let _ = exception
                 .value(py)
                 .setattr("fpm_query_coverage", failure.coverage.to_string());
@@ -5230,14 +5239,14 @@ fn replay_python_error(error: anyhow::Error) -> PyErr {
 /// Execute one canonical serialized ReplaySpec and return serialized report JSON.
 #[pyfunction]
 fn run_replay_json(py: Python<'_>, payload: &str) -> PyResult<String> {
-    py.allow_threads(|| execute_json(payload, false))
+    py.detach(|| execute_json(payload, false))
         .map_err(replay_python_error)
 }
 
 /// Execute one fixed aggregated ReplaySpec and return report plus parity artifacts.
 #[pyfunction]
 fn run_replay_with_artifacts_json(py: Python<'_>, payload: &str) -> PyResult<String> {
-    py.allow_threads(|| execute_json(payload, true))
+    py.detach(|| execute_json(payload, true))
         .map_err(replay_python_error)
 }
 
@@ -5310,9 +5319,9 @@ fn scan_weka_requests(
     on_request: Py<PyAny>,
 ) -> PyResult<()> {
     let mut raised = None;
-    let scanned = py.allow_threads(|| {
+    let scanned = py.detach(|| {
         crate::replay::loadgen::scan_weka_requests(&path, block_size, &mut |input, output| {
-            Python::with_gil(|py| match on_request.call1(py, (input, output)) {
+            Python::attach(|py| match on_request.call1(py, (input, output)) {
                 Ok(_) => ControlFlow::Continue(()),
                 Err(error) => {
                     raised = Some(error);
@@ -5334,7 +5343,9 @@ fn _build_source_files_json() -> &'static str {
 }
 
 /// AISim native runtime module.
-#[pymodule]
+// pyo3 0.28 made modules declare free-threaded support by default. Keep the
+// earlier behavior: the module requires the GIL.
+#[pymodule(gil_used = true)]
 fn _runtime(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(_build_source_files_json, module)?)?;
     module.add_function(wrap_pyfunction!(
@@ -5641,7 +5652,7 @@ mod tests {
 
     #[test]
     fn replay_python_error_preserves_contextual_resource_failure() {
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let error = anyhow::Error::new(crate::replay::ReplayError::ResourceLimited(
             "create exact report sample file: No space left on device".to_string(),
         ))
@@ -5649,7 +5660,7 @@ mod tests {
         .context("AISim replay failed");
         let expected_message = format!("{error:#}");
 
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let mapped = replay_python_error(error);
             assert!(mapped.is_instance_of::<PyMemoryError>(py));
             assert_eq!(mapped.value(py).to_string(), expected_message);
@@ -5658,11 +5669,11 @@ mod tests {
 
     #[test]
     fn replay_python_error_keeps_other_failures_as_runtime_errors() {
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let error = anyhow::anyhow!("invalid replay input").context("AISim replay failed");
         let expected_message = format!("{error:#}");
 
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let mapped = replay_python_error(error);
             assert!(mapped.is_instance_of::<PyRuntimeError>(py));
             assert_eq!(mapped.value(py).to_string(), expected_message);
@@ -5671,12 +5682,12 @@ mod tests {
 
     #[test]
     fn replay_python_error_preserves_unimplemented_routing() {
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let error =
             anyhow::Error::new(crate::AfdRoutingLocation::F.ensure_supported().unwrap_err())
                 .context("AISim replay failed");
         let expected_message = format!("{error:#}");
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let mapped = replay_python_error(error);
             assert!(mapped.is_instance_of::<PyNotImplementedError>(py));
             assert_eq!(mapped.value(py).to_string(), expected_message);
@@ -6714,7 +6725,7 @@ mod tests {
         use crate::perfmodel::engine::spec::EngineSpec;
 
         let required = std::env::var_os("AIC_REQUIRE_EMBEDDED_ROUND_TRIP").is_some();
-        if let Err(error) = Python::with_gil(|py| py.import("aisim_core.sdk.engine").map(|_| ())) {
+        if let Err(error) = Python::attach(|py| py.import("aisim_core.sdk.engine").map(|_| ())) {
             assert!(
                 !required,
                 "native_phase_evidence_matches_python_bridge: \
@@ -6751,7 +6762,7 @@ mod tests {
             | AicPhaseProvider::Python
             | AicPhaseProvider::NativeEntries(_) => unreachable!(),
         };
-        let bridge = Python::with_gil(|py| python_timing_model(native.engine.clone_ref(py), false));
+        let bridge = Python::attach(|py| python_timing_model(native.engine.clone_ref(py), false));
         let check =
             |native: &AicTimingModel, bridge: &AicTimingModel, args| {
                 let (batch, isl, osl, prefix, mode) = args;
@@ -6897,7 +6908,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let mut native = Python::with_gil(|py| {
+        let mut native = Python::attach(|py| {
             python_timing_model(
                 Py::new(
                     py,
@@ -6908,7 +6919,7 @@ mod tests {
                 false,
             )
         });
-        let bridge = Python::with_gil(|py| python_timing_model(native.engine.clone_ref(py), false));
+        let bridge = Python::attach(|py| python_timing_model(native.engine.clone_ref(py), false));
         native.phase_provider = AicPhaseProvider::Native(missing);
         for mode in ["static_ctx", "static_gen"] {
             let error = native
@@ -7025,7 +7036,7 @@ mod tests {
 
     #[test]
     fn fitted_replay_rejects_unsupported_work_before_loading_a_learned_source() {
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         for source in ["artifact_path", "checkpoint_path"] {
             let learned = || {
                 let mut config = aic_config();
@@ -7201,7 +7212,7 @@ mod tests {
 
     #[test]
     fn fitted_regression_prices_each_iteration_as_the_canonical_estimate() {
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let dir = tempfile::tempdir().unwrap();
         let identity = unknown_regression_identity(ForwardPassWorkerType::Aggregated);
         let mut model = ForwardPassPerfModel::best_available(identity).unwrap();
@@ -7287,7 +7298,7 @@ mod tests {
     fn fitted_role_passes_without_model_work_take_no_time() {
         use crate::engine::generalized::{EngineIdentity, SchedulerCommand};
         use crate::engine::{Command, EngineConfig, EngineFactory, Request, SglangConfig};
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let dir = tempfile::tempdir().unwrap();
         let mut model = ForwardPassPerfModel::best_available(unknown_sglang_identity(
             ForwardPassWorkerType::Aggregated,
@@ -7376,7 +7387,7 @@ mod tests {
 
     #[test]
     fn fitted_replay_rejects_a_decode_speedup_other_than_one() {
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let dir = tempfile::tempdir().unwrap();
         let mut model = ForwardPassPerfModel::best_available(unknown_regression_identity(
             ForwardPassWorkerType::Decode,
@@ -7424,7 +7435,7 @@ mod tests {
 
     #[test]
     fn fitted_replay_requires_every_store_its_role_prices() {
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let dir = tempfile::tempdir().unwrap();
         let build = |kinds: &[IterationKind],
                      cross_rank: bool,
@@ -7605,7 +7616,7 @@ mod tests {
 
     #[test]
     fn fitted_regression_with_request_axes_reads_per_request_detail() {
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         // A regression fitted to measured MTP rounds (nextn 5: each decode
         // request verifies 6 tokens) replays like one fitted without MTP: one
         // query per pass, never scaled by the draft length.
@@ -7667,7 +7678,7 @@ mod tests {
     #[test]
     fn fitted_regression_prices_the_drafts_each_request_was_scheduled() {
         use crate::engine::{DirectRequest, MockEngineArgs};
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         // A regression on scheduled tokens, fitted at nextn 5: 2 ms plus
         // 0.25 ms per token.
         let mut identity = unknown_regression_identity(ForwardPassWorkerType::Decode);
@@ -7740,7 +7751,7 @@ mod tests {
 
     #[test]
     fn fitted_regression_takes_an_mtp_scheme_as_its_nextn() {
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let dir = tempfile::tempdir().unwrap();
         let mut identity = unknown_regression_identity(ForwardPassWorkerType::Decode);
         identity.nextn = 2;
@@ -7805,7 +7816,7 @@ mod tests {
     #[test]
     fn fitted_mtp_role_takes_its_depth_from_the_scheme_with_or_without_a_cpu_tier() {
         use crate::engine::NativeHostOffloadConfig;
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let dir = tempfile::tempdir().unwrap();
         let mut identity = unknown_regression_identity(ForwardPassWorkerType::Aggregated);
         identity.nextn = 2;
@@ -7922,7 +7933,7 @@ mod tests {
 
     #[test]
     fn fitted_roles_reject_draft_schemes_before_reading_the_checkpoint() {
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let dir = tempfile::tempdir().unwrap();
         // Reading this local checkpoint would fail JSON parsing. Unsupported
         // fitted schemes must instead fail the execution eligibility check.
@@ -7946,7 +7957,7 @@ mod tests {
 
     #[test]
     fn fitted_mtp_snapshot_load_errors_precede_executor_depth_validation() {
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let dir = tempfile::tempdir().unwrap();
         let mut identity = unknown_regression_identity(ForwardPassWorkerType::Decode);
         identity.speculation = Some(
@@ -7996,7 +8007,7 @@ mod tests {
 
     #[test]
     fn fitted_aggregated_role_needs_a_locally_mixed_store_only_where_ranks_mix_work() {
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let dir = tempfile::tempdir().unwrap();
         for backend in [
             crate::BackendKind::Vllm,
@@ -8045,7 +8056,7 @@ mod tests {
 
     #[test]
     fn fitted_aggregated_role_checks_its_cross_rank_store_at_the_engine_width() {
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let dir = tempfile::tempdir().unwrap();
         // The identity records unknown attention DP and two GPUs; engine
         // dp_size 2 at tensor parallelism 1 uses both.
@@ -8105,7 +8116,7 @@ mod tests {
     fn fitted_kvcr_role_with_an_unknown_pipeline_width_runs_one_stage() {
         use crate::engine::{KvcrConfig, NativeHostOffloadConfig};
         use crate::replay::WorkerStage;
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let dir = tempfile::tempdir().unwrap();
         let mut model = ForwardPassPerfModel::best_available(unknown_regression_identity(
             ForwardPassWorkerType::Aggregated,
@@ -8442,10 +8453,10 @@ mod tests {
 
     #[test]
     fn measured_profile_capacity_forwards_depth_without_changing_analytical_defaults() {
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let role = aggregated_role(&ReplayEngineConfig::default());
         let mut config = aic_config();
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             for depth in [0, 3] {
                 config.nextn = depth;
                 let kwargs = aic_capacity_kwargs(py, &config, &role).unwrap();
@@ -8529,8 +8540,8 @@ mod tests {
 
     #[test]
     fn native_ngram_role_derives_missing_or_null_depth_and_default_acceptance() {
-        pyo3::prepare_freethreaded_python();
-        if let Err(error) = Python::with_gil(|py| py.import("aisim_core.sdk.engine").map(|_| ())) {
+        pyo3::Python::initialize();
+        if let Err(error) = Python::attach(|py| py.import("aisim_core.sdk.engine").map(|_| ())) {
             assert!(
                 std::env::var_os("AIC_REQUIRE_EMBEDDED_ROUND_TRIP").is_none(),
                 "embedded SDK is required: {error}"
@@ -9348,8 +9359,8 @@ mod tests {
 
     #[test]
     fn fpm_decode_timing_queries_exact_past_kv_total() {
-        pyo3::prepare_freethreaded_python();
-        let engine = Python::with_gil(|py| Py::new(py, DecodeCoordinateProbe).unwrap().into_any());
+        pyo3::Python::initialize();
+        let engine = Python::attach(|py| Py::new(py, DecodeCoordinateProbe).unwrap().into_any());
         let timing = python_timing_model(engine, true);
 
         let latency = timing
@@ -9369,9 +9380,9 @@ mod tests {
 
     #[test]
     fn prefill_totals_reach_fpm_exactly_and_op_level_as_means() {
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let engine =
-            || Python::with_gil(|py| Py::new(py, PrefillCoordinateProbe).unwrap().into_any());
+            || Python::attach(|py| Py::new(py, PrefillCoordinateProbe).unwrap().into_any());
         // Three requests computed 16 tokens after reading 8; the integer means
         // are (24 / 3, 8 / 3) = (8, 2).
         let fpm = python_timing_model(engine(), true);
@@ -9391,7 +9402,7 @@ mod tests {
         use crate::perf_database::fpm_forward::tests::RowSpec;
         use crate::perfmodel::engine::runtime::tests::build_fpm_engine_with_rows;
         use crate::perfmodel::fpm::ForwardPassPerfOptions;
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let row =
             |workload_kind, batch_size, total_prefill_tokens, total_kv_read_tokens, latency_ms| {
                 RowSpec {
@@ -9413,7 +9424,7 @@ mod tests {
             Arc::new(build_fpm_engine_with_rows(tmp.path(), &rows).unwrap()),
             ForwardPassPerfOptions::default(),
         ));
-        let engine = Python::with_gil(|py| Py::new(py, PrefillCoordinateProbe).unwrap().into_any());
+        let engine = Python::attach(|py| Py::new(py, PrefillCoordinateProbe).unwrap().into_any());
         let mut timing = python_timing_model(engine, true);
         timing.fpm_model = Some(Arc::clone(&model));
         assert_eq!(timing.predict_prefill_totals_ms(3, 16, 8).unwrap(), 5.0);
@@ -9504,7 +9515,7 @@ mod tests {
 
     #[test]
     fn replay_applies_a_tuned_models_corrections_with_and_without_capture() {
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let tmp = tempfile::tempdir().unwrap();
         let model = tuned_fpm_model(tmp.path());
         let prefill = crate::ScheduledRequestMetrics {
@@ -9526,7 +9537,7 @@ mod tests {
         assert!(expected.0 > 5.0 && expected.1 > 3.0, "{expected:?}");
 
         // Whole-model FPM: the same corrected timing with and without capture.
-        let engine = Python::with_gil(|py| Py::new(py, PrefillCoordinateProbe).unwrap().into_any());
+        let engine = Python::attach(|py| Py::new(py, PrefillCoordinateProbe).unwrap().into_any());
         let mut timing = python_timing_model(engine, true);
         timing.fpm_model = Some(Arc::clone(&model));
         timing.corrections = Some(Arc::clone(&model));
@@ -9548,7 +9559,7 @@ mod tests {
         // Operation graphs: phase latency, evidence and energy scale together,
         // so power is unchanged.
         let op_engine = || {
-            Python::with_gil(|py| {
+            Python::attach(|py| {
                 Py::new(py, PerOpEvidenceProbe::default())
                     .unwrap()
                     .into_any()
@@ -9640,11 +9651,10 @@ mod tests {
 
     #[test]
     fn native_fpm_mixed_pass_is_the_one_pass_estimate() {
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let tmp = tempfile::tempdir().unwrap();
         let model = Arc::new(mixed_fpm_model(tmp.path()));
-        let engine =
-            || Python::with_gil(|py| Py::new(py, DecodeCoordinateProbe).unwrap().into_any());
+        let engine = || Python::attach(|py| Py::new(py, DecodeCoordinateProbe).unwrap().into_any());
         let mut timing = python_timing_model(engine(), true);
         timing.fpm_model = Some(Arc::clone(&model));
         let prefill = MIXED_FPM_PREFILL;
@@ -9722,7 +9732,7 @@ mod tests {
 
     #[test]
     fn tuned_model_corrects_a_mixed_pass_as_one_mixed_iteration() {
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let tmp = tempfile::tempdir().unwrap();
         let mut model = mixed_fpm_model(tmp.path());
         let (prefill_only, mixed) = mixed_fpm_iterations();
@@ -9751,7 +9761,7 @@ mod tests {
         assert!(close(prefill_alone, 15.0), "{prefill_alone}");
         assert!(close(one_pass, 13.75), "{one_pass}");
 
-        let engine = Python::with_gil(|py| Py::new(py, DecodeCoordinateProbe).unwrap().into_any());
+        let engine = Python::attach(|py| Py::new(py, DecodeCoordinateProbe).unwrap().into_any());
         let mut timing = python_timing_model(engine, true);
         timing.fpm_model = Some(Arc::clone(&model));
         timing.corrections = Some(Arc::clone(&model));
@@ -9793,8 +9803,8 @@ mod tests {
 
     #[test]
     fn fpm_decode_timing_caps_logical_past_kv_at_physical_capacity() {
-        pyo3::prepare_freethreaded_python();
-        let engine = Python::with_gil(|py| Py::new(py, DecodeCoordinateProbe).unwrap().into_any());
+        pyo3::Python::initialize();
+        let engine = Python::attach(|py| Py::new(py, DecodeCoordinateProbe).unwrap().into_any());
         let timing = python_timing_model(engine, true);
 
         let latency = timing
@@ -9806,8 +9816,8 @@ mod tests {
 
     #[test]
     fn op_level_decode_timing_converts_inclusive_mean_to_past_kv() {
-        pyo3::prepare_freethreaded_python();
-        let engine = Python::with_gil(|py| Py::new(py, DecodeCoordinateProbe).unwrap().into_any());
+        pyo3::Python::initialize();
+        let engine = Python::attach(|py| Py::new(py, DecodeCoordinateProbe).unwrap().into_any());
         let timing = python_timing_model(engine, false);
 
         let latency = timing
@@ -9909,7 +9919,7 @@ mod tests {
     fn fpm_timing_pair(model: &Arc<ForwardPassPerfModel>) -> (AicTimingModel, AicTimingModel) {
         let timing = || {
             let engine =
-                Python::with_gil(|py| Py::new(py, DecodeCoordinateProbe).unwrap().into_any());
+                Python::attach(|py| Py::new(py, DecodeCoordinateProbe).unwrap().into_any());
             let mut timing = python_timing_model(engine, true);
             timing.fpm_model = Some(Arc::clone(model));
             timing.corrections = model.corrects_native_estimates().then(|| Arc::clone(model));
@@ -9926,7 +9936,7 @@ mod tests {
         };
         use crate::perfmodel::engine::runtime::tests::build_fpm_engine_with_rows;
 
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         for baseline_power in [None, Some(400.0)] {
             let tmp = tempfile::tempdir().unwrap();
             let row =
@@ -10020,7 +10030,7 @@ mod tests {
 
     #[test]
     fn fpm_iteration_matches_phase_pricing_for_one_rank_pure_passes() {
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let tmp = tempfile::tempdir().unwrap();
         let tuned_dir = tempfile::tempdir().unwrap();
         // Hand oracles: `mixed_fpm_model` prices 8 prefill tokens at 10 ms and
@@ -10067,7 +10077,7 @@ mod tests {
 
     #[test]
     fn fpm_iteration_prices_a_mixed_rank_as_one_forward() {
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let tmp = tempfile::tempdir().unwrap();
         let model = Arc::new(mixed_fpm_model(tmp.path()));
         let (_, mut timing) = fpm_timing_pair(&model);
@@ -10099,7 +10109,7 @@ mod tests {
 
     #[test]
     fn fpm_iteration_records_each_working_ranks_estimate() {
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let tmp = tempfile::tempdir().unwrap();
         let mut model = mixed_fpm_model(tmp.path());
         // Corrections of 1.5 for the prefill alone and of the mixed iteration
@@ -10175,7 +10185,7 @@ mod tests {
 
     #[test]
     fn fpm_iteration_takes_the_slowest_rank_under_the_heaviest_ranks_correction() {
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let tmp = tempfile::tempdir().unwrap();
         let mut model = mixed_fpm_model(tmp.path());
         // The prefill alone runs at 1.5x its native 10 ms (see
@@ -10232,7 +10242,7 @@ mod tests {
 
     #[test]
     fn iteration_cache_hits_only_when_every_rank_matches() {
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let tmp = tempfile::tempdir().unwrap();
         let model = Arc::new(mixed_fpm_model(tmp.path()));
         let (_, mut timing) = fpm_timing_pair(&model);
@@ -10277,7 +10287,7 @@ mod tests {
 
     #[test]
     fn iteration_pricing_declines_what_the_canonical_query_cannot_represent() {
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let tmp = tempfile::tempdir().unwrap();
         let model = Arc::new(mixed_fpm_model(tmp.path()));
         let (phase, mut timing) = fpm_timing_pair(&model);
@@ -10395,7 +10405,7 @@ mod tests {
     /// TensorRT-LLM 1.3.0rc20 model, whose GEMM and attention tables do.
     fn packaged_op_level_timing(test: &str, power: bool) -> Option<AicTimingModel> {
         let required = std::env::var_os("AIC_REQUIRE_EMBEDDED_ROUND_TRIP").is_some();
-        if let Err(error) = Python::with_gil(|py| py.import("aisim_core.sdk.engine").map(|_| ())) {
+        if let Err(error) = Python::attach(|py| py.import("aisim_core.sdk.engine").map(|_| ())) {
             assert!(
                 !required,
                 "{test}: AIC_REQUIRE_EMBEDDED_ROUND_TRIP is set but `aisim_core.sdk.engine` \
@@ -10444,7 +10454,7 @@ mod tests {
 
     #[test]
     fn op_level_iteration_on_a_packaged_model_keeps_pure_one_rank_phase_timing() {
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         for power in [false, true] {
             let Some(timing) = packaged_op_level_timing(
                 "op_level_iteration_on_a_packaged_model_keeps_pure_one_rank_phase_timing",
@@ -10539,7 +10549,7 @@ mod tests {
 
     #[test]
     fn op_level_iteration_on_a_packaged_model_uses_the_canonical_composition() {
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let Some(timing) = packaged_op_level_timing(
             "op_level_iteration_on_a_packaged_model_uses_the_canonical_composition",
             true,
@@ -10686,7 +10696,7 @@ mod tests {
 
     #[test]
     fn tuned_op_level_decode_takes_its_correction_at_the_packed_coordinates() {
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let Some(mut timing) = packaged_op_level_timing(
             "tuned_op_level_decode_takes_its_correction_at_the_packed_coordinates",
             false,
@@ -10758,7 +10768,7 @@ mod tests {
 
     #[test]
     fn op_level_iteration_records_every_ranks_operation_evidence() {
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let Some(timing) = packaged_op_level_timing(
             "op_level_iteration_records_every_ranks_operation_evidence",
             true,
@@ -10907,7 +10917,7 @@ mod tests {
 
     #[test]
     fn op_level_iteration_values_record_the_named_evidence_bit_for_bit() {
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let Some(mut timing) = packaged_op_level_timing(
             "op_level_iteration_values_record_the_named_evidence_bit_for_bit",
             true,
@@ -11034,7 +11044,7 @@ mod tests {
 
     #[test]
     fn rank_memo_entries_keep_their_rank_evidence() {
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let Some(mut timing) =
             packaged_op_level_timing("rank_memo_entries_keep_their_rank_evidence", true)
         else {
@@ -11079,7 +11089,7 @@ mod tests {
 
     #[test]
     fn sd_round_iteration_prices_a_mixed_rank_as_one_forward() {
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let tmp = tempfile::tempdir().unwrap();
         let model = Arc::new(ForwardPassPerfModel::from_engine(
             Arc::new(crate::perfmodel::engine::runtime::tests::full_round_engine(
@@ -11137,8 +11147,8 @@ mod tests {
 
     #[test]
     fn bounded_replay_rejects_heterogeneous_actual_prefill_geometry() {
-        pyo3::prepare_freethreaded_python();
-        let engine = Python::with_gil(|py| Py::new(py, DecodeCoordinateProbe).unwrap().into_any());
+        pyo3::Python::initialize();
+        let engine = Python::attach(|py| Py::new(py, DecodeCoordinateProbe).unwrap().into_any());
         let mut timing = python_timing_model(engine, false);
         timing.decoder_replay = true;
         for geometry in [vec![], vec![(3, 1536)], vec![(129, 128), (129, 128)]] {
@@ -11155,8 +11165,8 @@ mod tests {
 
     #[test]
     fn op_level_timing_exposes_typed_python_evidence() {
-        pyo3::prepare_freethreaded_python();
-        let engine = Python::with_gil(|py| {
+        pyo3::Python::initialize();
+        let engine = Python::attach(|py| {
             Py::new(py, PerOpEvidenceProbe::default())
                 .unwrap()
                 .into_any()
@@ -11184,16 +11194,14 @@ mod tests {
 
     #[test]
     fn repeated_shapes_reuse_provider_evidence_and_accumulate_every_step() {
-        pyo3::prepare_freethreaded_python();
-        let engine = Python::with_gil(|py| Py::new(py, PerOpEvidenceProbe::default()).unwrap());
-        let timing = python_timing_model(
-            Python::with_gil(|py| engine.clone_ref(py).into_any()),
-            false,
-        );
+        pyo3::Python::initialize();
+        let engine = Python::attach(|py| Py::new(py, PerOpEvidenceProbe::default()).unwrap());
+        let timing =
+            python_timing_model(Python::attach(|py| engine.clone_ref(py).into_any()), false);
         for _ in 0..1_000 {
             assert_eq!(timing.predict_decode_ms(2, 258, 128, 1024).unwrap(), 4.0);
         }
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             assert_eq!(
                 engine
                     .borrow(py)
@@ -11212,7 +11220,7 @@ mod tests {
         assert_eq!(cached.to_phase().energy_wms, Some(1_600.0));
         // Distinct coordinates must never reuse the preceding shape's result.
         timing.predict_decode_ms(2, 260, 129, 1024).unwrap();
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             assert_eq!(
                 engine
                     .borrow(py)
@@ -11225,12 +11233,10 @@ mod tests {
 
     #[test]
     fn aic_measurement_reset_clears_phase_provenance_without_clearing_shape_cache() {
-        pyo3::prepare_freethreaded_python();
-        let engine = Python::with_gil(|py| Py::new(py, PerOpEvidenceProbe::default()).unwrap());
-        let timing = python_timing_model(
-            Python::with_gil(|py| engine.clone_ref(py).into_any()),
-            false,
-        );
+        pyo3::Python::initialize();
+        let engine = Python::attach(|py| Py::new(py, PerOpEvidenceProbe::default()).unwrap());
+        let timing =
+            python_timing_model(Python::attach(|py| engine.clone_ref(py).into_any()), false);
         timing.predict_prefill_ms(2, 128, 0).unwrap();
         timing.predict_decode_ms(2, 258, 128, 1024).unwrap();
         let before = timing.evidence_summary().unwrap();
@@ -11248,7 +11254,7 @@ mod tests {
         assert_eq!(after.decode, before.decode);
         assert_eq!(replay_power_stats(&after).unwrap().coverage(), 1.0);
         assert_eq!(replay_power_stats(&after).unwrap().power_w(), Some(400.0));
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             assert_eq!(
                 engine
                     .borrow(py)
@@ -11268,7 +11274,7 @@ mod tests {
     fn empty_native_evidence_and_diagnostics_reject_nonzero_work() {
         use crate::perfmodel::engine::{Engine, spec::EngineSpec};
         use crate::perfmodel::fpm::ForwardPassPerfOptions;
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let db = crate::perf_database::PerfDatabase::load(
             &std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("../../python/aisim/src/aisim_core/systems"),
@@ -11286,7 +11292,7 @@ mod tests {
         .unwrap();
         let native =
             Arc::new(Engine::build(EngineSpec::new(config, vec![], vec![]), Arc::new(db)).unwrap());
-        let engine = Python::with_gil(|py| {
+        let engine = Python::attach(|py| {
             Py::new(py, PerOpEvidenceProbe::default())
                 .unwrap()
                 .into_any()
@@ -11332,12 +11338,10 @@ mod tests {
 
     #[test]
     fn empty_provider_evidence_rejects_nonzero_work() {
-        pyo3::prepare_freethreaded_python();
-        let engine = Python::with_gil(|py| Py::new(py, PerOpEvidenceProbe::default()).unwrap());
-        let timing = python_timing_model(
-            Python::with_gil(|py| engine.clone_ref(py).into_any()),
-            false,
-        );
+        pyo3::Python::initialize();
+        let engine = Python::attach(|py| Py::new(py, PerOpEvidenceProbe::default()).unwrap());
+        let timing =
+            python_timing_model(Python::attach(|py| engine.clone_ref(py).into_any()), false);
         assert!(timing.predict_prefill_ms(99, 128, 0).is_err());
         assert!(timing.predict_decode_ms(99, 12800, 128, 16384).is_err());
         let empty = timing
@@ -11349,7 +11353,7 @@ mod tests {
                 timing.predict_decode_ms(2, 258, 128, 1024).unwrap();
             }
             let before = timing.evidence_summary();
-            let calls = Python::with_gil(|py| {
+            let calls = Python::attach(|py| {
                 engine
                     .borrow(py)
                     .calls
@@ -11367,7 +11371,7 @@ mod tests {
                 ));
                 assert_eq!(timing.evidence_summary(), before);
             }
-            Python::with_gil(|py| {
+            Python::attach(|py| {
                 assert_eq!(
                     engine
                         .borrow(py)
@@ -11440,8 +11444,8 @@ mod tests {
             assert_eq!(a.power_w.map(f64::to_bits), b.power_w.map(f64::to_bits));
             assert_eq!(a.coverage.to_bits(), b.coverage.to_bits());
         };
-        pyo3::prepare_freethreaded_python();
-        let mut timing = Python::with_gil(|py| python_timing_model(py.None(), false));
+        pyo3::Python::initialize();
+        let mut timing = Python::attach(|py| python_timing_model(py.None(), false));
         timing.phase_provider = AicPhaseProvider::NativeEntries(vec![row("seed", 1.0, 2.0, "sol")]);
         timing.predict_decode_ms(1, 65, 64, 1024).unwrap();
         let cached = timing.phase_memo.peek(&(1, 63, 2, 0, false)).unwrap().0;

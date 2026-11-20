@@ -2342,6 +2342,25 @@ These files carry the same NVIDIA copyright and Apache-2.0 license above.
 The harness modifies their module placement to test the callback independently
 of the Dynamo scheduler; it does not replace callback or estimator behavior.
 
+## NVIDIA Dynamo CI pyo3 compatibility
+
+The exact-source rewrites in `scripts/performance/build_simulation_dynamo.py`
+(`patch_pyo3_bindings`) and their regression fixtures in
+`tests/test_ci_workflow_contracts.py` are adapted and modified from NVIDIA
+Dynamo's Python bindings, `lib/bindings/python/Cargo.toml` and the Rust
+sources under `lib/bindings/python/rust/`, at commit
+`def3b79b15c266805540a678dd400aeb6ccada1d`:
+https://github.com/ai-dynamo/dynamo/tree/def3b79b15c266805540a678dd400aeb6ccada1d/lib/bindings/python
+
+Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+Licensed under Apache-2.0; the full license is reproduced in `LICENSE`.
+Upstream license: https://github.com/ai-dynamo/dynamo/blob/def3b79b15c266805540a678dd400aeb6ccada1d/LICENSE
+The adaptation runs only when the selected AISim core uses pyo3 0.30. It moves
+the CI-built bindings from the pyo3 0.23 API to the pyo3 0.30 API, keeps the
+module's GIL requirement, and keeps the two path return values as `str`. It
+does not change scheduling or estimator behavior. It marks each rewritten file
+with a modification notice below its upstream header.
+
 ## SGLang simulator and HiSim feature definitions
 
 The per-request feature set of the learned forward-pass model

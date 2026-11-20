@@ -4983,6 +4983,130 @@ def test_simulation_dynamo_speculation_depth_patch_fails_without_writing(tmp_pat
     assert path.read_bytes() == original
 
 
+def _write_lock(source, *versions):
+    source.mkdir(parents=True, exist_ok=True)
+    (source / "Cargo.lock").write_text(
+        "".join(f'[[package]]\nname = "pyo3"\nversion = "{version}"\n\n' for version in versions)
+        + '[[package]]\nname = "pyo3-ffi"\nversion = "0.30.1"\n'
+    )
+
+
+@pytest.mark.parametrize(
+    ("versions", "error"), [(("0.23.5",), None), (("0.30.1",), None), ((), "found"), (("0.23.5", "0.30.1"), "found")]
+)
+def test_simulation_dynamo_reads_one_locked_pyo3_version(tmp_path, versions, error):
+    from scripts.performance import build_simulation_dynamo as builder
+
+    _write_lock(tmp_path, *versions)
+    if error:
+        with pytest.raises(ValueError, match=error):
+            builder.locked_pyo3_version(tmp_path / "Cargo.lock")
+    else:
+        assert builder.locked_pyo3_version(tmp_path / "Cargo.lock") == versions[0]
+
+
+_PYO3_BINDINGS_MANIFEST = (
+    'pyo3 = { version = "0.23.4", default-features = false }\n'
+    'pyo3-async-runtimes = { version = "0.23.0", default-features = false }\n'
+    'pythonize = "0.23"\n'
+)
+_PYO3_LIB = (
+    "//! Fixture bindings.\nuse pyo3::IntoPyObjectExt;\n\n#[pyclass]\n#[derive(Clone)]\npub struct Endpoint {}\n"
+)
+_PYO3_USER = "use pyo3::prelude::*;\n\nfn call(o: PyObject) {\n    Python::with_gil(|py| o.bind(py).len());\n}\n"
+
+
+def _pyo3_fixture(tmp_path, monkeypatch, core_pyo3):
+    from scripts.performance import build_simulation_dynamo as builder
+
+    source, dynamo = tmp_path / "source", tmp_path / "dynamo"
+    _write_lock(source, core_pyo3)
+    bindings = dynamo / builder.PYO3_BINDINGS
+    (bindings / "rust").mkdir(parents=True)
+    files = {
+        bindings / "Cargo.toml": _PYO3_BINDINGS_MANIFEST,
+        bindings / "rust/lib.rs": _PYO3_LIB,
+        bindings / "rust/user.rs": _PYO3_USER,
+    }
+    for path, text in files.items():
+        path.write_text(text)
+    monkeypatch.setattr(builder, "PYO3_030_RENAMES", ((r"Python::with_gil\(", "Python::attach(", 1),))
+    monkeypatch.setattr(builder, "PYO3_030_PYOBJECT_FILES", ("rust/user.rs",))
+    monkeypatch.setattr(builder, "PYO3_030_BY_VALUE_CLASSES", {"rust/lib.rs": ("Endpoint",)})
+    monkeypatch.setattr(builder, "PYO3_030_EDITS", (builder.PYO3_030_EDITS[0],))
+    return builder, source, dynamo, files
+
+
+def test_simulation_dynamo_pyo3_bindings_unchanged_for_matching_core(tmp_path, monkeypatch):
+    builder, source, dynamo, files = _pyo3_fixture(tmp_path, monkeypatch, "0.23.5")
+
+    def unexpected_write(*args, **kwargs):
+        pytest.fail("a core on the bindings' pyo3 must not rewrite Dynamo")
+
+    monkeypatch.setattr(Path, "write_text", unexpected_write)
+    assert builder.patch_pyo3_bindings(source, dynamo) == {"core_pyo3": "0.23.5", "files": []}
+    assert all(path.read_text() == text for path, text in files.items())
+
+
+def test_simulation_dynamo_pyo3_bindings_move_to_core_pyo3(tmp_path, monkeypatch):
+    builder, source, dynamo, files = _pyo3_fixture(tmp_path, monkeypatch, "0.30.1")
+
+    record = builder.patch_pyo3_bindings(source, dynamo)
+
+    bindings = dynamo / builder.PYO3_BINDINGS
+    marker = "Modified by AISim CI: moved from the pyo3 0.23 API to the pyo3 0.30 API."
+    assert (bindings / "Cargo.toml").read_text() == (
+        f"# {marker}\n"
+        'pyo3 = { version = "0.30.1", default-features = false }\n'
+        'pyo3-async-runtimes = { version = "0.30.0", default-features = false }\n'
+        'pythonize = "0.30"\n'
+    )
+    lib = (bindings / "rust/lib.rs").read_text()
+    assert lib.startswith(f"//! Fixture bindings.\n// {marker}\nuse pyo3::IntoPyObjectExt;\n")
+    assert "pub(crate) type PyObject = pyo3::Py<pyo3::PyAny>;" in lib
+    assert "#[pyclass(from_py_object)]\n#[derive(Clone)]\npub struct Endpoint" in lib
+    assert (bindings / "rust/user.rs").read_text() == (
+        f"// {marker}\n"
+        "use crate::PyObject;\nuse pyo3::prelude::*;\n\nfn call(o: PyObject) {\n"
+        "    Python::attach(|py| o.bind(py).len());\n}\n"
+    )
+    assert record["core_pyo3"] == "0.30.1"
+    assert sorted(entry["path"] for entry in record["files"]) == sorted(str(path.relative_to(dynamo)) for path in files)
+    for entry in record["files"]:
+        path = dynamo / entry["path"]
+        assert entry["before_sha256"] == hashlib.sha256(files[path].encode()).hexdigest()
+        assert entry["after_sha256"] == hashlib.sha256(path.read_text().encode()).hexdigest()
+
+
+@pytest.mark.parametrize(
+    "fault", ["unsupported_core", "rename_count", "edit_anchor", "dependency", "class", "pyobject"]
+)
+def test_simulation_dynamo_pyo3_bindings_fail_without_writing(tmp_path, monkeypatch, fault):
+    builder, source, dynamo, files = _pyo3_fixture(
+        tmp_path, monkeypatch, "0.29.0" if fault == "unsupported_core" else "0.30.1"
+    )
+    bindings = dynamo / builder.PYO3_BINDINGS
+    if fault == "rename_count":
+        monkeypatch.setattr(builder, "PYO3_030_RENAMES", ((r"Python::with_gil\(", "Python::attach(", 2),))
+    elif fault == "edit_anchor":
+        (bindings / "rust/lib.rs").write_text(_PYO3_LIB.replace("IntoPyObjectExt", "IntoPyObject"))
+    elif fault == "dependency":
+        (bindings / "Cargo.toml").write_text(_PYO3_BINDINGS_MANIFEST.replace("0.23.4", "0.23.5"))
+    elif fault == "class":
+        monkeypatch.setattr(builder, "PYO3_030_BY_VALUE_CLASSES", {"rust/lib.rs": ("Context",)})
+    elif fault == "pyobject":
+        (bindings / "rust/extra.rs").write_text("use pyo3::prelude::*;\nfn f(o: PyObject) {}\n")
+    before = {path: path.read_text() for path in sorted(bindings.rglob("*")) if path.is_file()}
+
+    def unexpected_write(*args, **kwargs):
+        pytest.fail("failed bindings validation must not write source files")
+
+    monkeypatch.setattr(Path, "write_text", unexpected_write)
+    with pytest.raises(ValueError):
+        builder.patch_pyo3_bindings(source, dynamo)
+    assert {path: path.read_text() for path in sorted(bindings.rglob("*")) if path.is_file()} == before
+
+
 @pytest.mark.parametrize("field_type", [None, "u32", "usize"])
 @pytest.mark.parametrize("drift", [None, "source", "anchors", "role"])
 def test_simulation_dynamo_replay_cp_compatibility(tmp_path, monkeypatch, field_type, drift):
@@ -5311,6 +5435,7 @@ def test_simulation_dynamo_resolves_then_builds_locked(tmp_path, monkeypatch, wr
         "before_sha256": "a" * 64,
         "after_sha256": "b" * 64,
     }
+    pyo3_compatibility = {"core_pyo3": "0.30.1", "files": [{"path": "x.rs", "before_sha256": "c", "after_sha256": "d"}]}
 
     def patch_handoff_timing(actual_core, actual_dynamo):
         assert actual_core == core.parent and actual_dynamo == dynamo
@@ -5332,6 +5457,11 @@ def test_simulation_dynamo_resolves_then_builds_locked(tmp_path, monkeypatch, wr
         patched.append(("replay", actual_core, actual_dynamo))
         return {"prefill_context_parallel_size": 1}
 
+    def patch_pyo3_bindings(actual_source, actual_dynamo):
+        assert actual_source == source and actual_dynamo == dynamo
+        patched.append(("pyo3", actual_source, actual_dynamo))
+        return pyo3_compatibility
+
     def check_output(args, **kwargs):
         if args[:2] == ["cargo", "metadata"]:
             assert patched == [
@@ -5339,6 +5469,7 @@ def test_simulation_dynamo_resolves_then_builds_locked(tmp_path, monkeypatch, wr
                 ("literals", core.parent, dynamo),
                 ("speculation", dynamo),
                 ("replay", core.parent, dynamo),
+                ("pyo3", source, dynamo),
             ]
             assert "--locked" not in args
             assert kwargs["cwd"] == bindings
@@ -5376,6 +5507,7 @@ def test_simulation_dynamo_resolves_then_builds_locked(tmp_path, monkeypatch, wr
     monkeypatch.setattr(builder, "patch_optional_literal_fields", patch_optional_literal_fields)
     monkeypatch.setattr(builder, "patch_speculation_depth", patch_speculation_depth)
     monkeypatch.setattr(builder, "patch_replay_engine_config", patch_replay_engine_config)
+    monkeypatch.setattr(builder, "patch_pyo3_bindings", patch_pyo3_bindings)
     if wrong_core:
         with pytest.raises(ValueError, match="different AISim core"):
             builder.build(source, dynamo, output)
@@ -5391,6 +5523,7 @@ def test_simulation_dynamo_resolves_then_builds_locked(tmp_path, monkeypatch, wr
         assert provenance["literal_compatibility"] == literal_compatibility
         assert provenance["speculation_compatibility"] == speculation_compatibility
         assert provenance["replay_compatibility"] == {"prefill_context_parallel_size": 1}
+        assert provenance["pyo3_compatibility"] == pyo3_compatibility
         assert (output / "dynamo-build.patch").read_bytes() == b"dependency patch\n"
 
 

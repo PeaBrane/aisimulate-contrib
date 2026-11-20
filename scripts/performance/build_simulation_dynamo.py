@@ -426,6 +426,255 @@ def patch_replay_engine_config(core: Path, dynamo: Path) -> dict:
     }
 
 
+def locked_pyo3_version(lock: Path) -> str:
+    """Return the pyo3 version that a source's Cargo.lock pins.
+
+    Only one package in a build may link `python`, so Dynamo's bindings and
+    the selected AISim core must use the same pyo3.
+    """
+    versions = re.findall(r'^name = "pyo3"\nversion = "([^"]+)"$', lock.read_text(), re.MULTILINE)
+    if len(versions) != 1:
+        raise ValueError(f"expected one locked pyo3 version in {lock}, found {versions}")
+    return versions[0]
+
+
+# Compatibility adaptation of NVIDIA Dynamo's Apache-2.0 Python bindings at DYNAMO_REVISION:
+# https://github.com/ai-dynamo/dynamo/tree/def3b79b15c266805540a678dd400aeb6ccada1d/lib/bindings/python
+# The pinned bindings use pyo3 0.23. When the selected AISim core uses pyo3 0.30,
+# these rewrites move the bindings to the pyo3 0.30 API without changing behavior.
+PYO3_BINDINGS = "lib/bindings/python"
+PYO3_BINDINGS_VERSION = "0.23."
+PYO3_030_DEPENDENCIES = (
+    ('pyo3 = { version = "0.23.4"', 'pyo3 = {{ version = "{version}"'),
+    ('pyo3-async-runtimes = { version = "0.23.0"', 'pyo3-async-runtimes = {{ version = "0.30.0"'),
+    ('pythonize = "0.23"', 'pythonize = "0.30"'),
+)
+# (pattern, replacement, sites across rust/**/*.rs): APIs that pyo3 0.30 removed.
+PYO3_030_RENAMES = (
+    (r"Python::with_gil\(", "Python::attach(", 77),
+    (r"\.allow_threads\(", ".detach(", 28),
+    (r"pyo3::prepare_freethreaded_python\(\)", "pyo3::Python::initialize()", 1),
+    # pyo3 downcasts only; anyhow's Error::downcast keeps its name.
+    (r"\.downcast::<((?:pyo3::types::)?Py(?:List|Bool|Int|Float|String|Dict))>\(\)", r".cast::<\1>()", 9),
+)
+# Files that use the `PyObject` alias, which pyo3 0.28 removed; lib.rs defines it.
+PYO3_030_PYOBJECT_FILES = (
+    "rust/backend.rs",
+    "rust/engine.rs",
+    "rust/http.rs",
+    "rust/llm/entrypoint.rs",
+    "rust/llm/frontend_routes.rs",
+    "rust/llm/kv.rs",
+    "rust/llm/kv/demand_driven.rs",
+    "rust/llm/local_model.rs",
+    "rust/llm/model_card.rs",
+    "rust/llm/replay.rs",
+    "rust/llm/routed_engine.rs",
+    "rust/prometheus_metrics.rs",
+    "rust/push_egress.rs",
+)
+# pyo3 0.30 no longer derives FromPyObject for Clone pyclasses. The bindings
+# take these classes by value, so they opt in with `from_py_object`.
+PYO3_030_BY_VALUE_CLASSES = {
+    "rust/backend.rs": ("DisaggregationMode", "LlmRegistration", "EngineConfig", "RuntimeConfig", "WorkerConfig"),
+    "rust/context.rs": ("Context",),
+    "rust/engine.rs": ("PythonAsyncEngine",),
+    "rust/http.rs": ("HttpAsyncEngine",),
+    "rust/lib.rs": ("RouterMode", "DistributedRuntime", "Endpoint", "ModelType", "ModelInput", "WorkerType"),
+    "rust/llm/entrypoint.rs": (
+        "EngineType",
+        "KvRouterConfig",
+        "AisPerfConfig",
+        "RouterConfig",
+        "EntrypointArgs",
+        "EngineConfig",
+    ),
+    "rust/llm/local_model.rs": ("RoutingConstraints", "ModelRuntimeConfig"),
+    "rust/llm/preprocessor.rs": ("MediaDecoder", "MediaFetcher"),
+    "rust/llm/replay.rs": ("ReasoningConfig", "SglangArgs", "TrtllmArgs", "MockEngineArgs"),
+    "rust/planner.rs": ("PlannerDecision",),
+}
+# (file, old, new, sites): changes that need the surrounding code. Anchors match
+# the text after PYO3_030_RENAMES.
+PYO3_030_EDITS = (
+    (
+        "rust/lib.rs",
+        "\nuse pyo3::IntoPyObjectExt;\n",
+        "\nuse pyo3::IntoPyObjectExt;\n\n/// pyo3 0.28 removed this alias.\n"
+        "pub(crate) type PyObject = pyo3::Py<pyo3::PyAny>;\n",
+        1,
+    ),
+    # FromPyObject gained an input lifetime and an error type in pyo3 0.27.
+    (
+        "rust/backend.rs",
+        "    T: for<'py> FromPyObject<'py>,\n{\n    let attr = match bound.getattr(name) {",
+        "    T: for<'py> FromPyObjectOwned<'py>,\n{\n    let attr = match bound.getattr(name) {",
+        1,
+    ),
+    (
+        "rust/backend.rs",
+        "    Ok(Some(attr.extract()?))\n",
+        "    Ok(Some(attr.extract::<T>().map_err(Into::into)?))\n",
+        1,
+    ),
+    (
+        "rust/python_payload.rs",
+        "    T: FromPyObject<'py>,\n{\n    optional_item(dict, name)?\n"
+        "        .map(|value| value.extract().map_err(|error| error.to_string()))",
+        "    T: FromPyObjectOwned<'py>,\n{\n    optional_item(dict, name)?\n"
+        "        .map(|value| {\n            value\n                .extract::<T>()\n"
+        "                .map_err(|error| Into::<PyErr>::into(error).to_string())\n        })",
+        1,
+    ),
+    (
+        "rust/lib.rs",
+        ".and_then(|repr_obj| repr_obj.extract::<Py<PyString>>(py))",
+        ".and_then(|repr_obj| repr_obj.extract::<Py<PyString>>(py).map_err(Into::into))",
+        1,
+    ),
+    # pyo3-async-runtimes 0.30 requires Send + 'static results.
+    (
+        "rust/lib.rs",
+        "    F: std::future::Future<Output = PyResult<T>> + Send + 'static,\n    T: for<'py> IntoPyObject<'py>,\n",
+        "    F: std::future::Future<Output = PyResult<T>> + Send + 'static,\n"
+        "    T: for<'py> IntoPyObject<'py> + Send + 'static,\n",
+        2,
+    ),
+    # pyo3 0.25 removed IntoPy.
+    (
+        "rust/lib.rs",
+        "                            #[allow(deprecated)]\n"
+        "                            let object = Python::attach(|py| object.into_py(py));\n",
+        "                            let object = Python::attach(|py| object.into_py_any(py))?;\n",
+        1,
+    ),
+    # pyo3 0.28 made modules declare free-threaded support by default; keep the GIL.
+    ("rust/lib.rs", "#[pymodule]\nfn _core(", "#[pymodule(gil_used = true)]\nfn _core(", 2),
+    # pyo3 0.24 converts PathBuf to pathlib.Path; these returned str before.
+    (
+        "rust/lib.rs",
+        "        LocalModel::fetch(&repo, ignore_weights)\n            .await\n            .map_err(to_pyerr)\n",
+        "        LocalModel::fetch(&repo, ignore_weights)\n            .await\n"
+        "            .map(std::path::PathBuf::into_os_string)\n            .map_err(to_pyerr)\n",
+        1,
+    ),
+    (
+        "rust/llm/replay.rs",
+        "    fn response_replay_trace_path(&self) -> Option<PathBuf> {\n"
+        "        self.inner.response_replay_trace_path.clone()\n",
+        "    fn response_replay_trace_path(&self) -> Option<std::ffi::OsString> {\n"
+        "        self.inner.response_replay_trace_path.clone().map(PathBuf::into_os_string)\n",
+        1,
+    ),
+)
+_COMMENT = re.compile(r"//[^\n]*")
+
+
+def _opt_in_from_py_object(text: str, rel: str, name: str) -> str:
+    lines = text.split("\n")
+    definition = re.compile(rf"\s*(pub(\([a-z]+\))? )?(struct|enum) {name}\b")
+    found = [index for index, line in enumerate(lines) if definition.match(line)]
+    if len(found) != 1:
+        raise ValueError(f"expected one definition of {name} in {rel}, found {len(found)}")
+    starts = [
+        index
+        for index in range(found[0] - 1, max(found[0] - 12, -1), -1)
+        if lines[index].lstrip().startswith("#[pyclass")
+    ]
+    if not starts:
+        raise ValueError(f"no #[pyclass] attribute above {name} in {rel}")
+    start = starts[0]
+    if lines[start].strip() == "#[pyclass]":
+        lines[start] = lines[start].replace("#[pyclass]", "#[pyclass(from_py_object)]")
+    elif lines[start].rstrip().endswith(")]"):
+        lines[start] = lines[start].rstrip()[:-2] + ", from_py_object)]"
+    else:
+        end = next((index for index in range(start, found[0]) if lines[index].strip() == ")]"), None)
+        if end is None:
+            raise ValueError(f"unrecognized #[pyclass] attribute above {name} in {rel}")
+        lines[end - 1] = lines[end - 1].rstrip().rstrip(",") + ",\n    from_py_object"
+    return "\n".join(lines)
+
+
+def _mark_modified(text: str, comment: str) -> str:
+    """Add the modification notice below a file's leading comment block."""
+    lines = text.split("\n")
+    header = 0
+    while header < len(lines) and lines[header].startswith(comment):
+        header += 1
+    lines.insert(header, f"{comment} Modified by AISim CI: moved from the pyo3 0.23 API to the pyo3 0.30 API.")
+    return "\n".join(lines)
+
+
+def patch_pyo3_bindings(source: Path, dynamo: Path) -> dict:
+    """Move the pinned Dynamo bindings to the selected core's pyo3, or leave them alone.
+
+    Every rewrite is staged and checked before any file is written.
+    """
+    version = locked_pyo3_version(source / "Cargo.lock")
+    if version.startswith(PYO3_BINDINGS_VERSION):
+        return {"core_pyo3": version, "files": []}
+    if not version.startswith("0.30."):
+        raise ValueError(f"no Dynamo bindings adaptation for pyo3 {version}")
+    bindings = dynamo / PYO3_BINDINGS
+    staged = {path: path.read_text() for path in sorted((bindings / "rust").rglob("*.rs"))}
+    manifest = bindings / "Cargo.toml"
+    staged[manifest] = manifest.read_text()
+    for old, new in PYO3_030_DEPENDENCIES:
+        if staged[manifest].count(old) != 1:
+            raise ValueError(f"pinned Dynamo bindings dependency anchor differs: {old}")
+        staged[manifest] = staged[manifest].replace(old, new.format(version=version))
+    for pattern, replacement, expected in PYO3_030_RENAMES:
+        total = 0
+        for path in staged:
+            if path.suffix == ".rs":
+                staged[path], count = re.subn(pattern, replacement, staged[path])
+                total += count
+        if total != expected:
+            raise ValueError(f"pinned Dynamo bindings have {total} sites for {pattern}, expected {expected}")
+    # The exact edits run after the renames, so their anchors use the new names.
+    for rel, old, new, expected in PYO3_030_EDITS:
+        path = bindings / rel
+        if staged[path].count(old) != expected:
+            raise ValueError(f"pinned Dynamo bindings anchor in {rel} differs: {old[:60]!r}")
+        staged[path] = staged[path].replace(old, new)
+    for rel in PYO3_030_PYOBJECT_FILES:
+        path = bindings / rel
+        text = staged[path]
+        first_use = re.search(r"^use ", text, re.MULTILINE)
+        if not re.search(r"\bPyObject\b", _COMMENT.sub("", text)) or first_use is None:
+            raise ValueError(f"pinned Dynamo bindings file no longer uses PyObject: {rel}")
+        staged[path] = text[: first_use.start()] + "use crate::PyObject;\n" + text[first_use.start() :]
+    unlisted = [
+        str(path.relative_to(bindings))
+        for path, text in staged.items()
+        if path.suffix == ".rs"
+        and path.relative_to(bindings).as_posix() not in PYO3_030_PYOBJECT_FILES
+        and path.relative_to(bindings).as_posix() != "rust/lib.rs"
+        and re.search(r"\bPyObject\b", _COMMENT.sub("", text))
+    ]
+    if unlisted:
+        raise ValueError(f"pinned Dynamo bindings use PyObject in unlisted files: {unlisted}")
+    for rel, names in PYO3_030_BY_VALUE_CLASSES.items():
+        path = bindings / rel
+        for name in names:
+            staged[path] = _opt_in_from_py_object(staged[path], rel, name)
+    records = []
+    for path, text in staged.items():
+        original = path.read_text()
+        if text != original:
+            text = _mark_modified(text, "#" if path.suffix == ".toml" else "//")
+            path.write_text(text)
+            records.append(
+                {
+                    "path": str(path.relative_to(dynamo)),
+                    "before_sha256": hashlib.sha256(original.encode()).hexdigest(),
+                    "after_sha256": hashlib.sha256(text.encode()).hexdigest(),
+                }
+            )
+    return {"core_pyo3": version, "files": records}
+
+
 def build(source: Path, dynamo: Path, output: Path) -> None:
     source, dynamo, output = source.resolve(), dynamo.resolve(), output.resolve()
     revision = subprocess.check_output(["git", "-C", str(dynamo), "rev-parse", "HEAD"], text=True).strip()
@@ -438,6 +687,7 @@ def build(source: Path, dynamo: Path, output: Path) -> None:
     literal_compatibility = patch_optional_literal_fields(core, dynamo)
     speculation_compatibility = patch_speculation_depth(dynamo)
     replay_compatibility = patch_replay_engine_config(core, dynamo)
+    pyo3_compatibility = patch_pyo3_bindings(source, dynamo)
     bindings = dynamo / "lib/bindings/python"
     for manifest, options in (
         (dynamo / "Cargo.toml", ""),
@@ -499,6 +749,7 @@ def build(source: Path, dynamo: Path, output: Path) -> None:
                 "literal_compatibility": literal_compatibility,
                 "speculation_compatibility": speculation_compatibility,
                 "replay_compatibility": replay_compatibility,
+                "pyo3_compatibility": pyo3_compatibility,
             },
             indent=2,
         )

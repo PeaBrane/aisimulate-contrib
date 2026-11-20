@@ -21,6 +21,7 @@ from build_simulation_dynamo import (
     SPECULATION_DEPTH_OLD,
     SPECULATION_DEPTH_PATH,
     SPECULATION_DEPTH_SHA256,
+    locked_pyo3_version,
 )
 
 from scripts.release.package_identity import core_package
@@ -98,7 +99,8 @@ def check(source: Path, dynamo: Path) -> None:
             "[dependencies]\n"
             f"aisimulate-core = {{ package = {json.dumps(core_package(core))}, "
             f'path = {json.dumps(str(core))}, features = ["embed-python"] }}\n'
-            'pyo3 = { version = "0.23.4", features = ["auto-initialize", "abi3-py311"] }\n'
+            f'pyo3 = {{ version = "={locked_pyo3_version(source / "Cargo.lock")}", '
+            'features = ["auto-initialize", "abi3-py311"] }\n'
             'serde_json = "1"\nanyhow = "1"\n[profile.dev]\ndebug = 0\n[profile.test]\ndebug = 0\n'
         )
         shutil.copyfile(source / "Cargo.lock", root / "Cargo.lock")
