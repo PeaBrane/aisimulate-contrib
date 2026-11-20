@@ -25,8 +25,8 @@ use super::profile::{
     AgenticIdleShift, AgenticProfileOptions, AgenticProfileReport, AgenticProfileState,
 };
 use super::trace::{
-    synthesize_validated_trace_tokens, validate_synthesizable_prompt,
-    validate_synthesizable_prompt_len,
+    extend_validated_trace_tokens, synthesize_validated_trace_tokens,
+    validate_synthesizable_prompt, validate_synthesizable_prompt_len,
 };
 use super::types::{
     AgenticDependency, AgenticDependencyRelation, AgenticDependencyTrigger, AgenticGraphIdentity,
@@ -314,9 +314,9 @@ struct SessionRuntime {
 
 #[derive(Debug)]
 enum PromptTokens {
-    // Full-prompt traces stay in their compact on-disk representation until
-    // dispatch. Delta-cumulative traces remain eager because later turns append
-    // generated output to already-materialized session history.
+    // Trace prompts stay in their compact on-disk representation until
+    // dispatch. A delta-cumulative turn is then synthesized straight into its
+    // session history, the only place its tokens are read from.
     Deferred {
         input_length: usize,
         hash_ids: Vec<u32>,
@@ -328,7 +328,6 @@ enum PromptTokens {
         source_index: usize,
         slot: u64,
     },
-    Materialized(Vec<u32>),
 }
 
 impl PromptTokens {
@@ -345,7 +344,6 @@ impl PromptTokens {
             Self::Deferred { input_length, .. } | Self::Snapshot { input_length, .. } => {
                 *input_length
             }
-            Self::Materialized(tokens) => tokens.len(),
         }
     }
 
@@ -355,18 +353,9 @@ impl PromptTokens {
                 input_length,
                 hash_ids,
             } => (*input_length, std::mem::take(hash_ids)),
-            Self::Snapshot { .. } | Self::Materialized(_) => {
-                unreachable!("full-prompt turns must retain their deferred representation")
+            Self::Snapshot { .. } => {
+                unreachable!("trace turns must retain their deferred representation")
             }
-        }
-    }
-
-    fn materialized(&self) -> &[u32] {
-        match self {
-            Self::Deferred { .. } | Self::Snapshot { .. } => {
-                unreachable!("delta-cumulative prompts are materialized during driver setup")
-            }
-            Self::Materialized(tokens) => tokens,
         }
     }
 }
@@ -2606,25 +2595,16 @@ impl WorkloadDriver {
                     .turns
                     .into_iter()
                     .map(|mut turn| -> Result<TurnRuntime> {
-                        let prompt_tokens = match prompt_mode {
-                            PromptMode::Full => PromptTokens::deferred(
-                                turn.input_length,
-                                std::mem::take(&mut turn.hash_ids),
-                                trace_block_size,
-                            )?,
-                            PromptMode::DeltaCumulative => {
-                                // Image spans index the turn's own prompt, not the
-                                // session history the cumulative request carries.
-                                if !turn.images.is_empty() {
-                                    bail!(
-                                        "accumulating session deltas does not support image turns"
-                                    );
-                                }
-                                PromptTokens::Materialized(
-                                    turn.synthesize_tokens(trace_block_size)?,
-                                )
-                            }
-                        };
+                        // Image spans index the turn's own prompt, not the
+                        // session history the cumulative request carries.
+                        if prompt_mode == PromptMode::DeltaCumulative && !turn.images.is_empty() {
+                            bail!("accumulating session deltas does not support image turns");
+                        }
+                        let prompt_tokens = PromptTokens::deferred(
+                            turn.input_length,
+                            std::mem::take(&mut turn.hash_ids),
+                            trace_block_size,
+                        )?;
                         let output_token_ids = Some(planned_output_token_ids(
                             turn.output_token_ids,
                             turn.max_output_tokens,
@@ -3014,9 +2994,13 @@ impl WorkloadDriver {
                     )
                 }
                 PromptMode::DeltaCumulative => {
-                    session
-                        .cumulative_tokens
-                        .extend_from_slice(turn.prompt_tokens.materialized());
+                    let (input_length, hash_ids) = turn.prompt_tokens.take_deferred();
+                    extend_validated_trace_tokens(
+                        &mut session.cumulative_tokens,
+                        input_length,
+                        &hash_ids,
+                        self.trace_block_size,
+                    );
                     let request_tokens = session.cumulative_tokens.clone();
                     let replay_hashes = self.include_replay_hashes.then(|| {
                         ReplayRequestHashes::from_tokens(&request_tokens, self.engine_block_size)
@@ -3827,9 +3811,7 @@ mod tests {
             .iter()
             .map(|session| match &session.turns[0].prompt_tokens {
                 PromptTokens::Deferred { hash_ids, .. } => hash_ids.clone(),
-                PromptTokens::Snapshot { .. } | PromptTokens::Materialized(_) => {
-                    panic!("agentic prompts stay deferred")
-                }
+                PromptTokens::Snapshot { .. } => panic!("agentic prompts stay deferred"),
             })
             .collect();
         assert_eq!(
@@ -4105,19 +4087,6 @@ mod tests {
             assert!(request.materialized_tokens().is_none());
             assert_eq!(request.into_direct_request().tokens, vec![1, 2]);
         }
-    }
-
-    #[test]
-    fn delta_cumulative_prompts_remain_materialized_during_setup() {
-        let driver =
-            WorkloadDriver::new_concurrency_accumulating_deltas(two_session_trace(), 1, 1).unwrap();
-
-        assert!(driver.sessions.iter().all(|session| {
-            session
-                .turns
-                .iter()
-                .all(|turn| matches!(turn.prompt_tokens, PromptTokens::Materialized(_)))
-        }));
     }
 
     #[test]
@@ -4574,6 +4543,9 @@ mod tests {
         );
         assert_eq!(second[0].request.priority, -2);
         assert_eq!(second[0].request.strict_priority, 7);
+        // Dispatch leaves a turn's prompt only in the session history.
+        let (_, hash_ids) = driver.sessions[0].turns[0].prompt_tokens.take_deferred();
+        assert!(hash_ids.is_empty());
     }
 
     #[test]

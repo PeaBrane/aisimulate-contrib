@@ -616,24 +616,18 @@ class _TraceCounters:
     # Dynamo, Agentic Mooncake and Weka loaders hold every u64 source hash
     # array at once. Mooncake-family loaders convert each row as it is read.
     retains_source_hashes: bool
-    # Mooncake-delta setup replaces each turn's hashes with its synthesized prompt.
-    materializes_inputs: bool = False
     # A snapshot expands prompts only for selected plays after their cuts.
     expands_every_input: bool = True
     hashes: int = 0
     authored_outputs: int = 0
     outputs: int = 0
     largest_input: int = 0
-    total_input: int = 0
     requests: int = 0
 
     @property
     def lower_bound(self) -> int:
         loaded = 8 * self.hashes + 4 * self.authored_outputs if self.retains_source_hashes else 0
-        if self.materializes_inputs:
-            prepared = max(4 * self.hashes, 4 * (self.total_input + self.outputs))
-        else:
-            prepared = 4 * (self.hashes + self.outputs)
+        prepared = 4 * (self.hashes + self.outputs)
         return max(loaded, prepared, 4 * self.largest_input if self.expands_every_input else 0)
 
 
@@ -689,7 +683,6 @@ def _scan_mooncake(events: Any, counters: _TraceCounters, state: dict[str, Any],
             elif event == "end_map":
                 length = hashes * block_size if row_input is None else row_input
                 counters.largest_input = max(counters.largest_input, length)
-                counters.total_input += length
                 counters.hashes += hashes
                 counters.authored_outputs += authored
                 hashes = authored = 0
@@ -852,7 +845,6 @@ def _scan_finite_trace(
 ) -> _TraceCounters:
     counters = _TraceCounters(
         retains_source_hashes=format_name in {"agentic_mooncake", "dynamo", "weka"},
-        materializes_inputs=format_name == "mooncake-delta",
         expands_every_input=not snapshot,
     )
     limit = None if inspection_budget_bytes is None else inspection_budget_bytes - WORKER_BASELINE_BYTES
@@ -986,7 +978,7 @@ def estimate_workload(
         model = "dynamo-eager-u32-v1"
         peak = WORKER_BASELINE_BYTES + 2 * tokens + count * (4096 + 16 * osl)
     elif stack == "engine":
-        # Every turn retains only its own prompt delta or hash IDs, planned
+        # Every turn retains only its own hash IDs, planned
         # output IDs and transcript share, which a one-token block prefix cache
         # can index. Completed sessions' prefixes can remain in every cache a
         # turn visited, even after they leave the active concurrency window.

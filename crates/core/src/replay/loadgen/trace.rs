@@ -429,19 +429,29 @@ pub(super) fn synthesize_validated_trace_tokens(
     trace_block_size: usize,
 ) -> Vec<u32> {
     let mut tokens = Vec::with_capacity(input_length);
+    extend_validated_trace_tokens(&mut tokens, input_length, hash_ids, trace_block_size);
+    tokens
+}
+
+/// Appends the prompt `synthesize_validated_trace_tokens` would build, so a
+/// caller that owns the destination needs no intermediate vector.
+pub(super) fn extend_validated_trace_tokens(
+    tokens: &mut Vec<u32>,
+    input_length: usize,
+    hash_ids: &[u32],
+    trace_block_size: usize,
+) {
+    let mut remaining = input_length;
     for &hash_id in hash_ids {
-        let remaining = input_length - tokens.len();
-        tokens.extend(std::iter::repeat_n(
-            hash_id,
-            remaining.min(trace_block_size),
-        ));
-        if tokens.len() == input_length {
+        let block = remaining.min(trace_block_size);
+        tokens.extend(std::iter::repeat_n(hash_id, block));
+        remaining -= block;
+        if remaining == 0 {
             break;
         }
     }
 
-    debug_assert_eq!(tokens.len(), input_length);
-    tokens
+    debug_assert_eq!(remaining, 0);
 }
 
 fn trace_to_replay_hashes(
