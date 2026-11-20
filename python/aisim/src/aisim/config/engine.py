@@ -282,11 +282,28 @@ class G3OffloadConfig(StrictModel):
     shared_write_bandwidth_gbps: NonNegativeFloat = 80.0
 
 
+class KvcrLocalG2Config(StrictModel):
+    """Host memory KVCR owns on each rank, behind the rank's own G2."""
+
+    num_blocks: PositiveU64
+    policy: Literal["lru", "fifo"] = "lru"
+    copy_bandwidth_gbps: NonNegativeFloat = 6.0
+
+
 class KvcrConfig(StrictModel):
     """KVCR peer G2 fetch: pull a hinted prefix from another rank's private G2."""
 
     latency_to_first_byte_ms: NonNegativeFloat = 1.0
-    bandwidth_gbps: NonNegativeFloat = 50.0
+    bandwidth_gbps: NonNegativeFloat = 32.0
+    local_g2: KvcrLocalG2Config | None = None
+
+    @model_serializer(mode="wrap")
+    def _omit_unset_local_g2(self, handler: Any) -> dict[str, Any]:
+        # Keep the peer-fetch-only descriptor shape unless KVCR owns memory.
+        payload = handler(self)
+        if payload.get("local_g2") is None:
+            payload.pop("local_g2", None)
+        return payload
 
 
 def manual_block_bytes(block_size: int | None, bytes_per_token: int | str) -> int:

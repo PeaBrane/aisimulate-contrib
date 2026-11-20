@@ -6,6 +6,15 @@
 //!
 //! Replay owns one registry per KVCR pool. A target rank's adapter reads and
 //! pins source blocks through the handles here; source ranks run no KVCR code.
+//!
+//! Independently written adaptation of behavioral contracts, with no upstream
+//! code copied; see `THIRD_PARTY_NOTICES.md`. vLLM (Apache-2.0, copyright
+//! contributors to the vLLM project) at commit
+//! `68e478651a20e3d23bf939912c38883d511ac3ee`:
+//! <https://github.com/vllm-project/vllm/blob/68e478651a20e3d23bf939912c38883d511ac3ee/vllm/v1/kv_offload/tiering/kvcr/manager.py>
+//! and `vllm/v1/kv_offload/tiering/manager.py`. KVCR (Apache-2.0) at commit
+//! `ca61ea0cb1cdbaa86dc6b33ab9007be3e9276f71`:
+//! <https://github.com/ai-dynamo/kvcr/tree/ca61ea0cb1cdbaa86dc6b33ab9007be3e9276f71/src/kvcr>
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -14,11 +23,11 @@ use anyhow::{Result, ensure};
 use serde::Serialize;
 
 use crate::engine::g3_offload::is_zero;
-use crate::engine::host_offload::HostTierHandle;
+use crate::engine::host_offload::{HostBlockKey, HostTierHandle};
 use rustc_hash::FxHashMap;
 
 use crate::engine::offload_transfer::{self, ClientEvent, Direction, FairTransfers, Link};
-use crate::engine::{KvHintSource, KvcrConfig};
+use crate::engine::{KvHintSource, KvcrConfig, KvcrLocalG2Config};
 
 pub(crate) type SharedKvcrRegistry = Arc<Mutex<KvcrRegistry>>;
 
@@ -53,6 +62,25 @@ pub struct KvcrStats {
     /// Requests that stopped using KVCR after too many rounds without progress.
     #[serde(skip_serializing_if = "is_zero")]
     pub bypassed: u64,
+    /// KVCR-owned memory of the pool's ranks; present with `kvcr.local_g2`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_g2: Option<KvcrLocalG2Stats>,
+}
+
+/// Block counters of the KVCR-owned memory of one pool's ranks.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct KvcrLocalG2Stats {
+    /// Written after a G2 store completed (`local_fill`), counted when the
+    /// copy into KVCR-owned memory completes.
+    pub stored_blocks: u64,
+    /// Not written: every other block was in use.
+    pub dropped_blocks: u64,
+    /// Evicted to make room.
+    pub evicted_blocks: u64,
+    /// Copied back into the rank's G2 (`local_deliver`).
+    pub promoted_blocks: u64,
+    /// Promoted blocks, counted when their first load into G1 starts.
+    pub loaded_blocks: u64,
 }
 
 struct Rank {
@@ -72,11 +100,22 @@ struct Pull {
     blocks: usize,
     bytes: usize,
     partial: bool,
+    /// Whether the pull starts no earlier than the end of its source's pass.
+    waits_for_source: bool,
+    /// Delivery waits for a local promotion as well as this peer transfer.
+    joined: bool,
 }
 
 pub(crate) struct KvcrRegistry {
     config: KvcrConfig,
     ranks: BTreeMap<KvHintSource, Rank>,
+    /// Each rank's KVCR-owned memory, which its adapter adds when it joins.
+    local_g2: BTreeMap<KvHintSource, HostTierHandle>,
+    /// Blocks of each rank's KVCR-owned memory that pulls in flight read, by
+    /// number of pulls. KVCR does not evict such a block and, unlike a
+    /// promotion's claim, a reader leaves it where it is in the FIFO queue
+    /// (`acquire_readers`).
+    local_readers: BTreeMap<KvHintSource, FxHashMap<HostBlockKey, u32>>,
     next_client: u64,
     busy_until_ms: BTreeMap<u64, f64>,
     pulls: BTreeMap<u64, Pull>,
@@ -95,6 +134,9 @@ pub(crate) struct KvcrRegistry {
     moving: BTreeMap<KvHintSource, BTreeMap<u64, usize>>,
     /// Landed pulls not yet taken by their target, in landing order.
     landed: BTreeMap<KvHintSource, Vec<(u64, f64)>>,
+    /// Physically completed pulls waiting for their joined G2 reservations
+    /// to become readable. They no longer retain their source worker.
+    deliveries: FxHashMap<u64, Pull>,
     /// Untaken pulls each worker sources or receives.
     in_flight: BTreeMap<u64, usize>,
     next_pull: u64,
@@ -103,9 +145,15 @@ pub(crate) struct KvcrRegistry {
 
 impl KvcrRegistry {
     pub(crate) fn new(config: KvcrConfig) -> SharedKvcrRegistry {
+        let stats = KvcrStats {
+            local_g2: config.local_g2.as_ref().map(|_| Default::default()),
+            ..Default::default()
+        };
         Arc::new(Mutex::new(Self {
             config,
             ranks: BTreeMap::new(),
+            local_g2: BTreeMap::new(),
+            local_readers: BTreeMap::new(),
             next_client: 0,
             busy_until_ms: BTreeMap::new(),
             pulls: BTreeMap::new(),
@@ -115,10 +163,61 @@ impl KvcrRegistry {
             client_events_stale: false,
             moving: BTreeMap::new(),
             landed: BTreeMap::new(),
+            deliveries: FxHashMap::default(),
             in_flight: BTreeMap::new(),
             next_pull: 0,
-            stats: KvcrStats::default(),
+            stats,
         }))
+    }
+
+    pub(crate) fn local_g2_config(&self) -> Option<&KvcrLocalG2Config> {
+        self.config.local_g2.as_ref()
+    }
+
+    /// Let peers pull from `rank`'s KVCR-owned memory too.
+    pub(crate) fn set_local_g2(&mut self, rank: KvHintSource, tier: HostTierHandle) {
+        self.local_g2.insert(rank, tier);
+    }
+
+    /// A pull starts reading `keys` of `rank`'s KVCR-owned memory.
+    pub(crate) fn read_local(&mut self, rank: KvHintSource, keys: &[HostBlockKey]) {
+        if !keys.is_empty() {
+            let readers = self.local_readers.entry(rank).or_default();
+            for key in keys {
+                *readers.entry(*key).or_default() += 1;
+            }
+        }
+    }
+
+    /// The pull that read `keys` of `rank`'s KVCR-owned memory has landed.
+    pub(crate) fn unread_local(&mut self, rank: KvHintSource, keys: &[HostBlockKey]) {
+        if keys.is_empty() {
+            return;
+        }
+        let readers = self
+            .local_readers
+            .get_mut(&rank)
+            .expect("a pull reads its source's KVCR memory");
+        for key in keys {
+            let count = readers.get_mut(key).expect("a pull reads each block");
+            *count -= 1;
+            if *count == 0 {
+                readers.remove(key);
+            }
+        }
+    }
+
+    /// Whether a pull in flight reads `key` of `rank`'s KVCR-owned memory.
+    pub(crate) fn reads_local(&self, rank: KvHintSource, key: HostBlockKey) -> bool {
+        (self.local_readers.get(&rank)).is_some_and(|readers| readers.contains_key(&key))
+    }
+
+    /// Counters of the pool's KVCR-owned memory.
+    pub(crate) fn local_g2_stats(&mut self) -> &mut KvcrLocalG2Stats {
+        self.stats
+            .local_g2
+            .as_mut()
+            .expect("kvcr.local_g2 is configured")
     }
 
     /// Join every attention-DP rank of a newly built worker, in rank order, or
@@ -182,6 +281,9 @@ impl KvcrRegistry {
             "cannot unregister KVCR worker {worker_id} with pulls in flight"
         );
         self.ranks.retain(|rank, _| rank.worker_id != worker_id);
+        self.local_g2.retain(|rank, _| rank.worker_id != worker_id);
+        self.local_readers
+            .retain(|rank, _| rank.worker_id != worker_id);
         self.landed.retain(|rank, _| rank.worker_id != worker_id);
         self.busy_until_ms.remove(&worker_id);
         Ok(())
@@ -204,6 +306,7 @@ impl KvcrRegistry {
                 .busy_until_ms
                 .get(&pull.source.worker_id)
                 .copied()
+                .filter(|_| pull.waits_for_source)
                 .unwrap_or(f64::NEG_INFINITY);
             // A lagging rank never schedules work in the past.
             let start_ms = pull
@@ -214,8 +317,52 @@ impl KvcrRegistry {
         }
     }
 
-    pub(crate) fn source(&self, rank: KvHintSource) -> Option<HostTierHandle> {
-        self.ranks.get(&rank).map(|rank| rank.g2.clone())
+    /// The G2 of the registered `rank` and, if it has any, its KVCR-owned
+    /// memory.
+    pub(crate) fn source(
+        &self,
+        rank: KvHintSource,
+    ) -> Option<(HostTierHandle, Option<HostTierHandle>)> {
+        let g2 = self.ranks.get(&rank)?.g2.clone();
+        Some((g2, self.local_g2.get(&rank).cloned()))
+    }
+
+    /// The staged pull `id` reads KVCR-owned memory only, which KVCR serves
+    /// without the source's scheduler: it does not wait for the source's pass.
+    pub(crate) fn skip_source_wait(&mut self, id: u64) {
+        self.pulls
+            .get_mut(&id)
+            .expect("a staged KVCR pull keeps its record")
+            .waits_for_source = false;
+    }
+
+    /// Count this pull's delivery only when its joined promotion is ready.
+    pub(crate) fn join_delivery(&mut self, id: u64) {
+        self.pulls
+            .get_mut(&id)
+            .expect("a staged pull exists")
+            .joined = true;
+    }
+
+    /// Both parts of a joined restore are readable in the target's G2.
+    pub(crate) fn complete_joined_delivery(&mut self, id: u64, at_ms: f64) {
+        let pull = self
+            .deliveries
+            .remove(&id)
+            .expect("a joined delivery follows its physical completion");
+        Self::record_delivery(&mut self.stats, &pull, at_ms);
+    }
+
+    fn record_delivery(stats: &mut KvcrStats, pull: &Pull, at_ms: f64) {
+        if pull.partial {
+            stats.pulls.partial += 1;
+        } else {
+            stats.pulls.success += 1;
+        }
+        stats.blocks += pull.blocks as u64;
+        stats.bytes += pull.bytes as u64;
+        stats.remote_deliver_ms += at_ms - pull.submitted_ms;
+        stats.source_wait_ms += pull.source_wait_ms;
     }
 
     /// Stage a pull of `blocks` blocks from the registered `source` into
@@ -249,6 +396,8 @@ impl KvcrRegistry {
                 blocks,
                 bytes,
                 partial,
+                waits_for_source: true,
+                joined: false,
             },
         );
         for worker in [target.worker_id, source.worker_id] {
@@ -338,15 +487,9 @@ impl KvcrRegistry {
                     self.moving.remove(&pull.target);
                 }
             }
-            if pull.partial {
-                self.stats.pulls.partial += 1;
-            } else {
-                self.stats.pulls.success += 1;
+            if !pull.joined {
+                Self::record_delivery(&mut self.stats, pull, at_ms);
             }
-            self.stats.blocks += pull.blocks as u64;
-            self.stats.bytes += pull.bytes as u64;
-            self.stats.remote_deliver_ms += at_ms - pull.submitted_ms;
-            self.stats.source_wait_ms += pull.source_wait_ms;
             let landed = self.landed.entry(pull.target).or_default();
             debug_assert!(
                 landed.last().is_none_or(|&(_, last)| last <= at_ms),
@@ -384,6 +527,9 @@ impl KvcrRegistry {
                 if *count == 0 {
                     self.in_flight.remove(&worker);
                 }
+            }
+            if pull.joined {
+                self.deliveries.insert(*id, pull);
             }
         }
         taken
@@ -448,6 +594,7 @@ mod tests {
         KvcrRegistry::new(KvcrConfig {
             latency_to_first_byte_ms: latency,
             bandwidth_gbps: gbps,
+            local_g2: None,
         })
     }
 
@@ -470,19 +617,24 @@ mod tests {
         join(&mut r, 1, 1);
         r.note_pass(0, 10.0);
         let id = r.submit(rank(1, 0), rank(0, 0), 2, false, 5.0);
+        // A pull of KVCR-owned memory starts at its submit time instead.
+        let unwaited = r.submit(rank(1, 0), rank(0, 0), 1, false, 5.0);
+        r.skip_source_wait(unwaited);
         r.start_parked();
+        assert_eq!(r.take_landed(rank(1, 0), 7.0), vec![(unwaited, 7.0)]);
+        assert_eq!(r.stats().source_wait_ms, 0.0);
         assert!(r.take_landed(rank(1, 0), 12.9).is_empty());
         assert_eq!(r.take_landed(rank(1, 0), 13.0), vec![(id, 13.0)]);
         let stats = r.stats();
         assert_eq!(
             stats.pulls,
             KvcrPullCounts {
-                success: 1,
+                success: 2,
                 partial: 0
             }
         );
-        assert_eq!((stats.blocks, stats.bytes), (2, 2 * BLOCK as u64));
-        assert_eq!((stats.source_wait_ms, stats.remote_deliver_ms), (5.0, 8.0));
+        assert_eq!((stats.blocks, stats.bytes), (3, 3 * BLOCK as u64));
+        assert_eq!((stats.source_wait_ms, stats.remote_deliver_ms), (5.0, 10.0));
     }
 
     #[test]

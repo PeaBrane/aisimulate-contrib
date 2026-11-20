@@ -116,13 +116,15 @@ impl SchedulerRank {
     }
 
     /// Pull hinted prefixes from peer ranks' G2. Returns this rank's own G2,
-    /// or `None` for an engine without KVCR.
+    /// or `None` for an engine without KVCR. A G2 block holds the KV of one
+    /// of the rank's `gpus_per_rank` GPUs.
     pub(crate) fn set_kvcr(
         &mut self,
         registry: crate::engine::kvcr::SharedKvcrRegistry,
         rank: KvHintSource,
-    ) -> Option<HostTierHandle> {
-        self.core.set_kvcr(registry, rank)
+        gpus_per_rank: usize,
+    ) -> Option<anyhow::Result<HostTierHandle>> {
+        self.core.set_kvcr(registry, rank, gpus_per_rank)
     }
 
     pub(crate) fn set_host_offload_observer(&mut self, observer: Arc<dyn HostOffloadObserver>) {

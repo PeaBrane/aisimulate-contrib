@@ -724,16 +724,73 @@ pub struct KvcrConfig {
     /// Per-source-rank bandwidth in decimal GB/s, shared by the rank's GPUs
     /// and by concurrent pulls from it. Zero is unlimited.
     pub bandwidth_gbps: f64,
+    /// Host memory KVCR owns on each rank, behind the rank's own G2. Unset:
+    /// KVCR only moves blocks between the ranks' G2 caches.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_g2: Option<KvcrLocalG2Config>,
+}
+
+/// KVCR-owned host memory of one rank (vLLM's `secondary_g2_slots`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KvcrLocalG2Config {
+    /// Capacity of each rank, in blocks of the rank's G2.
+    pub num_blocks: usize,
+    #[serde(default)]
+    pub policy: KvcrLocalG2Policy,
+    /// Rate of the copies between the rank's G2 and this memory, in decimal
+    /// GB/s. Zero is unlimited.
+    #[serde(default = "default_local_g2_copy_bandwidth_gbps")]
+    pub copy_bandwidth_gbps: f64,
+}
+
+fn default_local_g2_copy_bandwidth_gbps() -> f64 {
+    6.0
+}
+
+impl KvcrLocalG2Config {
+    /// `num_blocks` of memory with the default policy and copy rate.
+    pub fn new(num_blocks: usize) -> Self {
+        Self {
+            num_blocks,
+            policy: KvcrLocalG2Policy::default(),
+            copy_bandwidth_gbps: default_local_g2_copy_bandwidth_gbps(),
+        }
+    }
+}
+
+/// Which block KVCR-owned memory drops when it is full.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KvcrLocalG2Policy {
+    /// Least recently used; later prompt blocks first among equals.
+    #[default]
+    Lru,
+    /// Stored longest ago; a promotion queues its blocks again.
+    Fifo,
 }
 
 impl KvcrConfig {
     pub(crate) fn validate(&self) -> Result<()> {
-        for value in [self.latency_to_first_byte_ms, self.bandwidth_gbps] {
+        let copy_gbps = self
+            .local_g2
+            .as_ref()
+            .map(|local| local.copy_bandwidth_gbps);
+        for value in [self.latency_to_first_byte_ms, self.bandwidth_gbps]
+            .into_iter()
+            .chain(copy_gbps)
+        {
             ensure!(
                 value.is_finite() && value >= 0.0,
                 "kvcr timing must be finite and non-negative"
             );
         }
+        ensure!(
+            self.local_g2
+                .as_ref()
+                .is_none_or(|local| local.num_blocks > 0),
+            "kvcr.local_g2.num_blocks must be positive; omit local_g2 to disable it"
+        );
         Ok(())
     }
 }
@@ -742,7 +799,8 @@ impl Default for KvcrConfig {
     fn default() -> Self {
         Self {
             latency_to_first_byte_ms: 1.0,
-            bandwidth_gbps: 50.0,
+            bandwidth_gbps: 32.0,
+            local_g2: None,
         }
     }
 }
@@ -3756,7 +3814,8 @@ mod tests {
             config,
             KvcrConfig {
                 latency_to_first_byte_ms: 1.0,
-                bandwidth_gbps: 50.0
+                bandwidth_gbps: 32.0,
+                local_g2: None,
             }
         );
         assert_eq!(config, KvcrConfig::default());
@@ -3781,12 +3840,30 @@ mod tests {
         let encoded = serde_json::to_value(&engine).unwrap();
         assert_eq!(
             encoded["kvcr"],
-            serde_json::json!({"latency_to_first_byte_ms": 1.0, "bandwidth_gbps": 50.0})
+            serde_json::json!({"latency_to_first_byte_ms": 1.0, "bandwidth_gbps": 32.0})
         );
         assert_eq!(
             serde_json::from_value::<EngineConfig>(encoded).unwrap(),
             engine
         );
+
+        // KVCR-owned memory: the policy and copy rate default and round-trip.
+        let local = serde_json::json!({"local_g2": {"num_blocks": 4}});
+        let config: KvcrConfig = serde_json::from_value(local).unwrap();
+        assert_eq!(config.local_g2, Some(KvcrLocalG2Config::new(4)));
+        let encoded = serde_json::to_value(&config).unwrap();
+        assert_eq!(
+            encoded["local_g2"],
+            serde_json::json!({"num_blocks": 4, "policy": "lru", "copy_bandwidth_gbps": 6.0})
+        );
+        for rejected in [
+            serde_json::json!({"num_blocks": 4, "policy": "g3_lru"}),
+            serde_json::json!({"num_blocks": 4, "slots": 1}),
+            serde_json::json!({"policy": "fifo"}),
+        ] {
+            let wire = serde_json::json!({ "local_g2": rejected });
+            assert!(serde_json::from_value::<KvcrConfig>(wire).is_err());
+        }
     }
 
     #[test]
@@ -3850,6 +3927,19 @@ mod tests {
             ),
             (
                 |config| config.kvcr.as_mut().unwrap().latency_to_first_byte_ms = f64::INFINITY,
+                "kvcr timing must be finite and non-negative",
+            ),
+            (
+                |config| config.kvcr.as_mut().unwrap().local_g2 = Some(KvcrLocalG2Config::new(0)),
+                "kvcr.local_g2.num_blocks must be positive",
+            ),
+            (
+                |config| {
+                    config.kvcr.as_mut().unwrap().local_g2 = Some(KvcrLocalG2Config {
+                        copy_bandwidth_gbps: -1.0,
+                        ..KvcrLocalG2Config::new(4)
+                    })
+                },
                 "kvcr timing must be finite and non-negative",
             ),
         ];

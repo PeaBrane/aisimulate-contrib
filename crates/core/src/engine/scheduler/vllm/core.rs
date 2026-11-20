@@ -869,11 +869,12 @@ impl VllmCore {
         &mut self,
         registry: crate::engine::kvcr::SharedKvcrRegistry,
         rank: KvHintSource,
-    ) -> HostTierHandle {
+        gpus_per_rank: usize,
+    ) -> anyhow::Result<HostTierHandle> {
         self.native_host_offload
             .as_mut()
             .expect("KVCR requires G2")
-            .set_kvcr(registry, rank)
+            .set_kvcr(registry, rank, gpus_per_rank)
     }
 
     pub(crate) fn set_host_offload_observer(

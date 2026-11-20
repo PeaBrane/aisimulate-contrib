@@ -341,20 +341,25 @@ impl ReplayRoleFactory {
             }
         }
         if let Some(registry) = &self.kvcr {
+            let tensor_parallel_size =
+                usize::try_from(self.tensor_parallel_size).map_err(|_| {
+                    ReplayError::InvalidSpec("tensor_parallel_size overflows usize".into())
+                })?;
             let mut handles = Vec::new();
             for (dp_rank, rank) in engine.ranks_mut().enumerate() {
                 let key = crate::engine::KvHintSource {
                     worker_id,
                     dp_rank: u32::try_from(dp_rank).expect("dp_size fits u32"),
                 };
-                handles.push(rank.set_kvcr(Arc::clone(registry), key).ok_or_else(|| {
-                    ReplayError::InvalidSpec("kvcr requires vLLM ranks with host_offload".into())
-                })?);
+                let g2 = rank
+                    .set_kvcr(Arc::clone(registry), key, tensor_parallel_size)
+                    .ok_or_else(|| {
+                        ReplayError::InvalidSpec(
+                            "kvcr requires vLLM ranks with host_offload".into(),
+                        )
+                    })?;
+                handles.push(g2.map_err(|error| ReplayError::InvalidSpec(error.to_string()))?);
             }
-            let tensor_parallel_size =
-                usize::try_from(self.tensor_parallel_size).map_err(|_| {
-                    ReplayError::InvalidSpec("tensor_parallel_size overflows usize".into())
-                })?;
             registry
                 .lock()
                 .unwrap()

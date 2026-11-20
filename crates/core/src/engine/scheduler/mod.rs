@@ -400,9 +400,10 @@ impl EngineCore {
         &mut self,
         registry: crate::engine::kvcr::SharedKvcrRegistry,
         rank: KvHintSource,
-    ) -> Option<HostTierHandle> {
+        gpus_per_rank: usize,
+    ) -> Option<anyhow::Result<HostTierHandle>> {
         match self {
-            Self::Vllm(core) => Some(core.set_kvcr(registry, rank)),
+            Self::Vllm(core) => Some(core.set_kvcr(registry, rank, gpus_per_rank)),
             Self::Sglang(_) => None,
         }
     }

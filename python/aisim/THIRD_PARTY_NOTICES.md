@@ -731,6 +731,47 @@ under Apache-2.0. These repository-root-relative files adapt behavioral contract
 no upstream method bodies are copied. The Rust implementation and fixtures are
 modified for simulation and do not reproduce native filesystem timing.
 
+The KVCR model in these repository-root files is an independently written,
+modified Rust simulation adaptation of behavioral contracts of vLLM and KVCR:
+
+- `crates/core/src/engine/kvcr.rs`
+- `crates/core/src/engine/scheduler/vllm/kvcr.rs`
+- the KVCR call sites in `crates/core/src/engine/scheduler/vllm/host_offload.rs`
+- their tests in those files and in `crates/core/tests/kvcr_replay.rs`
+- the KVCR sections of `docs/replay/engine/kv-cache.md`
+
+vLLM at commit `68e478651a20e3d23bf939912c38883d511ac3ee`:
+
+- https://github.com/vllm-project/vllm/blob/68e478651a20e3d23bf939912c38883d511ac3ee/vllm/v1/kv_offload/tiering/kvcr/manager.py
+- https://github.com/vllm-project/vllm/blob/68e478651a20e3d23bf939912c38883d511ac3ee/vllm/v1/kv_offload/tiering/manager.py
+- https://github.com/vllm-project/vllm/blob/68e478651a20e3d23bf939912c38883d511ac3ee/vllm/v1/kv_offload/base.py
+- https://github.com/vllm-project/vllm/blob/68e478651a20e3d23bf939912c38883d511ac3ee/vllm/v1/kv_offload/cpu/manager.py
+- https://github.com/vllm-project/vllm/blob/68e478651a20e3d23bf939912c38883d511ac3ee/vllm/v1/kv_offload/cpu/policies/lru.py
+- https://github.com/vllm-project/vllm/blob/68e478651a20e3d23bf939912c38883d511ac3ee/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+- https://github.com/vllm-project/vllm/blob/68e478651a20e3d23bf939912c38883d511ac3ee/vllm/distributed/kv_transfer/kv_connector/v1/offloading/state.py
+
+Copyright contributors to the vLLM project. Licensed under Apache-2.0:
+https://github.com/vllm-project/vllm/blob/68e478651a20e3d23bf939912c38883d511ac3ee/LICENSE
+
+KVCR at commit `ca61ea0cb1cdbaa86dc6b33ab9007be3e9276f71`:
+
+- https://github.com/ai-dynamo/kvcr/blob/ca61ea0cb1cdbaa86dc6b33ab9007be3e9276f71/src/kvcr/runtime/core.py
+- https://github.com/ai-dynamo/kvcr/blob/ca61ea0cb1cdbaa86dc6b33ab9007be3e9276f71/src/kvcr/runtime/policy_runtime.py
+- https://github.com/ai-dynamo/kvcr/blob/ca61ea0cb1cdbaa86dc6b33ab9007be3e9276f71/src/kvcr/policy.py
+- https://github.com/ai-dynamo/kvcr/blob/ca61ea0cb1cdbaa86dc6b33ab9007be3e9276f71/src/kvcr/backends/local_dram.py
+- https://github.com/ai-dynamo/kvcr/blob/ca61ea0cb1cdbaa86dc6b33ab9007be3e9276f71/src/kvcr/backends/local_dram_pools.py
+- https://github.com/ai-dynamo/kvcr/blob/ca61ea0cb1cdbaa86dc6b33ab9007be3e9276f71/src/kvcr/backends/remote_fw_dram.py
+- https://github.com/ai-dynamo/kvcr/blob/ca61ea0cb1cdbaa86dc6b33ab9007be3e9276f71/src/kvcr/backends/remote_sources.py
+
+Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. Licensed under Apache-2.0:
+https://github.com/ai-dynamo/kvcr/blob/ca61ea0cb1cdbaa86dc6b33ab9007be3e9276f71/LICENSE
+
+No upstream method bodies or test fixtures are copied. The adaptation models
+which blocks a rank pulls from a hinted peer and when the pull starts and
+lands, which blocks KVCR-owned memory stores, evicts and promotes, the order
+its LRU and FIFO policies keep, and how long each operation protects the
+blocks it reads.
+
 The `offloading_v0_32` and `simple_cpu_v0_32` G2 connector profiles in
 repository-root files `crates/core/src/engine/host_offload/tier.rs` and
 `crates/core/src/engine/scheduler/vllm/{core,host_offload}.rs`, their tests in

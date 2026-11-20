@@ -52,6 +52,17 @@ impl HeldPrefix {
         }
         held
     }
+
+    /// Read `keys` again unless G2 is unchanged since the last reading of
+    /// them. Returns how many leading keys G2 holds and whether one of those
+    /// is pending.
+    pub(super) fn refresh(&mut self, tier: &HostTier, keys: &[HostBlockKey]) -> (usize, bool) {
+        if (self.epoch, self.keys_len) != (tier.lookup_epoch(), keys.len()) {
+            *self = Self::read(tier, keys);
+        }
+        debug_assert_eq!(*self, Self::read(tier, keys));
+        (self.len, self.pending)
+    }
 }
 
 pub(super) struct VllmG3OffloadAdapter {
@@ -125,18 +136,14 @@ impl VllmG3OffloadAdapter {
             self.attempted_at = now;
             self.attempted.clear();
         }
-        if (held.epoch, held.keys_len) != (tier.lookup_epoch(), keys.len()) {
-            *held = HeldPrefix::read(tier, keys);
-        }
-        debug_assert_eq!(*held, HeldPrefix::read(tier, keys));
+        let (held_len, mut deferred) = held.refresh(tier, keys);
         let (mut plan, mut no_room) = (None::<ExternalPlan>, None);
-        let mut deferred = held.pending;
         let mut registry = self.registry.lock().unwrap();
         // Like vLLM's tiering manager, which reserves each promoted block with
         // its own `prepare_write([key])`, a promotion protects only the blocks
         // it reserves: it may evict a later G2 hit of this same prefix, which
         // the walk then sees as missing.
-        for key in keys[held.len..].iter().copied() {
+        for key in keys[held_len..].iter().copied() {
             match tier.planned_lookup(plan.as_ref(), key) {
                 Lookup::Hit => {}
                 Lookup::Pending { .. } => deferred = true,
