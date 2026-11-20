@@ -1,0 +1,95 @@
+{
+  "$id": "aisim-e2e-series/v1",
+  "additionalProperties": true,
+  "description": "One interval of a server-side time series (running requests, KV use, ...).\n\nAn absent series means unavailable; an observed zero is a row with value 0. ``source`` names the one\nreporting rank or pool: replicas of a tensor-parallel group are never summed.",
+  "properties": {
+    "coverage": {
+      "anyOf": [
+        {
+          "maximum": 1,
+          "minimum": 0,
+          "type": "number"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Coverage"
+    },
+    "end_ms": {
+      "title": "End Ms",
+      "type": "number"
+    },
+    "metric": {
+      "minLength": 1,
+      "title": "Metric",
+      "type": "string"
+    },
+    "observation_id": {
+      "minLength": 1,
+      "title": "Observation Id",
+      "type": "string"
+    },
+    "phase": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Phase"
+    },
+    "source": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Source"
+    },
+    "start_ms": {
+      "title": "Start Ms",
+      "type": "number"
+    },
+    "unit": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Unit"
+    },
+    "value": {
+      "anyOf": [
+        {
+          "type": "number"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Value"
+    }
+  },
+  "required": [
+    "observation_id",
+    "metric",
+    "start_ms",
+    "end_ms"
+  ],
+  "title": "SeriesRow",
+  "type": "object"
+}

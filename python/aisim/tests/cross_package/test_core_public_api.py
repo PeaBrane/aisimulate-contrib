@@ -125,8 +125,10 @@ def test_stable_function_signatures() -> None:
         inspect.signature(estimate_state_cache).parameters
     )
     best_available = inspect.signature(RustForwardPassPerfModel.best_available).parameters
-    assert list(best_available) == ["config", "state_snapshot"]
+    assert list(best_available) == ["config", "state_snapshot", "dataset"]
     assert best_available["state_snapshot"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert best_available["dataset"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert best_available["dataset"].default is None
     assert not hasattr(RustForwardPassPerfModel, "from_regression")
     assert not hasattr(RustForwardPassPerfModel, "from_native")
 

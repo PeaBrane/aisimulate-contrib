@@ -48,7 +48,7 @@ implementation, while the product layers above describe user capabilities.
 | Search and materialize a deployment | [Search space](sweeper/search-space.md), [goals](sweeper/optimization-goals.md), [results](sweeper/results.md), [deployment generation](sweeper/deployment-generation.md) |
 | Implement an integration boundary | [Adapter ABI reference](adapters/README.md) |
 | Extend a component | [Performance modeling](perf-model/extending.md), [Collector](perf-model/collector/README.md), [Replay](replay/extending.md), [Sweeper SDK](sweeper/sdk.md) |
-| Look up shared syntax | [CLI](reference/cli.md), [top-level configuration](reference/configuration.md), [local resources](reference/local-resources.md) |
+| Look up shared syntax | [CLI](reference/cli.md), [top-level configuration](reference/configuration.md), [local resources](reference/local-resources.md), [e2e data schema](reference/e2e-schema.md) |
 | Maintain checks and releases | [CI](ci/README.md), [release](ci/release.md), [accuracy publication](ci/accuracy.md), [upstream sync](ci/aic-sync.md) |
 | Use or migrate AIC workflows | [AIC backward compatibility](aic-backward-compatibility/README.md) |
 

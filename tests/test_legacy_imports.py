@@ -78,7 +78,10 @@ def test_module_execution_and_console_commands_share_cli():
         prefix = f"usage: {program} "
         assert output.startswith(prefix), output
         # Launcher identity intentionally differs; all remaining help must match.
-        results.append("usage: <command> " + output.removeprefix(prefix))
+        # argparse indents wrapped usage lines by the program name's width, so
+        # compare the usage block without its line breaks and indentation.
+        usage, separator, rest = output.partition("\n\n")
+        results.append("usage: <command> " + " ".join(usage.removeprefix(prefix).split()) + separator + rest)
     assert len(set(results)) == 1
 
 

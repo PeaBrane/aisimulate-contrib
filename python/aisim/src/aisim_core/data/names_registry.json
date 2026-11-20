@@ -1,0 +1,697 @@
+{
+  "schema_version": "aisim-names/v1",
+  "kinds": {
+    "hardware": {
+      "closed": true,
+      "description": "AISim system name; the same spelling the op-latency and FPM identities use.",
+      "entries": {
+        "a100_pcie": {
+          "aliases": [
+            "a100-pcie",
+            "A100 PCIe"
+          ]
+        },
+        "a100_sxm": {
+          "aliases": [
+            "a100-sxm",
+            "A100 SXM"
+          ]
+        },
+        "a30": {
+          "aliases": [
+            "A30"
+          ]
+        },
+        "b200_sxm": {
+          "aliases": [
+            "b200",
+            "B200",
+            "b200-sxm"
+          ]
+        },
+        "b300_sxm": {
+          "aliases": [
+            "b300",
+            "B300",
+            "b300-sxm"
+          ]
+        },
+        "b60": {
+          "aliases": [
+            "B60"
+          ]
+        },
+        "gb200": {
+          "aliases": [
+            "GB200",
+            "gb200-nvl72"
+          ]
+        },
+        "gb300": {
+          "aliases": [
+            "GB300",
+            "gb300-nvl72"
+          ]
+        },
+        "h100_pcie": {
+          "aliases": [
+            "h100-pcie",
+            "H100 PCIe"
+          ]
+        },
+        "h100_sxm": {
+          "aliases": [
+            "h100",
+            "H100",
+            "h100-sxm"
+          ]
+        },
+        "h200_sxm": {
+          "aliases": [
+            "h200",
+            "H200",
+            "h200-sxm"
+          ]
+        },
+        "l40s": {
+          "aliases": [
+            "L40S"
+          ]
+        },
+        "l4": {
+          "aliases": [
+            "L4"
+          ]
+        },
+        "rtx_pro_6000_server": {
+          "aliases": [
+            "rtx6000pro",
+            "rtx-pro-6000",
+            "RTX PRO 6000"
+          ]
+        },
+        "mi300x": {
+          "aliases": [
+            "MI300X"
+          ],
+          "note": "no AISim system yet; e2e only"
+        },
+        "mi325x": {
+          "aliases": [
+            "MI325X"
+          ],
+          "note": "no AISim system yet; e2e only"
+        },
+        "mi355x": {
+          "aliases": [
+            "MI355X"
+          ],
+          "note": "no AISim system yet; e2e only"
+        },
+        "tpuv7": {
+          "aliases": [
+            "TPUv7"
+          ],
+          "note": "no AISim system yet; e2e only"
+        },
+        "vr200": {
+          "aliases": [
+            "VR200"
+          ],
+          "note": "no AISim system yet; e2e only"
+        }
+      }
+    },
+    "framework": {
+      "closed": true,
+      "description": "Inference engine only. Orchestrators and KV-transfer libraries are separate fields.",
+      "entries": {
+        "sglang": {
+          "aliases": [
+            "SGLang"
+          ]
+        },
+        "vllm": {
+          "aliases": [
+            "vLLM"
+          ]
+        },
+        "trtllm": {
+          "aliases": [
+            "trt",
+            "trt-llm",
+            "tensorrt-llm",
+            "TensorRT-LLM"
+          ]
+        },
+        "atom": {
+          "aliases": [
+            "ATOM"
+          ]
+        },
+        "tilert": {
+          "aliases": [
+            "TileRT"
+          ]
+        },
+        "nccl": {
+          "aliases": [],
+          "note": "communication library; op-latency only"
+        },
+        "oneccl": {
+          "aliases": [
+            "oneCCL"
+          ],
+          "note": "communication library; op-latency only"
+        }
+      }
+    },
+    "framework_composite": {
+      "closed": false,
+      "description": "Source spellings that fuse the engine with an orchestrator, a transfer library or a deployment mode.",
+      "entries": {
+        "dynamo-sglang": {
+          "framework": "sglang",
+          "orchestrator": "dynamo"
+        },
+        "dynamo-vllm": {
+          "framework": "vllm",
+          "orchestrator": "dynamo"
+        },
+        "dynamo-trt": {
+          "framework": "trtllm",
+          "orchestrator": "dynamo"
+        },
+        "llmd-vllm": {
+          "framework": "vllm",
+          "orchestrator": "llm-d"
+        },
+        "mori-sglang": {
+          "framework": "sglang",
+          "settings": {
+            "kv_transfer_backend": "mori"
+          }
+        },
+        "mooncake-atom": {
+          "framework": "atom",
+          "settings": {
+            "kv_transfer_backend": "mooncake"
+          }
+        },
+        "vllm-disagg": {
+          "framework": "vllm",
+          "deployment": "disaggregated"
+        },
+        "atom-disagg": {
+          "framework": "atom",
+          "deployment": "disaggregated"
+        }
+      }
+    },
+    "orchestrator": {
+      "closed": true,
+      "entries": {
+        "none": {
+          "aliases": [
+            "standalone"
+          ]
+        },
+        "dynamo": {
+          "aliases": [
+            "Dynamo"
+          ]
+        },
+        "llm-d": {
+          "aliases": [
+            "llmd",
+            "llm_d"
+          ]
+        }
+      }
+    },
+    "deployment": {
+      "closed": true,
+      "entries": {
+        "aggregated": {
+          "aliases": [
+            "agg",
+            "aggregate"
+          ]
+        },
+        "disaggregated": {
+          "aliases": [
+            "disagg",
+            "disaggregate"
+          ]
+        }
+      }
+    },
+    "precision": {
+      "closed": true,
+      "description": "Weight and KV-cache formats, spelled as the published FPM and op-latency identities spell them.",
+      "entries": {
+        "bfloat16": {
+          "aliases": [
+            "bf16"
+          ]
+        },
+        "float16": {
+          "aliases": [
+            "fp16",
+            "half"
+          ]
+        },
+        "fp8": {
+          "aliases": [
+            "float8"
+          ]
+        },
+        "fp8_e4m3": {
+          "aliases": [
+            "e4m3"
+          ]
+        },
+        "fp8_block": {
+          "aliases": [
+            "fp8-block",
+            "block_fp8"
+          ]
+        },
+        "nvfp4": {
+          "aliases": [
+            "nv_fp4"
+          ]
+        },
+        "mxfp4": {
+          "aliases": [
+            "mx_fp4"
+          ]
+        },
+        "fp4": {
+          "aliases": [],
+          "note": "InferenceX umbrella spelling; the 4-bit format is not specified by the source"
+        },
+        "int4": {
+          "aliases": [
+            "w4a16"
+          ]
+        }
+      }
+    },
+    "model": {
+      "closed": false,
+      "description": "Hugging Face repository ID when one exists. Unknown models are accepted unchanged.",
+      "entries": {
+        "deepseek-ai/DeepSeek-R1-0528": {
+          "aliases": [
+            "dsr1",
+            "DeepSeek-R1-0528"
+          ]
+        },
+        "openai/gpt-oss-120b": {
+          "aliases": [
+            "gptoss120b",
+            "gpt-oss-120b"
+          ]
+        },
+        "Qwen/Qwen3.5-397B-A17B": {
+          "aliases": [
+            "qwen3.5",
+            "Qwen-3.5-397B-A17B",
+            "Qwen3.5-397B-A17B"
+          ]
+        },
+        "nvidia/GLM-5.3-NVFP4": {
+          "aliases": [
+            "glm5.3",
+            "GLM-5.3-NVFP4"
+          ]
+        }
+      }
+    },
+    "metric": {
+      "closed": false,
+      "description": "Canonical metric names with their one canonical unit.",
+      "entries": {
+        "ttft": {
+          "unit": "ms",
+          "aliases": [
+            "time_to_first_token",
+            "time_to_first_token_ms",
+            "ttft_ms"
+          ]
+        },
+        "tpot": {
+          "unit": "ms",
+          "aliases": [
+            "time_per_output_token",
+            "tpot_ms"
+          ]
+        },
+        "itl": {
+          "unit": "ms",
+          "aliases": [
+            "inter_token_latency",
+            "itl_ms"
+          ]
+        },
+        "e2el": {
+          "unit": "ms",
+          "aliases": [
+            "e2e_latency",
+            "e2e_ms",
+            "e2el_ms",
+            "request_latency"
+          ]
+        },
+        "output_throughput": {
+          "unit": "tokens/s",
+          "aliases": [
+            "output_tput",
+            "output_tput_tps"
+          ]
+        },
+        "input_throughput": {
+          "unit": "tokens/s",
+          "aliases": [
+            "input_tput",
+            "input_tput_tps"
+          ]
+        },
+        "total_throughput": {
+          "unit": "tokens/s",
+          "aliases": [
+            "total_tput",
+            "total_tput_tps"
+          ]
+        },
+        "interactivity": {
+          "unit": "tokens/s/user",
+          "aliases": [
+            "intvty"
+          ]
+        },
+        "request_throughput": {
+          "unit": "requests/s",
+          "aliases": [
+            "qps",
+            "mean_qps",
+            "requests_per_second"
+          ]
+        },
+        "queue_time": {
+          "unit": "ms",
+          "aliases": [
+            "queue_time_ms",
+            "queue_ms"
+          ]
+        },
+        "gpu_cache_hit_rate": {
+          "unit": "ratio",
+          "aliases": [
+            "server_gpu_cache_hit_rate"
+          ]
+        },
+        "cpu_cache_hit_rate": {
+          "unit": "ratio",
+          "aliases": [
+            "server_cpu_cache_hit_rate"
+          ]
+        },
+        "kv_cache_pool_tokens": {
+          "unit": "tokens",
+          "aliases": [
+            "kv_cache_pool_size_tokens"
+          ]
+        },
+        "avg_power": {
+          "unit": "W",
+          "aliases": [
+            "avg_power_w"
+          ]
+        },
+        "running_requests": {
+          "unit": "requests",
+          "aliases": [
+            "running",
+            "num_requests_running"
+          ]
+        },
+        "waiting_requests": {
+          "unit": "requests",
+          "aliases": [
+            "waiting",
+            "num_requests_waiting"
+          ]
+        },
+        "kv_cache_used_tokens": {
+          "unit": "tokens",
+          "aliases": [
+            "cache_used"
+          ]
+        },
+        "kv_cache_capacity_tokens": {
+          "unit": "tokens",
+          "aliases": [
+            "cache_capacity"
+          ]
+        },
+        "kv_cache_evictable_tokens": {
+          "unit": "tokens",
+          "aliases": [
+            "cache_evictable"
+          ]
+        },
+        "prefill_tokens": {
+          "unit": "tokens",
+          "aliases": []
+        },
+        "output_processed_tokens": {
+          "unit": "tokens",
+          "aliases": []
+        },
+        "admitted_input_tokens": {
+          "unit": "tokens",
+          "aliases": [
+            "admission_input"
+          ]
+        },
+        "device_cache_hit_tokens": {
+          "unit": "tokens",
+          "aliases": [
+            "hbm"
+          ]
+        },
+        "host_cache_hit_tokens": {
+          "unit": "tokens",
+          "aliases": [
+            "host"
+          ]
+        },
+        "cache_miss_tokens": {
+          "unit": "tokens",
+          "aliases": [
+            "miss"
+          ]
+        },
+        "scheduler_hit_tokens": {
+          "unit": "tokens",
+          "aliases": [
+            "scheduler_hits"
+          ]
+        },
+        "scheduler_query_tokens": {
+          "unit": "tokens",
+          "aliases": [
+            "scheduler_queries"
+          ]
+        },
+        "speculation_acceptance": {
+          "unit": "tokens/forward",
+          "aliases": [
+            "acceptance"
+          ]
+        }
+      }
+    },
+    "statistic": {
+      "closed": true,
+      "entries": {
+        "mean": {
+          "aliases": [
+            "avg",
+            "average"
+          ]
+        },
+        "median": {
+          "aliases": [
+            "p50"
+          ]
+        },
+        "p75": {
+          "aliases": []
+        },
+        "p90": {
+          "aliases": []
+        },
+        "p95": {
+          "aliases": []
+        },
+        "p99": {
+          "aliases": []
+        },
+        "p99.9": {
+          "aliases": [
+            "p99_9",
+            "p999"
+          ]
+        },
+        "std": {
+          "aliases": [
+            "stddev",
+            "stdev"
+          ]
+        },
+        "min": {
+          "aliases": []
+        },
+        "max": {
+          "aliases": []
+        },
+        "count": {
+          "aliases": []
+        },
+        "sum": {
+          "aliases": [
+            "total"
+          ]
+        },
+        "value": {
+          "aliases": []
+        }
+      }
+    },
+    "phase": {
+      "closed": true,
+      "entries": {
+        "warmup": {
+          "aliases": [
+            "preparation",
+            "prep"
+          ]
+        },
+        "kernel_warmup": {
+          "aliases": []
+        },
+        "profile": {
+          "aliases": [
+            "profiling",
+            "measured",
+            "measurement"
+          ]
+        }
+      }
+    },
+    "workload_kind": {
+      "closed": true,
+      "entries": {
+        "single_turn": {
+          "aliases": [
+            "single-turn",
+            "fixed_shape"
+          ]
+        },
+        "agentic_trace": {
+          "aliases": [
+            "agentic_traces",
+            "agentic",
+            "agentx"
+          ]
+        },
+        "synthetic": {
+          "aliases": []
+        },
+        "trace_replay": {
+          "aliases": [
+            "replay"
+          ]
+        }
+      }
+    },
+    "workload_boundary": {
+      "closed": true,
+      "entries": {
+        "successful_profile_span": {
+          "aliases": []
+        },
+        "complete_finite_cohort": {
+          "aliases": []
+        },
+        "fixed_count": {
+          "aliases": []
+        }
+      }
+    },
+    "request_status": {
+      "closed": true,
+      "entries": {
+        "completed": {
+          "aliases": [
+            "ok",
+            "success",
+            "succeeded"
+          ]
+        },
+        "failed": {
+          "aliases": [
+            "error",
+            "errored",
+            "failure"
+          ]
+        },
+        "cancelled": {
+          "aliases": [
+            "canceled",
+            "aborted"
+          ]
+        }
+      }
+    },
+    "observer": {
+      "closed": true,
+      "entries": {
+        "client": {
+          "aliases": [
+            "aiperf",
+            "benchmark_client"
+          ]
+        },
+        "server": {
+          "aliases": [
+            "engine"
+          ]
+        }
+      }
+    },
+    "origin": {
+      "closed": true,
+      "entries": {
+        "official": {
+          "aliases": [
+            "inferencex",
+            "agentx-official",
+            "agentx"
+          ]
+        },
+        "self-collected": {
+          "aliases": [
+            "self_collected",
+            "selfcollected",
+            "developer",
+            "dev"
+          ]
+        }
+      }
+    }
+  }
+}
