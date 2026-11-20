@@ -239,8 +239,19 @@ separate Fast run; this preserves validation in both admission contexts.
 The Dynamo README profile uses fixed AISim/Dynamo RC source revisions. Its
 three-wheel bundle is built on a miss and reused through Artifactory on matching
 subsequent runs. The key includes both source revisions, the build recipe and
-storage tooling, locked harness dependencies, Python/Rust/uv versions, and the
-job image reference, effective OS/package inventory, and storage endpoint/repository. A changed key or expired manifest rebuilds
+storage tooling, locked harness dependencies, Python/Rust/uv versions, the job
+image reference, the OS ID and version, the native build packages, and storage
+endpoint/repository. The native build packages are the job's `apt-get`
+prerequisites except `gh`, plus every installed package they depend on: the
+compilers, linker, glibc, kernel headers, libclang, protoc, CMake, and linked
+libraries. Each is keyed by its full installed version, including epochs and
+Ubuntu packaging revisions: security and stable updates can change headers,
+compilers, or libraries without changing the upstream version. For example,
+`linux-libc-dev` `6.8.0-149.149` and `6.8.0-151.151` ship different public
+headers and must use different keys. Packages the build cannot reach keep the
+key. The full `dpkg` inventory and its hash are recorded outside
+the key in `rc-build-environment.json` in the job's `readme-rc-build-inputs`
+artifact. A changed key or expired manifest rebuilds
 the bundle. Cross-run reuse accepts successful Full CI producers from this
 repository's `main`, or the exact same admitted PR head; another PR cannot
 populate the cache for this PR or for `main`.

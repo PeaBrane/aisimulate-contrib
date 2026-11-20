@@ -26,6 +26,68 @@ INPUTS = (
     "scripts/ci/build_readme_rc_wheels.sh",
     "scripts/readme/requirements.txt",
 )
+# Native packages the Dynamo job installs for the RC build. `gh` is left out:
+# it only calls the GitHub API and cannot reach the wheels.
+BUILD_PACKAGES = (
+    "build-essential",
+    "cmake",
+    "libclang-dev",
+    "libhwloc-dev",
+    "libudev-dev",
+    "pkg-config",
+    "protobuf-compiler",
+)
+INVENTORY_FORMAT = "${Package}=${Version}\\n"
+DEPENDENCY_FORMAT = "${db:Status-Abbrev}\t${Package}\t${Version}\t${Provides}\t${Pre-Depends}, ${Depends}\\n"
+PACKAGE_NAME = re.compile(r"(?:^|[,|])\s*([a-z0-9][a-z0-9+.-]+)")
+
+
+def build_packages(roots: tuple[str, ...] = BUILD_PACKAGES) -> dict[str, str]:
+    """Full versions of the build prerequisites and every installed package they depend on.
+
+    The closure follows Pre-Depends and Depends (all installed alternatives and
+    providers), so meta packages resolve to the compiler, linker, C library,
+    kernel headers, libclang, protoc, CMake and libraries the build uses.
+    """
+    output = subprocess.check_output(["dpkg-query", "--show", f"--showformat={DEPENDENCY_FORMAT}"], text=True)
+    versions: dict[str, set[str]] = {}
+    providers: dict[str, set[str]] = {}
+    requirements: dict[str, set[str]] = {}
+    for line in output.splitlines():
+        status, name, version, provides, requires = line.split("\t")
+        if status[1:2] != "i":
+            continue  # Removed packages keep dpkg records but cannot affect the build.
+        versions.setdefault(name, set()).add(version)
+        requirements.setdefault(name, set()).update(PACKAGE_NAME.findall(requires))
+        for provided in PACKAGE_NAME.findall(provides):
+            providers.setdefault(provided, set()).add(name)
+    missing = [root for root in roots if root not in versions and root not in providers]
+    if missing:
+        raise ValueError(f"RC build prerequisites are not installed: {', '.join(missing)}")
+    closure: set[str] = set()
+    pending = list(roots)
+    while pending:
+        name = pending.pop()
+        for package in ({name} & versions.keys()) | providers.get(name, set()):
+            if package not in closure:
+                closure.add(package)
+                pending.extend(requirements[package])
+    return {package: " ".join(sorted(versions[package])) for package in sorted(closure)}
+
+
+def os_release() -> dict[str, str]:
+    fields = dict(line.split("=", 1) for line in OS_RELEASE.read_text().splitlines() if "=" in line)
+    return {key: fields.get(key, "").strip().strip("\"'") for key in ("ID", "VERSION_ID")}
+
+
+def environment() -> dict:
+    """Full runner inventory, recorded as evidence but deliberately outside the reuse key."""
+    inventory = subprocess.check_output(["dpkg-query", "--show", f"--showformat={INVENTORY_FORMAT}"])
+    return {
+        "os_release_sha256": hashlib.sha256(OS_RELEASE.read_bytes()).hexdigest(),
+        "packages_sha256": hashlib.sha256(inventory).hexdigest(),
+        "packages": inventory.decode().splitlines(),
+    }
 
 
 def api(endpoint: str) -> dict:
@@ -43,14 +105,14 @@ def identity(root: Path = ROOT) -> dict:
     image_reference = os.environ["RC_JOB_IMAGE"]
     if not image_reference or any(character in image_reference for character in "\r\n"):
         raise ValueError("RC job image must be identified")
-    # Fingerprint the effective image after the native prerequisites are
-    # installed, including OS/package changes under a mutable runner tag.
+    # Fingerprint what can change the wheels after the native prerequisites
+    # are installed: the OS release and the full versions of the toolchain
+    # and libraries. Packaging revisions can change native build inputs.
+    # Unrelated packages keep the key; environment() records the full inventory.
     image = {
         "reference": image_reference,
-        "os_release_sha256": hashlib.sha256(OS_RELEASE.read_bytes()).hexdigest(),
-        "packages_sha256": hashlib.sha256(
-            subprocess.check_output(["dpkg-query", "--show", "--showformat=${Package}=${Version}\\n"])
-        ).hexdigest(),
+        "os": os_release(),
+        "build_packages": build_packages(),
     }
     storage_repo = os.environ["RC_STORAGE_REPO"]
     if not re.fullmatch(r"[A-Za-z0-9_-]+", storage_repo):
@@ -69,7 +131,7 @@ def identity(root: Path = ROOT) -> dict:
     if platform.system() != "Linux" or platform.machine() != "x86_64":
         raise ValueError("RC reuse requires a Linux AMD64 runner image")
     return {
-        "schema": 1,
+        "schema": 2,
         "revisions": revisions,
         "image": image,
         "storage_repo": storage_repo,
@@ -152,7 +214,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", choices=("prepare", "verify"))
     parser.add_argument("--directory", required=True, type=Path)
+    parser.add_argument("--evidence", type=Path, help="prepare: file recording the full runner package inventory")
     args = parser.parse_args()
+    if args.mode == "prepare" and args.evidence is None:
+        parser.error("prepare requires --evidence")
     build_identity = identity()
     if args.mode == "verify":
         verify(args.directory, build_identity)
@@ -161,6 +226,7 @@ def main() -> None:
     producer = find_producer(name, dict(os.environ))
     args.directory.mkdir(parents=True, exist_ok=True)
     (args.directory / "rc-build-inputs.json").write_text(json.dumps(build_identity, indent=2) + "\n")
+    args.evidence.write_text(json.dumps(environment(), indent=2) + "\n")
     with Path(os.environ["GITHUB_OUTPUT"]).open("a") as output:
         for key, value in {"name": name, **producer}.items():
             output.write(f"{key}={value}\n")

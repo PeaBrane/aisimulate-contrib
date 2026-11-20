@@ -1278,50 +1278,228 @@ def test_rc_wheels_discovery_paginates_past_expired_manifests():
     assert any("page=2" in call for call in calls)
 
 
-@pytest.mark.parametrize("changed_input", rc_wheels.INPUTS)
-def test_rc_wheels_build_recipe_changes_invalidate_reuse(tmp_path, monkeypatch, changed_input):
+RC_OS_RELEASE = (
+    'PRETTY_NAME="Ubuntu 24.04.3 LTS"\nID=ubuntu\nVERSION_ID="24.04"\nVERSION="24.04.3 LTS (Noble Numbat)"\n'
+)
+
+
+def _rc_dpkg_database():
+    """A trimmed noble runner database: package -> (version, Pre-Depends/Depends, Provides, status)."""
+    return {
+        "build-essential": ("12.10ubuntu1", "libc6-dev | libc-dev, gcc (>= 4:12.3), g++, make, dpkg-dev", ""),
+        "gcc": ("4:13.2.0-7ubuntu1", "cpp (= 4:13.2.0-7ubuntu1), gcc-13 (>= 13.2.0-11~)", "c-compiler"),
+        "g++": ("4:13.2.0-7ubuntu1", "gcc (= 4:13.2.0-7ubuntu1), g++-13 (>= 13.2.0-11~)", "c++-compiler"),
+        "cpp": ("4:13.2.0-7ubuntu1", "cpp-13 (>= 13.2.0-11~)", ""),
+        "cpp-13": ("13.3.0-6ubuntu2~24.04.1", "gcc-13-base (= 13.3.0-6ubuntu2~24.04.1)", ""),
+        "gcc-13": ("13.3.0-6ubuntu2~24.04.1", "cpp-13 (= 13.3.0-6ubuntu2~24.04.1), binutils (>= 2.42), libc6", ""),
+        "gcc-13-base": ("13.3.0-6ubuntu2~24.04.1", "", ""),
+        "g++-13": ("13.3.0-6ubuntu2~24.04.1", "gcc-13 (= 13.3.0-6ubuntu2~24.04.1), libstdc++-13-dev", ""),
+        "libstdc++-13-dev": ("13.3.0-6ubuntu2~24.04.1", "libc6-dev (>= 2.13-0ubuntu6), libstdc++6", ""),
+        "libstdc++6": ("14.2.0-4ubuntu2~24.04.1", "libgcc-s1, libc6 (>= 2.36)", ""),
+        "libgcc-s1": ("14.2.0-4ubuntu2~24.04.1", "libc6 (>= 2.35)", ""),
+        "binutils": ("2.42-4ubuntu2.10", "libc6 (>= 2.38)", ""),
+        "make": ("4.3-4.1build2", "libc6 (>= 2.34)", ""),
+        "dpkg-dev": ("1.22.6ubuntu6.6", "perl:any, make, binutils", ""),
+        "libc6": ("2.39-0ubuntu8.12", "libgcc-s1", ""),
+        "libc6-dev": ("2.39-0ubuntu8.12", "libc6 (= 2.39-0ubuntu8.12), libc-dev-bin, linux-libc-dev", "libc-dev"),
+        "libc-dev-bin": ("2.39-0ubuntu8.11", "libc6", "", "rc "),
+        "linux-libc-dev": ("6.8.0-149.149", "", ""),
+        "cmake": ("3.28.3-1build7", "cmake-data (= 3.28.3-1build7), libc6, libstdc++6", ""),
+        "cmake-data": ("3.28.3-1build7", "", ""),
+        "libclang-dev": ("1:18.0-59~exp2", "libclang-18-dev", ""),
+        "libclang-18-dev": ("1:18.1.3-1ubuntu1", "libclang1-18 (= 1:18.1.3-1ubuntu1)", ""),
+        "libclang1-18": ("1:18.1.3-1ubuntu1", "libc6, libstdc++6", ""),
+        "libhwloc-dev": ("2.10.0-1build1", "libhwloc15 (= 2.10.0-1build1)", ""),
+        "libhwloc15": ("2.10.0-1build1", "libc6, libudev1 (>= 183)", ""),
+        "libudev-dev": ("255.4-1ubuntu8.18", "libudev1 (= 255.4-1ubuntu8.18)", ""),
+        "libudev1": ("255.4-1ubuntu8.18", "libc6", ""),
+        "pkg-config": ("1.8.1-2build1", "pkgconf", ""),
+        "pkgconf": ("1.8.1-2build1", "libc6", "pkg-config"),
+        "protobuf-compiler": ("3.21.12-8.2ubuntu0.4", "libprotoc32t64 (= 3.21.12-8.2ubuntu0.4)", ""),
+        "libprotoc32t64": ("3.21.12-8.2ubuntu0.4", "libc6, libstdc++6", ""),
+        # Installed in the job but unreachable from the build prerequisites.
+        "gh": ("2.45.0-1ubuntu0.3", "libc6 (>= 2.34)", ""),
+        "systemd": ("255.4-1ubuntu8.18", "libudev1, libc6", ""),
+        "tzdata": ("2025b-0ubuntu0.24.04.1", "debconf", ""),
+    }
+
+
+def _fake_rc_runner(tmp_path, monkeypatch, packages):
     for key in ("AISIM_RC_REVISION", "DYNAMO_RC_REVISION"):
         monkeypatch.setenv(key, "a" * 40)
     monkeypatch.setenv("RC_JOB_IMAGE", "runner:2.336.0")
     monkeypatch.setenv("RC_STORAGE_REPO", "sw-dynamo-aisimulate-pr-pypi-local")
     monkeypatch.setenv("RC_STORAGE_URL", "https://artifactory.invalid/artifactory")
     os_release = tmp_path / "os-release"
-    os_release.write_text("Linux image version")
+    os_release.write_text(RC_OS_RELEASE)
     monkeypatch.setattr(rc_wheels, "OS_RELEASE", os_release)
     monkeypatch.setattr(rc_wheels.platform, "system", lambda: "Linux")
     monkeypatch.setattr(rc_wheels.platform, "machine", lambda: "x86_64")
-    monkeypatch.setattr(
-        rc_wheels.subprocess,
-        "check_output",
-        lambda *a, **kw: "pinned tool version" if kw.get("text") else b"pinned package versions",
-    )
+
+    def check_output(command, text=False):
+        if command[0] != "dpkg-query":
+            return "pinned tool version"
+        if command[2] == f"--showformat={rc_wheels.INVENTORY_FORMAT}":
+            return "".join(f"{name}={entry[0]}\n" for name, entry in sorted(packages.items())).encode()
+        assert command[2] == f"--showformat={rc_wheels.DEPENDENCY_FORMAT}" and text
+        return "".join(
+            f"{(entry + ('ii ',))[3]}\t{name}\t{entry[0]}\t{entry[2]}\t, {entry[1]}\n"
+            for name, entry in sorted(packages.items())
+        )
+
+    monkeypatch.setattr(rc_wheels.subprocess, "check_output", check_output)
     for relative in rc_wheels.INPUTS:
         path = tmp_path / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("original")
-    original = rc_wheels.handoff_name(rc_wheels.identity(tmp_path))
+    return os_release
+
+
+def _rc_key(tmp_path):
+    return rc_wheels.handoff_name(rc_wheels.identity(tmp_path))
+
+
+@pytest.mark.parametrize("changed_input", rc_wheels.INPUTS)
+def test_rc_wheels_build_recipe_changes_invalidate_reuse(tmp_path, monkeypatch, changed_input):
+    os_release = _fake_rc_runner(tmp_path, monkeypatch, _rc_dpkg_database())
+    original = _rc_key(tmp_path)
     (tmp_path / changed_input).write_text("changed")
-    assert rc_wheels.handoff_name(rc_wheels.identity(tmp_path)) != original
+    assert _rc_key(tmp_path) != original
     (tmp_path / changed_input).write_text("original")
     monkeypatch.setenv("RC_JOB_IMAGE", "runner:new-version")
-    assert rc_wheels.handoff_name(rc_wheels.identity(tmp_path)) != original
+    assert _rc_key(tmp_path) != original
     monkeypatch.setenv("RC_JOB_IMAGE", "runner:2.336.0")
-    os_release.write_text("rebuilt Linux image")
-    assert rc_wheels.handoff_name(rc_wheels.identity(tmp_path)) != original
-    os_release.write_text("Linux image version")
-    monkeypatch.setattr(
-        rc_wheels.subprocess,
-        "check_output",
-        lambda *a, **kw: "pinned tool version" if kw.get("text") else b"updated package versions",
-    )
-    assert rc_wheels.handoff_name(rc_wheels.identity(tmp_path)) != original
-    monkeypatch.setattr(
-        rc_wheels.subprocess,
-        "check_output",
-        lambda *a, **kw: "pinned tool version" if kw.get("text") else b"pinned package versions",
-    )
+    os_release.write_text(RC_OS_RELEASE.replace('VERSION_ID="24.04"', 'VERSION_ID="26.04"'))
+    assert _rc_key(tmp_path) != original
+    os_release.write_text(RC_OS_RELEASE)
     monkeypatch.setenv("RC_STORAGE_REPO", "sw-dynamo-aisimulate-pypi-local")
-    assert rc_wheels.handoff_name(rc_wheels.identity(tmp_path)) != original
+    assert _rc_key(tmp_path) != original
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        # Packages the build cannot reach, and a removed package's leftover record.
+        {"gh": "2.83.0-1"},
+        {"systemd": "255.4-1ubuntu8.19"},
+        {"tzdata": "2026a-0ubuntu0.24.04.1"},
+        {"libc-dev-bin": "2.40-1ubuntu1"},
+    ],
+    ids=["gh", "systemd", "tzdata", "removed"],
+)
+def test_rc_wheels_key_ignores_unrelated_packages(tmp_path, monkeypatch, changes):
+    packages = _rc_dpkg_database()
+    os_release = _fake_rc_runner(tmp_path, monkeypatch, packages)
+    original, evidence = _rc_key(tmp_path), rc_wheels.environment()
+    for name, version in changes.items():
+        packages[name] = (version, *packages[name][1:])
+    assert _rc_key(tmp_path) == original
+    # The full inventory still records the drift, outside the key.
+    changed = rc_wheels.environment()
+    assert changed["packages_sha256"] != evidence["packages_sha256"]
+    assert {f"{name}={version}" for name, version in changes.items()} <= set(changed["packages"])
+    os_release.write_text(RC_OS_RELEASE.replace("24.04.3", "24.04.4"))
+    assert _rc_key(tmp_path) == original
+    assert rc_wheels.environment()["os_release_sha256"] != evidence["os_release_sha256"]
+
+
+def test_rc_wheels_kernel_header_revision_pair_invalidates_cached_build(tmp_path, monkeypatch):
+    packages = _rc_dpkg_database()
+    _fake_rc_runner(tmp_path, monkeypatch, packages)
+    original = rc_wheels.identity(tmp_path)
+    assert packages["linux-libc-dev"][0] == "6.8.0-149.149"
+    (tmp_path / "rc-build-inputs.json").write_text(json.dumps(original))
+
+    # This Ubuntu revision pair changes public headers despite the same upstream version.
+    packages["linux-libc-dev"] = ("6.8.0-151.151", *packages["linux-libc-dev"][1:])
+    changed = rc_wheels.identity(tmp_path)
+    assert rc_wheels.handoff_name(changed) != rc_wheels.handoff_name(original)
+    assert original["image"]["build_packages"]["linux-libc-dev"] == "6.8.0-149.149"
+    assert changed["image"]["build_packages"]["linux-libc-dev"] == "6.8.0-151.151"
+    with pytest.raises(ValueError, match="build inputs"):
+        rc_wheels.verify(tmp_path, changed)
+
+
+@pytest.mark.parametrize(
+    ("package", "version"),
+    [
+        ("libudev-dev", "255.4-1ubuntu8.19"),
+        ("libudev1", "255.4-1ubuntu8.19"),
+        ("libc6", "2.39-0ubuntu8.13"),
+        ("libc6-dev", "2.39-0ubuntu8.13"),
+        ("gcc-13", "13.3.0-6ubuntu2~24.04.2"),
+        ("libstdc++-13-dev", "13.3.0-6ubuntu2~24.04.2"),
+        ("binutils", "2.42-4ubuntu2.11"),
+        ("dpkg-dev", "1.22.6ubuntu6.7"),
+        ("build-essential", "12.10ubuntu1.1"),
+        ("libclang-18-dev", "1:18.1.3-1ubuntu2"),
+        ("libprotoc32t64", "3.21.12-8.2ubuntu0.5"),
+        ("cmake", "3.28.3-1build8"),
+        ("pkgconf", "1.8.1-2build2"),
+        ("libhwloc15", "2.10.0-1build2"),
+    ],
+)
+def test_rc_wheels_native_package_revision_changes_invalidate_reuse(tmp_path, monkeypatch, package, version):
+    packages = _rc_dpkg_database()
+    _fake_rc_runner(tmp_path, monkeypatch, packages)
+    original = _rc_key(tmp_path)
+    packages[package] = (version, *packages[package][1:])
+    assert _rc_key(tmp_path) != original
+
+
+@pytest.mark.parametrize(
+    ("package", "version"),
+    [
+        ("gcc-13", "13.4.0-1ubuntu1~24.04"),  # C compiler, behind the gcc meta package
+        ("libstdc++-13-dev", "14.2.0-4ubuntu2~24.04"),  # C++ headers
+        ("binutils", "2.43-1ubuntu1"),  # linker
+        ("libc6", "2.40-1ubuntu1"),  # glibc
+        ("linux-libc-dev", "6.11.0-8.8"),  # kernel headers
+        ("libclang-18-dev", "1:18.1.8-1ubuntu1"),  # bindgen, behind the libclang-dev meta package
+        ("libprotoc32t64", "3.25.3-1ubuntu1"),  # protoc
+        ("cmake", "3.30.3-1"),
+        ("pkgconf", "2.1.0-1"),  # provider behind pkg-config
+        ("libhwloc15", "2.11.0-1"),
+        ("libudev-dev", "256.1-1ubuntu1"),
+    ],
+)
+def test_rc_wheels_toolchain_and_library_changes_invalidate_reuse(tmp_path, monkeypatch, package, version):
+    packages = _rc_dpkg_database()
+    _fake_rc_runner(tmp_path, monkeypatch, packages)
+    original = _rc_key(tmp_path)
+    packages[package] = (version, *packages[package][1:])
+    assert _rc_key(tmp_path) != original
+
+
+def test_rc_wheels_key_follows_new_build_dependencies(tmp_path, monkeypatch):
+    packages = _rc_dpkg_database()
+    _fake_rc_runner(tmp_path, monkeypatch, packages)
+    original = _rc_key(tmp_path)
+    assert "tzdata" not in rc_wheels.build_packages()
+    packages["libhwloc15"] = (packages["libhwloc15"][0], "libc6, libudev1 (>= 183), tzdata", "")
+    assert "tzdata" in rc_wheels.build_packages()
+    assert _rc_key(tmp_path) != original
+
+
+@pytest.mark.parametrize("removed", [True, False], ids=["removed", "never-installed"])
+def test_rc_wheels_require_every_build_prerequisite(tmp_path, monkeypatch, removed):
+    packages = _rc_dpkg_database()
+    _fake_rc_runner(tmp_path, monkeypatch, packages)
+    if removed:
+        packages["libudev-dev"] = (*packages["libudev-dev"][:3], "rc ")
+    else:
+        del packages["libudev-dev"]
+    with pytest.raises(ValueError, match="libudev-dev"):
+        rc_wheels.identity(tmp_path)
+
+
+def test_rc_wheels_key_covers_every_native_prerequisite_except_gh():
+    job = _workflow("readme-checks.yml")["jobs"]["dynamo"]
+    install = re.search(r"apt-get install -y ([^\n]+)", _run_commands(job))
+    assert install is not None
+    installed = set(install[1].split())
+    assert set(rc_wheels.BUILD_PACKAGES) <= installed
+    assert installed - set(rc_wheels.BUILD_PACKAGES) == {"gh"}
 
 
 def test_main_rc_producers_share_test_storage_with_pr_consumers():
@@ -1354,18 +1532,34 @@ def test_main_rc_producers_share_test_storage_with_pr_consumers():
 )
 def test_rc_prepare_cli_outputs_reach_workflow_restore_inputs(tmp_path, monkeypatch, producer):
     expected = {"verified": "build identity"}
+    inventory = {"packages_sha256": "full runner inventory"}
     monkeypatch.setattr(rc_wheels, "identity", lambda: expected)
+    monkeypatch.setattr(rc_wheels, "environment", lambda: inventory)
     monkeypatch.setattr(rc_wheels, "find_producer", lambda name, env: producer)
     output = tmp_path / "github-output"
     directory = tmp_path / "wheels"
+    evidence = tmp_path / "rc-build-environment.json"
     monkeypatch.setenv("GITHUB_OUTPUT", str(output))
     monkeypatch.setattr(sys, "argv", ["readme_rc_wheels.py", "prepare", "--directory", str(directory)])
+    with pytest.raises(SystemExit):
+        rc_wheels.main()
+    assert not output.exists()
+    monkeypatch.setattr(sys, "argv", [*sys.argv, "--evidence", str(evidence)])
     rc_wheels.main()
     values = dict(line.split("=", 1) for line in output.read_text().splitlines())
     assert values == {"name": rc_wheels.handoff_name(expected), **producer}
     assert json.loads((directory / "rc-build-inputs.json").read_text()) == expected
+    # The inventory stays out of the wheelhouse, which is the Artifactory handoff.
+    assert json.loads(evidence.read_text()) == inventory
+    assert [path.name for path in directory.iterdir()] == ["rc-build-inputs.json"]
 
     job = _workflow("readme-checks.yml")["jobs"]["dynamo"]
+    prepare = next(step for step in job["steps"] if step.get("id") == "rc-wheels")
+    assert 'prepare --directory "$wheelhouse" --evidence "$evidence"' in prepare["run"]
+    assert 'evidence="${RUNNER_TEMP}/rc-build-environment.json"' in prepare["run"]
+    assert 'echo "AISIM_RC_EVIDENCE=${evidence}" >> "${GITHUB_ENV}"' in prepare["run"]
+    preserve = next(step for step in job["steps"] if step.get("name") == "Preserve RC build-input and runner evidence")
+    assert "${{ env.AISIM_RC_EVIDENCE }}" in preserve["with"]["path"].splitlines()
     assert job["env"]["RC_PR_NUMBER"] == "${{ inputs.pr_number }}"
     restore = next(step for step in job["steps"] if step.get("name") == "Restore verified pinned Dynamo RC wheels")
     inputs = {}
