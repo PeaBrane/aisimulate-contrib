@@ -120,6 +120,71 @@ radix cache receives the prompt at running admission and the output at terminal
 cleanup, rather than extending a leaf after every token. These host allocation
 choices do not reserve simulated GPU pages or change predicted serving times.
 
+### Native SGLang Mamba checkpoints
+
+The Rust `EngineConfig.sglang.mamba_cache` option models the non-speculative
+SGLang `extra_buffer` checkpoint cache. It is an opt-in **native Replay**
+configuration, available in a Rust `ReplaySpec.engine.rank` or the equivalent
+`run_replay_json` payload. The Python `KvCachePredictionConfig`, prediction YAML,
+compiler and deployment generator do not expose or forward this option. The
+native-only scope is deliberate: state-slot capacity must come from the measured
+deployment, and automatic Python capacity inference is not qualified here.
+This option is separate from the Python `kv_cache.state_cache` configuration.
+
+All paths in this table are relative to native `EngineConfig`:
+
+| Field | Default | Rules |
+| --- | --- | --- |
+| `sglang.mamba_cache` | Absent (off) | Optional `SglangMambaCacheConfig`; native aggregated SGLang Replay only. |
+| `sglang.mamba_cache.prefill_checkpoint_interval` | `64` | Positive tokens; must be a multiple of `block_size`. |
+| `sglang.mamba_cache.decode_checkpoint_interval` | `256` | Positive tokens; must be a multiple of `prefill_checkpoint_interval`. |
+| `sglang.mamba_cache.max_states` | Required | Effective native `max_mamba_cache_size` in state slots, at least `4`; includes live state, retained waiting copies and resident checkpoints. |
+
+For example, merge this fragment into the native rank descriptor:
+
+```json
+{
+  "backend": "sglang",
+  "block_size": 64,
+  "enable_prefix_caching": true,
+  "sglang": {
+    "chunked_prefill_size": 16384,
+    "mamba_cache": {
+      "prefill_checkpoint_interval": 64,
+      "decode_checkpoint_interval": 256,
+      "max_states": 994
+    }
+  }
+}
+```
+
+`994` is an example measured state-pool size, not a default. The native chunk
+size must be divisible by `block_size`. The supported scope requires
+`worker_type: aggregated`, prefix caching enabled, attention DP 1, prefill
+context parallelism 1 and pipeline parallelism 1. Speculative decoding, KV
+events, HiCache, native host/G3 offload, SWA prefix tails and Belady eviction
+are rejected. Tensor parallelism may shard the worker normally.
+
+A token prefix is reusable only at a resident recurrent-state checkpoint.
+Splitting a radix edge does not create a checkpoint. Prefill selects an aligned
+branch checkpoint when available, otherwise the last complete checkpoint
+interval in the chunk; a short final chunk does not create a new checkpoint.
+Decode tracks the configured decode interval. With `host_loop: true`, prefill
+publication waits until its producing forward is observed, including
+one-output completion. A matched waiting request retains one private state
+copy across admission retries; admission transfers that reservation into the
+active request's three state slots, and cancellation releases it.
+
+Checkpoint eviction and state-pool reclamation under pressure are not modeled.
+Exceeding `max_states` or requiring KV eviction returns an explicit runtime
+error rather than an optimistic hit or an idle pass with stranded work. Choose
+capacity sufficient for the whole replay; increasing the token pool alone does
+not increase `max_states`.
+
+The [historical Qwen diagnostic receipt](../../../benchmarks/evidence/sglang-mamba-cache/README.md)
+records input requirements, scoring commands and accuracy limits. It does not
+qualify automatic memory sizing or current-head end-to-end serving accuracy.
+
 ### SGLang decode radix cache
 
 An SGLang decode server runs a chunk cache unless it is launched with

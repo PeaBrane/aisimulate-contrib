@@ -155,6 +155,12 @@ impl ReplayEngineConfig {
     }
 
     fn validate_eviction_geometry(&self, rank: &EngineConfig) -> ReplayResult<()> {
+        if self.kv_eviction_policy == KvEvictionPolicy::Belady && rank.sglang.mamba_cache.is_some()
+        {
+            return Err(ReplayError::InvalidSpec(
+                "belady does not support sglang.mamba_cache checkpoint ownership".into(),
+            ));
+        }
         if self.kv_eviction_policy == KvEvictionPolicy::Belady && rank.prefix_match_unit.is_some() {
             // The oracle hashes complete physical pages. Fine state keys and
             // token-page aliases require a different future-demand index.
@@ -472,6 +478,15 @@ impl ReplayEngineFactory {
             ));
         }
         config.validate_eviction_geometry(&role.rank)?;
+        if role.rank.sglang.mamba_cache.is_some()
+            && (role.dp_size != 1
+                || role.prefill_context_parallel_size != 1
+                || pipeline_parallel_size(&role.rank.timing_model)? != 1)
+        {
+            return Err(ReplayError::InvalidSpec(
+                "sglang.mamba_cache requires attention DP, prefill context parallelism and pipeline parallelism of one".into(),
+            ));
+        }
         role.rank.emit_kv_events = emit_kv_events;
         let dp_size = NonZeroU32::new(role.dp_size).ok_or_else(|| {
             ReplayError::InvalidSpec("native engine dp_size must be positive".into())
@@ -763,6 +778,43 @@ fn engine_error(error: impl std::fmt::Display) -> ReplayError {
 #[cfg(test)]
 mod disaggregated_tests {
     use super::*;
+
+    #[test]
+    fn mamba_replay_rejects_dp_cp_pp_and_belady() {
+        let rank: EngineConfig = serde_json::from_value(serde_json::json!({
+            "backend": "sglang", "sglang": {"mamba_cache": {"max_states": 16}}
+        }))
+        .unwrap();
+        let base = ReplayEngineConfig {
+            rank,
+            ..Default::default()
+        };
+        let factory = ReplayEngineFactory::new();
+        assert!(
+            factory
+                .role_factory(&base, WorkerStage::Aggregated, false)
+                .is_ok()
+        );
+        for dimension in ["dp", "cp", "pp", "pp_size", "belady"] {
+            let mut config = base.clone();
+            match dimension {
+                "dp" => config.dp_size = 2,
+                "cp" => config.prefill_context_parallel_size = 2,
+                "belady" => config.kv_eviction_policy = KvEvictionPolicy::Belady,
+                pp => {
+                    config.rank.timing_model = crate::engine::TimingModelConfig::External {
+                        provider: "aic".into(),
+                        config: serde_json::json!({pp: 2}),
+                    }
+                }
+            }
+            let Err(error) = factory.role_factory(&config, WorkerStage::Aggregated, false) else {
+                panic!("Mamba cache must reject {dimension}");
+            };
+            assert!(matches!(error, ReplayError::InvalidSpec(_)), "{error}");
+            assert!(error.to_string().contains("sglang.mamba_cache"), "{error}");
+        }
+    }
 
     #[test]
     fn gpu_accounting_rejects_zero_cp_and_overflow() {

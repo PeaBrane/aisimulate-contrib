@@ -5027,7 +5027,10 @@ def test_simulation_dynamo_sglang_config_preserves_text_defaults(tmp_path, monke
         assert record["after_sha256"] == hashlib.sha256(adapter.read_bytes()).hexdigest()
 
 
-def test_simulation_dynamo_sglang_adapter_against_current_api(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "mamba_cache", [None, "None", "Some(custom_mamba_cache)"], ids=["omitted", "explicit-none", "custom"]
+)
+def test_simulation_dynamo_sglang_adapter_against_current_api(tmp_path, monkeypatch, mamba_cache):
     from scripts.performance import build_simulation_dynamo as builder
 
     dynamo = tmp_path / "dynamo"
@@ -5040,7 +5043,9 @@ def test_simulation_dynamo_sglang_adapter_against_current_api(tmp_path, monkeypa
         "        chunked_prefill_size: 8192,\n"
         "        clip_max_new_tokens: 4096,\n"
         "        schedule_conservativeness: 1.0,\n"
-        "    };\n" + "        num_gpu_blocks_is_explicit: Some(true),\n" * 4
+        + (f"        mamba_cache: {mamba_cache},\n" if mamba_cache is not None else "")
+        + "    };\n"
+        + "        num_gpu_blocks_is_explicit: Some(true),\n" * 4
     )
     adapter.write_text(source)
     monkeypatch.setattr(builder, "REPLAY_ADAPTER_SHA256", hashlib.sha256(source.encode()).hexdigest())
@@ -5051,6 +5056,9 @@ def test_simulation_dynamo_sglang_adapter_against_current_api(tmp_path, monkeypa
     assert "num_reserved_decode_tokens: SglangConfig::default().num_reserved_decode_tokens," in adapter.read_text()
     assert "disaggregation_decode_extra_slots: None," in adapter.read_text()
     assert "swa_prefix_tails: None," in adapter.read_text()
+    assert f"mamba_cache: {mamba_cache or 'None'}," in adapter.read_text()
+    assert adapter.read_text().count("mamba_cache:") == 1
+    assert ("mamba_cache" in record["inserted_sglang_fields"]) == (mamba_cache is None)
     assert "scheduler_select_time_ms: SglangConfig::default().scheduler_select_time_ms," in adapter.read_text()
     assert record["after_sha256"] == hashlib.sha256(adapter.read_bytes()).hexdigest()
 
