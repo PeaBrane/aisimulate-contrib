@@ -204,8 +204,10 @@ SKIPS: list[dict] = [
     # SGLang did not collect DSA modules with NVFP4 projections (DeepSeek-V3.2-NVFP4)
     # before; this keeps that coverage.
     {"backend": "sglang", "op": _DSA_MODULE_OPS, "gemm_type": "nvfp4"},
-    # SGLang loads NVFP4 checkpoints on Blackwell only (load_model_runner has no
-    # NVFP4 loader below SM100).
+    # SGLang serves an NVFP4 checkpoint below SM100 through Marlin, a weight-only W4A16 path,
+    # not on FP4 kernels (layers/quantization/fp4_utils.py initialize_fp4_gemm_config;
+    # layers/quantization/modelopt_quant.py ModelOptNvFp4FusedMoEMethod). The collector does
+    # not collect that path, and load_model_runner refuses the checkpoint there.
     {"backend": "sglang", "op": _DSA_MODULE_OPS, "checkpoint_quant": "nvfp4", "sm": [80, 86, 89, 90]},
     # SGLang: a one-token DSA prefill, timed eagerly, illegal-accesses in the indexer
     # (runtime_limits.dsa_indexer_prefill_shape_is_supported), and the sticky CUDA

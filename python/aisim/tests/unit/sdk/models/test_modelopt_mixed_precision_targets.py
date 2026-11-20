@@ -560,10 +560,9 @@ class TestPackagedExport:
         assert H.attention_projection_exclusions(raw) == ALL_GROUPS
         assert H.modelopt_shared_experts_unlisted(raw) is True
         assert _dense_mlp_groups(raw, GLM_LAYERS, FP8_STATIC) == [(DENSE_LAYERS, FP8_STATIC, FP8_STATIC)]
-        # The upstream config carries head_dim 64 (the rope width); it is read
-        # as is. For DSA it only feeds the activation-memory width (all
-        # backends); latency op keys and KV bytes per token are unaffected.
-        assert info["d"] == 64
+        # The DSA activation width is the residual width. The top-level head_dim of the
+        # export (64, the rope width) does not enter.
+        assert info["d"] == 96
 
 
 def test_packaged_targets_only_checkpoints_are_reviewed():

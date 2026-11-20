@@ -592,6 +592,57 @@ class TestBuildWideepMlaTestCases:
 
 
 @pytest.mark.unit
+class TestNativeNvfp4Policy:
+    @pytest.mark.parametrize("sm", [100, 103, 110, 120, 121])
+    def test_blackwell_capability_majors_are_native(self, sm):
+        assert _import_module()._has_native_nvfp4(sm) is True
+
+    @pytest.mark.parametrize("sm", [80, 86, 89, 90])
+    def test_older_sms_are_not_native(self, sm):
+        assert _import_module()._has_native_nvfp4(sm) is False
+
+    @pytest.mark.parametrize("sm", [110, 121])
+    def test_loader_guard_admits_every_native_major(self, sm, monkeypatch):
+        mod = _import_module()
+        # An import of SGLang raises ImportError, so that error proves that the SM guard passed.
+        monkeypatch.setitem(sys.modules, "sglang", None)
+        with (
+            patch.object(mod, "get_sm_version", return_value=sm),
+            patch.object(mod, "_model_native_gemm_quant", return_value="nvfp4"),
+            pytest.raises(ImportError),
+        ):
+            mod.load_model_runner("example/NVFP4", 8, "bfloat16", "dsa")
+
+    def test_guard_message_names_the_marlin_path(self):
+        mod = _import_module()
+        with (
+            patch.object(mod, "get_sm_version", return_value=90),
+            patch.object(mod, "_model_native_gemm_quant", return_value="nvfp4"),
+            pytest.raises(ValueError) as excinfo,
+        ):
+            mod.load_model_runner("example/NVFP4", 8, "bfloat16", "dsa")
+        message = str(excinfo.value)
+        assert "SM90" in message and "Marlin" in message and "W4A16" in message
+        assert "INT4-WO" not in message
+
+    def test_wideep_drop_is_logged(self, monkeypatch, capsys):
+        mod = _import_module()
+        monkeypatch.setenv("COLLECTOR_MODEL_PATH", "nvidia/DeepSeek-V3.1-NVFP4")
+        with patch.object(mod, "get_sm_version", return_value=90):
+            assert mod._build_wideep_mla_test_cases("context") == []
+        out = capsys.readouterr().out
+        assert "[MLA] wideep context: left out 1 NVFP4 checkpoint(s) on SM90" in out
+        assert "nvidia/DeepSeek-V3.1-NVFP4" in out
+
+    def test_wideep_logs_nothing_when_no_checkpoint_is_left_out(self, monkeypatch, capsys):
+        mod = _import_module()
+        monkeypatch.setenv("COLLECTOR_MODEL_PATH", "nvidia/DeepSeek-V3.1-NVFP4")
+        with patch.object(mod, "get_sm_version", return_value=100):
+            mod._build_wideep_mla_test_cases("context")
+        assert "left out" not in capsys.readouterr().out
+
+
+@pytest.mark.unit
 class TestFailClosedOrchestration:
     def test_empty_case_list_raises_before_model_load(self, monkeypatch):
         mod = _import_module()

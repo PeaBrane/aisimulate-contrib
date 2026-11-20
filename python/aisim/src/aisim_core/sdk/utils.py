@@ -1241,6 +1241,9 @@ def _parse_hf_config_json(config: dict) -> dict:
             "kv_lora_rank": config.get("kv_lora_rank", 0),
             "qk_rope_head_dim": config.get("qk_rope_head_dim", 0),
         }
+        # ``d`` is the residual width. See the comment in the DSA branch below. For MLA, ``d`` is also
+        # the vLLM attention head size when ``v_head_dim`` is missing (models/deepseek.py).
+        d = hidden_size // n
     elif architecture in {"DeepseekV32ForCausalLM", "GlmMoeDsaForCausalLM"}:
         # DeepSeek-V3.2 / GLM-5 share the DSA attention pattern but have different
         # projection/indexer dimensions, so keep these structural fields attached
@@ -1255,6 +1258,12 @@ def _parse_hf_config_json(config: dict) -> dict:
             "index_n_heads": config["index_n_heads"],
             "index_topk": config["index_topk"],
         }
+        # The attention ops read their geometry from extra_params. So ``d`` sets the activation-memory
+        # width h = num_heads * d (BaseBackend._get_memory_usage). On TRT-LLM and vLLM the same h is
+        # also the MoE dispatch workspace width (_moe_workspace_width). That width is the residual
+        # width for the MLA and DSA families. The top-level ``head_dim`` of these exports is not an
+        # attention width (GLM exports carry 64, 96 and 192 for one geometry).
+        d = hidden_size // n
     elif architecture == "Glm5NextForConditionalGeneration":
         extra_params = common.Glm53FlashConfig.from_text_config(config)
         d = extra_params.qk_nope_head_dim

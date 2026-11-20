@@ -1,0 +1,180 @@
+{
+  "sglang_version": "0.5.23",
+  "collector_compat": "sglang==0.5.23",
+  "gpu_name": "NVIDIA B200",
+  "capability": [
+    10,
+    0
+  ],
+  "model": "nvidia/GLM-5.3-NVFP4",
+  "plan_row": "[0, 256, 64, 'bfloat16', 'bfloat16', 'bfloat16', 'nvidia/GLM-5.3-NVFP4', 'dsa', None, 1, None, [[256, 16, 0], [256, 32, 0], [256, 64, 0], [256, 16, 1], [256, 32, 1], [256, 64, 1], [256, 16, 512], [256, 32, 512], [256, 64, 512], [256, 16, 1024], [256, 32, 1024], [256, 64, 1024], [256, 16, 1536], [256, 32, 1536], [256, 64, 1536], [256, 16, 2048], [256, 32, 2048], [256, 64, 2048], [256, 16, 3072], [256, 32, 3072], [256, 64, 3072]]]",
+  "num_layers": 2,
+  "load_format": "dummy",
+  "checkpoint_quant": "nvfp4",
+  "requested_quantization": "modelopt_fp4",
+  "resolved_quantization": "modelopt_mixed",
+  "requested_kv_cache_dtype": "bfloat16",
+  "server_args_kv_cache_dtype": "bfloat16",
+  "expected_kv_cache_dtype": "bfloat16",
+  "kv_cache_dtype": "bfloat16",
+  "kv_pool": {
+    "class": "DSATokenToKVPool",
+    "dtype": "bfloat16",
+    "store_dtype": "bfloat16",
+    "buffer_dtype": "bfloat16",
+    "model_runner_kv_cache_dtype": "bfloat16"
+  },
+  "attention_projection_count": 12,
+  "indexer_projection_count": 4,
+  "layers": [
+    {
+      "index": 0,
+      "layer_class": "DeepseekV2DecoderLayer",
+      "is_layer_sparse": false,
+      "mlp_class": "DeepseekV2MLP",
+      "indexer_class": "Indexer",
+      "attention_projections": 6,
+      "indexer_projections": 2
+    },
+    {
+      "index": 1,
+      "layer_class": "DeepseekV2DecoderLayer",
+      "is_layer_sparse": false,
+      "mlp_class": "DeepseekV2MLP",
+      "indexer_class": "Indexer",
+      "attention_projections": 6,
+      "indexer_projections": 2
+    }
+  ],
+  "linear_modules": [
+    {
+      "name": "model.layers.0.self_attn.fused_qkv_a_proj_with_mqa",
+      "module_class": "ReplicatedLinear",
+      "quant_method_class": "UnquantizedLinearMethod",
+      "weight_dtype": "bfloat16",
+      "attention_projection": true,
+      "indexer_projection": false
+    },
+    {
+      "name": "model.layers.0.self_attn.q_b_proj",
+      "module_class": "ColumnParallelLinear",
+      "quant_method_class": "UnquantizedLinearMethod",
+      "weight_dtype": "bfloat16",
+      "attention_projection": true,
+      "indexer_projection": false
+    },
+    {
+      "name": "model.layers.0.self_attn.indexer.wq_b",
+      "module_class": "ReplicatedLinear",
+      "quant_method_class": "UnquantizedLinearMethod",
+      "weight_dtype": "bfloat16",
+      "attention_projection": true,
+      "indexer_projection": true
+    },
+    {
+      "name": "model.layers.0.self_attn.indexer.wk_weights_proj",
+      "module_class": "ReplicatedLinear",
+      "quant_method_class": "UnquantizedLinearMethod",
+      "weight_dtype": "bfloat16",
+      "attention_projection": true,
+      "indexer_projection": true
+    },
+    {
+      "name": "model.layers.0.self_attn.kv_b_proj",
+      "module_class": "ColumnParallelLinear",
+      "quant_method_class": "UnquantizedLinearMethod",
+      "weight_dtype": "bfloat16",
+      "attention_projection": true,
+      "indexer_projection": false
+    },
+    {
+      "name": "model.layers.0.self_attn.o_proj",
+      "module_class": "RowParallelLinear",
+      "quant_method_class": "UnquantizedLinearMethod",
+      "weight_dtype": "bfloat16",
+      "attention_projection": true,
+      "indexer_projection": false
+    },
+    {
+      "name": "model.layers.0.mlp.gate_up_proj",
+      "module_class": "MergedColumnParallelLinear",
+      "quant_method_class": "ModelOptFp8LinearMethod",
+      "weight_dtype": "float8_e4m3fn",
+      "attention_projection": false,
+      "indexer_projection": false
+    },
+    {
+      "name": "model.layers.0.mlp.down_proj",
+      "module_class": "RowParallelLinear",
+      "quant_method_class": "ModelOptFp8LinearMethod",
+      "weight_dtype": "float8_e4m3fn",
+      "attention_projection": false,
+      "indexer_projection": false
+    },
+    {
+      "name": "model.layers.1.self_attn.fused_qkv_a_proj_with_mqa",
+      "module_class": "ReplicatedLinear",
+      "quant_method_class": "UnquantizedLinearMethod",
+      "weight_dtype": "bfloat16",
+      "attention_projection": true,
+      "indexer_projection": false
+    },
+    {
+      "name": "model.layers.1.self_attn.q_b_proj",
+      "module_class": "ColumnParallelLinear",
+      "quant_method_class": "UnquantizedLinearMethod",
+      "weight_dtype": "bfloat16",
+      "attention_projection": true,
+      "indexer_projection": false
+    },
+    {
+      "name": "model.layers.1.self_attn.indexer.wq_b",
+      "module_class": "ReplicatedLinear",
+      "quant_method_class": "UnquantizedLinearMethod",
+      "weight_dtype": "bfloat16",
+      "attention_projection": true,
+      "indexer_projection": true
+    },
+    {
+      "name": "model.layers.1.self_attn.indexer.wk_weights_proj",
+      "module_class": "ReplicatedLinear",
+      "quant_method_class": "UnquantizedLinearMethod",
+      "weight_dtype": "bfloat16",
+      "attention_projection": true,
+      "indexer_projection": true
+    },
+    {
+      "name": "model.layers.1.self_attn.kv_b_proj",
+      "module_class": "ColumnParallelLinear",
+      "quant_method_class": "UnquantizedLinearMethod",
+      "weight_dtype": "bfloat16",
+      "attention_projection": true,
+      "indexer_projection": false
+    },
+    {
+      "name": "model.layers.1.self_attn.o_proj",
+      "module_class": "RowParallelLinear",
+      "quant_method_class": "UnquantizedLinearMethod",
+      "weight_dtype": "bfloat16",
+      "attention_projection": true,
+      "indexer_projection": false
+    },
+    {
+      "name": "model.layers.1.mlp.gate_up_proj",
+      "module_class": "MergedColumnParallelLinear",
+      "quant_method_class": "ModelOptFp8LinearMethod",
+      "weight_dtype": "float8_e4m3fn",
+      "attention_projection": false,
+      "indexer_projection": false
+    },
+    {
+      "name": "model.layers.1.mlp.down_proj",
+      "module_class": "RowParallelLinear",
+      "quant_method_class": "ModelOptFp8LinearMethod",
+      "weight_dtype": "float8_e4m3fn",
+      "attention_projection": false,
+      "indexer_projection": false
+    }
+  ],
+  "failures": []
+}

@@ -142,7 +142,16 @@ _MODEL_CONFIG_DIR = os.path.join(
     "model_configs",
 )
 _GLM5_DSA_ARCHITECTURE = "GlmMoeDsaForCausalLM"
-_NATIVE_NVFP4_SMS = {100, 103, 120}
+# SGLang's Blackwell capability majors are 10, 11 and 12 (utils/common.py, is_blackwell_supported).
+# Its FP4 GEMM selection (layers/quantization/fp4_utils.py, initialize_fp4_gemm_config) takes Marlin
+# by default only below capability 10.0. On SM80 to SM90 it serves an NVFP4 checkpoint through Marlin,
+# a weight-only W4A16 path (layers/quantization/modelopt_quant.py, ModelOptNvFp4FusedMoEMethod). The
+# collector does not collect that path.
+_NATIVE_NVFP4_SM_MAJORS = (10, 11, 12)
+
+
+def _has_native_nvfp4(sm_version: int) -> bool:
+    return sm_version // 10 in _NATIVE_NVFP4_SM_MAJORS
 
 
 # Per-subprocess sum of the point phase times printed by run_mla_module.
@@ -592,105 +601,87 @@ def _model_native_gemm_quant(model_id: str) -> str | None:
     remain BF16 and are logged as ``bfloat16``.
 
     Reads the same AIC cached config files :func:`_resolve_local_model_path`
-    loads:
+    loads, and resolves one section as SGLang does: ``quantization_config`` in
+    ``*_config.json``, then ``compression_config``, then ``quantization`` in
+    ``*_hf_quant_config.json``, which is read only when both are absent:
 
-    * ModelOpt ``*_hf_quant_config.json`` → ``quantization.quant_algo``
-      (``NVFP4`` → ``"nvfp4"``, ``FP8`` → ``"fp8_block"``)
-    * HF ``*_config.json`` ``quantization_config`` → ``quant_method`` +
-      ``weight_block_size`` (block-fp8 → ``"fp8_block"``)
+    * ``quantization_config`` with ``quant_method`` absent or ``modelopt`` →
+      ``quant_algo`` (``NVFP4`` → ``"nvfp4"``, ``FP8`` → ``"fp8_block"``)
+    * ``quantization_config`` with another ``quant_method`` → ``quant_method`` +
+      ``weight_block_size`` (block-fp8 → ``"fp8_block"``, an FP4 method → ``"nvfp4"``)
+    * ``compression_config`` → ``None``
+    * ``*_hf_quant_config.json`` with a pure algorithm, with any ``quant_method`` →
+      ``quantization.quant_algo`` (``NVFP4`` → ``"nvfp4"``, ``FP8`` → ``"fp8_block"``)
     * ModelOpt ``MIXED_PRECISION`` export (one lane per module in
-      ``quantized_layers``), checked after the two above → ``"nvfp4"`` when a
+      ``quantized_layers``) in either ModelOpt section → ``"nvfp4"`` when a
       lane is NVFP4 or W4A16_NVFP4
 
     Returns one of ``"nvfp4"`` / ``"fp8_block"`` / ``None``. Raises
     ``ValueError`` for a ``MIXED_PRECISION`` export without an NVFP4 lane:
     SGLang resolves it to ``w4afp8``, which this collector has no path for.
     It also raises when a ``self_attn`` lane is listed: the ``bfloat16`` DSA label assumes BF16 attention.
-    For the mixed recipe a ``compression_config`` in ``*_config.json`` takes precedence over the sidecar, as
-    in SGLang, and a ``quantization_config``, ``compression_config`` or ``quantization`` section that is not
-    an object raises.
+    A ``quantization_config``, ``compression_config`` or ``quantization`` section that is not an object
+    raises, and a parse error of an existing file propagates.
     """
     base = os.path.join(_MODEL_CONFIG_DIR, model_id.replace("/", "--"))
-    quant_file = f"{base}_hf_quant_config.json"
-    if os.path.exists(quant_file):
-        try:
-            with open(quant_file) as f:
-                algo = (json.load(f).get("quantization") or {}).get("quant_algo")
-            if algo:
-                algo = str(algo).upper()
-                if "FP4" in algo:
-                    return "nvfp4"
-                if "FP8" in algo:
-                    return "fp8_block"
-        except Exception:
-            pass
     config_file = f"{base}_config.json"
-    if os.path.exists(config_file):
-        try:
-            with open(config_file) as f:
-                quant_cfg = json.load(f).get("quantization_config") or {}
-            method = str(quant_cfg.get("quant_method", "")).lower()
-            if method == "fp8" and quant_cfg.get("weight_block_size"):
-                return "fp8_block"
-            if "fp4" in method:
-                return "nvfp4"
-        except Exception:
-            pass
-    # ModelOpt MIXED_PRECISION export: one quantization lane per module in ``quantized_layers``.
-    # Citations are file:line@release-tag under python/sglang/srt/. SGLang gates the ``config.json``
-    # ``quantization_config`` on ``quant_method`` (configs/model_config.py:1034-1044), reads
-    # ``compression_config`` next (:1044-1046), and parses ``hf_quant_config.json`` as ModelOpt unconditionally
-    # (:1117-1123). The gate is applied to both sections here because ModelOpt writes no other ``quant_method``
-    # into that file.
-    # * 0.5.14, the pin: every MIXED_PRECISION export except NemotronH parses as ``w4afp8``
-    #   (configs/model_config.py:1145-1151). ``modelopt_fp4`` is then rejected inside ServerArgs, so a
-    #   targeted case fails loudly: the compatibility map allows only ``modelopt`` and the check raises
-    #   (configs/model_config.py:1299-1302, 1346-1375, reached from server_args.py:2533, 3497).
-    #   ``None`` would run W4AFp8Config, whose Fp8LinearMethod makes the BF16 attention projections block-FP8
-    #   (layers/quantization/w4afp8.py:99-104, layers/quantization/fp8.py:354-355), and those rows
-    #   would be labelled ``bfloat16``.
-    # * From v0.5.15: an export with an NVFP4 or W4A16_NVFP4 lane parses as ``modelopt_mixed``
-    #   (configs/model_config.py:1153-1163) and an explicit ``modelopt_fp4`` is overridden to it
-    #   (layers/quantization/modelopt_quant.py:649-654, configs/model_config.py:1466-1475).
-    # So SGLang's lane test decides here: an NVFP4 lane returns "nvfp4" (the SM guard and the ``modelopt_fp4``
-    # loader mapping apply). Without one SGLang resolves the export to ``w4afp8`` (NemotronH aside at 0.5.14), a
-    # path this collector lacks, so the helper raises.
-    # Past 0.5.14 SGLang stops rejecting ``modelopt_fp4`` and
-    # overrides it to ``modelopt_mixed``, so this path goes from a loud failure to live data: re-derive the
-    # ``bfloat16`` label premise (no attention lane), the ``ModelOptMixedPrecisionConfig`` methods for unlisted
-    # modules and the KV cache, the section precedence including ``compression_config``, the ``quant_method`` gate,
-    # the exact match and the lane tuple, the NemotronH exception and the ``w4afp8`` fallback.
-    # A parse error of an existing file propagates and a section that is not an object raises: ``None`` would
-    # become the ``bfloat16`` DSA label.
-    quant_cfg = None
-    compression_cfg = None
-    section = "config.json quantization_config"
+    quant_file = f"{base}_hf_quant_config.json"
+    # SGLang resolves one quantization section per checkpoint (configs/model_config.py,
+    # ModelConfig._parse_quant_hf_config): ``quantization_config`` in config.json, then
+    # ``compression_config``, then the ``hf_quant_config.json`` sidecar, which it reads only when both
+    # are absent. A ``quantization_config`` is ModelOpt when it has no ``quant_method`` or the value
+    # ``modelopt``. SGLang parses the sidecar as ModelOpt without that gate, and this helper reads a pure
+    # sidecar algorithm the same way. For a sidecar ``MIXED_PRECISION`` export the helper keeps the gate:
+    # ModelOpt writes no other ``quant_method`` into that file, so the gate changes no real export.
+    #
+    # A ModelOpt section with ``quant_algo`` exactly ``MIXED_PRECISION`` names one lane per module in
+    # ``quantized_layers`` (ModelConfig._parse_modelopt_quant_config):
+    # * A lane with ``NVFP4`` or ``W4A16_NVFP4`` resolves to ``modelopt_mixed``. This helper returns
+    #   "nvfp4", so load_model_runner asks for ``modelopt_fp4``, and SGLang replaces that request with
+    #   ``modelopt_mixed`` (ModelOptMixedPrecisionConfig.override_quantization_method in
+    #   layers/quantization/modelopt_quant.py, applied by ModelConfig._verify_quantization).
+    # * Without such a lane SGLang resolves the export to ``w4afp8``. ``_verify_quantization`` then
+    #   rejects ``modelopt_fp4``, and ``None`` would run W4AFp8Config (layers/quantization/w4afp8.py),
+    #   which loads the BF16 attention projections as block-FP8 under a ``bfloat16`` label. The
+    #   collector has no path for it, so the helper raises.
+    # The parser has no architecture exception. NemotronH is rerouted later
+    # (arg_groups/model_overrides/nemotron_h.py), and no MLA or DSA model is NemotronH.
+    #
+    # Premises of the rows that a mixed export writes:
+    # * ``bfloat16`` projection label: a linear module without a lane gets UnquantizedLinearMethod
+    #   (ModelOptMixedPrecisionConfig.get_quant_method), and the helper raises on a ``self_attn`` lane.
+    # * KV cache: ``kv_cache_quant_algo`` only attaches ModelOptFp8KVCacheMethod to the attention
+    #   layer. The KV dtype of a row is the ``kv_cache_dtype`` that load_model_runner passes.
+    # benchmarks/evidence/collector/sglang-modelopt-mixed-glm53/README.md holds the source lines at
+    # each qualified release and the load probe.
+    # A parse error of an existing file propagates and a section that is not an object raises: ``None``
+    # would become the ``bfloat16`` DSA label.
+    config = {}
     if os.path.exists(config_file):
         with open(config_file) as f:
             config = json.load(f)
-        quant_cfg = config.get("quantization_config")
-        compression_cfg = config.get("compression_config")
+    quant_cfg = config.get("quantization_config")
+    compression_cfg = config.get("compression_config")
+    section = "config.json quantization_config"
     if quant_cfg is not None and not isinstance(quant_cfg, dict):
         raise ValueError(f"{model_id}: {section} must be an object, got {type(quant_cfg).__name__}")
     if compression_cfg is not None and not isinstance(compression_cfg, dict):
         raise ValueError(
             f"{model_id}: config.json compression_config must be an object, got {type(compression_cfg).__name__}"
         )
-    # SGLang resolves ``quantization_config``, then ``compression_config``, then the sidecar
-    # (configs/model_config.py:1029, 1046 and 1117): a checkpoint that declares
-    # ``compression_config`` reaches the mixed recipe only through its own ``quantization_config``,
-    # never through the sidecar.
-    if quant_cfg is None and compression_cfg is None and os.path.exists(quant_file):
+    if quant_cfg is None:
+        if compression_cfg is not None or not os.path.exists(quant_file):
+            return None
         section = "hf_quant_config.json quantization"
         with open(quant_file) as f:
             quant_cfg = json.load(f).get("quantization")
-        if quant_cfg is not None and not isinstance(quant_cfg, dict):
+        if quant_cfg is None:
+            return None
+        if not isinstance(quant_cfg, dict):
             raise ValueError(f"{model_id}: {section} must be an object, got {type(quant_cfg).__name__}")
-    if (
-        isinstance(quant_cfg, dict)
-        and quant_cfg.get("quant_method", "modelopt") == "modelopt"
-        and quant_cfg.get("quant_algo") == "MIXED_PRECISION"
-    ):
+
+    is_modelopt = quant_cfg.get("quant_method", "modelopt") == "modelopt"
+    if is_modelopt and quant_cfg.get("quant_algo") == "MIXED_PRECISION":
         lanes_map = quant_cfg.get("quantized_layers")
         if lanes_map is None:
             lanes_map = {}
@@ -718,6 +709,19 @@ def _model_native_gemm_quant(model_id: str) -> str | None:
             f"{model_id} is a ModelOpt MIXED_PRECISION export with no NVFP4 lane in its {section}: "
             "SGLang resolves such an export to w4afp8, which this collector has no path for"
         )
+    # A pure algorithm of a ModelOpt section. The sidecar counts as ModelOpt here (see the gate note above).
+    if is_modelopt or section == "hf_quant_config.json quantization":
+        algo = str(quant_cfg.get("quant_algo") or "").upper()
+        if "FP4" in algo:
+            return "nvfp4"
+        if "FP8" in algo:
+            return "fp8_block"
+        return None
+    method = str(quant_cfg.get("quant_method", "")).lower()
+    if method == "fp8" and quant_cfg.get("weight_block_size"):
+        return "fp8_block"
+    if "fp4" in method:
+        return "nvfp4"
     return None
 
 
@@ -739,8 +743,16 @@ def _build_wideep_mla_test_cases(mode: str):
     if _skip_sm120_deepgemm_attention_modules():
         return []
     model_specs = get_mla_module_model_specs(attention_type="mla", wideep_mla=True)
-    if get_sm_version() not in _NATIVE_NVFP4_SMS:
-        model_specs = [spec for spec in model_specs if _model_native_gemm_quant(spec.model_path) != "nvfp4"]
+    sm_version = get_sm_version()
+    if not _has_native_nvfp4(sm_version):
+        kept_specs = [spec for spec in model_specs if _model_native_gemm_quant(spec.model_path) != "nvfp4"]
+        removed_paths = sorted({spec.model_path for spec in model_specs if spec not in kept_specs})
+        if removed_paths:
+            print(
+                f"[MLA] wideep {mode}: left out {len(removed_paths)} NVFP4 checkpoint(s) on SM{sm_version} "
+                f"({removed_paths}): the collector records NVFP4 only on capability majors 10, 11 and 12"
+            )
+        model_specs = kept_specs
     sweep = get_mla_module_sweep_spec("sglang")
     backends = _get_mla_backend_list()
     cases = []
@@ -1072,10 +1084,11 @@ def load_model_runner(
     """
     native_quant = _model_native_gemm_quant(model_path)
     sm_version = get_sm_version()
-    if native_quant == "nvfp4" and sm_version not in _NATIVE_NVFP4_SMS:
+    if native_quant == "nvfp4" and not _has_native_nvfp4(sm_version):
         raise ValueError(
-            f"SGLang has no collector-supported native NVFP4 model-loader backend on SM{sm_version}; "
-            "Marlin is valid only for INT4-WO"
+            f"SGLang has no collector-supported native NVFP4 model-loader backend on SM{sm_version}: "
+            "SGLang serves NVFP4 there through Marlin (weight-only W4A16), and the collector records "
+            "NVFP4 only from the FP4 kernels of capability majors 10, 11 and 12"
         )
 
     from sglang.srt.configs.model_config import ModelConfig
