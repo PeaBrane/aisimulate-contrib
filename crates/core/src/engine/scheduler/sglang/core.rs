@@ -1609,11 +1609,15 @@ impl SglangCore {
         let scheduled_decode_lens: Vec<u64> = if prefill_pass || skip_decode {
             Vec::new()
         } else {
-            self.running
-                .iter()
-                .filter(|req| req.pending_terminal || req.remaining_output_tokens() > 0)
-                .map(|req| req.current_sequence_len() as u64)
-                .collect()
+            // A filtered iterator has no lower size hint, so reserve the batch up front.
+            let mut lens = Vec::with_capacity(self.running.len());
+            lens.extend(
+                self.running
+                    .iter()
+                    .filter(|req| req.pending_terminal || req.remaining_output_tokens() > 0)
+                    .map(|req| req.current_sequence_len() as u64),
+            );
+            lens
         };
 
         // The prefill forward is priced later. Its first tokens take no time,
@@ -1645,6 +1649,7 @@ impl SglangCore {
         decode.end_ms += after_reclaim_ms - selected_ms;
         let selected_ms = after_reclaim_ms;
         if !prefill_pass {
+            committed_requests.reserve(decode.output_signals.len());
             // The decode step can retract requests before executing the batch.
             for signal in &decode.output_signals {
                 // Speculative bursts emit consecutive tokens for the same request.
