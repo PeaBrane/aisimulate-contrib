@@ -754,6 +754,7 @@ modified Rust simulation adaptation of behavioral contracts of vLLM and KVCR:
 
 - `crates/core/src/engine/kvcr.rs`
 - `crates/core/src/engine/scheduler/vllm/kvcr.rs`
+- `crates/core/src/engine/scheduler/vllm/kvcr_g3.rs`
 - the KVCR call sites in `crates/core/src/engine/scheduler/vllm/host_offload.rs`
 - their tests in those files and in `crates/core/tests/kvcr_replay.rs`
 - the KVCR sections of `docs/replay/engine/kv-cache.md`
@@ -778,6 +779,7 @@ KVCR at commit `ca61ea0cb1cdbaa86dc6b33ab9007be3e9276f71`:
 - https://github.com/ai-dynamo/kvcr/blob/ca61ea0cb1cdbaa86dc6b33ab9007be3e9276f71/src/kvcr/policy.py
 - https://github.com/ai-dynamo/kvcr/blob/ca61ea0cb1cdbaa86dc6b33ab9007be3e9276f71/src/kvcr/backends/local_dram.py
 - https://github.com/ai-dynamo/kvcr/blob/ca61ea0cb1cdbaa86dc6b33ab9007be3e9276f71/src/kvcr/backends/local_dram_pools.py
+- https://github.com/ai-dynamo/kvcr/blob/ca61ea0cb1cdbaa86dc6b33ab9007be3e9276f71/src/kvcr/backends/local_disk.py
 - https://github.com/ai-dynamo/kvcr/blob/ca61ea0cb1cdbaa86dc6b33ab9007be3e9276f71/src/kvcr/backends/remote_fw_dram.py
 - https://github.com/ai-dynamo/kvcr/blob/ca61ea0cb1cdbaa86dc6b33ab9007be3e9276f71/src/kvcr/backends/remote_sources.py
 
@@ -788,7 +790,9 @@ No upstream method bodies or test fixtures are copied. The adaptation models
 which blocks a rank pulls from a hinted peer and when the pull starts and
 lands, which blocks KVCR-owned memory stores, evicts and promotes, the order
 its LRU and FIFO policies keep, and how long each operation protects the
-blocks it reads.
+blocks it reads. With `kvcr.g3` it also models which blocks that
+memory writes to KVCR's disk tier and reads back, what a write and a read hold
+meanwhile, and the order the disk tier keeps.
 
 The `offloading_v0_32` and `simple_cpu_v0_32` G2 connector profiles in
 repository-root files `crates/core/src/engine/host_offload/tier.rs` and

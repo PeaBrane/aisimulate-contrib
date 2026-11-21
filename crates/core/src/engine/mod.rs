@@ -47,10 +47,10 @@ pub use common::speculative::normalize_conditional_accept_rates;
 pub use config::{AfdAPoolConfig, AfdEngineConfig, AfdFPoolConfig};
 pub use config::{
     Backend, EngineConfig, FrontendConfig, FrontendStage, G2Connector, G2Scope, G3OffloadConfig,
-    G3Scope, KvcrConfig, KvcrLocalG2Config, KvcrLocalG2Policy, NativeHostOffloadConfig,
-    PassLaunchConfig, PreemptionMode, SglangConfig, SglangHiCacheConfig, SglangHiCacheWritePolicy,
-    SglangMambaCacheConfig, SglangSchedulePolicy, SlidingWindowStateConfig, StateCacheConfig,
-    TrtllmCapacityPolicy, TrtllmConfig, WorkerType,
+    G3Scope, KvcrConfig, KvcrG3Config, KvcrLocalG2Config, KvcrLocalG2Policy,
+    NativeHostOffloadConfig, PassLaunchConfig, PreemptionMode, SglangConfig, SglangHiCacheConfig,
+    SglangHiCacheWritePolicy, SglangMambaCacheConfig, SglangSchedulePolicy,
+    SlidingWindowStateConfig, StateCacheConfig, TrtllmCapacityPolicy, TrtllmConfig, WorkerType,
 };
 pub(crate) use config::{MAX_PIPELINE_FILL_PASSES, afd_total_gpus};
 pub use fitted_timing::FittedIterationTiming;
@@ -59,13 +59,13 @@ pub use handoff::{
     HandoffId, HandoffTransferTiming, TransferTimingMode, prefill_handoff_delay_ms,
     transfer_delay_ms,
 };
-pub use kvcr::{KvcrLocalG2Stats, KvcrPullCounts, KvcrStats};
+pub use kvcr::{KvcrG3Stats, KvcrLocalG2Stats, KvcrPullCounts, KvcrStats};
 pub use protocol::{
     Admission, CacheTierAttribution, Command, CommandEffects, CommandResult, DecodeAcceptance,
     EncoderShape, ForwardPassMetrics, HostCacheMetrics, ImageSpec, KvBlock, KvEvent, KvEventData,
-    KvEventTier, KvHintSource, LifecycleEvent, Metrics, Output, PassCompletionEffects,
-    PassStartEffects, PrefixCacheLookupCounts, PressureEvent, PressureKind, PressureState, Request,
-    StoredBlocks, TtftMilestone,
+    KvEventDomain, KvEventTier, KvHintSource, LifecycleEvent, Metrics, Output,
+    PassCompletionEffects, PassStartEffects, PrefixCacheLookupCounts, PressureEvent, PressureKind,
+    PressureState, Request, StoredBlocks, TtftMilestone,
 };
 pub use runtime::{Engine, EngineFactory};
 pub use scheduler::SchedulerRank;

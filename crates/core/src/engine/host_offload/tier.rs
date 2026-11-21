@@ -115,6 +115,23 @@ pub(crate) struct HostBlockMeta {
     pub(crate) session_id: Option<Arc<str>>,
 }
 
+impl HostBlockMeta {
+    /// A `Stored` event of the one block `key` with this identity.
+    pub(crate) fn stored(&self, key: HostBlockKey) -> StoredBlocks {
+        StoredBlocks {
+            cache_salt: self.cache_salt.as_deref().map(str::to_owned),
+            parent_hash: self.parent,
+            start_position: Some(self.position),
+            blocks: vec![KvBlock {
+                block_hash: key.sequence_hash(),
+                tokens_hash: self.tokens_hash,
+                token_ids: None,
+            }],
+            session_id: self.session_id.as_deref().map(str::to_owned),
+        }
+    }
+}
+
 /// Visibility of one logical host block.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Lookup {
@@ -162,6 +179,10 @@ impl ExternalPlan {
         &self.victims
     }
 }
+
+/// The last block the searches of [`HostTier::oldest_evictable`] passed.
+#[derive(Default)]
+pub(crate) struct EvictionCursor(Option<NonZeroU32>);
 
 /// Result of scheduling an H2D selected by a framework adapter.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -776,6 +797,29 @@ impl HostTier {
         transfer_id
     }
 
+    /// The least recently used resident block that no pin holds and the
+    /// caller does not keep: the one a caller-managed pool evicts next. The
+    /// search resumes after the blocks `passed` records and adds those it
+    /// passes, so start a fresh cursor once `kept` changes or a passed block
+    /// may have been re-ranked.
+    pub(crate) fn oldest_evictable(
+        &self,
+        passed: &mut EvictionCursor,
+        kept: impl Fn(HostBlockKey) -> bool,
+    ) -> Option<HostBlockKey> {
+        for (node, key) in self.lru.oldest_after(passed.0) {
+            let evictable = !kept(key)
+                && self.entries.get(&key).is_some_and(|entry| {
+                    entry.state == EntryState::Resident && entry.load_pins == 0
+                });
+            if evictable {
+                return Some(key);
+            }
+            passed.0 = Some(node);
+        }
+        None
+    }
+
     /// Remove an unpinned resident in a caller-managed pool, publishing the same eviction effects
     /// as tier-managed admission. Pending transfers and pinned load sources cannot be removed.
     pub(crate) fn evict_resident(
@@ -1344,6 +1388,11 @@ impl HostTier {
         }
     }
 
+    /// The router identity retained for `key`, if the pool publishes residency.
+    pub(crate) fn meta(&self, key: HostBlockKey) -> Option<&HostBlockMeta> {
+        self.meta.get(&key)
+    }
+
     /// Moves whenever an entry appears, disappears or becomes resident, the
     /// only changes to a [`Self::lookup`] answer, so answers read at one
     /// epoch hold until it moves.
@@ -1869,11 +1918,6 @@ impl HostTier {
             let Some(meta) = self.meta.get(key) else {
                 continue;
             };
-            let block = KvBlock {
-                block_hash: key.sequence_hash(),
-                tokens_hash: meta.tokens_hash,
-                token_ids: None,
-            };
             match events.last_mut() {
                 Some(KvEventData::Stored(stored))
                     if stored.blocks.last().map(|last: &KvBlock| last.block_hash)
@@ -1881,18 +1925,26 @@ impl HostTier {
                         && stored.session_id.as_deref() == meta.session_id.as_deref()
                         && stored.cache_salt.as_deref() == meta.cache_salt.as_deref() =>
                 {
-                    stored.blocks.push(block);
+                    stored.blocks.push(KvBlock {
+                        block_hash: key.sequence_hash(),
+                        tokens_hash: meta.tokens_hash,
+                        token_ids: None,
+                    });
                 }
-                _ => events.push(KvEventData::Stored(StoredBlocks {
-                    cache_salt: meta.cache_salt.as_deref().map(str::to_owned),
-                    parent_hash: meta.parent,
-                    start_position: Some(meta.position),
-                    blocks: vec![block],
-                    session_id: meta.session_id.as_deref().map(str::to_owned),
-                })),
+                _ => events.push(KvEventData::Stored(meta.stored(*key))),
             }
         }
         events
+    }
+
+    /// Publish resident `key` as removed: its owner stopped serving it. Its
+    /// eviction then publishes nothing.
+    pub(crate) fn unpublish(&mut self, key: HostBlockKey) {
+        if self.meta.remove(&key).is_some() {
+            self.publish(|| KvEventData::Removed {
+                block_hashes: vec![key.sequence_hash()],
+            });
+        }
     }
 
     fn publish(&mut self, event: impl Fn() -> KvEventData) {
@@ -3348,6 +3400,23 @@ pub(crate) mod tests {
             eviction: HostEviction::Caller,
         });
         assert!(result.err().unwrap().to_string().contains("private pool"));
+    }
+
+    #[test]
+    fn a_victim_search_resumes_after_the_blocks_the_last_one_passed() {
+        let mut tier = tier(4);
+        tier.config.eviction = HostEviction::Caller;
+        let now = make_resident(&mut tier, &[key(1), key(2), key(3), key(4)], 0.0);
+        let (passed, calls) = (&mut EvictionCursor::default(), std::cell::Cell::new(0));
+        let kept = |block| {
+            calls.set(calls.get() + 1);
+            block == key(1) || block == key(2)
+        };
+        // The second search starts at k4, not at the kept k1 and k2 again.
+        assert_eq!(tier.oldest_evictable(passed, kept), Some(key(3)));
+        assert!(tier.evict_resident(request_id(), key(3), now));
+        assert_eq!(tier.oldest_evictable(passed, kept), Some(key(4)));
+        assert_eq!(calls.get(), 4);
     }
 
     #[test]

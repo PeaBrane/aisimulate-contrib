@@ -172,6 +172,7 @@ class EngineReplayRunnerFactory:
             supports_mtp_expected_acceptance=True,
             supports_generic_speculation=True,
             supports_mtp_host_offload=True,
+            supports_kvcr_g3=True,
             supported_engine_model_controls=ENGINE_MODEL_CONTROL_FIELDS,
             supports_state_cache=True,
             supports_grouped_kv_cache=True,

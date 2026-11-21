@@ -38,7 +38,7 @@ use crate::engine::common::hashing::{
 use crate::engine::common::kv_cache_trace;
 use crate::engine::common::protocols::{KvEventPublishers, PrefillCost, SchedulingPolicy};
 use crate::engine::common::sequence::{BlockIdentity, RequestSequence};
-use crate::engine::{KvBlock, KvEvent, KvEventData, KvEventTier, StoredBlocks};
+use crate::engine::{KvBlock, KvEvent, KvEventData, KvEventDomain, KvEventTier, StoredBlocks};
 
 /// Apply vLLM's EAGLE/MTP prefix-cache rule.
 ///
@@ -2847,13 +2847,21 @@ impl VllmKvManager {
                 block_hashes: full_blocks,
             }
         };
-        self.publish_event(data, KvEventTier::Device, token_ids.as_deref());
+        let (tier, domain) = (KvEventTier::Device, KvEventDomain::Worker);
+        self.publish_event(data, tier, domain, token_ids.as_deref());
     }
 
-    /// Relay a cluster-shared G2 residency change in this rank's event order.
-    pub(crate) fn publish_host_pinned_event(&mut self, data: KvEventData) {
+    /// Relay a residency change of a tier behind G1 in this rank's event
+    /// order: a G2 pool as the worker's `HostPinned`; KVCR-owned memory and
+    /// disk as the cache owner's `HostPinned` and `Disk`.
+    pub(crate) fn publish_residency_event(
+        &mut self,
+        data: KvEventData,
+        tier: KvEventTier,
+        domain: KvEventDomain,
+    ) {
         if !self.kv_event_publishers.is_empty() {
-            self.publish_event(data, KvEventTier::HostPinned, None);
+            self.publish_event(data, tier, domain, None);
         }
     }
 
@@ -2861,6 +2869,7 @@ impl VllmKvManager {
         &mut self,
         data: KvEventData,
         tier: KvEventTier,
+        domain: KvEventDomain,
         token_ids: Option<&[Vec<u32>]>,
     ) {
         let event = KvEvent {
@@ -2868,6 +2877,7 @@ impl VllmKvManager {
             data,
             dp_rank: self.dp_rank,
             tier,
+            domain,
         };
         self.next_event_id = self
             .next_event_id

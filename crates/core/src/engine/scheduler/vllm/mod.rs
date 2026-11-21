@@ -10,6 +10,7 @@ mod core;
 mod g3_offload;
 mod host_offload;
 mod kvcr;
+mod kvcr_g3;
 mod policy;
 mod request;
 

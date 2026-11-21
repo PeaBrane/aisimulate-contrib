@@ -478,6 +478,7 @@ class RunnerCapabilities:
 
     supports_agentic_primers_only: bool = False
     supports_weka_chat_template: bool = False
+    supports_kvcr_g3: bool = False
 
     def supports_backend_topology(self, backend: str, topology: str) -> bool:
         """Return whether a backend/topology pair is supported.
@@ -579,6 +580,9 @@ class RunnerCapabilities:
             rank = args.get("rank", args)
             if not isinstance(rank, Mapping):
                 continue
+            kvcr = rank.get("kvcr")
+            if isinstance(kvcr, Mapping) and kvcr.get("g3") is not None and not self.supports_kvcr_g3:
+                raise ValueError("runner does not support kvcr.g3; use --stack engine")
             timing = rank.get("timing_model")
             identity = timing.get("config", {}) if isinstance(timing, Mapping) else {}
             if not isinstance(identity, Mapping):

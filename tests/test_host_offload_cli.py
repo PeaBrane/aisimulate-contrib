@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -25,7 +26,7 @@ from aisim.recommend import _candidate_prediction, recommendation_to_sweeper
 from aisim.runner import EngineReplayRunnerFactory
 from aisim.sweeper.deploy import build_backend_deployment
 from aisim.sweeper.parallel_enum import ParallelShape, ReplicaParallelConfig
-from aisim.sweeper.replay import ReplayOutputRequirements, ReplaySpec
+from aisim.sweeper.replay import ReplayOutputRequirements, ReplaySpec, RunnerCapabilities
 from aisim.sweeper.sample import unroll_sample
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -741,31 +742,37 @@ def test_kvcr_defaults_and_overrides() -> None:
         cache["kvcr"] = {"local_g2": local_g2}
         with pytest.raises(ValidationError, match="local_g2"):
             KvCachePredictionConfig.model_validate(cache)
+    # KVCR-owned disk needs the memory it takes evicted blocks from.
+    cache["kvcr"] = {"g3": {"num_blocks": 8}}
+    with pytest.raises(ValidationError, match="kvcr.g3 requires kvcr.local_g2"):
+        KvCachePredictionConfig.model_validate(cache)
 
 
+@pytest.mark.parametrize("tier", ["local_g2", "g3"])
 @pytest.mark.parametrize("num_blocks", [1, (1 << 64) - 1])
-def test_kvcr_local_g2_block_count_accepts_u64_boundaries(num_blocks: int) -> None:
+def test_kvcr_block_count_accepts_u64_boundaries(tier: str, num_blocks: int) -> None:
     cache = {
         "bytes_per_token": 131_072,
         "host_offload": _host_offload(),
-        "kvcr": {"local_g2": {"num_blocks": num_blocks}},
+        "kvcr": {"local_g2": {"num_blocks": 4}} | {tier: {"num_blocks": num_blocks}},
     }
     config = KvCachePredictionConfig.model_validate(cache)
-    assert config.kvcr.local_g2.num_blocks == num_blocks
+    assert getattr(config.kvcr, tier).num_blocks == num_blocks
     assert KvCachePredictionConfig.model_validate_json(config.model_dump_json()) == config
 
 
+@pytest.mark.parametrize("tier", ["local_g2", "g3"])
 @pytest.mark.parametrize("num_blocks", [0, -1, 1 << 64, True, 1.0])
-def test_kvcr_local_g2_block_count_rejects_values_outside_rust_contract(num_blocks: object) -> None:
+def test_kvcr_block_count_rejects_values_outside_rust_contract(tier: str, num_blocks: object) -> None:
     engine = _prediction_engine()
     engine["workers"]["aggregated"]["kv_cache"].update(
         bytes_per_token=131_072,
         host_offload=_host_offload(),
-        kvcr={"local_g2": {"num_blocks": num_blocks}},
+        kvcr={"local_g2": {"num_blocks": 4}} | {tier: {"num_blocks": num_blocks}},
     )
     with pytest.raises(ValidationError) as error:
         CorePredictionConfig.model_validate({"engine": engine})
-    assert any(issue["loc"][-3:] == ("kvcr", "local_g2", "num_blocks") for issue in error.value.errors())
+    assert any(issue["loc"][-3:] == ("kvcr", tier, "num_blocks") for issue in error.value.errors())
 
 
 def test_kvcr_defaults_match_the_rust_runtime() -> None:
@@ -782,6 +789,77 @@ def test_kvcr_defaults_match_the_rust_runtime() -> None:
     }
     launch = json.loads(_runtime.engine_launch_from_replay_role_json(json.dumps(role)))
     assert launch["engine"]["kvcr"] == KvcrConfig().model_dump() == _kvcr_defaults()
+    # The same holds for the tiers KVCR owns.
+    role["rank"]["kvcr"] = {"local_g2": {"num_blocks": 4}, "g3": {"num_blocks": 8}}
+    launch = json.loads(_runtime.engine_launch_from_replay_role_json(json.dumps(role)))
+    assert launch["engine"]["kvcr"] == KvcrConfig(**role["rank"]["kvcr"]).model_dump()
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_kvcr_g3_requires_an_explicit_runner_capability(nested) -> None:
+    engine = _prediction_engine()
+    cache = engine["workers"]["aggregated"]["kv_cache"]
+    cache.update(bytes_per_token=256, host_offload=_host_offload(), kvcr={"local_g2": {"num_blocks": 4}})
+
+    def spec() -> ReplaySpec:
+        built = prediction_to_replay_spec(CorePredictionConfig.model_validate({"engine": engine}))
+        args = built.backend_deployment.agg_engine_args
+        deployment = replace(built.backend_deployment, agg_engine_args={"rank": args} if nested else args)
+        return replace(built, backend_deployment=deployment)
+
+    assert RunnerCapabilities().supports_kvcr_g3 is False
+    capabilities = EngineReplayRunnerFactory().capabilities()
+    unsupported = replace(capabilities, supports_kvcr_g3=False)
+    # KVCR-owned memory alone needs no capability.
+    unsupported.require_compatible(spec())
+    cache["kvcr"]["g3"] = {"num_blocks": 8}
+    capabilities.require_compatible(spec())
+    with pytest.raises(ValueError, match="runner does not support kvcr.g3"):
+        unsupported.require_compatible(spec())
+
+
+def test_predict_cli_spills_to_kvcr_g3_through_the_real_runtime(tmp_path, capsys) -> None:
+    engine = _prediction_engine()
+    engine["model"] = str(ROOT / "tests/e2e/configs/unified_cli/fixtures/tiny-model")
+    engine["workers"]["aggregated"]["kv_cache"].update(
+        bytes_per_token=256,
+        host_offload={"num_host_blocks": 8, "d2h_bandwidth_gbps": 0},
+        kvcr={
+            "local_g2": {"num_blocks": 1, "copy_bandwidth_gbps": 0},
+            "g3": {"num_blocks": 8, "latency_to_first_byte_ms": 0, "write_bandwidth_gbps": 0},
+        },
+    )
+    # Distinct synthetic prompts make the second completed store evict the
+    # first from KVCR memory. Generation gives each G2 store time to complete.
+    config = {
+        "engine": engine,
+        "traffic": {
+            "source": {"type": "synthetic", "input_tokens": 33, "output_tokens": 4},
+            "load": {"type": "concurrency", "concurrency": 1},
+            "stop": {"requests": 2},
+        },
+    }
+    path = tmp_path / "g3.yaml"
+    path.write_text(yaml.safe_dump(config), encoding="utf-8")
+    assert (
+        cli.main(
+            [
+                "predict",
+                "--stack",
+                "engine",
+                "--config",
+                str(path),
+                "--format",
+                "json",
+                "--output-dir",
+                str(tmp_path / "g3"),
+            ]
+        )
+        == 0
+    )
+    report = json.loads(capsys.readouterr().out)
+    assert report["completed_requests"] == 2
+    assert report["kvcr"]["g3"]["stored_blocks"] > 0
 
 
 def test_kvcr_supports_the_prefill_role_and_rejects_the_decode_role() -> None:

@@ -24,10 +24,10 @@ use serde::Serialize;
 
 use crate::engine::g3_offload::is_zero;
 use crate::engine::host_offload::{HostBlockKey, HostTierHandle};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::engine::offload_transfer::{self, ClientEvent, Direction, FairTransfers, Link};
-use crate::engine::{KvHintSource, KvcrConfig, KvcrLocalG2Config};
+use crate::engine::{KvHintSource, KvcrConfig, KvcrG3Config, KvcrLocalG2Config};
 
 pub(crate) type SharedKvcrRegistry = Arc<Mutex<KvcrRegistry>>;
 
@@ -65,6 +65,20 @@ pub struct KvcrStats {
     /// KVCR-owned memory of the pool's ranks; present with `kvcr.local_g2`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub local_g2: Option<KvcrLocalG2Stats>,
+    /// KVCR-owned disk of the pool's ranks; present with `kvcr.g3`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub g3: Option<KvcrG3Stats>,
+}
+
+/// Block counters of the KVCR-owned disk of one pool's ranks.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct KvcrG3Stats {
+    /// Written when KVCR-owned memory evicted them (`g3_store`).
+    pub stored_blocks: u64,
+    /// Dropped to make room.
+    pub evicted_blocks: u64,
+    /// Read back into the rank's G2 (`g3_deliver`).
+    pub read_blocks: u64,
 }
 
 /// Block counters of the KVCR-owned memory of one pool's ranks.
@@ -73,9 +87,10 @@ pub struct KvcrLocalG2Stats {
     /// Written after a G2 store completed (`local_fill`), counted when the
     /// copy into KVCR-owned memory completes.
     pub stored_blocks: u64,
-    /// Not written: every other block was in use.
+    /// Not written: every other block was in use, or with `kvcr.g3` the
+    /// block waited too long for room.
     pub dropped_blocks: u64,
-    /// Evicted to make room.
+    /// Evicted to make room; with `kvcr.g3`, written to disk or dropped.
     pub evicted_blocks: u64,
     /// Copied back into the rank's G2 (`local_deliver`).
     pub promoted_blocks: u64,
@@ -106,6 +121,14 @@ struct Pull {
     joined: bool,
 }
 
+/// Last completed peer-read batch for each key. Keeping only its last use
+/// bounds queued completion state by resident memory, even for an idle source.
+#[derive(Default)]
+struct PeerReads {
+    batch: u64,
+    keys: FxHashMap<HostBlockKey, u64>,
+}
+
 pub(crate) struct KvcrRegistry {
     config: KvcrConfig,
     ranks: BTreeMap<KvHintSource, Rank>,
@@ -116,6 +139,12 @@ pub(crate) struct KvcrRegistry {
     /// promotion's claim, a reader leaves it where it is in the FIFO queue
     /// (`acquire_readers`).
     local_readers: BTreeMap<KvHintSource, FxHashMap<HostBlockKey, u32>>,
+    /// Memory copies whose spill has settled but existing claims still hold
+    /// them. They stay resident until eviction but cannot serve new peers.
+    retiring_local: FxHashSet<(KvHintSource, HostBlockKey)>,
+    /// With `kvcr.g3`: the blocks peers read from each rank's KVCR-owned
+    /// memory since the rank last took them, preserving completion batches.
+    peer_reads: BTreeMap<KvHintSource, PeerReads>,
     next_client: u64,
     busy_until_ms: BTreeMap<u64, f64>,
     pulls: BTreeMap<u64, Pull>,
@@ -147,6 +176,7 @@ impl KvcrRegistry {
     pub(crate) fn new(config: KvcrConfig) -> SharedKvcrRegistry {
         let stats = KvcrStats {
             local_g2: config.local_g2.as_ref().map(|_| Default::default()),
+            g3: config.g3.as_ref().map(|_| Default::default()),
             ..Default::default()
         };
         Arc::new(Mutex::new(Self {
@@ -154,6 +184,8 @@ impl KvcrRegistry {
             ranks: BTreeMap::new(),
             local_g2: BTreeMap::new(),
             local_readers: BTreeMap::new(),
+            retiring_local: FxHashSet::default(),
+            peer_reads: BTreeMap::new(),
             next_client: 0,
             busy_until_ms: BTreeMap::new(),
             pulls: BTreeMap::new(),
@@ -172,6 +204,15 @@ impl KvcrRegistry {
 
     pub(crate) fn local_g2_config(&self) -> Option<&KvcrLocalG2Config> {
         self.config.local_g2.as_ref()
+    }
+
+    pub(crate) fn g3_config(&self) -> Option<&KvcrG3Config> {
+        self.config.g3.as_ref()
+    }
+
+    /// Counters of the pool's KVCR-owned disk.
+    pub(crate) fn g3_stats(&mut self) -> &mut KvcrG3Stats {
+        self.stats.g3.as_mut().expect("kvcr.g3 is configured")
     }
 
     /// Let peers pull from `rank`'s KVCR-owned memory too.
@@ -210,6 +251,54 @@ impl KvcrRegistry {
     /// Whether a pull in flight reads `key` of `rank`'s KVCR-owned memory.
     pub(crate) fn reads_local(&self, rank: KvHintSource, key: HostBlockKey) -> bool {
         (self.local_readers.get(&rank)).is_some_and(|readers| readers.contains_key(&key))
+    }
+
+    /// Withdraw a settled spill's memory copy from new peer pulls without
+    /// disturbing the readers and pins already holding it, or native G2.
+    pub(crate) fn retire_local(&mut self, rank: KvHintSource, key: HostBlockKey) {
+        self.retiring_local.insert((rank, key));
+    }
+
+    pub(crate) fn local_is_retiring(&self, rank: KvHintSource, key: HostBlockKey) -> bool {
+        self.retiring_local.contains(&(rank, key))
+    }
+
+    /// The old memory copy has left. A later copy may serve peers again.
+    pub(crate) fn forget_local_retirement(&mut self, rank: KvHintSource, key: HostBlockKey) {
+        self.retiring_local.remove(&(rank, key));
+    }
+
+    /// A peer read `keys` from `source`'s KVCR-owned memory. KVCR records
+    /// the use on the one record that also ranks a block on disk, when the
+    /// source next looks (`_drain_source_completions`).
+    pub(crate) fn note_peer_read(&mut self, source: KvHintSource, keys: &[HostBlockKey]) {
+        if self.config.g3.is_some() {
+            let reads = self.peer_reads.entry(source).or_default();
+            reads.batch += 1;
+            for key in keys {
+                reads.keys.insert(*key, reads.batch);
+            }
+        }
+    }
+
+    /// Completed reads in order, retaining only each key's latest use. Blocks
+    /// in one batch retain their prefix-position tie-break in the disk tier.
+    pub(crate) fn take_peer_reads(&mut self, rank: KvHintSource) -> Vec<Vec<HostBlockKey>> {
+        let Some(reads) = self.peer_reads.remove(&rank) else {
+            return Vec::new();
+        };
+        let mut keys: Vec<_> = reads.keys.into_iter().collect();
+        keys.sort_unstable_by_key(|(_, batch)| *batch);
+        let mut batches = Vec::new();
+        let mut previous = None;
+        for (key, batch) in keys {
+            if previous != Some(batch) {
+                batches.push(Vec::new());
+                previous = Some(batch);
+            }
+            batches.last_mut().unwrap().push(key);
+        }
+        batches
     }
 
     /// Counters of the pool's KVCR-owned memory.
@@ -284,7 +373,11 @@ impl KvcrRegistry {
         self.local_g2.retain(|rank, _| rank.worker_id != worker_id);
         self.local_readers
             .retain(|rank, _| rank.worker_id != worker_id);
+        self.retiring_local
+            .retain(|(rank, _)| rank.worker_id != worker_id);
         self.landed.retain(|rank, _| rank.worker_id != worker_id);
+        self.peer_reads
+            .retain(|rank, _| rank.worker_id != worker_id);
         self.busy_until_ms.remove(&worker_id);
         Ok(())
     }
@@ -594,7 +687,7 @@ mod tests {
         KvcrRegistry::new(KvcrConfig {
             latency_to_first_byte_ms: latency,
             bandwidth_gbps: gbps,
-            local_g2: None,
+            ..Default::default()
         })
     }
 
