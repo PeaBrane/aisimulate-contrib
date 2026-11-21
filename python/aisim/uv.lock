@@ -124,7 +124,7 @@ requires-dist = [
     { name = "pytest-split", marker = "extra == 'dev'", specifier = ">=0.10.0" },
     { name = "pytest-timeout", marker = "extra == 'dev'", specifier = ">=2.3.1" },
     { name = "pytest-xdist", marker = "extra == 'dev'", specifier = "==3.8.0" },
-    { name = "pyyaml", specifier = ">=6.0" },
+    { name = "pyyaml", specifier = ">=6.0,<6.0.4" },
     { name = "ruff", marker = "extra == 'dev'", specifier = "==0.14.1" },
     { name = "scikit-learn", marker = "extra == 'learned'", specifier = ">=1.4" },
     { name = "scipy", specifier = ">=1.13.1" },

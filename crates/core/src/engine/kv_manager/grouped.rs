@@ -12,7 +12,7 @@
 //! block pool, so that cached blocks stay until eviction.
 
 use crate::engine::cache::vllm_block_pool::{
-    BlockCopyId, BlockReservation, CacheKey, PrefixHit, VllmBlockPool,
+    BlockCopyId, BlockReservation, CacheKey, KeyInBlock, PrefixHit, VllmBlockPool,
 };
 use crate::engine::common::hashing::SequenceHash;
 use crate::perfmodel::{FpmCacheGroup, FpmCacheKind};
@@ -220,6 +220,26 @@ impl GroupedBlockPool {
             "a grouped pool caches grouped keys only"
         );
         self.pool.cache_private_key(id, key)
+    }
+
+    /// [`Self::cache`] for a key that can lie inside a block of its group, at
+    /// `at`. A hit search finds such a key through [`Self::keys_in_block`] only.
+    pub(crate) fn cache_at(
+        &mut self,
+        id: BlockCopyId,
+        key: CacheKey,
+        at: Option<KeyInBlock>,
+    ) -> bool {
+        self.pool.cache_private_key_at(id, key, at)
+    }
+
+    /// See [`VllmBlockPool::grouped_keys_in_block`].
+    pub(crate) fn keys_in_block(
+        &self,
+        group: u16,
+        first: SequenceHash,
+    ) -> impl DoubleEndedIterator<Item = u32> + '_ {
+        self.pool.grouped_keys_in_block(group, first)
     }
 
     pub(crate) fn release(&mut self, id: BlockCopyId) {
