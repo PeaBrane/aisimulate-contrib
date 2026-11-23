@@ -345,9 +345,9 @@
     "gpt-oss-20b-b200-vllm-isl1024-osl2": {
       "agg": {
         "values": {
-          "agg_request": 34.137828818309416,
-          "agg_tpot": 5.9001547380279575,
-          "agg_ttft": 28.237674080281455
+          "agg_request": 34.294704997814485,
+          "agg_tpot": 5.973978822500931,
+          "agg_ttft": 28.320726175313553
         }
       },
       "disagg": {
@@ -359,7 +359,7 @@
       },
       "mixed": {
         "values": {
-          "mixed_step": 5.9001547380279575
+          "mixed_step": 5.973978822500931
         }
       },
       "static": {
@@ -2075,7 +2075,7 @@
     },
     "gpt-oss-20b-b200-vllm-isl1024-osl2::agg": {
       "engine": "rust",
-      "git_head": "56cb821e347509711f29fda13c2574e655a57e21"
+      "git_head": "0fbe793de0a356886339bf7d7f726e760ce4647c"
     },
     "gpt-oss-20b-b200-vllm-isl1024-osl2::disagg": {
       "engine": "rust",
@@ -2083,7 +2083,7 @@
     },
     "gpt-oss-20b-b200-vllm-isl1024-osl2::mixed": {
       "engine": "rust",
-      "git_head": "56cb821e347509711f29fda13c2574e655a57e21"
+      "git_head": "0fbe793de0a356886339bf7d7f726e760ce4647c"
     },
     "gpt-oss-20b-b200-vllm-isl1024-osl2::static": {
       "engine": "rust",

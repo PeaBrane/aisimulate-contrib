@@ -317,6 +317,17 @@ The logits regressions explicitly admit their frozen SGLang 0.5.14 data
 coordinate after the fleet query slots advance; their shapes and assertions
 remain unchanged.
 
+Two GPT-OSS-20B B200 vLLM records (`mixed` and `agg`) also now cross the
+unchanged 1% tolerance. The head-free mixed-step control is 5.947968 ms,
+already 0.81% above main's 5.900155 ms reference. The missing one-row head
+costs 0.026011 ms independently through the per-op query, giving 5.973979 ms
+(1.25% above the old reference). Its aggregate TTFT contribution is 0.029263 ms;
+aggregate request latency gains their sum, 0.055274 ms. Only those two
+additional records were refreshed from
+`0fbe793de0a356886339bf7d7f726e760ce4647c` with the same verified native
+sources. Their head-free controls pass the existing tolerance; this refresh
+retains main's pre-existing sub-tolerance drift as well as the new head cost.
+
 ### B200 SGLang dense-prefix correction in PR #303
 
 Four existing B200 cases change because `deepseek_v32._dense_mlp_groups` now honors `first_k_dense_replace=3` and the checkpoint's packed-linear quantization exclusions. Previously those three dense layers were counted as MoE layers. DeepSeek-V3.2 now has 58 MoE plus three FP8-block dense layers (61 total); both GLM-5 cases have 75 MoE plus three BF16 dense layers (78 total). GLM-5.2 also has 75 MoE plus three dense layers, with its excluded packed gate/up and down projections using BF16 instead of inheriting the global NVFP4 GEMM mode.
