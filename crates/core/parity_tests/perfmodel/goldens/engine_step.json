@@ -680,9 +680,9 @@
     "minimax-m25-b200-vllm-empirical": {
       "agg": {
         "values": {
-          "agg_request": 107.93990632676807,
-          "agg_tpot": 24.536426506714385,
-          "agg_ttft": 83.40347982005369
+          "agg_request": 107.99523969037051,
+          "agg_tpot": 24.562465736644945,
+          "agg_ttft": 83.43277395372556
         }
       },
       "disagg": {
@@ -806,16 +806,16 @@
     "minimax-m25-nvfp4-h200-vllm-hybrid-xprofile": {
       "agg": {
         "values": {
-          "agg_request": 215.5426022454098,
-          "agg_tpot": 75.17298929195753,
-          "agg_ttft": 140.36961295345225
+          "agg_request": 215.63019269045247,
+          "agg_tpot": 75.21420832491881,
+          "agg_ttft": 140.41598436553366
         }
       },
       "disagg": {
         "values": {
-          "disagg_request": 154.701,
+          "disagg_request": 154.784,
           "disagg_tpot": 11.101,
-          "disagg_ttft": 143.6
+          "disagg_ttft": 143.683
         }
       },
       "mixed": {
@@ -823,9 +823,9 @@
       },
       "static": {
         "values": {
-          "static_ctx": 72.526,
+          "static_ctx": 72.567,
           "static_gen": 8.463,
-          "static_total": 80.98899999999999
+          "static_total": 81.02999999999999
         }
       }
     },
@@ -1231,56 +1231,56 @@
     "qwen3-235b-a22b-b200-vllm-hybrid-xprofile": {
       "agg": {
         "values": {
-          "agg_request": 144.32663152717362,
-          "agg_tpot": 28.106650130434645,
-          "agg_ttft": 116.21998139673897
+          "agg_request": 144.38857599130236,
+          "agg_tpot": 28.13580046649523,
+          "agg_ttft": 116.25277552480713
         }
       },
       "disagg": {
         "values": {
-          "disagg_request": 58.072,
+          "disagg_request": 58.13,
           "disagg_tpot": 9.994,
-          "disagg_ttft": 48.078
+          "disagg_ttft": 48.136
         }
       },
       "mixed": {
         "values": {
-          "mixed_step": 28.106650130434645
+          "mixed_step": 28.13580046649523
         }
       },
       "static": {
         "values": {
-          "static_ctx": 24.282,
+          "static_ctx": 24.311,
           "static_gen": 272.323,
-          "static_total": 296.60499999999996
+          "static_total": 296.63399999999996
         }
       }
     },
     "qwen3-235b-a22b-b200-vllm-hybrid-xquant": {
       "agg": {
         "values": {
-          "agg_request": 286.3677443003028,
-          "agg_tpot": 94.94952672955425,
-          "agg_ttft": 191.41821757074854
+          "agg_request": 286.42968876443155,
+          "agg_tpot": 94.97867706561483,
+          "agg_ttft": 191.4510116988167
         }
       },
       "disagg": {
         "values": {
-          "disagg_request": 197.81,
+          "disagg_request": 197.868,
           "disagg_tpot": 17.261,
-          "disagg_ttft": 180.549
+          "disagg_ttft": 180.607
         }
       },
       "mixed": {
         "values": {
-          "mixed_step": 94.94952672955425
+          "mixed_step": 94.97867706561483
         }
       },
       "static": {
         "values": {
-          "static_ctx": 91.187,
+          "static_ctx": 91.216,
           "static_gen": 12.908,
-          "static_total": 104.095
+          "static_total": 104.124
         }
       }
     },
@@ -2271,19 +2271,19 @@
     },
     "minimax-m25-b200-vllm-empirical::agg": {
       "engine": "rust",
-      "git_head": "56cb821e347509711f29fda13c2574e655a57e21"
+      "git_head": "8bcbb948a3ff14a740617ccf6df021eb78036faa"
     },
     "minimax-m25-b200-vllm-empirical::disagg": {
       "engine": "rust",
-      "git_head": "56cb821e347509711f29fda13c2574e655a57e21"
+      "git_head": "8bcbb948a3ff14a740617ccf6df021eb78036faa"
     },
     "minimax-m25-b200-vllm-empirical::mixed": {
       "engine": "rust",
-      "git_head": "56cb821e347509711f29fda13c2574e655a57e21"
+      "git_head": "8bcbb948a3ff14a740617ccf6df021eb78036faa"
     },
     "minimax-m25-b200-vllm-empirical::static": {
       "engine": "rust",
-      "git_head": "56cb821e347509711f29fda13c2574e655a57e21"
+      "git_head": "8bcbb948a3ff14a740617ccf6df021eb78036faa"
     },
     "minimax-m25-b200-vllm-isl1024-osl2::agg": {
       "engine": "rust",
@@ -2351,11 +2351,11 @@
     },
     "minimax-m25-nvfp4-h200-vllm-hybrid-xprofile::agg": {
       "engine": "rust",
-      "git_head": "82ff7f371523cf85328fa2a17f420ca30c5d5e52"
+      "git_head": "8bcbb948a3ff14a740617ccf6df021eb78036faa"
     },
     "minimax-m25-nvfp4-h200-vllm-hybrid-xprofile::disagg": {
       "engine": "rust",
-      "git_head": "82ff7f371523cf85328fa2a17f420ca30c5d5e52"
+      "git_head": "8bcbb948a3ff14a740617ccf6df021eb78036faa"
     },
     "minimax-m25-nvfp4-h200-vllm-hybrid-xprofile::mixed": {
       "engine": "rust",
@@ -2363,7 +2363,7 @@
     },
     "minimax-m25-nvfp4-h200-vllm-hybrid-xprofile::static": {
       "engine": "rust",
-      "git_head": "82ff7f371523cf85328fa2a17f420ca30c5d5e52"
+      "git_head": "8bcbb948a3ff14a740617ccf6df021eb78036faa"
     },
     "minimax-m27-b200-vllm-isl1024-osl2::agg": {
       "engine": "rust",
@@ -2579,59 +2579,59 @@
     },
     "qwen3-235b-a22b-b200-vllm-empirical::agg": {
       "engine": "rust",
-      "git_head": "56cb821e347509711f29fda13c2574e655a57e21"
+      "git_head": "8bcbb948a3ff14a740617ccf6df021eb78036faa"
     },
     "qwen3-235b-a22b-b200-vllm-empirical::disagg": {
       "engine": "rust",
-      "git_head": "56cb821e347509711f29fda13c2574e655a57e21"
+      "git_head": "8bcbb948a3ff14a740617ccf6df021eb78036faa"
     },
     "qwen3-235b-a22b-b200-vllm-empirical::mixed": {
       "engine": "rust",
-      "git_head": "56cb821e347509711f29fda13c2574e655a57e21"
+      "git_head": "8bcbb948a3ff14a740617ccf6df021eb78036faa"
     },
     "qwen3-235b-a22b-b200-vllm-empirical::static": {
       "engine": "rust",
-      "git_head": "56cb821e347509711f29fda13c2574e655a57e21"
+      "git_head": "8bcbb948a3ff14a740617ccf6df021eb78036faa"
     },
     "qwen3-235b-a22b-b200-vllm-hybrid-xprofile::agg": {
       "engine": "rust",
-      "git_head": "64c4266462bd35b99ca4dba9ac18b5e357fbb3cf"
+      "git_head": "8bcbb948a3ff14a740617ccf6df021eb78036faa"
     },
     "qwen3-235b-a22b-b200-vllm-hybrid-xprofile::disagg": {
       "engine": "rust",
-      "git_head": "64c4266462bd35b99ca4dba9ac18b5e357fbb3cf"
+      "git_head": "8bcbb948a3ff14a740617ccf6df021eb78036faa"
     },
     "qwen3-235b-a22b-b200-vllm-hybrid-xprofile::mixed": {
       "engine": "rust",
-      "git_head": "64c4266462bd35b99ca4dba9ac18b5e357fbb3cf"
+      "git_head": "8bcbb948a3ff14a740617ccf6df021eb78036faa"
     },
     "qwen3-235b-a22b-b200-vllm-hybrid-xprofile::static": {
       "engine": "rust",
-      "git_head": "64c4266462bd35b99ca4dba9ac18b5e357fbb3cf"
+      "git_head": "8bcbb948a3ff14a740617ccf6df021eb78036faa"
     },
     "qwen3-235b-a22b-b200-vllm-hybrid-xquant::agg": {
       "engine": "rust",
-      "git_head": "64c4266462bd35b99ca4dba9ac18b5e357fbb3cf"
+      "git_head": "8bcbb948a3ff14a740617ccf6df021eb78036faa"
     },
     "qwen3-235b-a22b-b200-vllm-hybrid-xquant::disagg": {
       "engine": "rust",
-      "git_head": "64c4266462bd35b99ca4dba9ac18b5e357fbb3cf"
+      "git_head": "8bcbb948a3ff14a740617ccf6df021eb78036faa"
     },
     "qwen3-235b-a22b-b200-vllm-hybrid-xquant::mixed": {
       "engine": "rust",
-      "git_head": "64c4266462bd35b99ca4dba9ac18b5e357fbb3cf"
+      "git_head": "8bcbb948a3ff14a740617ccf6df021eb78036faa"
     },
     "qwen3-235b-a22b-b200-vllm-hybrid-xquant::static": {
       "engine": "rust",
-      "git_head": "64c4266462bd35b99ca4dba9ac18b5e357fbb3cf"
+      "git_head": "8bcbb948a3ff14a740617ccf6df021eb78036faa"
     },
     "qwen3-235b-a22b-b200-vllm-sol::mixed": {
       "engine": "rust",
-      "git_head": "56cb821e347509711f29fda13c2574e655a57e21"
+      "git_head": "8bcbb948a3ff14a740617ccf6df021eb78036faa"
     },
     "qwen3-235b-a22b-b200-vllm-sol::static": {
       "engine": "rust",
-      "git_head": "56cb821e347509711f29fda13c2574e655a57e21"
+      "git_head": "8bcbb948a3ff14a740617ccf6df021eb78036faa"
     },
     "qwen3-235b-b200-sglang-adp8-etp4ep2::agg": {
       "engine": "rust",

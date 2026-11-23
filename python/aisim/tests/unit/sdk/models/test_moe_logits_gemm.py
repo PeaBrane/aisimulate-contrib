@@ -159,9 +159,11 @@ def test_moe_context_logits_stays_on_the_afd_boundary(role):
 
 @pytest.fixture(scope="module")
 def afd_database():
-    return get_database("h200_sxm", "sglang", "0.5.14")
+    # Keep this regression on its original measurement grid as query slots move.
+    return get_database("h200_sxm", "sglang", "0.5.14", allow_unlisted_version=True)
 
 
+@pytest.mark.usefixtures("raw_data_coordinates")
 @pytest.mark.parametrize("afd_pool", [False, True], ids=["ordinary", "afd-a-pool"])
 @pytest.mark.parametrize(
     ("is_context", "seq_len", "prefix"),
@@ -214,6 +216,7 @@ def test_moe_logits_latency_uses_one_token_per_request(afd_database, afd_pool, i
         assert float(logits._engine_query(afd_database, x=4 * seq_len)) > expected_logits
 
 
+@pytest.mark.usefixtures("raw_data_coordinates")
 @pytest.mark.parametrize("model_path", ["Qwen/Qwen3-30B-A3B", "Qwen/Qwen3-8B", "deepseek-ai/DeepSeek-R1"])
 @pytest.mark.parametrize("prefill,decode", [(1, 0), (3, 5), (128, 256), (0, 5)])
 def test_scheduled_iteration_logits_project_each_request_once(model_path, prefill, decode):

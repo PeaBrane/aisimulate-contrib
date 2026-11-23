@@ -301,6 +301,22 @@ their values and tolerances remain unchanged. The correction adds one integer
 sum per logits query with no new queries, allocations, preparation, or retained
 state.
 
+After merging main at `93105851352b5801bc9b542b7c0592fd977fa62d`, the same
+21 engine-step and six per-op records were selectively regenerated from
+`8bcbb948a3ff14a740617ccf6df021eb78036faa` using `pin_goldens.py --refresh`
+and its matching release wheel. Their `post_freeze_pins` identify that input.
+The control that removes only the MoE context head reproduces all 27 main
+records within 1e-10 relative tolerance. With the head restored, the six
+per-op cases gain only `context_logits_gemm`, costing 0.027183 to 0.028869 ms;
+all other per-op fields remain identical to main. Changed engine metrics
+increase by 0.020000 to 0.087590 ms. For example, MiniMax H200 cross-profile
+static context changes from 72.526 to 72.567 ms, and Qwen3-235B B200
+cross-profile changes from 24.282 to 24.311 ms. Static generation and
+disaggregated TPOT are unchanged, and unrelated main records are retained.
+The logits regressions explicitly admit their frozen SGLang 0.5.14 data
+coordinate after the fleet query slots advance; their shapes and assertions
+remain unchanged.
+
 ### B200 SGLang dense-prefix correction in PR #303
 
 Four existing B200 cases change because `deepseek_v32._dense_mlp_groups` now honors `first_k_dense_replace=3` and the checkpoint's packed-linear quantization exclusions. Previously those three dense layers were counted as MoE layers. DeepSeek-V3.2 now has 58 MoE plus three FP8-block dense layers (61 total); both GLM-5 cases have 75 MoE plus three BF16 dense layers (78 total). GLM-5.2 also has 75 MoE plus three dense layers, with its excluded packed gate/up and down projections using BF16 instead of inheriting the global NVFP4 GEMM mode.
