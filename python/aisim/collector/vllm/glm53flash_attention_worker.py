@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Worker-side probe for the vLLM GLM-5.3-Flash attention collector (stock vLLM 0.31.0).
+"""Worker-side probe for the vLLM GLM-5.3-Flash attention collector (stock vLLM 0.32.0).
 
 Loaded in every vLLM worker through vLLM's own general-plugin entry point
 (``vllm/plugins/__init__.py`` ``load_general_plugins``; called by
@@ -8,23 +8,23 @@ Loaded in every vLLM worker through vLLM's own general-plugin entry point
 ``GLM53_ATTN_MANIFEST`` is set by ``glm53flash_attention_runner``.
 
 Boundary: ``Glm5NextMLAAttention.forward`` (models/glm5next/common/
-attention.py:598-602) of one layer, i.e. the MLA wrapper including the
+attention.py:571-575) of one layer, i.e. the MLA wrapper including the
 IndexPool indexer and ``o_proj``. vLLM's ``o_proj`` is a ``RowParallelLinear``
 whose ``reduce_results`` flag owns the attention-output all-reduce; the model
 itself turns that flag off for sequence parallelism (models/glm5next/common/
-model.py:368-370). Measured repetitions run with the flag off so the
+model.py:435-437). Measured repetitions run with the flag off so the
 collective is excluded.
 
 Execution (serving default ``FULL_AND_PIECEWISE`` with the deployment's capture
 sizes): prefill steps replay vLLM's breakable PIECEWISE graphs
-(v1/worker/gpu/cudagraph_utils.py:552-557 ``run_pw_graph`` ->
+(v1/worker/gpu/cudagraph_utils.py:571-576 ``run_pw_graph`` ->
 compilation/breakable_cudagraph.py ``BreakableCUDAGraphWrapper``). The custom
 ops decorated with ``eager_break_during_capture`` -- the IndexPool indexer
-(models/glm5next/nvidia/sparse_indexer.py:93) and the MLA attention op
-(model_executor/layers/attention/mla_attention.py:1466) -- run eagerly against
+(models/glm5next/nvidia/sparse_indexer.py:100) and the MLA attention op
+(model_executor/layers/attention/mla_attention.py:1462) -- run eagerly against
 the step's forward context; every other kernel of the module replays from
 captured segments. Uniform decode batches replay FULL graphs
-(cudagraph_utils.py:531-545 and 751-764 ``run_fullgraph``). The probe records
+(cudagraph_utils.py:550-563 and 770 ``run_fullgraph``). The probe records
 the module's capture-time inputs per graph size, witnesses the real step's
 framework replay, then captures the module alone with the same capture
 mechanism under that step's forward context and times its replays with
@@ -52,9 +52,9 @@ STATE = SimpleNamespace(
 def register() -> None:
     """vLLM general-plugin entry point (runs in every vLLM process).
 
-    vLLM 0.31.0 workers use the V2 model runner by default (config/vllm.py:701
+    vLLM 0.32.0 workers use the V2 model runner by default (config/vllm.py:703
     ``use_v2_model_runner``; v1/worker/gpu/model_runner.py). Its
-    ``capture_model`` (model_runner.py:1019) drives
+    ``capture_model`` (model_runner.py:1053) drives
     ``ModelCudaGraphManager.capture`` (FULL and breakable PIECEWISE graphs),
     so the probe is installed immediately before it.
     """
@@ -138,7 +138,7 @@ def validate_attention(attention, manifest, model_runner) -> None:
         "index_head_dim": (indexer.head_dim, expected["index_head_dim"]),
         "index_topk": (indexer.topk_tokens, expected["index_topk"]),
         "index_kpool": (indexer.index_kpool, expected["index_pool"]),
-        # Only sequence parallelism turns the flag off (common/model.py:368-370).
+        # Only sequence parallelism turns the flag off (common/model.py:435-437).
         "o_proj.reduce_results": (bool(attention.o_proj.reduce_results), True),
         "cudagraph_mode": (model_runner.vllm_config.compilation_config.cudagraph_mode.name, "FULL_AND_PIECEWISE"),
         # The engine serves the key's latent KV dtype (bf16 on SM90, fp8 on SM10x).
@@ -150,7 +150,7 @@ def validate_attention(attention, manifest, model_runner) -> None:
     for name, (actual, wanted) in checks.items():
         if actual != wanted:
             raise RuntimeError(f"loaded attention {name}={actual!r}, contract expects {wanted!r}")
-    # models/glm5next/common/model.py:318-334 builds MLA with quant_config=None.
+    # models/glm5next/common/model.py:385-401 builds MLA with quant_config=None.
     for name in ("fused_qkv_a_proj", "q_b_proj", "kv_b_proj", "o_proj"):
         method = type(getattr(attention, name).quant_method).__name__
         if method != "UnquantizedLinearMethod" or expected["projection_quant_mode"] != "bfloat16":

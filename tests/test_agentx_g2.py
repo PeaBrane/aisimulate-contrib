@@ -423,6 +423,7 @@ def _mtp_with_drop_off(engine: dict, depth: int) -> dict:
     return worker
 
 
+@pytest.mark.usefixtures("raw_data_coordinates")
 @pytest.mark.parametrize("window", [False, True])
 def test_agentic_g2_accepts_mtp_for_a_state_cache(window: bool) -> None:
     """Both API boundaries accept MTP with G2: a recurrent state with the block drop off, a sliding window with it."""
@@ -443,6 +444,7 @@ def test_agentic_g2_accepts_mtp_for_a_state_cache(window: bool) -> None:
     _runtime.run_replay_json(json.dumps(payload))
 
 
+@pytest.mark.usefixtures("raw_data_coordinates")
 def test_hybrid_g2_forward_waits_for_stores_of_a_draft_slot_preemption() -> None:
     """A request preempted for MTP draft slots makes the forward wait for its slow stores.
 
@@ -499,6 +501,7 @@ def test_hybrid_g2_forward_waits_for_stores_of_a_draft_slot_preemption() -> None
     assert report["num_requests"] == len(turns)
 
 
+@pytest.mark.usefixtures("raw_data_coordinates")
 def test_agentic_g2_runs_multi_worker_attention_dp_pd_with_mtp_on_one_shared_pool(tmp_path) -> None:
     """Two DP2 prefill workers and one DP2 decode worker share one G2 pool under MTP.
 
@@ -681,6 +684,7 @@ def _canonical_mtp(config: dict) -> dict:
     return config
 
 
+@pytest.mark.usefixtures("raw_data_coordinates")
 def test_agentic_canonical_mtp_executes_with_local_g2() -> None:
     config = _canonical_mtp(_config("agentx-g2-local.yaml"))
     config["engine"]["workers"]["aggregated"]["kv_cache"]["capacity"]["blocks"] = 4
@@ -691,6 +695,7 @@ def test_agentic_canonical_mtp_executes_with_local_g2() -> None:
     assert _restored(report)["first_admission_host_reused_input_tokens"] > 0
 
 
+@pytest.mark.usefixtures("raw_data_coordinates")
 @pytest.mark.parametrize("replicas,attention_dp", [(1, 2), (2, 1), (2, 2)])
 def test_agentic_canonical_mtp_executes_on_static_local_g2_fleets(replicas, attention_dp, tmp_path) -> None:
     config = _canonical_mtp(_config("agentx-g2-local.yaml"))

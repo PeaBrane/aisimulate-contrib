@@ -7,6 +7,7 @@ Static (ast) checks: the collector needs a framework plus GPUs to import.
 """
 
 import ast
+import inspect
 from pathlib import Path
 
 import pytest
@@ -22,16 +23,26 @@ def _function(name: str) -> ast.FunctionDef:
 
 
 def _load_sglang_server_args_block(server_args_cls):
-    """Execute benchmark_sglang_allreduce's server-args preamble against a fake SGLang."""
-    function = _function("benchmark_sglang_allreduce")
+    """Execute benchmark_sglang_allreduce's server-args preamble against a fake SGLang.
+
+    The fake group builder takes the widths, as every release before 0.5.21 does."""
+    functions = [
+        _function(name)
+        for name in ("sglang_groups_take_widths", "publish_sglang_server_args", "benchmark_sglang_allreduce")
+    ]
     published = []
     stop = RuntimeError("stop after publishing server args")
 
     def setup(*_args, **_kwargs):
         raise stop
 
+    def initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1):
+        raise AssertionError("the preamble does not build groups")
+
     namespace = {
         "setup_sglang_distributed": setup,
+        "import_sglang": lambda: {"initialize_model_parallel": initialize_model_parallel},
+        "inspect": inspect,
         "torch": None,
     }
     fake_module = type("M", (), {})()
@@ -43,7 +54,7 @@ def _load_sglang_server_args_block(server_args_cls):
     saved = sys.modules.get("sglang.srt.server_args")
     sys.modules["sglang.srt.server_args"] = fake_module
     try:
-        exec(compile(ast.Module(body=[function], type_ignores=[]), str(_COLLECTOR), "exec"), namespace)
+        exec(compile(ast.Module(body=functions, type_ignores=[]), str(_COLLECTOR), "exec"), namespace)
         with pytest.raises(RuntimeError, match="stop after publishing"):
             namespace["benchmark_sglang_allreduce"]("bfloat16", "128,256,2", 2, 0, False, "x.txt")
     finally:

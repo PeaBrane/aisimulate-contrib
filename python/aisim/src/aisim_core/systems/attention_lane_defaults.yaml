@@ -93,3 +93,16 @@ architectures:
         100: trtllm_mha
         103: trtllm_mha
         120: flashinfer
+  MiMoV2FlashForCausalLM:
+    sglang:
+      "0.5.23":
+        # SGLang 0.5.23 arg_groups/model_overrides/mimo_v2.py
+        # _mimo_v2_overrides: attention_backend = fa4 when get_platform().is_sm100
+        # (capability major 10: SM100 and SM103) and the backend is unset. The
+        # collector times the model there on fa4 from 0.5.23 on
+        # (collector/case_generator.py, the MiMoV2FlashForCausalLM entry of the
+        # SGLang backend table); the earlier releases' rows for this geometry
+        # are triton rows, which the global map would rank first.
+        # Other SMs keep the global map.
+        100: fa4
+        103: fa4

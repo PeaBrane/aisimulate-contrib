@@ -608,16 +608,17 @@ def test_launch_follows_the_system_yaml_and_image_architecture(tmp_path):
         attempt = prepare(_launch_args(tmp_path, name, **overrides))
         return json.loads((attempt / "manifest.json").read_text()), (attempt / "run.sbatch").read_text()
 
-    # GB300 (NVL72, 4 GPUs/node, arm64): the NVL72 vLLM serving environment.
+    # GB300 (NVL72, 4 GPUs/node, arm64): the serving environment with multi-node
+    # NVLink off (one-node attempts; NCCL init fails without an IMEX channel).
     manifest, run = launch("gb300")
-    assert "#SBATCH --gres=gpu:4" in run and "NCCL_MNNVL_ENABLE=1" in run
+    assert "#SBATCH --gres=gpu:4" in run and "NCCL_MNNVL_ENABLE=0" in run
     assert "PYTHONNOUSERSITE=1" in run and "--no-container-mount-home" in run
     assert manifest["serving_env"]["VLLM_USE_NCCL_SYMM_MEM"] == "1"
-    assert manifest["serving_env"]["NCCL_MNNVL_ENABLE"] == "1"
+    assert manifest["serving_env"]["NCCL_MNNVL_ENABLE"] == "0"
     assert manifest["runtime_digest"] == RUNTIME_IMAGES[("vllm", "arm64")] and manifest["runtime_arch"] == "arm64"
     assert (manifest["system"], manifest["gpus_per_node"]) == ("gb300", 4)
     # HGX H200 (8 GPUs/node, x86): TP8 FP8; NVLS and symmetric memory stay on,
-    # MNNVL is off (the NVLink domain is one node).
+    # the MNNVL variable is not exported (the NVLink domain is one node).
     hopper = {"system": "h200_sxm", "arch": "amd64", "kv_cache_dtype": "bfloat16"}
     manifest, run = launch("h200", checkpoint="fp8", config=CONFIGS["fp8"], tp=8, **hopper)
     assert "#SBATCH --gres=gpu:8" in run and "--account=acct" in run

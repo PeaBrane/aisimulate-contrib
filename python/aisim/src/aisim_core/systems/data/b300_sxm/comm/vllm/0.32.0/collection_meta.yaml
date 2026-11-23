@@ -1,0 +1,23 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+schema_version: 1
+provenance: collected
+runtime:
+  framework: vllm
+  version: 0.32.0
+  image: vllm/vllm-openai:v0.32.0
+  image_digest: sha256:befccf0e7e4089aa23926bb6f887a85c0d46c2a99e6de5c5ffdf5cb7957c5b34
+  source_commit: 5df63a7203cdb9328d824a27b682e77c7b9928be
+tables:
+  custom_allreduce_perf:
+    # TP2/TP4/TP8 framework all-reduce (vLLM_custom_eager, vLLM_custom_graph), one node, the release's default server environment: no NCCL variables set and VLLM_USE_NCCL_SYMM_MEM unset (off).
+    # collector_hash: sha256 of collector/network/collect_all_reduce.py (standalone collector, no closure entry).
+    # case_plan_hash: sha256 of the sorted row keys (kernel_source|allreduce_dtype|num_gpus|message_size).
+    # data_sha256: 73810fcc8ff921a82e2575521c63e206e706e4c9bc419be0ccd52d29596587a1
+    collector_ref: 8b9ff265a
+    collector_hash: sha256:997728b46a26da0ba6811cc2793814507b5df686032b659a9894e0bf051a7d91
+    case_plan_hash: sha256:d5acf5e6911ad74e30d4bf0f485c30963cdcd27c70dbd44e2bdff4fdd38e3b0f
+    collected_at: '2026-11-16'
+    rows: 138
+    status: complete

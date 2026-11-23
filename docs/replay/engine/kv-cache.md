@@ -376,7 +376,7 @@ engine:
   model: Qwen/Qwen3-32B-FP8
   hardware: h200_sxm
   backend: vllm
-  backend_version: "0.24.0"
+  backend_version: current
   context_length: 8192
   workers:
     aggregated:

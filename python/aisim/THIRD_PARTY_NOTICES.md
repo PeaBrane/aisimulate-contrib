@@ -737,6 +737,21 @@ https://github.com/vllm-project/vllm/tree/dd10e03f95f94edbea1975c67ace3a35ec9a8a
 Copyright contributors to the vLLM project. Licensed under Apache-2.0;
 modifications adapt the serving contracts to synthetic collector batches.
 
+The capture-dependent DSA choices of `_dsa_serving_capture_parity` in
+`collector/vllm/collect_mla_module.py` are adapted (modified) from vLLM
+`v0.32.0` at commit `5df63a7203cdb9328d824a27b682e77c7b9928be`:
+
+- [`vllm/models/deepseek_v32/attention.py`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/models/deepseek_v32/attention.py)
+  (`_should_prepare_mqa_query`: when the W_UK BMM and the MQA query quantization run).
+- [`vllm/model_executor/layers/sparse_attn_indexer.py`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/model_executor/layers/sparse_attn_indexer.py)
+  (the dense-MHA early return of `sparse_attn_indexer`).
+
+Copyright contributors to the vLLM project. Licensed under Apache-2.0:
+https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/LICENSE
+
+Both predicates are modified: the CUDA-stream capture term is replaced by
+whether serving captures a step of that size. No upstream file is vendored.
+
 
 The independently written Rust deferred-queue and post-lookup-touch behavior in
 `crates/core/src/engine/scheduler/vllm/{core,host_offload}.rs`

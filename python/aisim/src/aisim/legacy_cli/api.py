@@ -279,7 +279,7 @@ def cli_default(
             Equivalent to repeating ``--generator-set`` on the CLI.
         generator_config: Path to a unified generator YAML config file.
         generator_dynamo_version: Override Dynamo version used by the generator.
-        attention_backend: Attention kernel-lane override ('fa3', 'triton',
+        attention_backend: Attention kernel-lane override ('fa3', 'fa4', 'triton',
             'trtllm_mha', 'flashinfer', 'fla', or 'default'). None uses the
             framework default for the target system/backend version.
         engine_step_backend: Engine-step backend; "rust" (the compiled engine,
@@ -530,7 +530,7 @@ def cli_recommend(
         max_seq_len: TRT-LLM max_seq_len setting.
         enable_wideep: Enable Wide Expert Parallelism for MoE models.
         moe_backend: Explicit SGLang MoE backend override.
-        attention_backend: Attention kernel-lane override ('fa3', 'triton',
+        attention_backend: Attention kernel-lane override ('fa3', 'fa4', 'triton',
             'trtllm_mha', 'flashinfer', 'fla', or 'default'). Supported values
             depend on the backend's collected tables (e.g. vllm supports
             'triton', 'flashinfer', and 'default'); an unsupported
@@ -720,7 +720,7 @@ def cli_exp(
         config: Dict containing experiment definitions (alternative to yaml_path).
             Keys are experiment names, values are experiment configs.
         attention_backend: Optional global attention kernel-lane override
-            ('fa3', 'triton', 'trtllm_mha', 'flashinfer', 'fla', or 'default'),
+            ('fa3', 'fa4', 'triton', 'trtllm_mha', 'flashinfer', 'fla', or 'default'),
             applied to every experiment. Per-experiment ``attention_backend``
             entries in the YAML/config take precedence.
         top_n: Number of top configurations to return for each experiment. Default is 5.
@@ -1201,7 +1201,7 @@ def cli_estimate(
             disagg. Overrides ``max_seq_len`` for the decode worker.
         engine_step_backend: Engine-step backend; "rust" (the compiled engine,
             default and only executor) is the only accepted value.
-        attention_backend: Attention kernel-lane override ('fa3', 'triton',
+        attention_backend: Attention kernel-lane override ('fa3', 'fa4', 'triton',
             'trtllm_mha', 'flashinfer', 'fla', or 'default'). Supported values
             depend on the backend's collected tables (e.g. vllm supports
             'triton', 'flashinfer', and 'default'); an unsupported

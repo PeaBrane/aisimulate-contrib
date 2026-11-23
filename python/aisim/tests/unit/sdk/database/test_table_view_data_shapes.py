@@ -658,6 +658,7 @@ def test_composite_weights_respect_child_weight_shields() -> None:
     assert FallbackOp("f", primary=dispatch, fallback=[]).get_weights() == 0.0
 
 
+@pytest.mark.usefixtures("raw_data_coordinates")
 def test_mamba2_view_exposes_decode_leaves():
     from aisim_core.sdk.engine_table_view import fetch_table_view
     from aisim_core.sdk.perf_database import get_database

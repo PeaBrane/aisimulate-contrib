@@ -56,7 +56,7 @@ def _resolve(backend, version, sm_version, override, systems_root, architecture=
 # Tests
 # ---------------------------------------------------------------------------
 
-_KNOWN_LANES_SORTED = ("fa3", "fla", "flashinfer", "triton", "trtllm_mha")
+_KNOWN_LANES_SORTED = ("fa3", "fa4", "fla", "flashinfer", "triton", "trtllm_mha")
 
 
 # ---------------------------------------------------------------------------

@@ -59,6 +59,44 @@ from helper import (
     xpu_graph_measure_enabled,
 )
 
+# vLLM's serving environment where the NVLink domain spans nodes (GB200 and GB300 NVL72):
+# NVLink SHARP, multi-node NVLink and vLLM's NCCL symmetric memory. With
+# VLLM_USE_NCCL_SYMM_MEM the communicator answers an all-reduce from NCCL symmetric memory
+# where it applies (vllm v0.32.0
+# cuda_communicator.py:428, symm_mem.py should_use_symm_mem) and bounds the custom
+# all-reduce by it (custom_all_reduce.py:243). On these systems the rows are about half the
+# default environment's (GB200, two GPUs: 3.8 vs 7.0 us at 128 bytes, 8.2 vs 24.5 us at
+# 1 MiB); on HGX systems the two environments measure the same. The benchmark exports it
+# itself, so the rows do not depend on the environment of the job that runs it.
+# glm53flash_attention_launch exports the same variables except NCCL_MNNVL_ENABLE, which it
+# turns off. Here it stays on: in a container with no IMEX channel on an NVL72 node the
+# benchmark then fails at communicator init, where with it off it ran but measured about
+# twice the serving latency (GB300, graph mode, 7.2 vs 3.7 us at 128 bytes on two GPUs).
+VLLM_NVL72_SERVING_ENV = {
+    "NCCL_CUMEM_ENABLE": "1",
+    "NCCL_NVLS_ENABLE": "1",
+    "NCCL_P2P_LEVEL": "NVL",
+    "NCCL_MNNVL_ENABLE": "1",
+    "VLLM_USE_NCCL_SYMM_MEM": "1",
+}
+NVL72_DEVICES = ("NVIDIA GB200", "NVIDIA GB300")
+
+
+def vllm_serving_env(device_name: str) -> dict[str, str]:
+    """The variables the vLLM all-reduce benchmark exports on ``device_name``."""
+    return dict(VLLM_NVL72_SERVING_ENV) if device_name in NVL72_DEVICES else {}
+
+
+def export_vllm_serving_env() -> dict[str, str]:
+    """Export ``vllm_serving_env`` of this node's GPU. Called before vLLM builds its groups:
+    NCCL reads its variables when a communicator is created and vLLM reads its switch when
+    the device communicator is built."""
+    if not torch.cuda.is_available():
+        return {}
+    env = vllm_serving_env(torch.cuda.get_device_name(0))
+    os.environ.update(env)
+    return env
+
 
 def _init_process_group_with_device_id(backend: str, init_method: str, world_size: int, rank: int, local_rank: int):
     """Pre-initialize torch.distributed with explicit device_id.
@@ -334,6 +372,9 @@ def benchmark_trtllm_allreduce(
 
 def setup_vllm_distributed(world_size, rank, use_slurm):
     """Setup vLLM distributed environment"""
+    serving_env = export_vllm_serving_env()
+    if serving_env and rank == 0:
+        print(f"vLLM serving environment: {serving_env}")
     try:
         from vllm.distributed.communication_op import tensor_model_parallel_all_reduce
         from vllm.distributed.parallel_state import (
@@ -447,7 +488,8 @@ def import_sglang():
             init_distributed_environment,
             initialize_model_parallel,
             set_custom_all_reduce,
-            set_mscclpp_all_reduce,
+            set_flashinfer_allreduce_only,
+            set_mscclpp,
             set_torch_symm_mem_all_reduce,
         )
 
@@ -458,7 +500,8 @@ def import_sglang():
             "graph_capture": graph_capture,
             "destroy_model_parallel": destroy_model_parallel,
             "set_custom_all_reduce": set_custom_all_reduce,
-            "set_mscclpp_all_reduce": set_mscclpp_all_reduce,
+            "set_flashinfer_allreduce_only": set_flashinfer_allreduce_only,
+            "set_mscclpp": set_mscclpp,
             "set_torch_symm_mem_all_reduce": set_torch_symm_mem_all_reduce,
         }
     except ImportError as e:
@@ -517,19 +560,75 @@ def setup_sglang_distributed(world_size, rank, use_slurm):
             print(f"\nERROR: Failed to initialize distributed environment: {e}")
             raise
 
+    # The groups read the all-reduce switches when they are built, so set them first, as
+    # serving does (distributed/bootstrap.py: _set_all_reduce_flags before the group setup).
+    set_sglang_serving_all_reduce_flags(sglang_mods)
+
     # Initialize model parallel groups
     # SGLang requires world_size == tensor_model_parallel_size * pipeline_model_parallel_size
-    sglang_mods["initialize_model_parallel"](
-        tensor_model_parallel_size=world_size,
-        pipeline_model_parallel_size=1,
-    )
-
-    # Enable CustomAllReduce and disable other allreduce implementations
-    sglang_mods["set_custom_all_reduce"](True)
-    sglang_mods["set_mscclpp_all_reduce"](False)
-    sglang_mods["set_torch_symm_mem_all_reduce"](False)
+    if sglang_groups_take_widths(sglang_mods["initialize_model_parallel"]):
+        sglang_mods["initialize_model_parallel"](
+            tensor_model_parallel_size=world_size,
+            pipeline_model_parallel_size=1,
+        )
+    else:
+        # The widths come from the topology publish_sglang_server_args() published.
+        sglang_mods["initialize_model_parallel"]()
 
     return sglang_mods, local_rank
+
+
+def sglang_groups_take_widths(initialize_model_parallel) -> bool:
+    """Whether this SGLang builds its groups from call arguments (<= 0.5.20) rather than from
+    the published topology (>= 0.5.21, where initialize_model_parallel() has no width
+    parameters and reads get_parallel().tp_size / pp_size). Probed from the signature."""
+    return "tensor_model_parallel_size" in inspect.signature(initialize_model_parallel).parameters
+
+
+def publish_sglang_server_args(world_size, rank, takes_widths):
+    """Publish the process config the SGLang all-reduce path reads.
+
+    sglang >= 0.5.21 builds the groups from the published topology, so the record carries the
+    one tensor-parallel group this benchmark runs (tp_size = world size) and the launcher's
+    rank, as SGLang's own benchmark/kernels/all_reduce/benchmark_all_reduce.py does through
+    publish_build_topology(world_rank=rank, tp_size=world_size). model_path="dummy" returns
+    early from argument resolution; symmetric memory stays at the server default (off).
+    """
+    from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+
+    if not takes_widths:
+        from sglang.srt.runtime_context import SpawnRanks, publish
+
+        publish(
+            ServerArgs(model_path="dummy", tp_size=world_size, enable_symm_mem=False),
+            role="scheduler",
+            ranks=SpawnRanks(world_rank=rank),
+        )
+    elif hasattr(ServerArgs, "resolve_once"):
+        # SGLang 0.5.20 publishes through runtime_context, which resolves the
+        # real ServerArgs (publish -> resolve_once); a bare mock is rejected.
+        set_global_server_args_for_scheduler(ServerArgs(model_path="dummy", enable_symm_mem=False))
+    else:
+
+        class MockServerArgs:
+            def __init__(self):
+                self.enable_symm_mem = False
+
+        set_global_server_args_for_scheduler(MockServerArgs())
+
+
+def set_sglang_serving_all_reduce_flags(sglang_mods):
+    """The all-reduce switches a default SGLang server sets before it builds its groups.
+
+    sglang v0.5.23 distributed/bootstrap.py _set_all_reduce_flags: the custom all-reduce kernel
+    is on unless --disable-custom-all-reduce, MSCCL++ and torch symmetric memory are opt-in
+    (--enable-mscclpp, --enable-torch-symm-mem, both default False), and the FlashInfer
+    all-reduce-only dispatch follows --flashinfer-allreduce-fusion-backend (default unset).
+    """
+    sglang_mods["set_custom_all_reduce"](True)
+    sglang_mods["set_mscclpp"](False)
+    sglang_mods["set_torch_symm_mem_all_reduce"](False)
+    sglang_mods["set_flashinfer_allreduce_only"](False)
 
 
 def _vllm_graph_pool():
@@ -836,22 +935,9 @@ def benchmark_sglang_allreduce(
     measure_power: bool = False,
     power_min_duration: float = 1.0,
 ):
-    class MockServerArgs:
-        def __init__(self):
-            self.enable_symm_mem = False
-
-    from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
-
-    if hasattr(ServerArgs, "resolve_once"):
-        # SGLang 0.5.20 publishes through runtime_context, which resolves the
-        # real ServerArgs (publish -> resolve_once); a bare mock is rejected.
-        # model_path="dummy" returns early from resolution
-        # (arg_groups/pipeline.py:121); enable_symm_mem stays False.
-        set_global_server_args_for_scheduler(ServerArgs(model_path="dummy", enable_symm_mem=False))
-    else:
-        set_global_server_args_for_scheduler(MockServerArgs())
-
     """Benchmark SGLang custom AllReduce implementation"""
+    takes_widths = sglang_groups_take_widths(import_sglang()["initialize_model_parallel"])
+    publish_sglang_server_args(world_size, rank, takes_widths)
     sglang_mods, local_rank = setup_sglang_distributed(world_size, rank, use_slurm)
 
     # Parse test range

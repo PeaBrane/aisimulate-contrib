@@ -127,6 +127,7 @@ def _mtp_host_engine(*, mode="aggregated", expected=1.5) -> dict:
     return engine
 
 
+@pytest.mark.usefixtures("raw_data_coordinates")
 @pytest.mark.parametrize("agentic", [False, True])
 def test_canonical_mtp_host_config_roundtrips_and_preserves_cost_identity(
     agentic,
@@ -191,6 +192,7 @@ def test_canonical_mtp_host_config_preserves_composition_limits(change, error) -
         CorePredictionConfig.model_validate({"engine": engine})
 
 
+@pytest.mark.usefixtures("raw_data_coordinates")
 def test_canonical_mtp_host_config_takes_attention_dp() -> None:
     engine = _mtp_host_engine()
     engine["workers"]["aggregated"]["parallelism"]["attention_data"] = 2
@@ -202,6 +204,7 @@ def test_canonical_mtp_host_config_takes_attention_dp() -> None:
     assert lowered["rank"]["aic_nextn"] == 2
 
 
+@pytest.mark.usefixtures("raw_data_coordinates")
 def test_canonical_mtp_host_config_takes_prefill_and_decode_workers_without_kvcr() -> None:
     engine = _mtp_host_engine(mode="disaggregated")
     # These workers take either pool scope; an aggregated worker only a local pool.
@@ -236,6 +239,7 @@ def test_host_offload_stays_unsupported_with_an_afd_worker(canonical_mtp) -> Non
         CorePredictionConfig.model_validate({"engine": engine})
 
 
+@pytest.mark.usefixtures("raw_data_coordinates")
 @pytest.mark.parametrize("expected", [0.0, 2.0])
 def test_canonical_mtp_native_replay_restores_an_evicted_host_prefix(expected) -> None:
     from aisim import _runtime

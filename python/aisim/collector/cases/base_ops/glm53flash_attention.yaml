@@ -10,7 +10,7 @@ description: >-
   regimes (prefix+x <= 2048 short, otherwise pooled + retained tail), plus B=1
   long-context rows at 256K, 512K and ~1M. Every step stays inside the pinned
   serving chunked-prefill budget of 8192 scheduled tokens, and every prefill
-  chunk starts on a multiple of the IndexPool size 4 (stock vLLM 0.31.0
+  chunk starts on a multiple of the IndexPool size 4 (stock vLLM 0.32.0
   corrupts unaligned chunk starts).
 common_case_values:
   glm53flash_attention:

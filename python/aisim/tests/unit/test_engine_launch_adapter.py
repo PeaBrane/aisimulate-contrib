@@ -122,6 +122,7 @@ def _native_launch(engine, *, explicit_capacity=True):
 @pytest.mark.parametrize("role", ["aggregated", "prefill", "decode"])
 @pytest.mark.parametrize("kind", ["mtp", "eagle3"])
 @pytest.mark.parametrize("canonical_only", [False, True], ids=["public-selection", "nested-cost-only"])
+@pytest.mark.usefixtures("raw_data_coordinates")
 def test_generic_speculation_survives_canonical_launch(local_target, backend, role, kind, canonical_only):
     timing = _timing_config(local_target, backend, role)
     cost = _speculative_cost(kind)
