@@ -307,6 +307,9 @@ struct SessionRuntime {
     session_id: String,
     turns: Vec<TurnRuntime>,
     cumulative_tokens: Vec<u32>,
+    // Replay hashes of `cumulative_tokens`' complete blocks as of the last
+    // dispatch, so each turn hashes only the blocks it adds.
+    cumulative_hashes: ReplayRequestHashes,
     next_turn_index: usize,
     next_ready_at_ms: Option<f64>,
     in_flight: Option<Uuid>,
@@ -2141,6 +2144,7 @@ impl WorkloadDriver {
                         deterministic_request_id: Some(snapshot.request_uuid(source_index)?),
                     }],
                     cumulative_tokens: Vec::new(),
+                    cumulative_hashes: ReplayRequestHashes::default(),
                     next_turn_index: 0,
                     next_ready_at_ms: None,
                     in_flight: None,
@@ -2471,6 +2475,7 @@ impl WorkloadDriver {
                     deterministic_request_id: Some(deterministic_request_id),
                 }],
                 cumulative_tokens: Vec::new(),
+                cumulative_hashes: ReplayRequestHashes::default(),
                 next_turn_index: 0,
                 next_ready_at_ms: None,
                 in_flight: None,
@@ -2660,6 +2665,7 @@ impl WorkloadDriver {
                     session_id: session.session_id,
                     turns,
                     cumulative_tokens: Vec::with_capacity(cumulative_capacity),
+                    cumulative_hashes: ReplayRequestHashes::default(),
                     next_turn_index: 0,
                     next_ready_at_ms,
                     in_flight: None,
@@ -3023,7 +3029,9 @@ impl WorkloadDriver {
                     );
                     let request_tokens = session.cumulative_tokens.clone();
                     let replay_hashes = self.include_replay_hashes.then(|| {
-                        ReplayRequestHashes::from_tokens(&request_tokens, self.engine_block_size)
+                        let hashes = &mut session.cumulative_hashes;
+                        hashes.extend_from_tokens(&request_tokens, self.engine_block_size);
+                        hashes.clone()
                     });
                     let request = ReplayRequestPayload::materialized(DirectRequest {
                         cache_salt: None,
@@ -3525,6 +3533,7 @@ impl WorkloadDriver {
         session.next_ready_at_ms = next_ready_at_ms;
         if session_ended {
             session.cumulative_tokens = Vec::new();
+            session.cumulative_hashes = ReplayRequestHashes::default();
         }
         if next_ready_at_ms.is_some()
             && outcome == TurnOutcome::Completed
@@ -4581,6 +4590,8 @@ mod tests {
         let first = driver.pop_ready(0.0, usize::MAX);
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].request.tokens, vec![10, 10, 10, 10, 11, 11]);
+        let rehashed = |t: &ReadyTurn| ReplayRequestHashes::from_tokens(&t.request.tokens, 4);
+        assert_eq!(first[0].replay_hashes, Some(rehashed(&first[0])));
         assert_eq!(first[0].request.output_token_ids, Some(vec![20, 21]));
         assert_eq!(first[0].request.priority, 3);
         assert_eq!(first[0].request.strict_priority, 4);
@@ -4599,6 +4610,8 @@ mod tests {
             second[0].request.tokens,
             vec![10, 10, 10, 10, 11, 11, 20, 21, 12, 12, 12]
         );
+        // The second engine block spans turn 1's input and its emitted output.
+        assert_eq!(second[0].replay_hashes, Some(rehashed(&second[0])));
         assert_eq!(second[0].request.priority, -2);
         assert_eq!(second[0].request.strict_priority, 7);
         // Dispatch leaves a turn's prompt only in the session history.
@@ -4779,6 +4792,7 @@ mod tests {
                 .find(|s| s.session_id == "10")
                 .unwrap();
             assert_eq!(ended_session.cumulative_tokens.capacity(), 0);
+            assert!(ended_session.cumulative_hashes.sequence_hashes.is_empty());
             driver.on_complete(surviving.request_uuid, 2.0).unwrap();
             assert!(!driver.is_drained());
             assert_eq!(driver.next_ready_time_ms(), Some(7.0));
