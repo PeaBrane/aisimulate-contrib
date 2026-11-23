@@ -19,7 +19,7 @@ use crate::engine::{
 use crate::memo::{Memo, OnThread};
 use crate::perfmodel::afd::model::{AfdForwardPassPerfModel, AfdTimingConfig};
 use crate::perfmodel::engine::runtime::{
-    IterationDispatch, MixedPass, PerOpSlotValue, RankDetail, RankPricing,
+    FpmRankTerms, IterationDispatch, MixedPass, PerOpSlotValue, RankDetail, RankPricing,
 };
 use crate::perfmodel::engine::{Engine as PerfEngine, RuntimeConfig};
 use crate::replay::{
@@ -1605,11 +1605,12 @@ impl AicTimingModel {
     }
 
     /// Price one iteration with the canonical model: the plain estimate of
-    /// whole-model FPM, its detailed estimate while diagnostics are captured,
-    /// and for operation graphs the estimate with each rank's operations,
-    /// which are the power evidence, as values or, while diagnostics are
-    /// captured, diagnostics. Corrections are the model's own: the heaviest
-    /// rank's workload correction applied to the rank maximum.
+    /// whole-model FPM, with each rank's phase terms when its table carries
+    /// power, its detailed estimate while diagnostics are captured, and for
+    /// operation graphs the estimate with each rank's operations, which are
+    /// the power evidence, as values or, while diagnostics are captured,
+    /// diagnostics. Corrections are the model's own: the heaviest rank's
+    /// workload correction applied to the rank maximum.
     fn price_iteration(
         &self,
         pricing: &IterationPricing,
@@ -1637,11 +1638,18 @@ impl AicTimingModel {
         } else {
             RankDetail::Values
         };
-        if !whole_model
+        // Whole-model diagnostics are the detailed estimate's direct lookups.
+        if !(whole_model && capture)
             && let Some(iteration) = model
                 .estimate_native_iteration(&metrics, detail)
                 .context("AIC iteration prediction failed")?
         {
+            let evidence = if whole_model {
+                let ranks = iteration.ranks.iter().map(|rank| rank.fpm_terms);
+                fpm_terms_evidence(iteration.correction_factor, ranks)?
+            } else {
+                self.native_rank_evidence(pricing, &iteration, queries, capture)?
+            };
             return Ok(PricedIteration {
                 total_ms: iteration.latency_ms,
                 wait_ms: attention_dp_wait_ms(
@@ -1649,7 +1657,7 @@ impl AicTimingModel {
                     iteration.correction_factor,
                     iteration.ranks.iter().map(|rank| rank.latency_ms),
                 ),
-                evidence: self.native_rank_evidence(pricing, &iteration, queries, capture)?,
+                evidence,
                 estimate: None,
             });
         }
@@ -2069,10 +2077,19 @@ fn attention_dp_wait_ms(
         .sum()
 }
 
-/// Fold active rank evidence once when pricing, so a cached iteration
-/// records at most two components regardless of its attention-DP width.
+/// [`fpm_terms_evidence`] of a detailed whole-model FPM estimate.
 fn fpm_rank_evidence(
     estimate: &crate::ForwardPassEstimate,
+) -> Result<Vec<(Arc<ValidatedTimingPhase>, bool)>> {
+    let ranks = estimate.ranks.iter().map(crate::FpmRankEstimate::terms);
+    fpm_terms_evidence(estimate.correction_factor.unwrap_or(1.0), ranks)
+}
+
+/// Fold active rank evidence once when pricing, so a cached iteration
+/// records at most two components regardless of its attention-DP width.
+fn fpm_terms_evidence(
+    correction: f64,
+    ranks: impl IntoIterator<Item = FpmRankTerms>,
 ) -> Result<Vec<(Arc<ValidatedTimingPhase>, bool)>> {
     #[derive(Default)]
     struct Totals {
@@ -2081,16 +2098,8 @@ fn fpm_rank_evidence(
         energy_wms: f64,
     }
 
-    let correction = estimate.correction_factor.unwrap_or(1.0);
     let mut phases = [Totals::default(), Totals::default()];
-    for rank in &estimate.ranks {
-        let components = [
-            (rank.prefill_ms, rank.prefill_energy_wms),
-            (
-                rank.marginal_decode_ms.or(rank.decode_ms),
-                rank.decode_energy_wms,
-            ),
-        ];
+    for components in ranks {
         for (phase, (latency, energy)) in phases.iter_mut().zip(components) {
             if let Some(latency_ms) = latency.filter(|&ms| ms > 0.0) {
                 let latency_ms = latency_ms * correction;
@@ -10158,6 +10167,73 @@ mod tests {
             timing
         };
         (timing(), with_iteration_pricing(timing(), model))
+    }
+
+    #[test]
+    fn powered_fpm_rank_terms_preserve_corrected_iteration_evidence() {
+        use crate::perf_database::fpm_forward::{
+            FPM_FORWARD_POWER_MEASUREMENT_POLICY,
+            tests::{PowerCell, RowSpec},
+        };
+        use crate::perfmodel::engine::runtime::tests::build_fpm_engine_with_rows;
+
+        pyo3::Python::initialize();
+        let row = |workload_kind, total_prefill_tokens, total_kv_read_tokens, latency_ms, power| {
+            RowSpec {
+                workload_kind,
+                batch_size: 1,
+                total_prefill_tokens,
+                total_kv_read_tokens,
+                latency_ms,
+                measurement: Some((FPM_FORWARD_POWER_MEASUREMENT_POLICY, 1)),
+                power_w: Some(PowerCell::Double(Some(power))),
+                ..RowSpec::default()
+            }
+        };
+        let rows = [
+            row("prefill", 256, 128, 13.0, 300.0),
+            row("decode", 0, 4, 3.0, 200.0),
+            row("decode", 0, 4096, 7.0, 400.0),
+        ];
+        let tmp = tempfile::tempdir().unwrap();
+        let mut model = ForwardPassPerfModel::from_engine(
+            Arc::new(build_fpm_engine_with_rows(tmp.path(), &rows).unwrap()),
+            Default::default(),
+        );
+        let queries = [[1, 256, 128, 1, 4096], [0, 0, 0, 1, 4096], [0; 5]];
+        let mut observed = rank_metrics(&queries[0]);
+        // Mixed native latency is 13 + (7 - 3) = 17 ms; tune to 1.5x.
+        observed.wall_time = 25.5 / 1000.0;
+        model.tune_with_fpms(&vec![vec![observed]; 8]).unwrap();
+        let model = Arc::new(model);
+        let (_, mut timing) = fpm_timing_pair(&model);
+        timing.fpm_power = true;
+        let pricing = timing.iteration.as_ref().unwrap();
+        // Independent oracle, including the correction: prefill (13*1.5,
+        // 13*300*1.5); decode ((7-3+7)*1.5, (7*400-3*200+7*400)*1.5).
+        // The rank maximum is 17*1.5=25.5; waiting is (17-7+17)*1.5=40.5.
+        // Repeated non-capture calls reuse rank entries; capture uses the
+        // detailed route. Both must satisfy these values independently.
+        for capture in [false, true] {
+            for _ in 0..2 {
+                let priced = timing.price_iteration(pricing, &queries, capture).unwrap();
+                assert!(close(priced.total_ms, 25.5), "{}", priced.total_ms);
+                assert!(close(priced.wait_ms, 40.5), "{}", priced.wait_ms);
+                assert_eq!(priced.estimate.is_some(), capture);
+                assert_eq!(priced.evidence.len(), 2);
+                for ((phase, prefill), (is_prefill, latency_ms, energy_wms)) in priced
+                    .evidence
+                    .iter()
+                    .zip([(true, 19.5, 5850.0), (false, 16.5, 7500.0)])
+                {
+                    let phase = phase.to_phase();
+                    assert_eq!(*prefill, is_prefill);
+                    assert!(close(phase.latency_ms, latency_ms));
+                    assert!(close(phase.energy_wms.unwrap(), energy_wms));
+                    assert!(close(phase.covered_latency_ms, latency_ms));
+                }
+            }
+        }
     }
 
     #[test]
