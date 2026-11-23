@@ -10,6 +10,7 @@ Tests model validation, default models, and model-specific configurations.
 import json
 from collections import Counter
 from importlib.resources import files
+from pathlib import Path
 from typing import ClassVar
 from unittest.mock import patch
 
@@ -2339,3 +2340,58 @@ class TestQwen38MaxRegistration:
 
     def test_architecture_is_not_multimodal(self):
         assert _QWEN38_MAX_ARCH not in common.MULTIMODAL_TEXT_CONFIG_KEY
+
+
+# ── DSA and MLA activation width (AISIM-2180) ───────────────────────────────────
+
+_CONFIGS = Path(str(files("aisim_core") / "model_configs"))
+
+_RESIDUAL_WIDTH_CONFIGS = {
+    "zai-org/GLM-5": 96,
+    "zai-org/GLM-5-FP8": 96,
+    "nvidia/GLM-5-NVFP4": 96,
+    "zai-org/GLM-5.1": 96,
+    "zai-org/GLM-5.1-FP8": 96,
+    "nvidia/GLM-5.1-NVFP4": 96,
+    "zai-org/GLM-5.2": 96,
+    "zai-org/GLM-5.2-FP8": 96,
+    "nvidia/GLM-5.2-NVFP4": 96,
+    "zai-org/GLM-5.3": 96,
+    "zai-org/GLM-5.3-BF16": 96,
+    "nvidia/GLM-5.3-NVFP4": 96,
+    "deepseek-ai/DeepSeek-V3.2": 56,
+    "nvidia/DeepSeek-V3.2-NVFP4": 56,
+    "deepseek-ai/DeepSeek-V3": 56,
+    "deepseek-ai/DeepSeek-R1": 56,
+    "nvidia/DeepSeek-V3.1-NVFP4": 56,
+    "moonshotai/Kimi-K2-Instruct": 112,
+}
+
+
+@pytest.mark.parametrize(("model", "width"), sorted(_RESIDUAL_WIDTH_CONFIGS.items()))
+def test_dsa_and_mla_activation_width_is_the_residual_width(model, width):
+    info = get_model_config_from_model_path(model)
+    raw = info["raw_config"]
+    assert info["d"] == width
+    # An inexact division would put the width below the residual stream.
+    assert info["d"] * raw["num_attention_heads"] == raw["hidden_size"]
+
+
+def test_no_packaged_dsa_or_mla_config_is_missing_from_the_width_table():
+    architectures = {"DeepSeekForCausalLM", "DeepseekV3ForCausalLM", "DeepseekV32ForCausalLM", "GlmMoeDsaForCausalLM"}
+    packaged = {
+        path.name[: -len("_config.json")].replace("--", "/")
+        for path in _CONFIGS.glob("*_config.json")
+        if not path.name.endswith("_hf_quant_config.json")
+        and set(json.loads(path.read_text()).get("architectures") or []) & architectures
+    }
+    assert packaged == set(_RESIDUAL_WIDTH_CONFIGS)
+
+
+@pytest.mark.parametrize("model", ["zai-org/GLM-5", "zai-org/GLM-5.2"])
+def test_dsa_model_activation_width_is_the_residual_width(model):
+    # The top-level head_dim of these exports is 64 (GLM-5) and 192 (GLM-5.2). The backends read
+    # h = _num_heads * _head_size as the activation width, so h must be the residual width.
+    model_config = config.ModelConfig(tp_size=1, moe_tp_size=1, moe_ep_size=1)
+    built = get_model(model, model_config, backend_name="sglang")
+    assert built._num_heads * built._head_size == 6144

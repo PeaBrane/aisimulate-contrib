@@ -131,6 +131,8 @@ struct UnpricedPass {
     selected_ms: f64,
     /// When the language-model forward starts: after the vision encoder.
     forward_start_ms: f64,
+    /// Already-scaled vision time, retained independently of absolute timestamps.
+    vision_ms: f64,
     prefill: Option<PrefillTotals>,
     decode: Option<DecodeShape>,
     /// When the pass ends regardless of its forward: under the host loop, when
@@ -1313,6 +1315,13 @@ impl SglangCore {
         // of forward telemetry and out of repeated pipeline stages.
         let scheduled_end_ms = forward_end_ms + scheduler_ms;
         let mut result = pass.result;
+        result.forward_time = forward_time;
+        // Vision runs before the language forward and belongs to the same
+        // active prefill evidence. Include its already-scaled time in rank
+        // wait accounting without adding it to the simulated timeline again.
+        if pass.vision_ms > 0.0 {
+            result.forward_time.prefill += modeled_duration(pass.vision_ms, 1.0)?;
+        }
         // When this pass's forward leaves stage 0, and its time per stage.
         let mut stage0 = Some((scheduled_end_ms, forward_ms));
         let host_launch = pass.launch.is_some();
@@ -1971,6 +1980,7 @@ impl SglangCore {
                 .host_deadline_ms()
                 .is_some_and(|deadline| deadline > now_ms);
         let result = EnginePassResult {
+            forward_time: ForwardTime::default(),
             committed_requests,
             // The forward's end is set when it is priced; `now_ms` holds its place.
             end_ms: now_ms,
@@ -2009,6 +2019,7 @@ impl SglangCore {
         self.unpriced = Some(UnpricedPass {
             selected_ms,
             forward_start_ms: decode.end_ms,
+            vision_ms,
             prefill,
             decode: decode_shape,
             end_ms,

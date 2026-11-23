@@ -19,7 +19,7 @@ use crate::engine::{
 use crate::memo::{Memo, OnThread};
 use crate::perfmodel::afd::model::{AfdForwardPassPerfModel, AfdTimingConfig};
 use crate::perfmodel::engine::runtime::{
-    IterationDispatch, MixedPass, PerOpSlotValue, RankDetail, RankPricing,
+    FpmRankTerms, IterationDispatch, MixedPass, PerOpSlotValue, RankDetail, RankPricing,
 };
 use crate::perfmodel::engine::{Engine as PerfEngine, RuntimeConfig};
 use crate::replay::{
@@ -908,6 +908,8 @@ impl IterationPricing {
 #[derive(Debug)]
 struct PricedIteration {
     total_ms: f64,
+    /// Step-local uncovered rank wait at the corrected provider duration.
+    wait_ms: f64,
     /// The detailed whole-model FPM estimate, when diagnostics are captured.
     estimate: Option<crate::ForwardPassEstimate>,
     /// Operation evidence of every working rank, corrected, each with whether
@@ -1047,7 +1049,7 @@ impl AicTimingModel {
             use_fpm_decode_totals,
             config.decoder_replay,
         )?;
-        let engine = Python::with_gil(|py| -> PyResult<_> {
+        let engine = Python::attach(|py| -> PyResult<_> {
             Ok(Py::new(py, crate::AicEngine::from_shared_engine(native))?.into_any())
         })?;
         let fpm_decode_kv_ceiling = if use_fpm_decode_totals {
@@ -1111,7 +1113,7 @@ impl AicTimingModel {
         if speculation_kind == Some("mtp") {
             // Wait for scheme registration before canonical construction uses
             // the base module. Executor depth is checked only after loading.
-            Python::with_gil(|py| PyModule::import(py, "aisim_core.sdk.speculation").map(|_| ()))?;
+            Python::attach(|py| PyModule::import(py, "aisim_core.sdk.speculation").map(|_| ()))?;
         }
         Ok(())
     }
@@ -1122,7 +1124,7 @@ impl AicTimingModel {
     fn build_fitted(model: Arc<ForwardPassPerfModel>) -> Result<Self> {
         let fitted = FittedIterationTiming::from_model(model)?;
         Ok(Self {
-            engine: Python::with_gil(|py| py.None()),
+            engine: Python::attach(|py| py.None()),
             diagnostic_model: None,
             fpm_model: None,
             corrections: None,
@@ -1307,7 +1309,7 @@ impl AicTimingModel {
         prefix: u32,
         mode: &str,
     ) -> PyResult<(PythonPerOpEntries, PythonPerOpEntries)> {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let kwargs = PyDict::new(py);
             kwargs.set_item("batch_size", batch_size)?;
             kwargs.set_item("beam_width", 1)?;
@@ -1333,8 +1335,12 @@ impl AicTimingModel {
         evidence.record(phase, prefill)
     }
 
-    fn record_pass_evidence(&self, phases: &[(Arc<ValidatedTimingPhase>, bool)]) -> Result<()> {
-        if phases.is_empty() {
+    fn record_pass_evidence(
+        &self,
+        phases: &[(Arc<ValidatedTimingPhase>, bool)],
+        wait_ms: f64,
+    ) -> Result<()> {
+        if phases.is_empty() && wait_ms == 0.0 {
             return Ok(());
         }
         let mut evidence = self
@@ -1344,6 +1350,7 @@ impl AicTimingModel {
         for (phase, prefill) in phases {
             evidence.record(phase, *prefill)?;
         }
+        evidence.iteration_wait_ms += wait_ms;
         Ok(())
     }
 
@@ -1364,7 +1371,7 @@ impl AicTimingModel {
             .latency_ms
             .context("native FPM returned no estimate")?;
         if self.fpm_power {
-            self.record_pass_evidence(&fpm_rank_evidence(&estimate)?)?;
+            self.record_pass_evidence(&fpm_rank_evidence(&estimate)?, 0.0)?;
         }
         if self.diagnostic_model.is_none() {
             return Ok(latency_ms);
@@ -1507,7 +1514,7 @@ impl AicTimingModel {
                 .map(|native| native * correction)
                 .context("AIC prefill prediction failed");
         }
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             self.engine
                 .bind(py)
                 .call_method1(
@@ -1598,11 +1605,12 @@ impl AicTimingModel {
     }
 
     /// Price one iteration with the canonical model: the plain estimate of
-    /// whole-model FPM, its detailed estimate while diagnostics are captured,
-    /// and for operation graphs the estimate with each rank's operations,
-    /// which are the power evidence, as values or, while diagnostics are
-    /// captured, diagnostics. Corrections are the model's own: the heaviest
-    /// rank's workload correction applied to the rank maximum.
+    /// whole-model FPM, with each rank's phase terms when its table carries
+    /// power, its detailed estimate while diagnostics are captured, and for
+    /// operation graphs the estimate with each rank's operations, which are
+    /// the power evidence, as values or, while diagnostics are captured,
+    /// diagnostics. Corrections are the model's own: the heaviest rank's
+    /// workload correction applied to the rank maximum.
     fn price_iteration(
         &self,
         pricing: &IterationPricing,
@@ -1620,6 +1628,7 @@ impl AicTimingModel {
                 .context("canonical model returned no iteration estimate")?;
             return Ok(PricedIteration {
                 total_ms,
+                wait_ms: 0.0,
                 estimate: None,
                 evidence: Vec::new(),
             });
@@ -1629,23 +1638,55 @@ impl AicTimingModel {
         } else {
             RankDetail::Values
         };
-        if !whole_model
+        // Whole-model diagnostics are the detailed estimate's direct lookups.
+        if !(whole_model && capture)
             && let Some(iteration) = model
                 .estimate_native_iteration(&metrics, detail)
                 .context("AIC iteration prediction failed")?
         {
+            let evidence = if whole_model {
+                let ranks = iteration.ranks.iter().map(|rank| rank.fpm_terms);
+                fpm_terms_evidence(iteration.correction_factor, ranks)?
+            } else {
+                self.native_rank_evidence(pricing, &iteration, queries, capture)?
+            };
             return Ok(PricedIteration {
                 total_ms: iteration.latency_ms,
-                evidence: self.native_rank_evidence(pricing, &iteration, queries, capture)?,
+                wait_ms: attention_dp_wait_ms(
+                    iteration.latency_ms,
+                    iteration.correction_factor,
+                    iteration.ranks.iter().map(|rank| rank.latency_ms),
+                ),
+                evidence,
                 estimate: None,
             });
         }
         let estimate = model
             .estimate_forward_pass_detailed(&metrics)
             .context("AIC iteration prediction failed")?;
+        self.price_detailed_iteration(pricing, queries, capture, estimate)
+    }
+
+    fn price_detailed_iteration(
+        &self,
+        pricing: &IterationPricing,
+        queries: &[RankQuery],
+        capture: bool,
+        estimate: crate::ForwardPassEstimate,
+    ) -> Result<PricedIteration> {
+        let whole_model = matches!(pricing.dispatch, IterationDispatch::WholeModel { .. });
         let total_ms = estimate
             .latency_ms
             .context("canonical model returned no iteration estimate")?;
+        let wait_ms = if !whole_model || self.fpm_power {
+            attention_dp_wait_ms(
+                total_ms,
+                estimate.correction_factor.unwrap_or(1.0),
+                estimate.ranks.iter().map(|rank| rank.latency_ms),
+            )
+        } else {
+            0.0
+        };
         if whole_model {
             let evidence = if self.fpm_power {
                 fpm_rank_evidence(&estimate)?
@@ -1654,12 +1695,14 @@ impl AicTimingModel {
             };
             return Ok(PricedIteration {
                 total_ms,
+                wait_ms,
                 estimate: capture.then_some(estimate),
                 evidence,
             });
         }
         Ok(PricedIteration {
             total_ms,
+            wait_ms,
             evidence: self.rank_operation_evidence(pricing, &estimate, queries)?,
             estimate: None,
         })
@@ -1956,7 +1999,7 @@ impl AicTimingModel {
     /// FPM estimate under the iteration's correction, as each rank recorded
     /// its own estimate when it priced its own phases.
     fn record_iteration(&self, priced: &PricedIteration, queries: &[RankQuery]) -> Result<()> {
-        self.record_pass_evidence(&priced.evidence)?;
+        self.record_pass_evidence(&priced.evidence, priced.wait_ms)?;
         let Some(estimate) = priced
             .estimate
             .as_ref()
@@ -2020,10 +2063,33 @@ fn rank_estimate(
     }
 }
 
-/// Fold active rank evidence once when pricing, so a cached iteration
-/// records at most two components regardless of its attention-DP width.
+/// Each idle rank has zero active time and contributes the full step.
+fn attention_dp_wait_ms(
+    total_ms: f64,
+    correction: f64,
+    ranks: impl ExactSizeIterator<Item = f64>,
+) -> f64 {
+    if ranks.len() <= 1 {
+        return 0.0;
+    }
+    ranks
+        .map(|active_ms| total_ms - active_ms * correction)
+        .sum()
+}
+
+/// [`fpm_terms_evidence`] of a detailed whole-model FPM estimate.
 fn fpm_rank_evidence(
     estimate: &crate::ForwardPassEstimate,
+) -> Result<Vec<(Arc<ValidatedTimingPhase>, bool)>> {
+    let ranks = estimate.ranks.iter().map(crate::FpmRankEstimate::terms);
+    fpm_terms_evidence(estimate.correction_factor.unwrap_or(1.0), ranks)
+}
+
+/// Fold active rank evidence once when pricing, so a cached iteration
+/// records at most two components regardless of its attention-DP width.
+fn fpm_terms_evidence(
+    correction: f64,
+    ranks: impl IntoIterator<Item = FpmRankTerms>,
 ) -> Result<Vec<(Arc<ValidatedTimingPhase>, bool)>> {
     #[derive(Default)]
     struct Totals {
@@ -2032,16 +2098,8 @@ fn fpm_rank_evidence(
         energy_wms: f64,
     }
 
-    let correction = estimate.correction_factor.unwrap_or(1.0);
     let mut phases = [Totals::default(), Totals::default()];
-    for rank in &estimate.ranks {
-        let components = [
-            (rank.prefill_ms, rank.prefill_energy_wms),
-            (
-                rank.marginal_decode_ms.or(rank.decode_ms),
-                rank.decode_energy_wms,
-            ),
-        ];
+    for components in ranks {
         for (phase, (latency, energy)) in phases.iter_mut().zip(components) {
             if let Some(latency_ms) = latency.filter(|&ms| ms > 0.0) {
                 let latency_ms = latency_ms * correction;
@@ -2327,7 +2385,7 @@ impl TimingModel for AicTimingModel {
                 .map(|native| native * correction)
                 .context("AIC prefill prediction failed");
         }
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             self.engine
                 .bind(py)
                 .call_method1(
@@ -2381,7 +2439,7 @@ impl TimingModel for AicTimingModel {
                     .map(|native| native * correction)
                     .context("AIC decode prediction failed");
             }
-            return Python::with_gil(|py| {
+            return Python::attach(|py| {
                 self.engine
                     .bind(py)
                     .call_method1(
@@ -2496,13 +2554,37 @@ impl TimingModel for AicTimingModel {
     }
 
     fn evidence_summary(&self) -> Option<TimingEvidenceSummary> {
-        if (self.use_fpm_decode_totals && !self.fpm_power) || self.is_fitted() {
+        if !self.tracks_attention_dp_wait() {
             return None;
         }
         self.evidence
             .lock()
             .ok()
             .map(|evidence| evidence.snapshot())
+    }
+
+    fn power_evidence_summary(&self) -> Option<(TimingEvidenceSummary, f64, f64)> {
+        if !self.tracks_attention_dp_wait() {
+            return None;
+        }
+        let evidence = self.evidence.lock().ok()?;
+        Some((
+            evidence.snapshot(),
+            evidence.iteration_wait_ms,
+            evidence.phase_priced_wait_ms,
+        ))
+    }
+
+    fn tracks_attention_dp_wait(&self) -> bool {
+        (!self.use_fpm_decode_totals || self.fpm_power) && !self.is_fitted()
+    }
+
+    fn record_phase_priced_wait(&self, wait_ms: f64) -> Result<()> {
+        self.evidence
+            .lock()
+            .map_err(|_| anyhow!("AIC timing evidence accumulator was poisoned"))?
+            .phase_priced_wait_ms += wait_ms;
+        Ok(())
     }
 
     /// Time and source diagnostics use query history. Power uses the component accumulator.
@@ -2655,7 +2737,7 @@ fn aic_capacity_kwargs<'py>(
 }
 
 fn estimate_aic_num_gpu_blocks(config: &AicTimingConfig, role: &ReplayRoleConfig) -> Result<usize> {
-    Python::with_gil(|py| -> PyResult<usize> {
+    Python::attach(|py| -> PyResult<usize> {
         let memory = PyModule::import(py, "aisim_core.sdk.memory")?;
         let kwargs = aic_capacity_kwargs(py, config, role)?;
         memory
@@ -2677,7 +2759,7 @@ fn estimate_aic_grouped_budget(
     config: &AicTimingConfig,
     role: &ReplayRoleConfig,
 ) -> Result<crate::perfmodel::fpm::FpmCacheBudget> {
-    let serialized = Python::with_gil(|py| -> PyResult<String> {
+    let serialized = Python::attach(|py| -> PyResult<String> {
         let memory = PyModule::import(py, "aisim_core.sdk.memory")?;
         let kwargs = aic_capacity_kwargs(py, config, role)?;
         kwargs.del_item("scheduler_block_size")?;
@@ -3398,7 +3480,7 @@ fn check_afd_memory_fit_and_kv_budget_py(
         ForwardPassWorkerType::Decode => "decode",
         ForwardPassWorkerType::Aggregated => "both",
     };
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let module = py.import("aisim.sdk.afd_memory")?;
         let common = PyDict::new(py);
         common.set_item("model_path", &config.model)?;
@@ -3407,8 +3489,17 @@ fn check_afd_memory_fit_and_kv_budget_py(
         common.set_item("database_mode", config.estimator.database_mode.as_str())?;
         // Match the timing models' configuration-scoped roots. Empty means
         // the normal packaged/default discovery, rather than an empty search.
-        let systems_paths =
-            (!config.estimator.systems_paths.is_empty()).then_some(&config.estimator.systems_paths);
+        // The Python API takes `list[str]`. Pass `str`, not the `pathlib.Path`
+        // that pyo3 makes from a `PathBuf`: the memory check returns these
+        // paths, and its result goes through `json.dumps` below.
+        let systems_paths = (!config.estimator.systems_paths.is_empty()).then(|| {
+            config
+                .estimator
+                .systems_paths
+                .iter()
+                .map(|path| path.as_os_str())
+                .collect::<Vec<_>>()
+        });
         common.set_item("systems_paths", systems_paths)?;
         common.set_item("isl", isl)?;
         common.set_item("osl", osl)?;
@@ -3427,7 +3518,7 @@ fn check_afd_memory_fit_and_kv_budget_py(
         a_pool.set_item("a_tp_size", config.topology.a_pool.a_tp_size)?;
         a_pool.set_item("n_a_nodes", config.topology.a_pool.n_a_nodes)?;
         if let Some(root) = perf.pool_systems_root(true) {
-            a_pool.set_item("systems_paths", vec![root])?;
+            a_pool.set_item("systems_paths", vec![root.as_os_str()])?;
         }
         common.set_item("a_pool", a_pool)?;
         common.set_item("gpus_per_node", config.topology.gpus_per_node)?;
@@ -3498,13 +3589,13 @@ fn check_afd_memory_fit_and_kv_budget_py(
         common.set_item("max_seq_len", max_seq_len)?;
         common.set_item("phase", phase)?;
 
-        let check_kwargs = common.call_method0("copy")?.downcast_into::<PyDict>()?;
+        let check_kwargs = common.call_method0("copy")?.cast_into::<PyDict>()?;
         let f_pool = PyDict::new(py);
         f_pool.set_item("system", &config.topology.f_pool.system)?;
         f_pool.set_item("f_moe_ep_size", config.topology.f_pool.f_moe_ep_size)?;
         f_pool.set_item("n_f_nodes", config.topology.f_pool.n_f_nodes)?;
         if let Some(root) = perf.pool_systems_root(false) {
-            f_pool.set_item("systems_paths", vec![root])?;
+            f_pool.set_item("systems_paths", vec![root.as_os_str()])?;
         }
         check_kwargs.set_item("f_pool", f_pool)?;
         check_kwargs.set_item(
@@ -3541,7 +3632,7 @@ fn check_afd_memory_fit_and_kv_budget_py(
         let memory: serde_json::Value = serde_json::from_str(&memory_json)
             .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
 
-        let estimate_kwargs = common.call_method0("copy")?.downcast_into::<PyDict>()?;
+        let estimate_kwargs = common.call_method0("copy")?.cast_into::<PyDict>()?;
         estimate_kwargs.set_item("a_weight_gb", phase_weights(true)?)?;
         let budget: (f64, f64) = module
             .getattr("estimate_afd_kv_budget_bytes")?
@@ -4149,6 +4240,7 @@ struct TimingPowerSource {
     timing: Arc<dyn TimingModel>,
     prefill_speedup_ratio: f64,
     decode_speedup_ratio: f64,
+    wait_power_w: Option<f64>,
 }
 
 impl TimingPowerSource {
@@ -4159,35 +4251,70 @@ impl TimingPowerSource {
             timing,
             prefill_speedup_ratio: speedup_ratio,
             decode_speedup_ratio: speedup_ratio * config.decode_speedup_ratio,
+            wait_power_w: config.wait_power_w,
         })
     }
 }
 
-fn replay_timing_evidence(sources: &[TimingPowerSource]) -> Result<Option<TimingEvidenceSummary>> {
+#[derive(Default)]
+struct ReplayTimingEvidence {
+    active: TimingEvidenceSummary,
+    wait_ms: f64,
+    /// None when a role with positive wait has no configured watts.
+    wait_energy_wms: Option<f64>,
+    /// A role's timing model does not track attention-DP wait, so the
+    /// pooled `wait_ms` is not evidence of zero wait.
+    wait_untracked: bool,
+}
+
+fn replay_timing_evidence(sources: &[TimingPowerSource]) -> Result<Option<ReplayTimingEvidence>> {
     replay_timing_evidence_with_fpm(sources, false)
 }
 
 fn replay_timing_evidence_with_fpm(
     sources: &[TimingPowerSource],
     include_fpm: bool,
-) -> Result<Option<TimingEvidenceSummary>> {
-    let mut combined = TimingEvidenceSummary::default();
+) -> Result<Option<ReplayTimingEvidence>> {
+    let mut combined = ReplayTimingEvidence {
+        wait_energy_wms: Some(0.0),
+        ..Default::default()
+    };
     for source in sources {
-        let Some(summary) = include_fpm
-            .then(|| source.timing.fpm_evidence_summary())
-            .flatten()
-            .or_else(|| source.timing.evidence_summary())
-        else {
+        let evidence = if include_fpm {
+            source
+                .timing
+                .fpm_evidence_summary()
+                .or_else(|| source.timing.evidence_summary())
+                .map(|summary| (summary, 0.0, 0.0))
+        } else {
+            source.timing.power_evidence_summary()
+        };
+        let Some((summary, iteration_wait_ms, phase_priced_wait_ms)) = evidence else {
             return Ok(None);
         };
-        combined.prefill.try_accumulate(scale_power_phase(
+        combined.wait_untracked |= include_fpm || !source.timing.tracks_attention_dp_wait();
+        combined.active.prefill.try_accumulate(scale_power_phase(
             summary.prefill,
             source.prefill_speedup_ratio,
         )?)?;
-        combined.decode.try_accumulate(scale_power_phase(
+        combined.active.decode.try_accumulate(scale_power_phase(
             summary.decode,
             source.decode_speedup_ratio,
         )?)?;
+        // Whole-iteration pricing uses the same speedup for both phases.
+        let wait_ms = iteration_wait_ms * power_time_scale(source.prefill_speedup_ratio)
+            + phase_priced_wait_ms;
+        ensure!(
+            wait_ms.is_finite() && wait_ms >= 0.0,
+            "invalid attention-DP wait duration"
+        );
+        combined.wait_ms += wait_ms;
+        if wait_ms > 0.0 {
+            combined.wait_energy_wms = combined
+                .wait_energy_wms
+                .zip(source.wait_power_w)
+                .map(|(energy, watts)| energy + wait_ms * watts);
+        }
     }
     Ok(Some(combined))
 }
@@ -4228,9 +4355,9 @@ fn replay_fpm_query_evidence(sources: &[TimingPowerSource]) -> Result<Option<ser
     }))
 }
 
-fn replay_power_stats(summary: &TimingEvidenceSummary) -> Result<TracePowerStats> {
-    let mut combined = summary.prefill.clone();
-    combined.try_accumulate(summary.decode.clone())?;
+fn replay_power_stats(evidence: &ReplayTimingEvidence) -> Result<TracePowerStats> {
+    let mut combined = evidence.active.prefill.clone();
+    combined.try_accumulate(evidence.active.decode.clone())?;
     phase_power_stats(&combined)
 }
 
@@ -4313,10 +4440,10 @@ fn replay_performance_diagnostics(summary: Option<&TimingEvidenceSummary>) -> se
 }
 
 fn replay_power_diagnostics(
-    summary: Option<&TimingEvidenceSummary>,
+    evidence: Option<&ReplayTimingEvidence>,
     unavailable_reason: Option<&'static str>,
 ) -> Result<ReplayPowerDiagnostics> {
-    let Some(summary) = summary else {
+    let Some(evidence) = evidence else {
         return Ok(ReplayPowerDiagnostics {
             schema_version: "1.0",
             scope: "active_forward_pass_per_gpu",
@@ -4325,6 +4452,8 @@ fn replay_power_diagnostics(
             latency_unit: "ms",
             coverage_gate: POWER_DATA_COVERAGE_THRESHOLD,
             publication_status: "unsupported",
+            attention_dp_wait_ms: None,
+            step_power_w: None,
             energy_wms: None,
             latency_ms: None,
             covered_latency_ms: None,
@@ -4335,9 +4464,25 @@ fn replay_power_diagnostics(
         });
     };
 
-    let stats = replay_power_stats(summary)?;
+    let summary = &evidence.active;
     let mut combined = summary.prefill.clone();
     combined.try_accumulate(summary.decode.clone())?;
+    let stats = phase_power_stats(&combined)?;
+    let step_ms = combined.latency_ms + evidence.wait_ms;
+    ensure!(step_ms.is_finite(), "invalid attention-DP step duration");
+    let step_power_w = if evidence.wait_untracked {
+        None
+    } else if evidence.wait_ms == 0.0 {
+        stats.power_w
+    } else if stats.power_w.is_some() {
+        combined
+            .energy_wms
+            .zip(evidence.wait_energy_wms)
+            .map(|(active, wait)| (active + wait) / step_ms)
+            .filter(|watts| watts.is_finite() && *watts > 0.0)
+    } else {
+        None
+    };
     let observed = combined.latency_ms > 0.0;
     Ok(ReplayPowerDiagnostics {
         schema_version: "1.0",
@@ -4350,6 +4495,8 @@ fn replay_power_diagnostics(
         energy_wms: combined.energy_wms.filter(|energy| *energy > 0.0),
         latency_ms: Some(combined.latency_ms),
         covered_latency_ms: Some(combined.covered_latency_ms),
+        attention_dp_wait_ms: (!evidence.wait_untracked).then_some(evidence.wait_ms),
+        step_power_w,
         power_w: stats.power_w,
         power_coverage: Some(stats.coverage),
         unavailable_reason: (!observed).then_some("no forward-pass timing evidence was observed"),
@@ -4474,11 +4621,7 @@ fn scale_power_phase(
         speedup_ratio.is_finite() && speedup_ratio >= 0.0,
         "modeled speedup ratio must be finite and non-negative, got {speedup_ratio}"
     );
-    let scale = if speedup_ratio > 0.0 {
-        speedup_ratio.recip()
-    } else {
-        1.0
-    };
+    let scale = power_time_scale(speedup_ratio);
     phase.energy_wms = phase.energy_wms.map(|energy| energy * scale);
     phase.latency_ms *= scale;
     phase.covered_latency_ms *= scale;
@@ -4495,6 +4638,14 @@ fn scale_power_phase(
         // remains an unscaled physical baseline.
     }
     Ok(phase)
+}
+
+fn power_time_scale(speedup_ratio: f64) -> f64 {
+    if speedup_ratio > 0.0 {
+        speedup_ratio.recip()
+    } else {
+        1.0
+    }
 }
 
 fn infer_aic_timing_topology(engine: &mut serde_json::Value) -> Result<()> {
@@ -4832,6 +4983,7 @@ fn execute_json(payload: &str, capture_artifacts: bool) -> Result<String> {
             timing: Arc::clone(timing),
             prefill_speedup_ratio: 1.0,
             decode_speedup_ratio: 1.0,
+            wait_power_w: None,
         });
     }
     let mut prediction_provenance = serde_json::Map::new();
@@ -5074,8 +5226,11 @@ fn execute_json(payload: &str, capture_artifacts: bool) -> Result<String> {
     }
     if capture_performance_diagnostics {
         let performance_evidence = replay_timing_evidence_with_fpm(&power_sources, true)?;
-        report_json["performance_diagnostics"] =
-            replay_performance_diagnostics(performance_evidence.as_ref());
+        report_json["performance_diagnostics"] = replay_performance_diagnostics(
+            performance_evidence
+                .as_ref()
+                .map(|evidence| &evidence.active),
+        );
     }
     if let Some(evidence) = replay_fpm_query_evidence(&power_sources)? {
         report_json["fpm_query_evidence"] = evidence;
@@ -5218,7 +5373,7 @@ fn replay_python_error(error: anyhow::Error) -> PyErr {
         PyRuntimeError::new_err(format!("{error:#}"))
     };
     if let Some(failure) = error.downcast_ref::<ReplayCoverageFailure>() {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let _ = exception
                 .value(py)
                 .setattr("fpm_query_coverage", failure.coverage.to_string());
@@ -5230,14 +5385,14 @@ fn replay_python_error(error: anyhow::Error) -> PyErr {
 /// Execute one canonical serialized ReplaySpec and return serialized report JSON.
 #[pyfunction]
 fn run_replay_json(py: Python<'_>, payload: &str) -> PyResult<String> {
-    py.allow_threads(|| execute_json(payload, false))
+    py.detach(|| execute_json(payload, false))
         .map_err(replay_python_error)
 }
 
 /// Execute one fixed aggregated ReplaySpec and return report plus parity artifacts.
 #[pyfunction]
 fn run_replay_with_artifacts_json(py: Python<'_>, payload: &str) -> PyResult<String> {
-    py.allow_threads(|| execute_json(payload, true))
+    py.detach(|| execute_json(payload, true))
         .map_err(replay_python_error)
 }
 
@@ -5310,9 +5465,9 @@ fn scan_weka_requests(
     on_request: Py<PyAny>,
 ) -> PyResult<()> {
     let mut raised = None;
-    let scanned = py.allow_threads(|| {
+    let scanned = py.detach(|| {
         crate::replay::loadgen::scan_weka_requests(&path, block_size, &mut |input, output| {
-            Python::with_gil(|py| match on_request.call1(py, (input, output)) {
+            Python::attach(|py| match on_request.call1(py, (input, output)) {
                 Ok(_) => ControlFlow::Continue(()),
                 Err(error) => {
                     raised = Some(error);
@@ -5334,7 +5489,9 @@ fn _build_source_files_json() -> &'static str {
 }
 
 /// AISim native runtime module.
-#[pymodule]
+// pyo3 0.28 made modules declare free-threaded support by default. Keep the
+// earlier behavior: the module requires the GIL.
+#[pymodule(gil_used = true)]
 fn _runtime(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(_build_source_files_json, module)?)?;
     module.add_function(wrap_pyfunction!(
@@ -5641,7 +5798,7 @@ mod tests {
 
     #[test]
     fn replay_python_error_preserves_contextual_resource_failure() {
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let error = anyhow::Error::new(crate::replay::ReplayError::ResourceLimited(
             "create exact report sample file: No space left on device".to_string(),
         ))
@@ -5649,7 +5806,7 @@ mod tests {
         .context("AISim replay failed");
         let expected_message = format!("{error:#}");
 
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let mapped = replay_python_error(error);
             assert!(mapped.is_instance_of::<PyMemoryError>(py));
             assert_eq!(mapped.value(py).to_string(), expected_message);
@@ -5658,11 +5815,11 @@ mod tests {
 
     #[test]
     fn replay_python_error_keeps_other_failures_as_runtime_errors() {
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let error = anyhow::anyhow!("invalid replay input").context("AISim replay failed");
         let expected_message = format!("{error:#}");
 
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let mapped = replay_python_error(error);
             assert!(mapped.is_instance_of::<PyRuntimeError>(py));
             assert_eq!(mapped.value(py).to_string(), expected_message);
@@ -5671,12 +5828,12 @@ mod tests {
 
     #[test]
     fn replay_python_error_preserves_unimplemented_routing() {
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let error =
             anyhow::Error::new(crate::AfdRoutingLocation::F.ensure_supported().unwrap_err())
                 .context("AISim replay failed");
         let expected_message = format!("{error:#}");
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let mapped = replay_python_error(error);
             assert!(mapped.is_instance_of::<PyNotImplementedError>(py));
             assert_eq!(mapped.value(py).to_string(), expected_message);
@@ -6714,7 +6871,7 @@ mod tests {
         use crate::perfmodel::engine::spec::EngineSpec;
 
         let required = std::env::var_os("AIC_REQUIRE_EMBEDDED_ROUND_TRIP").is_some();
-        if let Err(error) = Python::with_gil(|py| py.import("aisim_core.sdk.engine").map(|_| ())) {
+        if let Err(error) = Python::attach(|py| py.import("aisim_core.sdk.engine").map(|_| ())) {
             assert!(
                 !required,
                 "native_phase_evidence_matches_python_bridge: \
@@ -6751,7 +6908,7 @@ mod tests {
             | AicPhaseProvider::Python
             | AicPhaseProvider::NativeEntries(_) => unreachable!(),
         };
-        let bridge = Python::with_gil(|py| python_timing_model(native.engine.clone_ref(py), false));
+        let bridge = Python::attach(|py| python_timing_model(native.engine.clone_ref(py), false));
         let check =
             |native: &AicTimingModel, bridge: &AicTimingModel, args| {
                 let (batch, isl, osl, prefix, mode) = args;
@@ -6897,7 +7054,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let mut native = Python::with_gil(|py| {
+        let mut native = Python::attach(|py| {
             python_timing_model(
                 Py::new(
                     py,
@@ -6908,7 +7065,7 @@ mod tests {
                 false,
             )
         });
-        let bridge = Python::with_gil(|py| python_timing_model(native.engine.clone_ref(py), false));
+        let bridge = Python::attach(|py| python_timing_model(native.engine.clone_ref(py), false));
         native.phase_provider = AicPhaseProvider::Native(missing);
         for mode in ["static_ctx", "static_gen"] {
             let error = native
@@ -7025,7 +7182,7 @@ mod tests {
 
     #[test]
     fn fitted_replay_rejects_unsupported_work_before_loading_a_learned_source() {
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         for source in ["artifact_path", "checkpoint_path"] {
             let learned = || {
                 let mut config = aic_config();
@@ -7201,7 +7358,7 @@ mod tests {
 
     #[test]
     fn fitted_regression_prices_each_iteration_as_the_canonical_estimate() {
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let dir = tempfile::tempdir().unwrap();
         let identity = unknown_regression_identity(ForwardPassWorkerType::Aggregated);
         let mut model = ForwardPassPerfModel::best_available(identity).unwrap();
@@ -7287,7 +7444,7 @@ mod tests {
     fn fitted_role_passes_without_model_work_take_no_time() {
         use crate::engine::generalized::{EngineIdentity, SchedulerCommand};
         use crate::engine::{Command, EngineConfig, EngineFactory, Request, SglangConfig};
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let dir = tempfile::tempdir().unwrap();
         let mut model = ForwardPassPerfModel::best_available(unknown_sglang_identity(
             ForwardPassWorkerType::Aggregated,
@@ -7376,7 +7533,7 @@ mod tests {
 
     #[test]
     fn fitted_replay_rejects_a_decode_speedup_other_than_one() {
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let dir = tempfile::tempdir().unwrap();
         let mut model = ForwardPassPerfModel::best_available(unknown_regression_identity(
             ForwardPassWorkerType::Decode,
@@ -7424,7 +7581,7 @@ mod tests {
 
     #[test]
     fn fitted_replay_requires_every_store_its_role_prices() {
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let dir = tempfile::tempdir().unwrap();
         let build = |kinds: &[IterationKind],
                      cross_rank: bool,
@@ -7605,7 +7762,7 @@ mod tests {
 
     #[test]
     fn fitted_regression_with_request_axes_reads_per_request_detail() {
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         // A regression fitted to measured MTP rounds (nextn 5: each decode
         // request verifies 6 tokens) replays like one fitted without MTP: one
         // query per pass, never scaled by the draft length.
@@ -7667,7 +7824,7 @@ mod tests {
     #[test]
     fn fitted_regression_prices_the_drafts_each_request_was_scheduled() {
         use crate::engine::{DirectRequest, MockEngineArgs};
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         // A regression on scheduled tokens, fitted at nextn 5: 2 ms plus
         // 0.25 ms per token.
         let mut identity = unknown_regression_identity(ForwardPassWorkerType::Decode);
@@ -7740,7 +7897,7 @@ mod tests {
 
     #[test]
     fn fitted_regression_takes_an_mtp_scheme_as_its_nextn() {
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let dir = tempfile::tempdir().unwrap();
         let mut identity = unknown_regression_identity(ForwardPassWorkerType::Decode);
         identity.nextn = 2;
@@ -7805,7 +7962,7 @@ mod tests {
     #[test]
     fn fitted_mtp_role_takes_its_depth_from_the_scheme_with_or_without_a_cpu_tier() {
         use crate::engine::NativeHostOffloadConfig;
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let dir = tempfile::tempdir().unwrap();
         let mut identity = unknown_regression_identity(ForwardPassWorkerType::Aggregated);
         identity.nextn = 2;
@@ -7922,7 +8079,7 @@ mod tests {
 
     #[test]
     fn fitted_roles_reject_draft_schemes_before_reading_the_checkpoint() {
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let dir = tempfile::tempdir().unwrap();
         // Reading this local checkpoint would fail JSON parsing. Unsupported
         // fitted schemes must instead fail the execution eligibility check.
@@ -7946,7 +8103,7 @@ mod tests {
 
     #[test]
     fn fitted_mtp_snapshot_load_errors_precede_executor_depth_validation() {
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let dir = tempfile::tempdir().unwrap();
         let mut identity = unknown_regression_identity(ForwardPassWorkerType::Decode);
         identity.speculation = Some(
@@ -7996,7 +8153,7 @@ mod tests {
 
     #[test]
     fn fitted_aggregated_role_needs_a_locally_mixed_store_only_where_ranks_mix_work() {
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let dir = tempfile::tempdir().unwrap();
         for backend in [
             crate::BackendKind::Vllm,
@@ -8045,7 +8202,7 @@ mod tests {
 
     #[test]
     fn fitted_aggregated_role_checks_its_cross_rank_store_at_the_engine_width() {
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let dir = tempfile::tempdir().unwrap();
         // The identity records unknown attention DP and two GPUs; engine
         // dp_size 2 at tensor parallelism 1 uses both.
@@ -8105,7 +8262,7 @@ mod tests {
     fn fitted_kvcr_role_with_an_unknown_pipeline_width_runs_one_stage() {
         use crate::engine::{KvcrConfig, NativeHostOffloadConfig};
         use crate::replay::WorkerStage;
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let dir = tempfile::tempdir().unwrap();
         let mut model = ForwardPassPerfModel::best_available(unknown_regression_identity(
             ForwardPassWorkerType::Aggregated,
@@ -8442,10 +8599,10 @@ mod tests {
 
     #[test]
     fn measured_profile_capacity_forwards_depth_without_changing_analytical_defaults() {
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let role = aggregated_role(&ReplayEngineConfig::default());
         let mut config = aic_config();
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             for depth in [0, 3] {
                 config.nextn = depth;
                 let kwargs = aic_capacity_kwargs(py, &config, &role).unwrap();
@@ -8529,8 +8686,8 @@ mod tests {
 
     #[test]
     fn native_ngram_role_derives_missing_or_null_depth_and_default_acceptance() {
-        pyo3::prepare_freethreaded_python();
-        if let Err(error) = Python::with_gil(|py| py.import("aisim_core.sdk.engine").map(|_| ())) {
+        pyo3::Python::initialize();
+        if let Err(error) = Python::attach(|py| py.import("aisim_core.sdk.engine").map(|_| ())) {
             assert!(
                 std::env::var_os("AIC_REQUIRE_EMBEDDED_ROUND_TRIP").is_none(),
                 "embedded SDK is required: {error}"
@@ -8561,7 +8718,7 @@ mod tests {
                     "backend": "vllm", "num_gpu_blocks": 64, "block_size": 16,
                     "timing_model": {"type": "external", "provider": "aic", "config": {
                         "model": dir.path(), "system": "h200_sxm", "backend": "vllm",
-                        "backend_version": "0.24.0", "estimation_mode": "op_level",
+                        "backend_version": "current", "estimation_mode": "op_level",
                         "speculation": {"kind": "ngram", "params": {"num_speculative_tokens": 3}}
                     }}
                 }
@@ -8850,11 +9007,43 @@ mod tests {
             })),
             prefill_speedup_ratio: 2.0,
             decode_speedup_ratio: 4.0,
+            wait_power_w: None,
         };
         let evidence = replay_timing_evidence(&[source]).unwrap().unwrap();
         let power = replay_power_stats(&evidence).unwrap();
         assert_eq!(power.power_w, Some(500.0));
         assert!((power.coverage - 170.0 / 175.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn untracked_attention_dp_wait_is_not_published_as_zero_wait() {
+        // A provider with energy evidence but no wait tracking (for example AFD
+        // timing) leaves wait unknown even with watts configured.
+        let source = TimingPowerSource {
+            timing: Arc::new(PowerTiming(TimingEvidenceSummary {
+                prefill: TimingPhaseEvidence {
+                    energy_wms: Some(4_000.0),
+                    latency_ms: 10.0,
+                    covered_latency_ms: 10.0,
+                    ..Default::default()
+                },
+                decode: TimingPhaseEvidence::default(),
+            })),
+            prefill_speedup_ratio: 1.0,
+            decode_speedup_ratio: 1.0,
+            wait_power_w: Some(60.0),
+        };
+        assert!(!source.timing.tracks_attention_dp_wait());
+        let evidence = replay_timing_evidence(&[source]).unwrap().unwrap();
+        assert!(evidence.wait_untracked);
+        let output = replay_power_diagnostics(Some(&evidence), None).unwrap();
+        assert_eq!(output.power_w, Some(400.0));
+        assert_eq!(output.power_coverage, Some(1.0));
+        assert_eq!(output.attention_dp_wait_ms, None);
+        assert_eq!(output.step_power_w, None);
+        let wire = serde_json::to_value(&output).unwrap();
+        assert!(wire.get("attention_dp_wait_ms").is_none());
+        assert_eq!(wire["step_power_w"], serde_json::Value::Null);
     }
 
     #[test]
@@ -8889,6 +9078,7 @@ mod tests {
                     timing: Arc::new(PowerTiming(summary)),
                     prefill_speedup_ratio: speedup,
                     decode_speedup_ratio: speedup,
+                    wait_power_w: None,
                 };
                 // The final case overflows only when two phases are summed.
                 if energy == f64::MAX && speedup == 1.0 && !failing_prefill {
@@ -8917,6 +9107,7 @@ mod tests {
             })),
             prefill_speedup_ratio: 1.0,
             decode_speedup_ratio: 1.0,
+            wait_power_w: None,
         };
         let evidence = replay_timing_evidence(&[source]).unwrap().unwrap();
         let power = replay_power_stats(&evidence).unwrap();
@@ -8958,7 +9149,12 @@ mod tests {
                         for (phase, prefill) in &evidence {
                             accumulated.record(phase, *prefill).unwrap();
                         }
-                        let stats = replay_power_stats(&accumulated.snapshot()).unwrap();
+                        let stats = replay_power_stats(&ReplayTimingEvidence {
+                            active: accumulated.snapshot(),
+                            wait_ms: 0.0,
+                            ..Default::default()
+                        })
+                        .unwrap();
                         if covered_ms == 0.27 {
                             assert_eq!(stats.coverage(), 0.9);
                             // 135 W-ms / 0.30 ms = 450 W per invocation.
@@ -9025,6 +9221,7 @@ mod tests {
                     timing,
                     prefill_speedup_ratio: speedup,
                     decode_speedup_ratio: speedup,
+                    wait_power_w: None,
                 });
             }
             let evidence = replay_timing_evidence(&sources).unwrap();
@@ -9064,6 +9261,52 @@ mod tests {
     }
 
     #[test]
+    fn corrected_rank_wait_preserves_single_rank_and_balanced_results() {
+        assert_eq!(attention_dp_wait_ms(20.0, 2.0, [10.0].into_iter()), 0.0);
+        assert_eq!(attention_dp_wait_ms(20.0, 2.0, [10.0; 3].into_iter()), 0.0);
+        assert_eq!(
+            attention_dp_wait_ms(20.0, 2.0, [10.0, 8.0].into_iter()),
+            4.0
+        );
+    }
+
+    #[test]
+    fn step_power_uses_assumed_wait_energy_and_preserves_active_coverage() {
+        let mut evidence = ReplayTimingEvidence {
+            active: TimingEvidenceSummary {
+                prefill: TimingPhaseEvidence::from_operations(vec![
+                    TimingOperationEvidence::new(
+                        "gemm",
+                        10.0,
+                        Some(4_000.0),
+                        TimingEvidenceSource::Silicon,
+                    )
+                    .unwrap(),
+                ]),
+                ..Default::default()
+            },
+            wait_ms: 10.0,
+            ..Default::default()
+        };
+        for (wait_energy_wms, expected) in [
+            (None, None),
+            (Some(0.0), Some(200.0)),
+            (Some(600.0), Some(230.0)),
+        ] {
+            evidence.wait_energy_wms = wait_energy_wms;
+            let output = replay_power_diagnostics(Some(&evidence), None).unwrap();
+            assert_eq!(output.attention_dp_wait_ms, Some(10.0));
+            assert_eq!(output.step_power_w, expected);
+            assert_eq!(output.power_w, Some(400.0));
+            assert_eq!(output.power_coverage, Some(1.0));
+            assert_eq!(output.phases.len(), 2);
+        }
+        evidence.wait_ms = 0.0;
+        let output = replay_power_diagnostics(Some(&evidence), None).unwrap();
+        assert_eq!(output.step_power_w, output.power_w);
+    }
+
+    #[test]
     fn replay_power_is_published_at_the_exact_coverage_gate() {
         let source = TimingPowerSource {
             timing: Arc::new(PowerTiming(TimingEvidenceSummary {
@@ -9077,6 +9320,7 @@ mod tests {
             })),
             prefill_speedup_ratio: 1.0,
             decode_speedup_ratio: 1.0,
+            wait_power_w: None,
         };
         let evidence = replay_timing_evidence(&[source]).unwrap().unwrap();
         let power = replay_power_stats(&evidence).unwrap();
@@ -9114,7 +9358,15 @@ mod tests {
             ]),
         };
 
-        let diagnostics = replay_power_diagnostics(Some(&summary), None).unwrap();
+        let diagnostics = replay_power_diagnostics(
+            Some(&ReplayTimingEvidence {
+                active: summary,
+                wait_ms: 0.0,
+                ..Default::default()
+            }),
+            None,
+        )
+        .unwrap();
         let value = serde_json::to_value(diagnostics).unwrap();
 
         assert_eq!(value["publication_status"], "withheld");
@@ -9348,8 +9600,8 @@ mod tests {
 
     #[test]
     fn fpm_decode_timing_queries_exact_past_kv_total() {
-        pyo3::prepare_freethreaded_python();
-        let engine = Python::with_gil(|py| Py::new(py, DecodeCoordinateProbe).unwrap().into_any());
+        pyo3::Python::initialize();
+        let engine = Python::attach(|py| Py::new(py, DecodeCoordinateProbe).unwrap().into_any());
         let timing = python_timing_model(engine, true);
 
         let latency = timing
@@ -9369,9 +9621,9 @@ mod tests {
 
     #[test]
     fn prefill_totals_reach_fpm_exactly_and_op_level_as_means() {
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let engine =
-            || Python::with_gil(|py| Py::new(py, PrefillCoordinateProbe).unwrap().into_any());
+            || Python::attach(|py| Py::new(py, PrefillCoordinateProbe).unwrap().into_any());
         // Three requests computed 16 tokens after reading 8; the integer means
         // are (24 / 3, 8 / 3) = (8, 2).
         let fpm = python_timing_model(engine(), true);
@@ -9391,7 +9643,7 @@ mod tests {
         use crate::perf_database::fpm_forward::tests::RowSpec;
         use crate::perfmodel::engine::runtime::tests::build_fpm_engine_with_rows;
         use crate::perfmodel::fpm::ForwardPassPerfOptions;
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let row =
             |workload_kind, batch_size, total_prefill_tokens, total_kv_read_tokens, latency_ms| {
                 RowSpec {
@@ -9413,7 +9665,7 @@ mod tests {
             Arc::new(build_fpm_engine_with_rows(tmp.path(), &rows).unwrap()),
             ForwardPassPerfOptions::default(),
         ));
-        let engine = Python::with_gil(|py| Py::new(py, PrefillCoordinateProbe).unwrap().into_any());
+        let engine = Python::attach(|py| Py::new(py, PrefillCoordinateProbe).unwrap().into_any());
         let mut timing = python_timing_model(engine, true);
         timing.fpm_model = Some(Arc::clone(&model));
         assert_eq!(timing.predict_prefill_totals_ms(3, 16, 8).unwrap(), 5.0);
@@ -9504,7 +9756,7 @@ mod tests {
 
     #[test]
     fn replay_applies_a_tuned_models_corrections_with_and_without_capture() {
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let tmp = tempfile::tempdir().unwrap();
         let model = tuned_fpm_model(tmp.path());
         let prefill = crate::ScheduledRequestMetrics {
@@ -9526,7 +9778,7 @@ mod tests {
         assert!(expected.0 > 5.0 && expected.1 > 3.0, "{expected:?}");
 
         // Whole-model FPM: the same corrected timing with and without capture.
-        let engine = Python::with_gil(|py| Py::new(py, PrefillCoordinateProbe).unwrap().into_any());
+        let engine = Python::attach(|py| Py::new(py, PrefillCoordinateProbe).unwrap().into_any());
         let mut timing = python_timing_model(engine, true);
         timing.fpm_model = Some(Arc::clone(&model));
         timing.corrections = Some(Arc::clone(&model));
@@ -9548,7 +9800,7 @@ mod tests {
         // Operation graphs: phase latency, evidence and energy scale together,
         // so power is unchanged.
         let op_engine = || {
-            Python::with_gil(|py| {
+            Python::attach(|py| {
                 Py::new(py, PerOpEvidenceProbe::default())
                     .unwrap()
                     .into_any()
@@ -9640,11 +9892,10 @@ mod tests {
 
     #[test]
     fn native_fpm_mixed_pass_is_the_one_pass_estimate() {
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let tmp = tempfile::tempdir().unwrap();
         let model = Arc::new(mixed_fpm_model(tmp.path()));
-        let engine =
-            || Python::with_gil(|py| Py::new(py, DecodeCoordinateProbe).unwrap().into_any());
+        let engine = || Python::attach(|py| Py::new(py, DecodeCoordinateProbe).unwrap().into_any());
         let mut timing = python_timing_model(engine(), true);
         timing.fpm_model = Some(Arc::clone(&model));
         let prefill = MIXED_FPM_PREFILL;
@@ -9722,7 +9973,7 @@ mod tests {
 
     #[test]
     fn tuned_model_corrects_a_mixed_pass_as_one_mixed_iteration() {
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let tmp = tempfile::tempdir().unwrap();
         let mut model = mixed_fpm_model(tmp.path());
         let (prefill_only, mixed) = mixed_fpm_iterations();
@@ -9751,7 +10002,7 @@ mod tests {
         assert!(close(prefill_alone, 15.0), "{prefill_alone}");
         assert!(close(one_pass, 13.75), "{one_pass}");
 
-        let engine = Python::with_gil(|py| Py::new(py, DecodeCoordinateProbe).unwrap().into_any());
+        let engine = Python::attach(|py| Py::new(py, DecodeCoordinateProbe).unwrap().into_any());
         let mut timing = python_timing_model(engine, true);
         timing.fpm_model = Some(Arc::clone(&model));
         timing.corrections = Some(Arc::clone(&model));
@@ -9793,8 +10044,8 @@ mod tests {
 
     #[test]
     fn fpm_decode_timing_caps_logical_past_kv_at_physical_capacity() {
-        pyo3::prepare_freethreaded_python();
-        let engine = Python::with_gil(|py| Py::new(py, DecodeCoordinateProbe).unwrap().into_any());
+        pyo3::Python::initialize();
+        let engine = Python::attach(|py| Py::new(py, DecodeCoordinateProbe).unwrap().into_any());
         let timing = python_timing_model(engine, true);
 
         let latency = timing
@@ -9806,8 +10057,8 @@ mod tests {
 
     #[test]
     fn op_level_decode_timing_converts_inclusive_mean_to_past_kv() {
-        pyo3::prepare_freethreaded_python();
-        let engine = Python::with_gil(|py| Py::new(py, DecodeCoordinateProbe).unwrap().into_any());
+        pyo3::Python::initialize();
+        let engine = Python::attach(|py| Py::new(py, DecodeCoordinateProbe).unwrap().into_any());
         let timing = python_timing_model(engine, false);
 
         let latency = timing
@@ -9909,7 +10160,7 @@ mod tests {
     fn fpm_timing_pair(model: &Arc<ForwardPassPerfModel>) -> (AicTimingModel, AicTimingModel) {
         let timing = || {
             let engine =
-                Python::with_gil(|py| Py::new(py, DecodeCoordinateProbe).unwrap().into_any());
+                Python::attach(|py| Py::new(py, DecodeCoordinateProbe).unwrap().into_any());
             let mut timing = python_timing_model(engine, true);
             timing.fpm_model = Some(Arc::clone(model));
             timing.corrections = model.corrects_native_estimates().then(|| Arc::clone(model));
@@ -9919,14 +10170,81 @@ mod tests {
     }
 
     #[test]
-    fn fpm_replay_powers_components_and_weights_active_ranks_on_every_execution() {
+    fn powered_fpm_rank_terms_preserve_corrected_iteration_evidence() {
         use crate::perf_database::fpm_forward::{
             FPM_FORWARD_POWER_MEASUREMENT_POLICY,
             tests::{PowerCell, RowSpec},
         };
         use crate::perfmodel::engine::runtime::tests::build_fpm_engine_with_rows;
 
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
+        let row = |workload_kind, total_prefill_tokens, total_kv_read_tokens, latency_ms, power| {
+            RowSpec {
+                workload_kind,
+                batch_size: 1,
+                total_prefill_tokens,
+                total_kv_read_tokens,
+                latency_ms,
+                measurement: Some((FPM_FORWARD_POWER_MEASUREMENT_POLICY, 1)),
+                power_w: Some(PowerCell::Double(Some(power))),
+                ..RowSpec::default()
+            }
+        };
+        let rows = [
+            row("prefill", 256, 128, 13.0, 300.0),
+            row("decode", 0, 4, 3.0, 200.0),
+            row("decode", 0, 4096, 7.0, 400.0),
+        ];
+        let tmp = tempfile::tempdir().unwrap();
+        let mut model = ForwardPassPerfModel::from_engine(
+            Arc::new(build_fpm_engine_with_rows(tmp.path(), &rows).unwrap()),
+            Default::default(),
+        );
+        let queries = [[1, 256, 128, 1, 4096], [0, 0, 0, 1, 4096], [0; 5]];
+        let mut observed = rank_metrics(&queries[0]);
+        // Mixed native latency is 13 + (7 - 3) = 17 ms; tune to 1.5x.
+        observed.wall_time = 25.5 / 1000.0;
+        model.tune_with_fpms(&vec![vec![observed]; 8]).unwrap();
+        let model = Arc::new(model);
+        let (_, mut timing) = fpm_timing_pair(&model);
+        timing.fpm_power = true;
+        let pricing = timing.iteration.as_ref().unwrap();
+        // Independent oracle, including the correction: prefill (13*1.5,
+        // 13*300*1.5); decode ((7-3+7)*1.5, (7*400-3*200+7*400)*1.5).
+        // The rank maximum is 17*1.5=25.5; waiting is (17-7+17)*1.5=40.5.
+        // Repeated non-capture calls reuse rank entries; capture uses the
+        // detailed route. Both must satisfy these values independently.
+        for capture in [false, true] {
+            for _ in 0..2 {
+                let priced = timing.price_iteration(pricing, &queries, capture).unwrap();
+                assert!(close(priced.total_ms, 25.5), "{}", priced.total_ms);
+                assert!(close(priced.wait_ms, 40.5), "{}", priced.wait_ms);
+                assert_eq!(priced.estimate.is_some(), capture);
+                assert_eq!(priced.evidence.len(), 2);
+                for ((phase, prefill), (is_prefill, latency_ms, energy_wms)) in priced
+                    .evidence
+                    .iter()
+                    .zip([(true, 19.5, 5850.0), (false, 16.5, 7500.0)])
+                {
+                    let phase = phase.to_phase();
+                    assert_eq!(*prefill, is_prefill);
+                    assert!(close(phase.latency_ms, latency_ms));
+                    assert!(close(phase.energy_wms.unwrap(), energy_wms));
+                    assert!(close(phase.covered_latency_ms, latency_ms));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fpm_replay_counts_uncovered_components_and_rank_wait_on_cache_hits() {
+        use crate::perf_database::fpm_forward::{
+            FPM_FORWARD_POWER_MEASUREMENT_POLICY,
+            tests::{PowerCell, RowSpec},
+        };
+        use crate::perfmodel::engine::runtime::tests::build_fpm_engine_with_rows;
+
+        pyo3::Python::initialize();
         for baseline_power in [None, Some(400.0)] {
             let tmp = tempfile::tempdir().unwrap();
             let row =
@@ -9974,12 +10292,22 @@ mod tests {
                 let pure_decode = decode_work(1, 1, 13, 1024);
                 for _ in 0..2 {
                     assert_eq!(
-                        iteration_ms(&timing, &[mixed.clone(), pure_decode.clone()]),
+                        iteration_ms(
+                            &timing,
+                            &[mixed.clone(), pure_decode.clone(), RankWork::idle(2)]
+                        ),
                         102.0
                     );
                 }
-                let summary = timing.evidence_summary().unwrap();
-                let stats = replay_power_stats(&summary).unwrap();
+                let (summary, wait_ms, _) = timing.power_evidence_summary().unwrap();
+                let evidence = ReplayTimingEvidence {
+                    active: summary,
+                    wait_ms,
+                    ..Default::default()
+                };
+                let diagnostics = replay_power_diagnostics(Some(&evidence), None).unwrap();
+                let stats = replay_power_stats(&evidence).unwrap();
+                let summary = &evidence.active;
                 assert_eq!(summary.prefill.latency_ms, 200.0);
                 assert_eq!(summary.decode.latency_ms, 12.0);
                 let covered_ms = if baseline_power.is_some() {
@@ -9987,6 +10315,14 @@ mod tests {
                 } else {
                     104.0
                 };
+                assert_eq!(wait_ms, 2.0 * (98.0 + 102.0));
+                assert_eq!(diagnostics.latency_ms, Some(212.0));
+                assert_eq!(diagnostics.attention_dp_wait_ms, Some(wait_ms));
+                assert_eq!(diagnostics.step_power_w, None);
+                assert_eq!(
+                    diagnostics.energy_wms,
+                    Some(2.0 * (52_000.0 + marginal_wms))
+                );
                 assert!(close(stats.coverage(), covered_ms / 106.0));
                 assert!(close(
                     stats.power_w().unwrap(),
@@ -10008,6 +10344,42 @@ mod tests {
                     phase.evidence_summary().unwrap().decode.energy_wms,
                     Some(2000.0 + marginal_wms)
                 );
+
+                let timing = Arc::new(timing) as Arc<dyn TimingModel>;
+                let mut roles =
+                    [(2.0, Some(60.0)), (4.0, Some(100.0))].map(|(speedup, wait_power_w)| {
+                        TimingPowerSource {
+                            timing: Arc::clone(&timing),
+                            prefill_speedup_ratio: speedup,
+                            decode_speedup_ratio: speedup,
+                            wait_power_w,
+                        }
+                    });
+                let pooled = replay_timing_evidence(&roles).unwrap().unwrap();
+                let diagnostics = replay_power_diagnostics(Some(&pooled), None).unwrap();
+                assert_eq!(diagnostics.attention_dp_wait_ms, Some(300.0));
+                assert_eq!(diagnostics.latency_ms, Some(159.0));
+                assert!(close(
+                    diagnostics.step_power_w.unwrap(),
+                    ((52_000.0 + marginal_wms) * 1.5 + 22_000.0) / 459.0
+                ));
+
+                roles[1].wait_power_w = None;
+                let pooled = replay_timing_evidence(&roles).unwrap().unwrap();
+                let missing = replay_power_diagnostics(Some(&pooled), None).unwrap();
+                assert_eq!(missing.step_power_w, None);
+                assert_eq!(missing.power_w, diagnostics.power_w);
+
+                timing.reset_evidence().unwrap();
+                let (_, iteration_wait_ms, _) = timing.power_evidence_summary().unwrap();
+                assert_eq!(iteration_wait_ms, 0.0);
+                let next = timing
+                    .predict_iteration_ms(&[mixed, pure_decode, RankWork::idle(2)])
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(next.total_ms, 102.0);
+                let (_, iteration_wait_ms, _) = timing.power_evidence_summary().unwrap();
+                assert_eq!(iteration_wait_ms, 200.0);
             }
         }
     }
@@ -10020,7 +10392,7 @@ mod tests {
 
     #[test]
     fn fpm_iteration_matches_phase_pricing_for_one_rank_pure_passes() {
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let tmp = tempfile::tempdir().unwrap();
         let tuned_dir = tempfile::tempdir().unwrap();
         // Hand oracles: `mixed_fpm_model` prices 8 prefill tokens at 10 ms and
@@ -10067,7 +10439,7 @@ mod tests {
 
     #[test]
     fn fpm_iteration_prices_a_mixed_rank_as_one_forward() {
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let tmp = tempfile::tempdir().unwrap();
         let model = Arc::new(mixed_fpm_model(tmp.path()));
         let (_, mut timing) = fpm_timing_pair(&model);
@@ -10099,7 +10471,7 @@ mod tests {
 
     #[test]
     fn fpm_iteration_records_each_working_ranks_estimate() {
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let tmp = tempfile::tempdir().unwrap();
         let mut model = mixed_fpm_model(tmp.path());
         // Corrections of 1.5 for the prefill alone and of the mixed iteration
@@ -10175,7 +10547,7 @@ mod tests {
 
     #[test]
     fn fpm_iteration_takes_the_slowest_rank_under_the_heaviest_ranks_correction() {
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let tmp = tempfile::tempdir().unwrap();
         let mut model = mixed_fpm_model(tmp.path());
         // The prefill alone runs at 1.5x its native 10 ms (see
@@ -10232,7 +10604,7 @@ mod tests {
 
     #[test]
     fn iteration_cache_hits_only_when_every_rank_matches() {
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let tmp = tempfile::tempdir().unwrap();
         let model = Arc::new(mixed_fpm_model(tmp.path()));
         let (_, mut timing) = fpm_timing_pair(&model);
@@ -10277,7 +10649,7 @@ mod tests {
 
     #[test]
     fn iteration_pricing_declines_what_the_canonical_query_cannot_represent() {
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let tmp = tempfile::tempdir().unwrap();
         let model = Arc::new(mixed_fpm_model(tmp.path()));
         let (phase, mut timing) = fpm_timing_pair(&model);
@@ -10395,7 +10767,7 @@ mod tests {
     /// TensorRT-LLM 1.3.0rc20 model, whose GEMM and attention tables do.
     fn packaged_op_level_timing(test: &str, power: bool) -> Option<AicTimingModel> {
         let required = std::env::var_os("AIC_REQUIRE_EMBEDDED_ROUND_TRIP").is_some();
-        if let Err(error) = Python::with_gil(|py| py.import("aisim_core.sdk.engine").map(|_| ())) {
+        if let Err(error) = Python::attach(|py| py.import("aisim_core.sdk.engine").map(|_| ())) {
             assert!(
                 !required,
                 "{test}: AIC_REQUIRE_EMBEDDED_ROUND_TRIP is set but `aisim_core.sdk.engine` \
@@ -10407,6 +10779,16 @@ mod tests {
         let mut config = aic_config();
         config.model = "Qwen/Qwen3-0.6B".into();
         if power {
+            // The B200 TensorRT-LLM 1.3.0rc20 tables are the only shipped ones that carry
+            // power. That collection is outside the query slots, so the SDK reads it as a
+            // raw data coordinate. The opt-in is set on the embedded interpreter, whose
+            // `os.environ` no longer follows the process environment once it has started.
+            Python::with_gil(|py| {
+                py.import("os")
+                    .and_then(|os| os.getattr("environ"))
+                    .and_then(|environ| environ.set_item("AIC_ALLOW_UNLISTED_VERSIONS", "1"))
+            })
+            .unwrap();
             config.system = "b200_sxm".into();
             config.backend = "trtllm".into();
             config.backend_version = Some("1.3.0rc20".into());
@@ -10444,7 +10826,7 @@ mod tests {
 
     #[test]
     fn op_level_iteration_on_a_packaged_model_keeps_pure_one_rank_phase_timing() {
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         for power in [false, true] {
             let Some(timing) = packaged_op_level_timing(
                 "op_level_iteration_on_a_packaged_model_keeps_pure_one_rank_phase_timing",
@@ -10539,7 +10921,7 @@ mod tests {
 
     #[test]
     fn op_level_iteration_on_a_packaged_model_uses_the_canonical_composition() {
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let Some(timing) = packaged_op_level_timing(
             "op_level_iteration_on_a_packaged_model_uses_the_canonical_composition",
             true,
@@ -10686,7 +11068,7 @@ mod tests {
 
     #[test]
     fn tuned_op_level_decode_takes_its_correction_at_the_packed_coordinates() {
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let Some(mut timing) = packaged_op_level_timing(
             "tuned_op_level_decode_takes_its_correction_at_the_packed_coordinates",
             false,
@@ -10758,7 +11140,7 @@ mod tests {
 
     #[test]
     fn op_level_iteration_records_every_ranks_operation_evidence() {
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let Some(timing) = packaged_op_level_timing(
             "op_level_iteration_records_every_ranks_operation_evidence",
             true,
@@ -10907,7 +11289,7 @@ mod tests {
 
     #[test]
     fn op_level_iteration_values_record_the_named_evidence_bit_for_bit() {
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let Some(mut timing) = packaged_op_level_timing(
             "op_level_iteration_values_record_the_named_evidence_bit_for_bit",
             true,
@@ -10969,6 +11351,8 @@ mod tests {
             // by the provider accumulator and by the checked accumulator.
             let mut named = TimingEvidenceAccumulator::default();
             let mut checked = TimingEvidenceSummary::default();
+            let mut rank_time_ms = 0.0;
+            let mut expected_wait_ms = 0.0;
             timing.reset_evidence().unwrap();
             for ranks in groups.iter().chain(&groups) {
                 let total_ms = iteration_ms(timing, ranks);
@@ -10979,10 +11363,21 @@ mod tests {
                 let metrics: Vec<_> = queries.iter().map(rank_metrics).collect();
                 let estimate = model.estimate_forward_pass_detailed(&metrics).unwrap();
                 assert_eq!(total_ms.to_bits(), estimate.latency_ms.unwrap().to_bits());
-                for (phase, prefill) in timing
-                    .rank_operation_evidence(pricing, &estimate, &queries)
-                    .unwrap()
-                {
+                let correction = estimate.correction_factor.unwrap_or(1.0);
+                let step_rank_ms = total_ms * ranks.len() as f64;
+                let reference_wait_ms = step_rank_ms
+                    - estimate
+                        .ranks
+                        .iter()
+                        .map(|rank| rank.latency_ms * correction)
+                        .sum::<f64>();
+                let detailed = timing
+                    .price_detailed_iteration(pricing, &queries, capture, estimate)
+                    .unwrap();
+                assert!((detailed.wait_ms - reference_wait_ms).abs() < 1e-9);
+                expected_wait_ms += reference_wait_ms;
+                rank_time_ms += step_rank_ms;
+                for (phase, prefill) in detailed.evidence {
                     named.record(&phase, prefill).unwrap();
                     let target = if prefill {
                         &mut checked.prefill
@@ -10994,7 +11389,23 @@ mod tests {
                         .unwrap();
                 }
             }
-            let actual = timing.evidence_summary().unwrap();
+            let (actual, wait_ms, _) = timing.power_evidence_summary().unwrap();
+            assert!((wait_ms - expected_wait_ms).abs() < 1e-9);
+            let diagnostics = replay_power_diagnostics(
+                Some(&ReplayTimingEvidence {
+                    active: actual.clone(),
+                    wait_ms,
+                    ..Default::default()
+                }),
+                None,
+            )
+            .unwrap();
+            assert!(
+                (diagnostics.latency_ms.unwrap() + diagnostics.attention_dp_wait_ms.unwrap()
+                    - rank_time_ms)
+                    .abs()
+                    < 1e-9
+            );
             let named = named.snapshot();
             for (actual, named, checked) in [
                 (&actual.prefill, &named.prefill, &checked.prefill),
@@ -11034,7 +11445,7 @@ mod tests {
 
     #[test]
     fn rank_memo_entries_keep_their_rank_evidence() {
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let Some(mut timing) =
             packaged_op_level_timing("rank_memo_entries_keep_their_rank_evidence", true)
         else {
@@ -11079,7 +11490,7 @@ mod tests {
 
     #[test]
     fn sd_round_iteration_prices_a_mixed_rank_as_one_forward() {
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let tmp = tempfile::tempdir().unwrap();
         let model = Arc::new(ForwardPassPerfModel::from_engine(
             Arc::new(crate::perfmodel::engine::runtime::tests::full_round_engine(
@@ -11137,8 +11548,8 @@ mod tests {
 
     #[test]
     fn bounded_replay_rejects_heterogeneous_actual_prefill_geometry() {
-        pyo3::prepare_freethreaded_python();
-        let engine = Python::with_gil(|py| Py::new(py, DecodeCoordinateProbe).unwrap().into_any());
+        pyo3::Python::initialize();
+        let engine = Python::attach(|py| Py::new(py, DecodeCoordinateProbe).unwrap().into_any());
         let mut timing = python_timing_model(engine, false);
         timing.decoder_replay = true;
         for geometry in [vec![], vec![(3, 1536)], vec![(129, 128), (129, 128)]] {
@@ -11155,8 +11566,8 @@ mod tests {
 
     #[test]
     fn op_level_timing_exposes_typed_python_evidence() {
-        pyo3::prepare_freethreaded_python();
-        let engine = Python::with_gil(|py| {
+        pyo3::Python::initialize();
+        let engine = Python::attach(|py| {
             Py::new(py, PerOpEvidenceProbe::default())
                 .unwrap()
                 .into_any()
@@ -11184,16 +11595,14 @@ mod tests {
 
     #[test]
     fn repeated_shapes_reuse_provider_evidence_and_accumulate_every_step() {
-        pyo3::prepare_freethreaded_python();
-        let engine = Python::with_gil(|py| Py::new(py, PerOpEvidenceProbe::default()).unwrap());
-        let timing = python_timing_model(
-            Python::with_gil(|py| engine.clone_ref(py).into_any()),
-            false,
-        );
+        pyo3::Python::initialize();
+        let engine = Python::attach(|py| Py::new(py, PerOpEvidenceProbe::default()).unwrap());
+        let timing =
+            python_timing_model(Python::attach(|py| engine.clone_ref(py).into_any()), false);
         for _ in 0..1_000 {
             assert_eq!(timing.predict_decode_ms(2, 258, 128, 1024).unwrap(), 4.0);
         }
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             assert_eq!(
                 engine
                     .borrow(py)
@@ -11212,7 +11621,7 @@ mod tests {
         assert_eq!(cached.to_phase().energy_wms, Some(1_600.0));
         // Distinct coordinates must never reuse the preceding shape's result.
         timing.predict_decode_ms(2, 260, 129, 1024).unwrap();
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             assert_eq!(
                 engine
                     .borrow(py)
@@ -11224,18 +11633,323 @@ mod tests {
     }
 
     #[test]
-    fn aic_measurement_reset_clears_phase_provenance_without_clearing_shape_cache() {
-        pyo3::prepare_freethreaded_python();
-        let engine = Python::with_gil(|py| Py::new(py, PerOpEvidenceProbe::default()).unwrap());
-        let timing = python_timing_model(
-            Python::with_gil(|py| engine.clone_ref(py).into_any()),
-            false,
+    fn phase_priced_dp_wait_pools_roles_after_their_phase_speedups() {
+        use crate::engine::generalized::{EngineIdentity, SchedulerCommand};
+        use crate::engine::{Command, EngineFactory, Request};
+
+        pyo3::Python::initialize();
+        // The probe reports 10 ms of prefill and 4 ms per decode. Each
+        // pass schedules one rank while its DP peer waits the full pass.
+        let roles = [(2.0, 2.0, 60.0, 5.0, 1.0), (4.0, 0.5, 100.0, 2.5, 2.0)].map(
+            |(speedup_ratio, decode_speedup_ratio, wait_power_w, prefill_ms, decode_ms)| {
+                let probe = Python::attach(|py| {
+                    Py::new(py, PerOpEvidenceProbe::default())
+                        .unwrap()
+                        .into_any()
+                });
+                let timing = Arc::new(python_timing_model(probe, false)) as Arc<dyn TimingModel>;
+                let config = EngineConfig {
+                    num_gpu_blocks: 1024,
+                    block_size: 16,
+                    max_num_seqs: 16,
+                    max_num_batched_tokens: 128,
+                    enable_prefix_caching: false,
+                    speedup_ratio,
+                    decode_speedup_ratio,
+                    wait_power_w: Some(wait_power_w),
+                    ..EngineConfig::for_backend(Backend::Vllm)
+                };
+                let power = TimingPowerSource::new(Arc::clone(&timing), &config).unwrap();
+                let mut engine = EngineFactory::with_timing_model(config, timing)
+                    .unwrap()
+                    .build(
+                        EngineIdentity::new(0),
+                        std::num::NonZeroU32::new(2).unwrap(),
+                    )
+                    .unwrap();
+                engine
+                    .apply_command_effects(
+                        SchedulerCommand::new(
+                            0,
+                            Command::Submit(Request {
+                                cache_salt: None,
+                                request_id: uuid::Uuid::from_u128(1),
+                                tokens: vec![1; 32],
+                                max_output_tokens: 4,
+                                output_token_ids: None,
+                                session_id: None,
+                                images: Vec::new(),
+                                kv_hint: None,
+                            }),
+                        ),
+                        0.0,
+                    )
+                    .unwrap();
+
+                let mut now_ms = 0.0;
+                for forward_ms in [prefill_ms, decode_ms, decode_ms, decode_ms] {
+                    let started = engine.execute_pass(now_ms).unwrap().unwrap();
+                    assert_eq!(started.end_ms - now_ms, forward_ms);
+                    engine
+                        .complete_pass(started.pass_id, started.end_ms)
+                        .unwrap();
+                    now_ms = started.end_ms;
+                    let (_, iteration_wait, phase_wait) =
+                        power.timing.power_evidence_summary().unwrap();
+                    assert_eq!((iteration_wait, phase_wait), (0.0, now_ms));
+                }
+                power
+            },
         );
+
+        let summary = replay_timing_evidence(&roles).unwrap().unwrap();
+        // The roles wait 8 and 8.5 ms at 60 and 100 W respectively.
+        assert_eq!(summary.wait_ms, 16.5);
+        assert_eq!(summary.wait_energy_wms, Some(1_330.0));
+        let diagnostics = replay_power_diagnostics(Some(&summary), None).unwrap();
+        assert_eq!(diagnostics.latency_ms, Some(16.5));
+        assert_eq!(diagnostics.attention_dp_wait_ms, Some(16.5));
+        assert_eq!(diagnostics.energy_wms, Some(6_000.0));
+        assert_eq!(diagnostics.covered_latency_ms, Some(15.0));
+        assert_eq!(diagnostics.power_coverage, Some(15.0 / 16.5));
+        assert_eq!(diagnostics.power_w, Some(6_000.0 / 16.5));
+        assert_eq!(diagnostics.step_power_w, Some(7_330.0 / 33.0));
+
+        for role in roles {
+            role.timing.reset_evidence().unwrap();
+            let (_, iteration_wait, phase_wait) = role.timing.power_evidence_summary().unwrap();
+            assert_eq!((iteration_wait, phase_wait), (0.0, 0.0));
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::unbalanced(0.0, 1.0, 20.0, 10.0, Some(60.0))]
+    #[case::unbalanced_scaled(0.0, 2.0, 20.0, 10.0, Some(60.0))]
+    #[case::balanced_at_zero(0.0, 1.0, 1.000001, 11.000001, None)]
+    #[case::balanced_at_late_time(2_f64.powi(34), 1.0, 1.000001, 11.000001, None)]
+    #[case::balanced_scaled_at_zero(0.0, 2.0, 2.000002, 12.000002, None)]
+    #[case::balanced_scaled_at_late_time(2_f64.powi(34), 2.0, 2.000002, 12.000002, None)]
+    fn sglang_phase_priced_dp_wait_includes_vision_in_step_power(
+        #[case] selected_ms: f64,
+        #[case] speedup_ratio: f64,
+        #[case] vision_ms: f64,
+        #[case] peer_prefill_ms: f64,
+        #[case] wait_power_w: Option<f64>,
+    ) {
+        use crate::engine::generalized::{EngineIdentity, SchedulerCommand};
+        use crate::engine::{Command, EncoderShape, EngineFactory, ImageSpec, Request};
+
+        struct VisionTiming {
+            evidence: Mutex<(TimingEvidenceSummary, f64)>,
+            vision_ms: f64,
+            peer_prefill_ms: f64,
+        }
+
+        impl VisionTiming {
+            // Synthetic operation evidence at 400 W for both vision and language work.
+            fn record(&self, name: &str, ms: f64, prefill: bool) -> Result<f64> {
+                let phase =
+                    TimingPhaseEvidence::from_operations(vec![TimingOperationEvidence::new(
+                        name,
+                        ms,
+                        Some(ms * 400.0),
+                        TimingEvidenceSource::Other("synthetic".into()),
+                    )?]);
+                let mut evidence = self.evidence.lock().unwrap();
+                if prefill {
+                    evidence.0.prefill.try_accumulate(phase)?;
+                } else {
+                    evidence.0.decode.try_accumulate(phase)?;
+                }
+                Ok(ms)
+            }
+        }
+
+        impl TimingModel for VisionTiming {
+            fn predict_vision_ms(&self, shapes: &[VisionShape]) -> Result<Option<f64>> {
+                let ms = shapes
+                    .iter()
+                    .map(|shape| self.vision_ms * shape.count as f64)
+                    .sum();
+                self.record("encoder", ms, true).map(Some)
+            }
+
+            fn predict_prefill_ms(&self, _: usize, new_tokens: usize, _: usize) -> Result<f64> {
+                // Rank 0 has 32 input tokens and vision; its peer has 48 tokens.
+                let ms = if new_tokens == 32 {
+                    10.0
+                } else {
+                    self.peer_prefill_ms
+                };
+                self.record("prefill", ms, true)
+            }
+
+            fn predict_decode_ms(&self, _: usize, _: usize, _: usize, _: usize) -> Result<f64> {
+                self.record("decode", 4.0, false)
+            }
+
+            fn power_evidence_summary(&self) -> Option<(TimingEvidenceSummary, f64, f64)> {
+                let evidence = self.evidence.lock().unwrap();
+                Some((evidence.0.clone(), 0.0, evidence.1))
+            }
+
+            fn tracks_attention_dp_wait(&self) -> bool {
+                true
+            }
+
+            fn record_phase_priced_wait(&self, wait_ms: f64) -> Result<()> {
+                self.evidence.lock().unwrap().1 += wait_ms;
+                Ok(())
+            }
+        }
+
+        let balanced = wait_power_w.is_none();
+        let timing = Arc::new(VisionTiming {
+            evidence: Mutex::default(),
+            vision_ms,
+            peer_prefill_ms,
+        }) as Arc<dyn TimingModel>;
+        let config = EngineConfig {
+            num_gpu_blocks: 1024,
+            block_size: 16,
+            max_num_seqs: 16,
+            max_num_batched_tokens: 128,
+            enable_prefix_caching: false,
+            speedup_ratio,
+            decode_speedup_ratio: 2.0,
+            wait_power_w,
+            ..EngineConfig::for_backend(Backend::Sglang)
+        };
+        let power = TimingPowerSource::new(Arc::clone(&timing), &config).unwrap();
+        let mut engine = EngineFactory::with_timing_model(config, timing)
+            .unwrap()
+            .build(
+                EngineIdentity::new(0),
+                std::num::NonZeroU32::new(2).unwrap(),
+            )
+            .unwrap();
+        for dp_rank in 0..2 {
+            let images = if dp_rank == 0 {
+                vec![ImageSpec {
+                    identity: 1,
+                    token_start: 0,
+                    token_end: 4,
+                    encoder: EncoderShape {
+                        sequences: 1,
+                        patch_tokens: 16,
+                        transformer_tokens: 16,
+                        output_tokens: 4,
+                    },
+                    embedding_bytes: 4_000,
+                }]
+            } else {
+                Vec::new()
+            };
+            engine
+                .apply_command_effects(
+                    SchedulerCommand::new(
+                        dp_rank,
+                        Command::Submit(Request {
+                            cache_salt: None,
+                            request_id: uuid::Uuid::from_u128(dp_rank as u128 + 1),
+                            tokens: vec![dp_rank + 1; if dp_rank == 0 { 32 } else { 48 }],
+                            max_output_tokens: 2,
+                            output_token_ids: None,
+                            session_id: None,
+                            images,
+                            kv_hint: None,
+                        }),
+                    ),
+                    selected_ms,
+                )
+                .unwrap();
+        }
+
+        let prefill = engine.execute_pass(selected_ms).unwrap().unwrap();
+        // Unbalanced: 30 + 10 active rank-ms, 20 wait rank-ms, and
+        // (400 * 40 + 60 * 20) / 60 W, all times scaled once.
+        // Balanced: vision + 10 ms equals the peer's language prefill,
+        // so wait is exactly zero and step watts need no wait-power input.
+        // Preserve the timeline's existing timestamp arithmetic even when
+        // it rounds away a nanosecond at a late virtual timestamp.
+        let scaled_ms = |raw_ms: f64| {
+            std::time::Duration::from_nanos((raw_ms * 1_000_000.0 / speedup_ratio).round() as u64)
+                .as_secs_f64()
+                * 1000.0
+        };
+        let vision_end_ms = selected_ms + scaled_ms(vision_ms);
+        let rank0_end_ms = (selected_ms + vision_end_ms - selected_ms) + scaled_ms(10.0);
+        let rank1_end_ms = selected_ms + scaled_ms(peer_prefill_ms);
+        assert_eq!(prefill.end_ms, rank0_end_ms.max(rank1_end_ms));
+        assert_eq!(prefill.by_rank[0].rank_end_ms, rank0_end_ms);
+        assert_eq!(prefill.by_rank[1].rank_end_ms, rank1_end_ms);
+        let sources = [power];
+        let evidence = replay_timing_evidence(&sources).unwrap().unwrap();
+        let diagnostics = replay_power_diagnostics(Some(&evidence), None).unwrap();
+        let active_ms = (vision_ms + 10.0 + peer_prefill_ms) / speedup_ratio;
+        let wait_ms = if balanced { 0.0 } else { 20.0 / speedup_ratio };
+        assert_eq!(diagnostics.latency_ms, Some(active_ms));
+        assert_eq!(diagnostics.attention_dp_wait_ms, Some(wait_ms));
+        if balanced {
+            // Fractional operation evidence may accumulate a few ulps of error.
+            assert!((diagnostics.power_w.unwrap() - 400.0).abs() <= 2.0 * f64::EPSILON * 400.0);
+        } else {
+            assert_eq!(diagnostics.power_w, Some(400.0));
+        }
+        assert_eq!(diagnostics.power_coverage, Some(1.0));
+        assert_eq!(
+            diagnostics.step_power_w,
+            if balanced {
+                diagnostics.power_w
+            } else {
+                Some(17_200.0 / 60.0)
+            }
+        );
+        engine
+            .complete_pass(prefill.pass_id, prefill.end_ms)
+            .unwrap();
+
+        // A subsequent balanced decode must not retain the vision time.
+        let decode = engine.execute_pass(prefill.end_ms).unwrap().unwrap();
+        assert_eq!(decode.end_ms - prefill.end_ms, 2.0 / speedup_ratio);
+        engine.complete_pass(decode.pass_id, decode.end_ms).unwrap();
+        assert!(engine.execute_pass(decode.end_ms).unwrap().is_none());
+        let evidence = replay_timing_evidence(&sources).unwrap().unwrap();
+        let diagnostics = replay_power_diagnostics(Some(&evidence), None).unwrap();
+        assert_eq!(
+            diagnostics.latency_ms,
+            Some(active_ms + 4.0 / speedup_ratio)
+        );
+        assert_eq!(diagnostics.attention_dp_wait_ms, Some(wait_ms));
+        assert_eq!(
+            diagnostics.step_power_w,
+            if balanced {
+                diagnostics.power_w
+            } else {
+                Some(18_800.0 / 64.0)
+            }
+        );
+    }
+
+    #[test]
+    fn aic_measurement_reset_clears_phase_provenance_without_clearing_shape_cache() {
+        pyo3::Python::initialize();
+        let engine = Python::attach(|py| Py::new(py, PerOpEvidenceProbe::default()).unwrap());
+        let timing =
+            python_timing_model(Python::attach(|py| engine.clone_ref(py).into_any()), false);
         timing.predict_prefill_ms(2, 128, 0).unwrap();
         timing.predict_decode_ms(2, 258, 128, 1024).unwrap();
         let before = timing.evidence_summary().unwrap();
         assert_eq!(before.prefill.source, Some(TimingEvidenceSource::Mixed));
-        assert!(replay_power_stats(&before).unwrap().coverage() < 1.0);
+        assert!(
+            replay_power_stats(&ReplayTimingEvidence {
+                active: before.clone(),
+                ..Default::default()
+            })
+            .unwrap()
+            .coverage()
+                < 1.0
+        );
 
         timing.reset_evidence().unwrap();
         assert_eq!(
@@ -11246,9 +11960,15 @@ mod tests {
         let after = timing.evidence_summary().unwrap();
         assert_eq!(after.prefill, TimingPhaseEvidence::default());
         assert_eq!(after.decode, before.decode);
-        assert_eq!(replay_power_stats(&after).unwrap().coverage(), 1.0);
-        assert_eq!(replay_power_stats(&after).unwrap().power_w(), Some(400.0));
-        Python::with_gil(|py| {
+        let stats = replay_power_stats(&ReplayTimingEvidence {
+            active: after,
+            wait_ms: 0.0,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(stats.coverage(), 1.0);
+        assert_eq!(stats.power_w(), Some(400.0));
+        Python::attach(|py| {
             assert_eq!(
                 engine
                     .borrow(py)
@@ -11268,7 +11988,7 @@ mod tests {
     fn empty_native_evidence_and_diagnostics_reject_nonzero_work() {
         use crate::perfmodel::engine::{Engine, spec::EngineSpec};
         use crate::perfmodel::fpm::ForwardPassPerfOptions;
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
         let db = crate::perf_database::PerfDatabase::load(
             &std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("../../python/aisim/src/aisim_core/systems"),
@@ -11286,7 +12006,7 @@ mod tests {
         .unwrap();
         let native =
             Arc::new(Engine::build(EngineSpec::new(config, vec![], vec![]), Arc::new(db)).unwrap());
-        let engine = Python::with_gil(|py| {
+        let engine = Python::attach(|py| {
             Py::new(py, PerOpEvidenceProbe::default())
                 .unwrap()
                 .into_any()
@@ -11332,12 +12052,10 @@ mod tests {
 
     #[test]
     fn empty_provider_evidence_rejects_nonzero_work() {
-        pyo3::prepare_freethreaded_python();
-        let engine = Python::with_gil(|py| Py::new(py, PerOpEvidenceProbe::default()).unwrap());
-        let timing = python_timing_model(
-            Python::with_gil(|py| engine.clone_ref(py).into_any()),
-            false,
-        );
+        pyo3::Python::initialize();
+        let engine = Python::attach(|py| Py::new(py, PerOpEvidenceProbe::default()).unwrap());
+        let timing =
+            python_timing_model(Python::attach(|py| engine.clone_ref(py).into_any()), false);
         assert!(timing.predict_prefill_ms(99, 128, 0).is_err());
         assert!(timing.predict_decode_ms(99, 12800, 128, 16384).is_err());
         let empty = timing
@@ -11349,7 +12067,7 @@ mod tests {
                 timing.predict_decode_ms(2, 258, 128, 1024).unwrap();
             }
             let before = timing.evidence_summary();
-            let calls = Python::with_gil(|py| {
+            let calls = Python::attach(|py| {
                 engine
                     .borrow(py)
                     .calls
@@ -11367,7 +12085,7 @@ mod tests {
                 ));
                 assert_eq!(timing.evidence_summary(), before);
             }
-            Python::with_gil(|py| {
+            Python::attach(|py| {
                 assert_eq!(
                     engine
                         .borrow(py)
@@ -11440,8 +12158,8 @@ mod tests {
             assert_eq!(a.power_w.map(f64::to_bits), b.power_w.map(f64::to_bits));
             assert_eq!(a.coverage.to_bits(), b.coverage.to_bits());
         };
-        pyo3::prepare_freethreaded_python();
-        let mut timing = Python::with_gil(|py| python_timing_model(py.None(), false));
+        pyo3::Python::initialize();
+        let mut timing = Python::attach(|py| python_timing_model(py.None(), false));
         timing.phase_provider = AicPhaseProvider::NativeEntries(vec![row("seed", 1.0, 2.0, "sol")]);
         timing.predict_decode_ms(1, 65, 64, 1024).unwrap();
         let cached = timing.phase_memo.peek(&(1, 63, 2, 0, false)).unwrap().0;

@@ -1,23 +1,23 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Time one real GLM-5.3-Flash sparse-MLA layer standalone on stock vLLM 0.31.0.
+"""Time one real GLM-5.3-Flash sparse-MLA layer standalone on stock vLLM 0.32.0.
 
 The checkpoint is built by vLLM's own ``LLM`` engine (model builder, KV/IndexPool
 and retained-tail cache allocation, scheduler and metadata builders) with the
 pinned serving configuration. The in-process engine core (``VLLM_ENABLE_V1_
 MULTIPROCESSING=0``, v1/engine/core_client.py InprocClient) lets this driver
 set, before each step, the scheduler's per-step token budget
-(``Scheduler.max_num_scheduled_tokens``, v1/core/sched/scheduler.py:132-136,
-582) and per-request chunk (``SchedulerConfig.long_prefill_token_threshold``,
-scheduler.py:611-626, 679-680; ignored for a lone request, which the budget
+(``Scheduler.max_num_scheduled_tokens``, v1/core/sched/scheduler.py:137-141,
+611) and per-request chunk (``SchedulerConfig.long_prefill_token_threshold``,
+scheduler.py:640-655, 708-709; ignored for a lone request, which the budget
 then bounds) so B homogeneous requests advance in lockstep. Those two knobs
 only decide how real requests are batched; every KV/IndexPool slot and
 metadata field is still produced by vLLM. The worker probe
 (``glm53flash_attention_worker``) times the module.
 
-IndexPool alignment: stock 0.31.0 leaves the boundary pool of a prefill chunk
+IndexPool alignment: stock 0.32.0 leaves the boundary pool of a prefill chunk
 that starts off the 4-token pool grid unwritten or fills it with another
-request's tokens (models/glm5next/nvidia/sparse_indexer.py:47-90
+request's tokens (models/glm5next/nvidia/sparse_indexer.py:54-98
 ``_kpool_compress_insert``, "Assumes pool-aligned chunk starts"). Every planned
 chunk starts on a multiple of 4 (contract ``seed_chunk``; aligned targets); the
 driver checks every scheduled prefill chunk and raises ``KpoolAlignmentError``
@@ -74,7 +74,7 @@ def write_plugin(directory: Path) -> Path:
 
 
 class KpoolAlignmentError(RuntimeError):
-    """A vLLM prefill chunk would start off the IndexPool grid (stock 0.31.0 defect)."""
+    """A vLLM prefill chunk would start off the IndexPool grid (stock 0.32.0 defect)."""
 
 
 class Driver:

@@ -560,10 +560,9 @@ class TestPackagedExport:
         assert H.attention_projection_exclusions(raw) == ALL_GROUPS
         assert H.modelopt_shared_experts_unlisted(raw) is True
         assert _dense_mlp_groups(raw, GLM_LAYERS, FP8_STATIC) == [(DENSE_LAYERS, FP8_STATIC, FP8_STATIC)]
-        # The upstream config carries head_dim 64 (the rope width); it is read
-        # as is. For DSA it only feeds the activation-memory width (all
-        # backends); latency op keys and KV bytes per token are unaffected.
-        assert info["d"] == 64
+        # The DSA activation width is the residual width. The top-level head_dim of the
+        # export (64, the rope width) does not enter.
+        assert info["d"] == 96
 
 
 def test_packaged_targets_only_checkpoints_are_reviewed():
@@ -622,6 +621,7 @@ def _phase_attention(model):
     return result
 
 
+@pytest.mark.usefixtures("raw_data_coordinates")
 @pytest.mark.parametrize("layout", _SILICON_LAYOUTS, ids=lambda layout: "tp{}-moetp{}-ep{}".format(*layout))
 @pytest.mark.parametrize(("backend", "version"), _SILICON_RUNTIMES)
 @pytest.mark.parametrize("system", _SILICON_SYSTEMS)
@@ -641,6 +641,7 @@ def test_packaged_silicon_covers_the_checkpoint_precision(glm53_export, system, 
         model.close()
 
 
+@pytest.mark.usefixtures("raw_data_coordinates")
 def test_modelopt_mixed_quant_method_reaches_the_silicon_rows(tmp_path):
     # The modelopt_mixed header takes the same targets-only path through the
     # canonical constructor with fallback denied: attention is priced at the
@@ -655,6 +656,7 @@ def test_modelopt_mixed_quant_method_reaches_the_silicon_rows(tmp_path):
         model.close()
 
 
+@pytest.mark.usefixtures("raw_data_coordinates")
 def test_coarse_attention_mode_has_no_silicon_rows(glm53, monkeypatch):
     # Negative control: pricing attention at the coarse fp8_static mode (the
     # behaviour without the targets-only rule) selects DSA rows that do not exist.

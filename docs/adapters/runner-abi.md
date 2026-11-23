@@ -97,9 +97,15 @@ including Dynamo, must opt in only after their runtime and dependency pins
 support the same composition. Generic speculation or G2 support alone does
 not enable it.
 
+`supports_kvcr_g3` defaults to `False`; the built-in engine factory advertises
+it. A runner must opt in before accepting a role with `kvcr.g3`, including
+support for serialized `Disk` residency events.
+
 `require_compatible(spec)` checks versions and coarse combinations before
-execution. AgentX G2 additionally requires offline vLLM and static workers. G3
-cannot be combined with AgentX G2. Speculation with G2 is limited to canonical
+execution. AgentX G2 additionally requires offline vLLM and static workers.
+`g3_offload` cannot be combined with AgentX G2; `kvcr.local_g2` and `kvcr.g3`
+are accepted but are not qualified for AgentX.
+Speculation with G2 is limited to canonical
 MTP with prefix caching and synchronous scheduling, and to MTP on a
 [hybrid G2](../replay/engine/kv-cache.md#hybrid-g2) with
 `disable_eagle_block_drop`. The [feature matrix](../replay/features.md) records the built-in

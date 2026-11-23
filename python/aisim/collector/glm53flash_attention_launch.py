@@ -63,9 +63,14 @@ VLLM_ENV = {
     "NCCL_P2P_LEVEL": "NVL",
     "VLLM_USE_NCCL_SYMM_MEM": "1",
 }
-# Multi-node NVLink (MNNVL) only where the NVLink domain spans nodes
-# (GB200/GB300 NVL72); HGX nodes are one NVLink domain each.
-VLLM_NVL72_ENV = {"NCCL_MNNVL_ENABLE": "1"}
+# GB200/GB300 NVL72, where the NVLink domain spans nodes: NCCL's multi-node
+# NVLink (MNNVL) is switched off. Every attempt is one node, and with it on
+# NCCL fails communicator init in a container that has no IMEX channel ("MNNVL
+# ... is available but not working on this system"), which is how collection
+# jobs start. GB300 NVFP4 TP2 measured this way is within 2% of the 0.31.0
+# table, which was collected with MNNVL on. HGX nodes are one NVLink domain
+# each and leave the variable unset.
+VLLM_NVL72_ENV = {"NCCL_MNNVL_ENABLE": "0"}
 # Checkpoint safetensors payload (zai-org/GLM-5.3-Flash@eb9eb208: 305.8 GiB;
 # nvidia/GLM-5.3-Flash-NVFP4@09b04e5e: 190.4 GiB). A deployment whose
 # per-rank weight share exceeds one GPU's memory cannot load (capacity fact);
@@ -123,7 +128,13 @@ def serving_env(backend: str, spec: dict) -> dict:
     return {**VLLM_ENV, **(VLLM_NVL72_ENV if spec["multi_node_nvlink"] else {})}
 
 
-def prepare(args) -> Path:
+def freeze(args) -> tuple[Path, dict, dict]:
+    """Write ``manifest.json`` of one attempt into a fresh ``args.attempt`` directory.
+
+    Returns the attempt directory, the manifest and the serving environment. ``prepare``
+    adds the Slurm script; the pipeline collector (``collector/vllm/collect_glm53_attention``)
+    runs the runner on the frozen manifest itself.
+    """
     import yaml
 
     spec = system_spec(args.system, args.systems_dir)
@@ -150,7 +161,7 @@ def prepare(args) -> Path:
     if args.backend == "vllm":
         bad = unaligned_targets({"sets": selected})
         if bad:
-            # Stock vLLM 0.31.0 must never run an unaligned chunk start.
+            # Stock vLLM 0.32.0 must never run an unaligned chunk start.
             raise SystemExit(f"kpool_align4: vLLM plan has unaligned prefill targets {bad[:6]}")
     max_model_len = selected[0]["max_model_len"]
     env_serving = serving_env(args.backend, spec)
@@ -165,8 +176,7 @@ def prepare(args) -> Path:
         "runtime_arch": args.arch,
         "system": args.system,
         "gpus_per_node": args.gpus_per_node,
-        # Exported framework environment (MNNVL excluded on single-node
-        # NVLink domains).
+        # Exported framework environment (NCCL_MNNVL_ENABLE only on NVL72).
         "serving_env": env_serving,
         "layer_id": sweep["layer_id"],
         "sweep": sweep,
@@ -199,6 +209,12 @@ def prepare(args) -> Path:
     attempt.mkdir(parents=True, exist_ok=True)
     manifest = {**body, "manifest_sha256": sha256_json(body)}
     (attempt / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    return attempt, manifest, env_serving
+
+
+def prepare(args) -> Path:
+    attempt, manifest, env_serving = freeze(args)
+    max_model_len = manifest["max_model_len"]
     suffix = f"-{args.tag}" if args.tag else ""
     job = f"glm53-attn-{args.backend}-{args.checkpoint}-tp{args.tp}{suffix}"
     container = f"{args.remote_attempt}"

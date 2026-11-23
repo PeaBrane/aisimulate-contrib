@@ -18,7 +18,7 @@ use crate::engine::common::hashing::{
 };
 use crate::engine::common::kv_cache_trace;
 use crate::engine::common::protocols::KvEventPublishers;
-use crate::engine::{KvBlock, KvEvent, KvEventData, KvEventTier, StoredBlocks};
+use crate::engine::{KvBlock, KvEvent, KvEventData, KvEventDomain, KvEventTier, StoredBlocks};
 use fixedbitset::FixedBitSet;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -566,6 +566,7 @@ impl SglangKvManager {
                 data,
                 dp_rank: self.dp_rank,
                 tier: KvEventTier::HostPinned,
+                domain: KvEventDomain::Worker,
             });
         }
     }
@@ -1573,6 +1574,7 @@ impl SglangKvManager {
             }),
             dp_rank: self.dp_rank,
             tier: KvEventTier::Device,
+            domain: KvEventDomain::Worker,
         };
         self.publish_event(event);
 
@@ -1605,6 +1607,7 @@ impl SglangKvManager {
             data: KvEventData::Removed { block_hashes },
             dp_rank: self.dp_rank,
             tier: KvEventTier::Device,
+            domain: KvEventDomain::Worker,
         };
         self.publish_event(event);
     }

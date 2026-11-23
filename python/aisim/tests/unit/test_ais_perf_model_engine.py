@@ -1675,6 +1675,8 @@ def test_mapping_that_an_alias_writes_as_the_section_many_times_is_read_once(mon
 REPEAT, ONCE = "{estimation_mode: op_level, estimation_mode: auto}", "{estimation_mode: op_level}"
 # What the reader makes of each value: the one written with a repeat reads as ``auto``.
 READ_AS = {REPEAT: {"estimation_mode": "auto"}, ONCE: {"estimation_mode": "op_level"}, None: None}
+# In one merge of a list of mappings, PyYAML up to 6.0.3 keeps the key of the earlier mapping; 6.0.4 can keep the later.
+THE_READER_DECIDES = object()
 
 
 @pytest.mark.parametrize(
@@ -1692,8 +1694,14 @@ READ_AS = {REPEAT: {"estimation_mode": "auto"}, ONCE: {"estimation_mode": "op_le
             ONCE,
         ),
         (f"a: &a\n  ais_perf_model: {REPEAT}\nb: &b\n  <<: *a\nengine:\n  <<: *b\n", REPEAT),
-        (f"a: &a\n  ais_perf_model: {ONCE}\nb: &b\n  ais_perf_model: {REPEAT}\nengine:\n  <<: [*a, *b]\n", ONCE),
-        (f"a: &a\n  ais_perf_model: {ONCE}\nb: &b\n  ais_perf_model: {REPEAT}\nengine:\n  <<: [*b, *a]\n", REPEAT),
+        (
+            f"a: &a\n  ais_perf_model: {ONCE}\nb: &b\n  ais_perf_model: {REPEAT}\nengine:\n  <<: [*a, *b]\n",
+            THE_READER_DECIDES,
+        ),
+        (
+            f"a: &a\n  ais_perf_model: {ONCE}\nb: &b\n  ais_perf_model: {REPEAT}\nengine:\n  <<: [*b, *a]\n",
+            THE_READER_DECIDES,
+        ),
         (
             f"a: &a\n  ais_perf_model: {ONCE}\nb: &b\n  ais_perf_model: {REPEAT}\nengine:\n  <<: *b\n  <<: *a\n",
             ONCE,
@@ -1731,7 +1739,10 @@ def test_the_value_that_is_checked_is_the_one_the_yaml_reader_keeps(text, kept):
     # No section in these files writes ``ais_perf_model`` twice, and none that writes it is written twice.
     # A merge brings in what the file does not write, and a repeated section that never writes the key
     # keeps its last value. Which value that leaves is shown here by the reader itself.
-    assert yaml.safe_load(text)["engine"].get("ais_perf_model") == READ_AS[kept]
+    read = yaml.safe_load(text)["engine"].get("ais_perf_model")
+    if kept is THE_READER_DECIDES:
+        kept = REPEAT if read == READ_AS[REPEAT] else ONCE
+    assert read == READ_AS[kept]
 
     if kept == REPEAT:
         with pytest.raises(AisPerfModelError, match="the key 'estimation_mode' is written twice"):

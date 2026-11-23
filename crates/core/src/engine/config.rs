@@ -729,6 +729,62 @@ pub struct KvcrConfig {
     /// KVCR only moves blocks between the ranks' G2 caches.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub local_g2: Option<KvcrLocalG2Config>,
+    /// Local disk KVCR owns on each rank, behind `local_g2`: a block that
+    /// memory evicts is written here instead of dropped. Unset: no disk tier.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub g3: Option<KvcrG3Config>,
+}
+
+/// KVCR-owned disk cache of one rank (KVCR's `g3`). The timing defaults are
+/// what a B200 node's local NVMe gave through NIXL's POSIX backend.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KvcrG3Config {
+    /// Capacity of each rank, in blocks of the rank's G2.
+    pub num_blocks: usize,
+    /// Fixed delay of each read and each write.
+    #[serde(default = "default_g3_latency_ms")]
+    pub latency_to_first_byte_ms: f64,
+    /// Rate of reads into the rank's G2, in decimal GB/s. Zero is unlimited.
+    #[serde(default = "default_g3_read_bandwidth_gbps")]
+    pub read_bandwidth_gbps: f64,
+    /// Rate of writes from KVCR-owned memory, in decimal GB/s. Zero is
+    /// unlimited.
+    #[serde(default = "default_g3_write_bandwidth_gbps")]
+    pub write_bandwidth_gbps: f64,
+    /// How long a block of a completed store waits for room in KVCR-owned
+    /// memory before KVCR gives it up (KVCR's `operation_timeout_ms`).
+    #[serde(default = "default_g3_spill_timeout_ms")]
+    pub spill_timeout_ms: f64,
+}
+
+fn default_g3_latency_ms() -> f64 {
+    3.0
+}
+
+fn default_g3_read_bandwidth_gbps() -> f64 {
+    5.0
+}
+
+fn default_g3_write_bandwidth_gbps() -> f64 {
+    0.8
+}
+
+fn default_g3_spill_timeout_ms() -> f64 {
+    1000.0
+}
+
+impl KvcrG3Config {
+    /// `num_blocks` of disk with the default timing.
+    pub fn new(num_blocks: usize) -> Self {
+        Self {
+            num_blocks,
+            latency_to_first_byte_ms: default_g3_latency_ms(),
+            read_bandwidth_gbps: default_g3_read_bandwidth_gbps(),
+            write_bandwidth_gbps: default_g3_write_bandwidth_gbps(),
+            spill_timeout_ms: default_g3_spill_timeout_ms(),
+        }
+    }
 }
 
 /// KVCR-owned host memory of one rank (vLLM's `secondary_g2_slots`).
@@ -777,9 +833,19 @@ impl KvcrConfig {
             .local_g2
             .as_ref()
             .map(|local| local.copy_bandwidth_gbps);
+        let g3 = self.g3.as_ref();
+        let g3_timing = g3.into_iter().flat_map(|g3| {
+            [
+                g3.latency_to_first_byte_ms,
+                g3.read_bandwidth_gbps,
+                g3.write_bandwidth_gbps,
+                g3.spill_timeout_ms,
+            ]
+        });
         for value in [self.latency_to_first_byte_ms, self.bandwidth_gbps]
             .into_iter()
             .chain(copy_gbps)
+            .chain(g3_timing)
         {
             ensure!(
                 value.is_finite() && value >= 0.0,
@@ -792,6 +858,18 @@ impl KvcrConfig {
                 .is_none_or(|local| local.num_blocks > 0),
             "kvcr.local_g2.num_blocks must be positive; omit local_g2 to disable it"
         );
+        if let Some(g3) = g3 {
+            // KVCR writes to disk only what its memory evicts.
+            ensure!(self.local_g2.is_some(), "kvcr.g3 requires kvcr.local_g2");
+            ensure!(
+                g3.num_blocks > 0,
+                "kvcr.g3.num_blocks must be positive; omit g3 to disable it"
+            );
+            ensure!(
+                g3.spill_timeout_ms > 0.0,
+                "kvcr.g3.spill_timeout_ms must be positive"
+            );
+        }
         Ok(())
     }
 }
@@ -802,6 +880,7 @@ impl Default for KvcrConfig {
             latency_to_first_byte_ms: 1.0,
             bandwidth_gbps: 32.0,
             local_g2: None,
+            g3: None,
         }
     }
 }
@@ -1273,6 +1352,9 @@ pub struct EngineConfig {
     /// Additional divisor applied to decode latency.
     #[serde(default = "default_one")]
     pub decode_speedup_ratio: f64,
+    /// Assumed watts per GPU during in-pass attention-DP rank wait.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wait_power_w: Option<f64>,
     /// Later pipeline stages a prefill forward still crosses after its pass retires (PP size - 1
     /// on a PP prefill worker, whose passes retire at the per-stage rate); delays the KV handoff.
     #[serde(default)]
@@ -1400,6 +1482,8 @@ struct EngineConfigWire {
     #[serde(default = "default_one")]
     decode_speedup_ratio: f64,
     #[serde(default)]
+    wait_power_w: Option<f64>,
+    #[serde(default)]
     pipeline_fill_passes: f64,
     #[serde(default)]
     aic_nextn: Option<usize>,
@@ -1489,6 +1573,7 @@ impl<'de> Deserialize<'de> for EngineConfig {
             enable_chunked_prefill: wire.enable_chunked_prefill,
             speedup_ratio: wire.speedup_ratio,
             decode_speedup_ratio: wire.decode_speedup_ratio,
+            wait_power_w: wire.wait_power_w,
             pipeline_fill_passes: wire.pipeline_fill_passes,
             aic_nextn: wire.aic_nextn,
             aic_nextn_accept_rates: wire.aic_nextn_accept_rates,
@@ -1541,6 +1626,7 @@ impl Default for EngineConfig {
             enable_chunked_prefill: true,
             speedup_ratio: 1.0,
             decode_speedup_ratio: 1.0,
+            wait_power_w: None,
             pipeline_fill_passes: 0.0,
             aic_nextn: None,
             aic_nextn_accept_rates: None,
@@ -2016,6 +2102,11 @@ impl EngineConfig {
             "decode_speedup_ratio must be finite and non-negative"
         );
         ensure!(
+            self.wait_power_w
+                .is_none_or(|watts| watts.is_finite() && watts >= 0.0),
+            "wait_power_w must be finite and non-negative"
+        );
+        ensure!(
             self.pipeline_fill_passes.is_finite()
                 && self.pipeline_fill_passes >= 0.0
                 && self.pipeline_fill_passes.fract() == 0.0,
@@ -2297,6 +2388,39 @@ impl EngineConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wait_power_round_trips_and_rejects_negative_or_non_finite_watts() {
+        let config: EngineConfig =
+            serde_json::from_value(serde_json::json!({"wait_power_w": 60.0})).unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.wait_power_w, Some(60.0));
+        let wire = serde_json::to_value(&config).unwrap();
+        assert_eq!(wire["wait_power_w"], 60.0);
+        let round_trip: EngineConfig = serde_json::from_value(wire).unwrap();
+        assert_eq!(round_trip.wait_power_w, Some(60.0));
+
+        let unset = EngineConfig::default();
+        assert!(unset.wait_power_w.is_none());
+        assert!(
+            serde_json::to_value(&unset)
+                .unwrap()
+                .get("wait_power_w")
+                .is_none()
+        );
+
+        for watts in [-1.0, f64::NAN, f64::INFINITY] {
+            let config = EngineConfig {
+                wait_power_w: Some(watts),
+                ..EngineConfig::default()
+            };
+            let error = config.validate().unwrap_err().to_string();
+            assert!(
+                error.contains("wait_power_w must be finite and non-negative"),
+                "{watts}: {error}"
+            );
+        }
+    }
 
     #[test]
     fn mamba_native_config_round_trip_defaults_and_rejections() {
@@ -3866,6 +3990,7 @@ mod tests {
                 latency_to_first_byte_ms: 1.0,
                 bandwidth_gbps: 32.0,
                 local_g2: None,
+                g3: None,
             }
         );
         assert_eq!(config, KvcrConfig::default());
@@ -3914,6 +4039,30 @@ mod tests {
             let wire = serde_json::json!({ "local_g2": rejected });
             assert!(serde_json::from_value::<KvcrConfig>(wire).is_err());
         }
+
+        // KVCR-owned disk: its timing defaults and round-trips.
+        let disk = serde_json::json!({"local_g2": {"num_blocks": 4}, "g3": {"num_blocks": 8}});
+        let config: KvcrConfig = serde_json::from_value(disk).unwrap();
+        assert_eq!(config.g3, Some(KvcrG3Config::new(8)));
+        assert_eq!(
+            serde_json::to_value(&config).unwrap()["g3"],
+            serde_json::json!({
+                "num_blocks": 8,
+                "latency_to_first_byte_ms": 3.0,
+                "read_bandwidth_gbps": 5.0,
+                "write_bandwidth_gbps": 0.8,
+                "spill_timeout_ms": 1000.0,
+            })
+        );
+        let unknown = serde_json::json!({"g3": {"num_blocks": 8, "scope": "worker_local"}});
+        assert!(serde_json::from_value::<KvcrConfig>(unknown).is_err());
+    }
+
+    /// Give `config`'s KVCR memory and a disk tier changed by `change`.
+    fn with_g3(config: &mut EngineConfig, change: fn(&mut KvcrG3Config)) {
+        let kvcr = config.kvcr.as_mut().unwrap();
+        kvcr.local_g2 = Some(KvcrLocalG2Config::new(4));
+        change(kvcr.g3.insert(KvcrG3Config::new(8)));
     }
 
     #[test]
@@ -3991,6 +4140,22 @@ mod tests {
                     })
                 },
                 "kvcr timing must be finite and non-negative",
+            ),
+            (
+                |config| config.kvcr.as_mut().unwrap().g3 = Some(KvcrG3Config::new(8)),
+                "kvcr.g3 requires kvcr.local_g2",
+            ),
+            (
+                |config| with_g3(config, |g3| g3.num_blocks = 0),
+                "kvcr.g3.num_blocks must be positive",
+            ),
+            (
+                |config| with_g3(config, |g3| g3.read_bandwidth_gbps = -1.0),
+                "kvcr timing must be finite and non-negative",
+            ),
+            (
+                |config| with_g3(config, |g3| g3.spill_timeout_ms = 0.0),
+                "kvcr.g3.spill_timeout_ms must be positive",
             ),
         ];
         for &(mutate, expected) in cases {

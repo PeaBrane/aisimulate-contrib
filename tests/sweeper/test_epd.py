@@ -559,6 +559,7 @@ def test_worker_paths_share_one_language_replay(monkeypatch, path, outcome):
     assert [candidate.metrics["encoder_gpus"] for candidate in result.candidates] == [1.0, 2.0]
 
 
+@pytest.mark.usefixtures("raw_data_coordinates")
 def test_runner_defers_only_the_encoder_overlay(monkeypatch):
     monkeypatch.setattr(search_mod, "resolve_backend_version", lambda *a, systems_paths=None: "0.5.14")
     config = _config()
@@ -669,6 +670,7 @@ def test_catalog_uses_aic_geometry_memory_and_identity(monkeypatch):
     assert all(point.power_w is None for point in catalog.values())
 
 
+@pytest.mark.usefixtures("raw_data_coordinates")
 @pytest.mark.parametrize(
     "encoder_hardware,language_version,encoder_version,implicit",
     [

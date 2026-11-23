@@ -464,8 +464,13 @@ impl G1Manager {
             .attach_store_source_dependency(owner, snapshot.inner, dependency);
     }
 
-    pub(crate) fn publish_host_pinned_event(&mut self, data: crate::engine::KvEventData) {
-        self.inner.publish_host_pinned_event(data);
+    pub(crate) fn publish_residency_event(
+        &mut self,
+        data: crate::engine::KvEventData,
+        tier: crate::engine::KvEventTier,
+        domain: crate::engine::KvEventDomain,
+    ) {
+        self.inner.publish_residency_event(data, tier, domain);
     }
 
     pub(crate) fn satisfy_native_source_dependency(

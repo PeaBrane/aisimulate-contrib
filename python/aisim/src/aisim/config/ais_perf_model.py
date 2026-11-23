@@ -937,7 +937,7 @@ def reject_repeated_keys(
     try:
         root = yaml.compose(text, Loader=yaml.SafeLoader)
         outer = _repeated_key_or_section(root, section)
-        value = None if outer else _kept_node(_kept_node(root, section, set()), KEY, set())
+        value = None if outer else _kept_node(_kept_node(root, section), KEY)
     except (yaml.YAMLError, RecursionError):
         return
     if outer:
@@ -1075,37 +1075,51 @@ def _written(node: Any, name: str) -> list[tuple[int, Any]]:
     ]
 
 
-def _kept_node(node: Any, name: str, searched: set[int]) -> Any:
+def _kept_node(node: Any, name: str) -> Any:
     """Return the YAML node that the reader keeps as the value of key ``name`` of a mapping node, or None.
 
-    The reader keeps the last value written for a key. It takes a key from a
-    merge (``<<``) only when the mapping does not write the key itself.
-    ``searched`` holds the mappings already looked at. A mapping can be merged
-    in more than one place, and can merge itself; it has no value to add the
-    second time.
+    The reader keeps the last value written for a key, after it has put the
+    keys that merges (``<<``) bring in before the written ones. Which merged
+    mapping wins differs between PyYAML releases, so the reader's own merge
+    step orders the keys here. It runs on a copy, because it rewrites the
+    mappings it merges and the caller still counts the keys as written. A
+    merge the reader rejects raises the reader's error.
     """
     import yaml
 
-    if not isinstance(node, yaml.MappingNode) or id(node) in searched:
+    if not isinstance(node, yaml.MappingNode):
         return None
-    searched.add(id(node))
-    written, merged = None, []
-    for key_node, value_node in node.value:
-        if not isinstance(key_node, yaml.ScalarNode):
-            continue
-        if key_node.tag == _YAML_MERGE_TAG:
-            merged.append(value_node)
-        elif key_node.tag == _YAML_TEXT_TAG and key_node.value == name:
-            written = value_node
-    if written is not None:
-        return written
-    # Of two merges the reader lets the later one win; in one merge of a list of mappings, the earlier mapping.
-    for merge in reversed(merged):
-        for source in merge.value if isinstance(merge, yaml.SequenceNode) else [merge]:
-            found = _kept_node(source, name, searched)
-            if found is not None:
-                return found
-    return None
+    flat = _merge_copy(node, {})
+    yaml.constructor.SafeConstructor().flatten_mapping(flat)
+    kept = None
+    for key_node, value_node in flat.value:
+        if isinstance(key_node, yaml.ScalarNode) and key_node.tag == _YAML_TEXT_TAG and key_node.value == name:
+            kept = value_node
+    return kept
+
+
+def _merge_copy(node: Any, copies: dict[int, Any]) -> Any:
+    """Return a copy of a YAML node in which the mappings that the reader's merge step rewrites are new.
+
+    Those are the mapping itself and each mapping it merges, directly or in a
+    list. Keys and all other values are the nodes of the original, and a
+    mapping merged in two places is one copy in both, as it is one node for
+    the reader.
+    """
+    import yaml
+
+    if id(node) in copies:
+        return copies[id(node)]
+    if isinstance(node, yaml.MappingNode):
+        copy = copies[id(node)] = yaml.MappingNode(node.tag, [], node.start_mark, node.end_mark)
+        copy.value = [
+            (key, _merge_copy(value, copies) if key.tag == _YAML_MERGE_TAG else value) for key, value in node.value
+        ]
+        return copy
+    if isinstance(node, yaml.SequenceNode):
+        items = [_merge_copy(item, copies) for item in node.value]
+        return yaml.SequenceNode(node.tag, items, node.start_mark, node.end_mark)
+    return node
 
 
 def anchor_paths(raw: Any, base_dir: str | os.PathLike[str], kind: str) -> Any:

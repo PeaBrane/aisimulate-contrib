@@ -405,24 +405,10 @@ def test_preparation_rejects_malformed_profile_json(dataset, keys, value):
     assert not output.exists()
 
 
-@pytest.mark.parametrize(
-    "legacy,valid",
-    [
-        ({"catalog_version": 5}, True),
-        ({"catalog_version": 6}, True),
-        ({"catalog_version": 7}, True),
-        ([], False),
-        ({}, False),
-        ({"catalog_version": []}, False),
-        ({"catalog_version": {}}, False),
-        ({"catalog_version": 5.0}, False),
-        ({"catalog_version": "5"}, False),
-        ({"catalog_version": True}, False),
-    ],
-)
-def test_legacy_fpm_discovery_requires_supported_integer_version(tmp_path, legacy, valid):
+def test_the_retired_legacy_fpm_layout_is_rejected(tmp_path):
+    # The published dataset indexes use the "category" layout only; "legacy-fpm" was retired with the FPM move.
     path = "catalog/fpm/index.json"
-    write(tmp_path, path, legacy)
+    write(tmp_path, path, {"catalog_version": 5})
     write(
         tmp_path,
         "catalog/dataset.json",
@@ -434,11 +420,25 @@ def test_legacy_fpm_discovery_requires_supported_integer_version(tmp_path, legac
             },
         },
     )
-    if valid:
-        assert check_dataset(tmp_path).categories["fpm"].layout == "legacy-fpm"
-    else:
-        with pytest.raises(ValueError, match="unsupported legacy FPM index"):
-            check_dataset(tmp_path)
+    with pytest.raises(ValueError, match="layout"):
+        check_dataset(tmp_path)
+
+
+def test_preparation_check_ignores_the_environment_dataset_pin(dataset, monkeypatch, tmp_path):
+    import aisim_core.data.ensure as ensure_module
+
+    root, path, _ = dataset
+    unrelated = tmp_path / "unrelated-dataset"
+    unrelated.mkdir()
+    monkeypatch.setenv("AISIM_DATA_LOCAL", str(unrelated))  # a pin with no matching catalog entry
+    real_ensure = ensure_module.ensure_data
+    calls = []
+    monkeypatch.setattr(ensure_module, "ensure_data", lambda *a, **k: calls.append(a) or real_ensure(*a, **k))
+    output = root.parent / "prepared-with-env-pin"
+    config = prepare_execution_profile(root, path, output)
+    assert calls == []
+    assert config["systems_paths"] == [str(output / "systems")]
+    assert json.loads((output / "config.json").read_bytes()) == config
 
 
 @pytest.mark.parametrize("field", ["hardware", "framework", "framework_version"])
@@ -454,6 +454,21 @@ def test_preparation_rejects_manifest_predictor_identity_mismatch(dataset, field
     check_manifest(root, path)
     output = root.parent / "rejected"
     with pytest.raises(ValueError, match="manifest identity differs from predictor configuration"):
+        prepare_execution_profile(root, path, output)
+    assert not output.exists()
+
+
+def test_preparation_rejects_a_manifest_for_another_model_before_creating_output(dataset):
+    root, path, manifest = dataset
+    assert manifest["identity"]["model"] is not None  # an execution profile belongs to one model
+    manifest["identity"]["model"] = "org/another-model"
+    manifest["configuration_id"] = configuration_id(
+        manifest["category"], manifest["purpose"], Identity(**manifest["identity"])
+    )
+    write(root, path, manifest)
+    check_manifest(root, path)  # self-consistent, but labels a different model than the predictor configuration
+    output = root.parent / "rejected-model"
+    with pytest.raises(ValueError, match="manifest model differs from predictor configuration"):
         prepare_execution_profile(root, path, output)
     assert not output.exists()
 

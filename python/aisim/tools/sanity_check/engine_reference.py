@@ -18,9 +18,13 @@ deliberately differ from the retired raw-table facade semantics:
 
 - context attention includes the fused rope/kv-write extras the engine
   charges on top of the attention table (small shape-independent additive);
-- gemm ``fp8_static`` charts the engine's model (dynamic-fp8 row minus the
-  overhead tables); the facade's fp8_static curve was a duplicate of the
-  fp8 curve (its lookup normalized to the fp8 table).
+- gemm ``fp8_static`` in SILICON charts its own rows when the table has
+  them, otherwise the dynamic-FP8 row minus the overhead tables. The engine's
+  HYBRID/EMPIRICAL modes can also use direct rows to calibrate utilization,
+  but these charts do not select those modes. SOL_FULL always charts the
+  derived path using analytic GEMM and overhead values, without table reads;
+  the facade's fp8_static curve was a duplicate of the fp8 curve (its lookup
+  normalized to the fp8 table).
 
 Only the two modes the charts use are supported: ``DatabaseMode.SILICON``
 (the probe engine's configured mode) and ``DatabaseMode.SOL_FULL``. Rust
@@ -110,8 +114,10 @@ class EngineReference:
     # ------------------------------------------------------------------ #
 
     def query_gemm(self, m, n, k, quant_mode, database_mode):
-        # fp8_static charts the ENGINE's model for it (dynamic-fp8 row minus
-        # the collected overhead tables, floored at the roofline). The old
+        # In SILICON, fp8_static charts its own rows when present, otherwise
+        # dynamic-FP8 minus collected overheads, floored at the roofline.
+        # SOL_FULL always uses analytic GEMM and overhead values on the
+        # derived path, even when direct rows exist. The old
         # facade normalized the lookup to fp8, so its fp8_static curve was a
         # pixel-identical duplicate of the fp8 curve — no information lost.
         op = GEMM("gemm", 1.0, n, k, quant_mode)

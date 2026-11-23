@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 # Canonical user-facing attention-backend vocabulary. ``"default"`` selects
 # the framework default and is not a named measurement lane.
-ATTENTION_BACKEND_CHOICES: tuple[str, ...] = ("fa3", "triton", "trtllm_mha", "flashinfer", "fla", "default")
+ATTENTION_BACKEND_CHOICES: tuple[str, ...] = ("fa3", "fa4", "triton", "trtllm_mha", "flashinfer", "fla", "default")
 _KNOWN_LANES: frozenset[str] = frozenset(choice for choice in ATTENTION_BACKEND_CHOICES if choice != "default")
 _KNOWN_LANE_VALUES: frozenset[str] = frozenset(ATTENTION_BACKEND_CHOICES)
 
@@ -52,6 +52,7 @@ _KNOWN_LANE_VALUES: frozenset[str] = frozenset(ATTENTION_BACKEND_CHOICES)
 _OVERRIDE_LANES: dict[str, dict[str, tuple[str, ...]]] = {
     "sglang": {
         "fa3": ("fa3",),
+        "fa4": ("fa4",),
         "triton": ("triton",),
         "trtllm_mha": ("trtllm_mha",),
         "flashinfer": ("flashinfer",),
@@ -393,7 +394,7 @@ def resolve_attention_lane_order(
        given. A match replaces the global map for this resolution.
     3. Otherwise, the global framework-default lane for (*backend*,
        floor-matched *version*, *sm_version*) from the same file, if present.
-    4. The remaining known lanes ``{"fa3","triton","trtllm_mha","flashinfer",
+    4. The remaining known lanes ``{"fa3","fa4","triton","trtllm_mha","flashinfer",
        "fla"}`` minus already-listed entries, in sorted (alphabetical) order.
     5. ``"default"`` — always last, exactly once.
 

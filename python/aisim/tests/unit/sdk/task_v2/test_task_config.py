@@ -2457,6 +2457,57 @@ def test_validate_fp8_static_not_transfer_admitted_in_hybrid():
         t.validate()
 
 
+@pytest.mark.parametrize("quant", [common.GEMMQuantMode.fp8, common.GEMMQuantMode.sq])
+def test_validate_gemm_transfer_gate_never_borrows_from_fp8_static_rows(monkeypatch, quant):
+    """The engine never takes fp8_static rows as a transfer-ladder reference
+    (gemm_table_quants in operators/gemm.rs). A table with its own fp8_static
+    rows and scale_matrix rows lists fp8_static without fp8, so the gate must
+    not count that name as a same-profile (XQUANT) donor for fp8 or sq.
+    Vehicle: the real b200/vllm 0.30.0 database with its gemm listing replaced."""
+    from aisim.sdk.perf_database import get_database
+
+    real = get_database("b200_sxm", "vllm", "0.30.0")
+
+    class GemmListing:
+        """The real database with only its gemm listing replaced."""
+
+        def __init__(self, gemm_modes):
+            self.supported_quant_mode = {**real.supported_quant_mode, "gemm": gemm_modes}
+
+        def __getattr__(self, name):
+            return getattr(real, name)
+
+    def make(gemm_modes, policy, gemm_quant=quant):
+        database = GemmListing(gemm_modes)
+        monkeypatch.setattr(Task, "_try_load_role_database", lambda self, role: database)
+        return Task(
+            serving_mode="agg",
+            model_path="meta-llama/Meta-Llama-3.1-8B",
+            system_name="b200_sxm",
+            backend_name="vllm",
+            backend_version="0.30.0",
+            gemm_quant_mode=gemm_quant,
+            database_mode="HYBRID",
+            transfer_policy=policy,
+        )
+
+    own_rows = ["bfloat16", "fp8_static"]
+    # XQUANT only ("balanced" = xshape + xquant, or "xquant" alone): no donor of the same profile.
+    for policy in ("balanced", "xquant"):
+        with pytest.raises(ValueError, match=f"Unsupported gemm quant mode '{quant.name}'"):
+            make(own_rows, policy).validate()
+    # XPROFILE: bfloat16 is a donor of another profile, so all transfers and XPROFILE alone admit it.
+    make(own_rows, None).validate()
+    make(own_rows, "xprofile").validate()
+    # A table that lists fp8 behaves as before: fp8 directly, sq through XQUANT from fp8.
+    make(["bfloat16", "fp8", "fp8_static"], "balanced").validate()
+    # Nor is fp8_static an XPROFILE donor: with only fp8_static listed, bfloat16 has no
+    # reference of another profile, so XPROFILE and all transfers reject it.
+    for policy in ("xprofile", None):
+        with pytest.raises(ValueError, match="Unsupported gemm quant mode 'bfloat16'"):
+            make(["fp8_static"], policy, common.GEMMQuantMode.bfloat16).validate()
+
+
 def test_validate_gemm_xprofile_requires_listed_level_profile(monkeypatch):
     """The gate deliberately refuses XPROFILE admission for a profile missing
     from the GEMM util-LEVEL table (the runtime ladder would fall back to a

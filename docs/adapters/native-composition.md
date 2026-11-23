@@ -193,6 +193,12 @@ order, and a snapshot taken after a parent was evicted contains the children
 without it. Consumers must place blocks by `start_position`, not by arrival.
 Every rank of a shared pool retains its blocks' `tokens_hash`, so a block's
 Router identity does not depend on which rank stored it.
+Events without `domain` describe the worker's own caches. A rank also
+publishes what KVCR owns, with `"domain": "cache_owner"`: the blocks of its
+[KVCR-owned memory](../replay/engine/kv-cache.md#kvcr-owned-memory)
+(`kvcr.local_g2`) with `"tier": "host_pinned"`, and those of its
+[KVCR disk tier](../replay/engine/kv-cache.md#kvcr-owned-disk) (`kvcr.g3`)
+with `"tier": "disk"`.
 
 `ReplayTelemetryObserver` is independent of scaling. It samples at a positive
 finite cadence after workload settlement and before same-time scaling. It must

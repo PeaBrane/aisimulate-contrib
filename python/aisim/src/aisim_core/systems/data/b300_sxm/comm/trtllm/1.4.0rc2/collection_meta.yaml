@@ -1,0 +1,22 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+schema_version: 1
+provenance: collected
+runtime:
+  framework: trtllm
+  version: 1.4.0rc2
+  image: nvcr.io/nvidia/tensorrt-llm/release:1.4.0rc2
+  image_digest: sha256:93a3eaf1fa574813d608a7147735134bcfbd06d18d1aa98e8ee0d5da09e51e3a
+tables:
+  custom_allreduce_perf:
+    # TP2/TP4/TP8 framework all-reduce (TRTLLM), one node, the release's default environment: no NCCL variables set.
+    # collector_hash: sha256 of collector/network/collect_all_reduce.py (standalone collector, no closure entry).
+    # case_plan_hash: sha256 of the sorted row keys (kernel_source|allreduce_dtype|num_gpus|message_size).
+    # data_sha256: 1155b73024d989296191b68578a7abedc1c1e1aef08f8b0b01164e778bcdcf0a
+    collector_ref: 64ba3773a
+    collector_hash: sha256:e292684d90341cc9e7ff13f1c24a1df4f50826606c59ce02167e5f56a2704883
+    case_plan_hash: sha256:4fa18d4017fe628bb1f638503af73ae3651315d9b78d6f3a3fa57ef53351d36e
+    collected_at: '2026-11-17'
+    rows: 69
+    status: complete

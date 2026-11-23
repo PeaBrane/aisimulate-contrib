@@ -17,11 +17,32 @@ baseline. A marginal with zero latency or missing target or floor power
 contributes zero energy. A positive-latency marginal with zero energy is
 uncovered.
 
-FPM Replay with attention DP sums energy and covered component time across
-working ranks and divides each by summed modeled active rank time, as op-level
-Replay does. The scheduler still uses the slowest rank to price the step.
-[Attention-DP wait accounting](https://linear.app/nvidia/issue/AISIM-2452)
-tracks a later change to both paths.
+FPM and op-level Replay with attention DP sum active energy and covered
+component time across working ranks. The summary divides each by summed
+active rank time and applies the existing 90% coverage gate. The scheduler
+uses the slowest rank to price the step.
+
+With `predict --stack engine --detail energy`, `attention_dp_wait_ms` reports
+the modeled wait inside lockstep forward passes, in rank-ms. Each executed
+pass contributes `N × T − Σ t_r`, where `N` is the attention-DP width,
+`T` is the corrected step duration and `t_r` is a rank's corrected active
+duration. A rank with no modeled work waits for the full step.
+
+`step_power_w` estimates watts per GPU over those passes. For each role,
+multiply its wait by its assumed [`wait_power_w`](../replay/engine/workers.md#attention-dp-wait-power)
+and add that energy to the role's active energy. Pool the energy and rank
+time across roles before dividing. Step watts are null when active watts
+are unavailable or a role with positive wait lacks its input. When there
+is no wait, step watts equal active watts. Uncovered active work supplies
+no modeled energy. If any role's timing model does not track attention-DP
+wait, such as AFD timing, Replay omits `attention_dp_wait_ms` and reports
+null step watts rather than assuming zero wait. Active watts and coverage
+are unchanged.
+
+For example, one of two ranks works for 10 ms at 400 W while the other
+waits for 10 ms. With `wait_power_w: 60`, step power is
+`(400 × 10 + 60 × 10) / 20 = 230 W/GPU`. The active result is still
+400 W/GPU with 100% active coverage.
 
 FPM v6/v7 have no row-power evidence. FPM watts are withheld for speculative
 schemes, models with encoder operations, and language-only EPD workers. The
@@ -386,6 +407,10 @@ serializing. Existing Rust struct literals that enumerate the old fields
 without a `..` update no longer compile. Callers should use
 `..Default::default()` for unspecified fields. This source compatibility
 change is separate from the additive JSON fields.
+
+**AISIM-2452 release note.** Engine Replay energy details add
+`attention_dp_wait_ms` and `step_power_w`. The `power-metrics-v1` summary
+continues to describe active work and retains its 90% gate.
 
 Support and accuracy remain separate gates. Execution with sufficient data
 coverage establishes that a power result can be produced; parity with AIC and

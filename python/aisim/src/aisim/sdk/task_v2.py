@@ -2138,8 +2138,9 @@ class Task:
             raise ValueError("agg mode requires model_path")
         if not self.system_name:
             raise ValueError("agg mode requires system_name")
-        # fp8_static is not hard-gated to trtllm: it is derived from the dynamic
-        # fp8 GEMM minus compute_scale/scale_matrix overhead and works on any
+        # fp8_static is not hard-gated to trtllm: it is read from its own GEMM
+        # rows when the table has them, and is otherwise derived from the dynamic
+        # fp8 GEMM minus compute_scale/scale_matrix overhead; it works on any
         # backend whose perf DB carries those tables.  _validate_database_quant_modes
         # rejects it on backends/systems that lack the data.
 
@@ -2205,10 +2206,11 @@ class Task:
         database = self._try_load_role_database(role)
 
         if database is None:
-            # In SILICON mode the DB must exist; fp8_static is derived from
-            # compute_scale/scale_matrix overhead tables we can't confirm without it,
-            # so fail fast rather than defer to a late run() failure.  Other modes
-            # (and other quant modes) keep deferring to the sweep.
+            # In SILICON mode the DB must exist; fp8_static needs its own GEMM rows
+            # or the compute_scale/scale_matrix overhead tables, which we can't
+            # confirm without it, so fail fast rather than defer to a late run()
+            # failure.  Other modes (and other quant modes) keep deferring to
+            # the sweep.
             if self.database_mode in (None, common.DatabaseMode.SILICON.name) and (
                 self._role_attr(role, "gemm_quant_mode") == common.GEMMQuantMode.fp8_static
             ):
@@ -2231,7 +2233,8 @@ class Task:
         # shared quant-transfer primitive in operations/util_empirical.py) can
         # synthesize a quant from a collected sibling: XQUANT borrows within the
         # same (memory, compute) profile, XPROFILE borrows across profiles rescaled
-        # by the op's util-LEVEL ratio. This gate mirrors exactly what the resolved
+        # by the op's util-LEVEL ratio (a GEMM borrows from no fp8_static rows, so
+        # that name is never a donor here). This gate mirrors exactly what the resolved
         # policy + DB contents make reachable at query time — truly-unreachable
         # quants still fail early here rather than crashing late in the sweep.
         # Admission only holds if (a) we're in a non-SILICON mode AND (b) the
@@ -2321,12 +2324,16 @@ class Task:
             # fp8_static is a COMPOSITE mode: its base GEMM is transferable, but
             # it also requires compute_scale/scale_matrix overhead tables that
             # have no transfer ladder (by design). Its admission stays purely
-            # data-driven (fp8_static in modes iff all three tables exist, see
-            # _gemm_key_names).
+            # data-driven (see _gemm_key_names: its own GEMM rows plus
+            # scale_matrix, or fp8 plus both overhead tables).
             transfer_ok = profile_transfer and mode is not common.GEMMQuantMode.fp8_static
-            if transfer_ok and xquant_enabled and _profile_reachable(mode, modes):
+            # The engine never takes fp8_static GEMM rows as a ladder reference
+            # (gemm_table_quants in operators/gemm.rs), so the name is no donor
+            # here. It stays in ``modes`` for the direct ``name in modes`` test.
+            donors = [m for m in modes if m != "fp8_static"] if op == "gemm" else modes
+            if transfer_ok and xquant_enabled and _profile_reachable(mode, donors):
                 return  # XQUANT-reachable in HYBRID/EMPIRICAL (same-profile data)
-            if transfer_ok and xprofile_enabled and _xprofile_reachable(op, mode, modes):
+            if transfer_ok and xprofile_enabled and _xprofile_reachable(op, mode, donors):
                 return  # XPROFILE-reachable (calibrated level + any other-profile data)
             exc_type = UnsupportedWideepConfigError if op.startswith("wideep_") else ValueError
             raise exc_type(

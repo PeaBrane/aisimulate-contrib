@@ -226,8 +226,9 @@ class TestMixedPrecisionExport:
 
     @pytest.mark.parametrize("section", ["config.json", "hf_quant_config.json"])
     def test_lower_case_quant_algo_is_not_the_mixed_recipe(self, mod, tmp_path, section):
-        # SGLang compares quant_algo to "MIXED_PRECISION" exactly (configs/model_config.py:1145,
-        # 1153), so a lower-case value is not the mixed recipe to the framework either.
+        # SGLang compares quant_algo to "MIXED_PRECISION" exactly (configs/model_config.py,
+        # ModelConfig._parse_modelopt_quant_config), so a lower-case value is not the mixed recipe to
+        # the framework either.
         if section == "config.json":
             _write_config(tmp_path, _mixed_config(GLM53_LANES, quant_algo="mixed_precision"))
         else:
@@ -322,7 +323,7 @@ class TestMixedPrecisionExport:
 
     def test_compression_config_takes_precedence_over_the_sidecar(self, mod, tmp_path):
         # SGLang resolves ``quantization_config``, then ``compression_config``, then the ModelOpt sidecar
-        # (configs/model_config.py:1029, 1046 and 1117), so a checkpoint that declares
+        # (configs/model_config.py, ModelConfig._parse_quant_hf_config), so a checkpoint that declares
         # ``compression_config`` reaches the mixed recipe only through its own ``quantization_config``,
         # never through the sidecar.
         payload = {
@@ -401,3 +402,62 @@ def test_bundled_glm53_nvfp4_export_selects_the_nvfp4_loader():
     # export only through the mixed rule.
     mod = _import_module()
     assert mod._model_native_gemm_quant("nvidia/GLM-5.3-NVFP4") == "nvfp4"
+
+
+class TestSectionOrder:
+    def test_quantization_config_takes_precedence_over_a_pure_sidecar(self, mod, tmp_path):
+        _write_hf_quant(tmp_path, {"quant_algo": "NVFP4", "group_size": 16})
+        _write_config(tmp_path, {"quant_method": "fp8", "weight_block_size": [128, 128]})
+        assert mod._model_native_gemm_quant(MODEL_ID) == "fp8_block"
+
+    def test_compression_config_takes_precedence_over_a_pure_sidecar(self, mod, tmp_path):
+        payload = {
+            "architectures": ["GlmMoeDsaForCausalLM"],
+            "compression_config": {"quant_method": "compressed-tensors", "format": "float-quantized"},
+        }
+        (tmp_path / "org--m_config.json").write_text(json.dumps(payload))
+        _write_hf_quant(tmp_path, {"quant_algo": "NVFP4", "group_size": 16})
+        assert mod._model_native_gemm_quant(MODEL_ID) is None
+
+    def test_empty_quantization_config_is_declared(self, mod, tmp_path):
+        _write_hf_quant(tmp_path, {"quant_algo": "NVFP4", "group_size": 16})
+        _write_config(tmp_path, {})
+        assert mod._model_native_gemm_quant(MODEL_ID) is None
+
+    @pytest.mark.parametrize(
+        ("quantization_config", "expected"),
+        [
+            pytest.param({"quant_method": "modelopt", "quant_algo": "NVFP4"}, "nvfp4", id="modelopt-nvfp4"),
+            pytest.param({"quant_algo": "NVFP4"}, "nvfp4", id="no-quant-method-nvfp4"),
+            pytest.param({"quant_method": "modelopt", "quant_algo": "FP8"}, "fp8_block", id="modelopt-fp8"),
+        ],
+    )
+    def test_modelopt_quantization_config_without_a_sidecar(self, mod, tmp_path, quantization_config, expected):
+        _write_config(tmp_path, quantization_config)
+        assert mod._model_native_gemm_quant(MODEL_ID) == expected
+
+    def test_pure_sidecar_algorithm_is_read_with_any_quant_method(self, mod, tmp_path):
+        _write_config(tmp_path)
+        _write_hf_quant(tmp_path, {"quant_method": "compressed-tensors", "quant_algo": "NVFP4"})
+        assert mod._model_native_gemm_quant(MODEL_ID) == "nvfp4"
+
+    def test_mxfp4_quantization_config_without_a_sidecar(self, mod, tmp_path):
+        _write_config(tmp_path, {"quant_method": "mxfp4"})
+        assert mod._model_native_gemm_quant(MODEL_ID) == "nvfp4"
+
+
+def _declared_module_model_ids():
+    from collector import case_generator
+
+    specs = case_generator.get_mla_module_model_specs(backend="sglang", apply_model_filter=False)
+    return sorted({spec.model_path for spec in specs})
+
+
+@pytest.mark.parametrize("model_id", _declared_module_model_ids())
+def test_both_readers_agree_on_nvfp4_for_every_declared_checkpoint(model_id):
+    # collector.op_plans._checkpoint_quant is the plan's reader of the same files. This collector
+    # loads only the checkpoints that the cases YAML declares for the MLA and DSA module ops.
+    from collector import op_plans
+
+    native = _import_module()._model_native_gemm_quant(model_id)
+    assert (op_plans._checkpoint_quant(model_id) == "nvfp4") == (native == "nvfp4")

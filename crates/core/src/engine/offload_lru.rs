@@ -21,14 +21,17 @@ use crate::engine::host_offload::HostBlockKey;
 /// where the caller last put it, so the caller can move them again without
 /// finding them. A run stops being whole when one of its blocks is touched
 /// alone, removed or joined to another run.
+/// Each block joins at its place in the caller's key list, and the run stays
+/// whole from the place after the highest one a block left.
 pub(crate) struct Lru {
     nodes: Vec<LruNode>,
     /// Unlinked nodes reused before the slab grows.
     vacant: Vec<NonZeroU32>,
     /// See [`Self::touches`].
     touches: u64,
-    /// Whether each run is whole, by run. [`NO_RUN`] never is.
-    whole_runs: Vec<bool>,
+    /// The place each run is whole from, by run: 0 until a block leaves it.
+    /// [`NO_RUN`]'s is unused.
+    whole_from: Vec<u32>,
 }
 
 #[derive(Clone, Copy)]
@@ -38,6 +41,8 @@ struct LruNode {
     newer: u32,
     /// The block's run, [`NO_RUN`] until it joins one.
     run: u32,
+    /// The block's place in its run.
+    place: u32,
 }
 
 const SENTINEL: u32 = 0;
@@ -51,10 +56,11 @@ impl Default for Lru {
                 older: SENTINEL,
                 newer: SENTINEL,
                 run: NO_RUN,
+                place: 0,
             }],
             vacant: Vec::new(),
             touches: 0,
-            whole_runs: vec![false],
+            whole_from: vec![0],
         }
     }
 }
@@ -65,7 +71,7 @@ impl Lru {
         let node = match *slot {
             Some(node) => {
                 self.unlink(node);
-                self.join_run(node, NO_RUN);
+                self.join_run(node, NO_RUN, 0);
                 node
             }
             None => *slot.insert(self.allocate(key)),
@@ -95,22 +101,28 @@ impl Lru {
 
     /// From `oldest`, take the newer neighbours while their keys match `keys`
     /// read backwards, join them all to `run` and make the span the newest.
-    /// Returns its newest block and how many keys matched.
+    /// `oldest` joins at `place` and each newer block one place lower, so
+    /// `keys` are at most the `place` keys before `oldest`'s. Returns the
+    /// span's newest block and how many keys matched.
     pub(crate) fn touch_matching_span(
         &mut self,
         run: u32,
         oldest: NonZeroU32,
+        place: usize,
         keys: &[HostBlockKey],
     ) -> (NonZeroU32, usize) {
+        debug_assert!(keys.len() <= place);
+        let mut place = u32::try_from(place).expect("offload LRU place overflow");
         let mut newest = oldest;
         let mut rest = keys;
         loop {
-            self.join_run(newest, run);
+            self.join_run(newest, run, place);
             let newer = self.nodes[newest.get() as usize].newer;
             match (NonZeroU32::new(newer), rest.split_last()) {
                 (Some(node), Some((key, before))) if self.nodes[newer as usize].key == *key => {
                     newest = node;
                     rest = before;
+                    place -= 1;
                 }
                 _ => break,
             }
@@ -121,21 +133,21 @@ impl Lru {
 
     /// A new run, whole and without blocks.
     pub(crate) fn new_run(&mut self) -> u32 {
-        let run = u32::try_from(self.whole_runs.len()).expect("offload LRU run overflow");
-        self.whole_runs.push(true);
+        let run = u32::try_from(self.whole_from.len()).expect("offload LRU run overflow");
+        self.whole_from.push(0);
         run
     }
 
-    /// Whether `run` was whole. It is whole afterwards: the caller rejoins
-    /// its blocks.
-    pub(crate) fn resume_run(&mut self, run: u32) -> bool {
-        std::mem::replace(&mut self.whole_runs[run as usize], true)
+    /// The place `run` was whole from. It is whole afterwards: the caller
+    /// rejoins the blocks before that place.
+    pub(crate) fn resume_run(&mut self, run: u32) -> usize {
+        std::mem::take(&mut self.whole_from[run as usize]) as usize
     }
 
     pub(crate) fn remove(&mut self, slot: &mut Option<NonZeroU32>) {
         if let Some(node) = slot.take() {
             self.unlink(node);
-            self.join_run(node, NO_RUN);
+            self.join_run(node, NO_RUN, 0);
             self.vacant.push(node);
         }
     }
@@ -216,15 +228,22 @@ impl Lru {
             older: SENTINEL,
             newer: SENTINEL,
             run: NO_RUN,
+            place: 0,
         });
         node
     }
 
-    /// Move `node` into `run`. The run it leaves is no longer whole.
-    fn join_run(&mut self, node: NonZeroU32, run: u32) {
-        let left = std::mem::replace(&mut self.nodes[node.get() as usize].run, run);
-        if left != run {
-            self.whole_runs[left as usize] = false;
+    /// Move `node` into `run` at `place`. The run it leaves is whole only
+    /// after the place the node had.
+    fn join_run(&mut self, node: NonZeroU32, run: u32, place: u32) {
+        let node = &mut self.nodes[node.get() as usize];
+        let left = std::mem::replace(&mut node.run, run);
+        let left_place = std::mem::replace(&mut node.place, place);
+        if left != run && left != NO_RUN {
+            let whole_from = &mut self.whole_from[left as usize];
+            if *whole_from <= left_place {
+                *whole_from = left_place + 1;
+            }
         }
     }
 

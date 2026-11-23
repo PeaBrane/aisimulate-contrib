@@ -16,7 +16,7 @@ use pyo3::types::PyModule;
 
 #[test]
 fn embeds_python_interpreter() {
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         // Import a stdlib module to confirm the interpreter is live.
         let sys = PyModule::import(py, "sys").expect("import sys");
         let version: String = sys

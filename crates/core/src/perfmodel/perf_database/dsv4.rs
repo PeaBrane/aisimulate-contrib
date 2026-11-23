@@ -118,12 +118,43 @@ pub struct Dsv4Table {
 /// Raw per-key nested grids straight from the parquet (loader output).
 struct ModuleGrids {
     by_keys: BTreeMap<ModuleKey, ByNative>,
+    /// CSA loads only (empty otherwise): per `(native, local)` node, which of
+    /// its winning rows came from which top-k regime (see [`NodeRegime`]).
+    regimes: BTreeMap<ModuleKey, BTreeMap<(u32, u32), NodeRegime>>,
+    /// CSA nodes whose leaves already stand in their final top-k regime
+    /// (filled by [`settle_topk_regimes`]); see [`ModuleNodes::topk_settled`].
+    topk_settled: BTreeMap<ModuleKey, BTreeSet<(u32, u32)>>,
+}
+
+/// Top-k regime bookkeeping of one CSA `(key, native, local)` node, over the
+/// rows that won the first-wins merge. A row is new-regime when its release
+/// timed the module on non-degenerate index scores (the calibration file next
+/// to it holds top_last rows only) and legacy-regime otherwise: a legacy row
+/// still contains the degenerate-score top-k cost the DELTA removes.
+#[derive(Default)]
+struct NodeRegime {
+    /// Winning rows from new-regime sources.
+    new_rows: usize,
+    /// `(step, isl, batch)` of the winning rows from legacy-regime sources.
+    legacy: Vec<(u32, u32, u32)>,
 }
 
 /// Engine-ready tables: per (key, native, local), the phase-shaped `Node`
 /// (context: `[step][isl][batch]`; generation: `[batch][s_total]`).
 struct ModuleNodes {
     by_keys: BTreeMap<ModuleKey, BTreeMap<u32, BTreeMap<u32, PreparedGrid>>>,
+    /// CSA `(native, local)` nodes that take no top-k DELTA at query time:
+    /// every leaf is a new-regime row, or the node mixes regimes and its
+    /// legacy leaves were corrected at load. A node outside this set holds
+    /// legacy rows only and is corrected at query time, as before.
+    topk_settled: BTreeMap<ModuleKey, BTreeSet<(u32, u32)>>,
+}
+
+/// One resolved `(key, native, local)` module table.
+struct ResolvedNode<'a> {
+    grid: &'a PreparedGrid,
+    /// See [`ModuleNodes::topk_settled`].
+    topk_settled: bool,
 }
 
 /// Table key mirroring the Python loaders (PR #1337 alignment):
@@ -336,13 +367,17 @@ impl Dsv4Table {
             )
         };
         let cfg = OpInterpConfig::grid(&["prefix", "seq_len", "batch"], &sol);
-        let value = node.query_value(&cfg, &[prefix as f64, isl as f64, b as f64])?;
+        let value = node
+            .grid
+            .query_value(&cfg, &[prefix as f64, isl as f64, b as f64])?;
         // Mirrors Python `ContextDeepSeekV4AttentionModule` get_silicon
         // (operations/dsv4.py): for CSA (compress_ratio==4) ONLY, subtract the
         // measured topK DELTA = flat_ms - top_last_ms at the ORIGINAL query
         // point (prefix, s, b) and clamp at 0 (energy rescales by the
-        // corrected/base latency ratio). HCA (cr==128) is left untouched.
-        if attn_kind == AttnKind::Csa {
+        // corrected/base latency ratio). HCA (cr==128) is left untouched, and
+        // so is a CSA node whose leaves already stand in their final top-k
+        // regime (`ModuleNodes::topk_settled`).
+        if attn_kind == AttnKind::Csa && !node.topk_settled {
             return self.topk_corrected(
                 value,
                 TopkPhase::Context,
@@ -418,12 +453,15 @@ impl Dsv4Table {
             )
         };
         let cfg = OpInterpConfig::grid(&["batch", "seq_len"], &sol);
-        let value = node.query_value(&cfg, &[b as f64, sequence_tokens as f64])?;
+        let value = node
+            .grid
+            .query_value(&cfg, &[b as f64, sequence_tokens as f64])?;
         // Mirrors Python `GenerationDeepSeekV4AttentionModule` get_silicon
         // (operations/dsv4.py): subtract the topK DELTA for CSA (cr==4) only.
         // Decode is q_len=1 with past_kv = s_total - 1, so the DELTA keys at
-        // (prefix = max(s_total - 1, 0), isl = 1, bs = b).
-        if attn_kind == AttnKind::Csa {
+        // (prefix = max(s_total - 1, 0), isl = 1, bs = b). A settled node
+        // (`ModuleNodes::topk_settled`) takes none.
+        if attn_kind == AttnKind::Csa && !node.topk_settled {
             return self.topk_corrected(
                 value,
                 TopkPhase::Generation,
@@ -440,25 +478,31 @@ impl Dsv4Table {
 
     fn load_csa_context(&self) -> Result<&ModuleNodes, AicError> {
         let cell = self.csa_context.get_or_init(|| {
-            load_module_parquet(&self.csa_context_sources, true).map(context_nodes)
+            let grids = load_module_parquet(&self.csa_context_sources, true, true)?;
+            Ok(context_nodes(
+                self.settle_topk_regimes(grids, TopkPhase::Context)?,
+            ))
         });
         cell.as_ref().map_err(clone_err)
     }
     fn load_hca_context(&self) -> Result<&ModuleNodes, AicError> {
         let cell = self.hca_context.get_or_init(|| {
-            load_module_parquet(&self.hca_context_sources, true).map(context_nodes)
+            load_module_parquet(&self.hca_context_sources, true, false).map(context_nodes)
         });
         cell.as_ref().map_err(clone_err)
     }
     fn load_csa_generation(&self) -> Result<&ModuleNodes, AicError> {
         let cell = self.csa_generation.get_or_init(|| {
-            load_module_parquet(&self.csa_generation_sources, false).map(generation_nodes)
+            let grids = load_module_parquet(&self.csa_generation_sources, false, true)?;
+            Ok(generation_nodes(
+                self.settle_topk_regimes(grids, TopkPhase::Generation)?,
+            ))
         });
         cell.as_ref().map_err(clone_err)
     }
     fn load_hca_generation(&self) -> Result<&ModuleNodes, AicError> {
         let cell = self.hca_generation.get_or_init(|| {
-            load_module_parquet(&self.hca_generation_sources, false).map(generation_nodes)
+            load_module_parquet(&self.hca_generation_sources, false, false).map(generation_nodes)
         });
         cell.as_ref().map_err(clone_err)
     }
@@ -486,24 +530,32 @@ impl Dsv4Table {
         // applies; an uncovered native (Pro today) is a no-op, never a
         // borrowed Flash correction (#1460 review; Python warn-once twin:
         // `_dsv4_topk_calib_for_native`).
-        let grid = self.load_topk_calib()?.and_then(|calib| {
-            match phase {
-                TopkPhase::Context => &calib.delta_v1,
-                TopkPhase::Generation => &calib.delta_v2,
-            }
-            .get(&native_heads)
-        });
-        let corrected = apply_topk_delta(value.latency, grid, shape);
-        let energy = if value.latency > 0.0 && value.energy != 0.0 {
-            value.energy * (corrected / value.latency)
+        let grid = self
+            .load_topk_calib()?
+            .and_then(|calib| calib.delta(phase).get(&native_heads));
+        Ok(topk_corrected_value(value, grid, shape))
+    }
+
+    /// Bring the CSA module rows of one phase into their final top-k regime
+    /// ([`settle_topk_regimes`]). The calibration is loaded only when a
+    /// new-regime row exists and the correction is enabled, so a tree of
+    /// legacy rows loads exactly as before.
+    fn settle_topk_regimes(
+        &self,
+        grids: ModuleGrids,
+        phase: TopkPhase,
+    ) -> Result<ModuleGrids, AicError> {
+        let has_new_rows = grids
+            .regimes
+            .values()
+            .flat_map(BTreeMap::values)
+            .any(|regime| regime.new_rows > 0);
+        let calib = if has_new_rows && topk_correction_enabled() {
+            self.load_topk_calib()?
         } else {
-            value.energy
+            None
         };
-        Ok(LeafValue {
-            latency: corrected,
-            power: value.power,
-            energy,
-        })
+        Ok(settle_topk_regimes(grids, calib, phase))
     }
 
     /// Lazy-load the topK DELTA calibration (Python `_get_dsv4_topk_calib`,
@@ -594,6 +646,7 @@ impl Dsv4Table {
             native_heads,
             local_heads,
         )
+        .map(|node| node.grid)
     }
 
     /// Inclusive bounds of collected prefix keys whose subtree has a leaf.
@@ -689,7 +742,8 @@ impl Dsv4Table {
             AttnKind::Csa => self.load_csa_generation()?,
             AttnKind::Hca => self.load_hca_generation()?,
         };
-        let node = select_resolved(grids, None, kv_quant, gemm_quant, native_heads, local_heads)?;
+        let node =
+            select_resolved(grids, None, kv_quant, gemm_quant, native_heads, local_heads)?.grid;
         let points = perf_interp::node_points(node.node());
         if points.is_empty() {
             return Err(AicError::PerfDatabase(format!(
@@ -736,6 +790,7 @@ impl Dsv4Table {
 /// local), a `[step][isl][batch]` Node (the raw nesting, step axis KEPT).
 fn context_nodes(grids: ModuleGrids) -> ModuleNodes {
     let mut by_keys: BTreeMap<ModuleKey, BTreeMap<u32, BTreeMap<u32, Node>>> = BTreeMap::new();
+    let topk_settled = grids.topk_settled;
     for (key, by_native) in grids.by_keys {
         let per_native = by_keys.entry(key).or_default();
         for (native, by_local) in by_native {
@@ -752,7 +807,7 @@ fn context_nodes(grids: ModuleGrids) -> ModuleNodes {
             }
         }
     }
-    prepare_module_nodes(by_keys)
+    prepare_module_nodes(by_keys, topk_settled)
 }
 
 /// Convert loaded grids into generation-phase engine tables: per (key,
@@ -762,6 +817,7 @@ fn context_nodes(grids: ModuleGrids) -> ModuleNodes {
 /// Python's flat `{b: {s_total: leaf}}` dict overwrite.
 fn generation_nodes(grids: ModuleGrids) -> ModuleNodes {
     let mut by_keys: BTreeMap<ModuleKey, BTreeMap<u32, BTreeMap<u32, Node>>> = BTreeMap::new();
+    let topk_settled = grids.topk_settled;
     for (key, by_native) in grids.by_keys {
         let per_native = by_keys.entry(key).or_default();
         for (native, by_local) in by_native {
@@ -779,13 +835,15 @@ fn generation_nodes(grids: ModuleGrids) -> ModuleNodes {
             }
         }
     }
-    prepare_module_nodes(by_keys)
+    prepare_module_nodes(by_keys, topk_settled)
 }
 
 fn prepare_module_nodes(
     by_keys: BTreeMap<ModuleKey, BTreeMap<u32, BTreeMap<u32, Node>>>,
+    topk_settled: BTreeMap<ModuleKey, BTreeSet<(u32, u32)>>,
 ) -> ModuleNodes {
     ModuleNodes {
+        topk_settled,
         by_keys: by_keys
             .into_iter()
             .map(|(key, by_native)| {
@@ -828,6 +886,14 @@ fn prepare_module_nodes(
 // matching variant's DELTA is SUBTRACTED from the CSA (compress_ratio==4)
 // module latency only; the module ENERGY rescales by the corrected/base
 // latency ratio (see `topk_corrected`).
+// A release whose calibration carries only top_last rows has a module timed
+// on non-degenerate scores (new regime): its module rows take no DELTA and
+// its calibration forms none. The module tables merge releases row by row,
+// so a table can hold new rows next to rows of an earlier release (legacy
+// regime) that still contain the degenerate-score cost. The DELTA follows
+// the row, not the table: it is built from the legacy releases' calibration
+// only (`load_topk_calib_parquet`) and applied to legacy rows only
+// (`settle_topk_regimes`).
 // Gate: AIC_DSV4_TOPK_CORRECTION (default on; set "0" to disable).
 // ---------------------------------------------------------------------------
 
@@ -852,6 +918,27 @@ fn parse_topk_correction_env(value: Option<&str>) -> bool {
 enum TopkPhase {
     Context,
     Generation,
+}
+
+impl TopkPhase {
+    /// The DELTA lookup shape of one module row `(step, isl, batch)`: the
+    /// shape a query that hits the row exactly uses (context keys at
+    /// `(prefix = step, isl, b)`, generation at `(s_total - 1, 1, b)` with
+    /// `s_total = isl + step`).
+    fn row_shape(self, step: u32, isl: u32, batch: u32) -> TopkShape {
+        match self {
+            TopkPhase::Context => TopkShape {
+                prefix: step,
+                isl,
+                bs: batch,
+            },
+            TopkPhase::Generation => TopkShape {
+                prefix: (isl + step).saturating_sub(1),
+                isl: 1,
+                bs: batch,
+            },
+        }
+    }
 }
 
 /// Coordinates for one topK DELTA lookup. Named fields prevent the query
@@ -939,6 +1026,16 @@ struct TopkCalib {
     top_last: BTreeMap<u32, SparseGrid>,
 }
 
+impl TopkCalib {
+    /// The DELTA tables of one phase's selector variant, by native head count.
+    fn delta(&self, phase: TopkPhase) -> &BTreeMap<u32, TopkDeltaGrid> {
+        match phase {
+            TopkPhase::Context => &self.delta_v1,
+            TopkPhase::Generation => &self.delta_v2,
+        }
+    }
+}
+
 /// Python apply formula shared by both apply sites:
 /// `corrected = max(0.0, latency - _dsv4_topk_delta_ms(calib, prefix, isl, bs))`,
 /// with a missing calib meaning DELTA = 0 (no-op).
@@ -947,6 +1044,121 @@ fn apply_topk_delta(latency: f64, grid: Option<&TopkDeltaGrid>, shape: TopkShape
         Some(grid) => (latency - grid.delta_ms(shape)).max(0.0),
         None => latency,
     }
+}
+
+/// [`apply_topk_delta`] on a whole leaf: the energy rescales by
+/// `corrected_latency / latency` when both the base latency and the energy
+/// are non-zero (Python: `if latency > 0.0 and energy: energy *=
+/// corrected_latency / latency`). Shared by the query-time apply site
+/// (`Dsv4Table::topk_corrected`) and the load-time one
+/// ([`settle_topk_regimes`]).
+fn topk_corrected_value(
+    value: LeafValue,
+    grid: Option<&TopkDeltaGrid>,
+    shape: TopkShape,
+) -> LeafValue {
+    let corrected = apply_topk_delta(value.latency, grid, shape);
+    let energy = if value.latency > 0.0 && value.energy != 0.0 {
+        value.energy * (corrected / value.latency)
+    } else {
+        value.energy
+    };
+    LeafValue {
+        latency: corrected,
+        power: value.power,
+        energy,
+    }
+}
+
+/// Whether a calibration `score_mode` is a flat (degenerate-score) row of
+/// either selector variant.
+fn is_flat_mode(mode: &str) -> bool {
+    matches!(mode, "v1_flat" | "v2_flat")
+}
+
+const TOPK_CALIB_FILE: &str = "dsv4_csa_topk_calib_perf.parquet";
+
+/// Whether the release a CSA module file belongs to is new-regime: the
+/// calibration file in the SAME directory exists, has rows, and none of them
+/// is a flat row. Decided per file, over every row (no head-count or
+/// `kernel_source` split): a release's collector either times the module on
+/// degenerate index scores or it does not. A directory without a calibration
+/// file is legacy-regime, which keeps the correction on every row of a tree
+/// that predates the regime change.
+fn calib_is_top_last_only(module_path: &std::path::Path) -> Result<bool, AicError> {
+    let Some(dir) = module_path.parent() else {
+        return Ok(false);
+    };
+    let path = dir.join(TOPK_CALIB_FILE);
+    if !path.exists() {
+        return Ok(false);
+    }
+    let reader = PerfReader::open(&path)?;
+    let score_mode_col = reader.col("score_mode")?;
+    let mut rows = 0usize;
+    for row in reader.rows()? {
+        if is_flat_mode(&row?.str_owned(score_mode_col)?) {
+            return Ok(false);
+        }
+        rows += 1;
+    }
+    Ok(rows > 0)
+}
+
+/// Bring every CSA `(key, native, local)` node into one top-k regime, from
+/// the per-row bookkeeping `load_module_parquet` recorded:
+/// - legacy rows only: untouched. The DELTA is subtracted at query time, at
+///   the query point, exactly as for a tree without new-regime releases.
+/// - new rows only: nothing to correct; the node is marked settled.
+/// - both: each legacy leaf is corrected here, at its own shape, with the
+///   same formula the query-time site uses ([`topk_corrected_value`]) and the
+///   DELTA bucket of the row's native head count; the node is marked settled.
+///   A retained legacy point then returns its corrected latency on an exact
+///   hit, and interpolation runs over leaves of one regime.
+///
+/// `calib` is `None` when the correction is disabled or no calibration
+/// loads: the leaves stay raw, as the query-time site would leave them.
+fn settle_topk_regimes(
+    mut grids: ModuleGrids,
+    calib: Option<&TopkCalib>,
+    phase: TopkPhase,
+) -> ModuleGrids {
+    for (key, nodes) in std::mem::take(&mut grids.regimes) {
+        for ((native, local), regime) in nodes {
+            if regime.new_rows == 0 {
+                continue;
+            }
+            let delta = calib.and_then(|calib| calib.delta(phase).get(&native));
+            if delta.is_some() {
+                let leaves = grids
+                    .by_keys
+                    .get_mut(&key)
+                    .and_then(|by_native| by_native.get_mut(&native))
+                    .and_then(|by_local| by_local.get_mut(&local));
+                if let Some(by_step) = leaves {
+                    for (step, isl, batch) in regime.legacy {
+                        let leaf = by_step
+                            .get_mut(&step)
+                            .and_then(|by_isl| by_isl.get_mut(&isl))
+                            .and_then(|by_batch| by_batch.get_mut(&batch));
+                        if let Some(leaf) = leaf {
+                            *leaf = topk_corrected_value(
+                                *leaf,
+                                delta,
+                                phase.row_shape(step, isl, batch),
+                            );
+                        }
+                    }
+                }
+            }
+            grids
+                .topk_settled
+                .entry(key.clone())
+                .or_default()
+                .insert((native, local));
+        }
+    }
+    grids
 }
 
 /// Load `dsv4_csa_topk_calib_perf.parquet` from an ordered source list and
@@ -968,6 +1180,17 @@ fn apply_topk_delta(latency: f64, grid: Option<&TopkDeltaGrid>, shape: TopkShape
 /// Returns `Ok(None)` when every source file is absent (Python: rows is
 /// None) or no usable row exists (no DELTA pair AND no top_last row —
 /// behaviourally identical to Python's two separate None/{} outcomes).
+///
+/// DELTA pairs form within the legacy regime only. A source is legacy-regime
+/// when its file holds a flat row (`v1_flat` or `v2_flat`, any head count,
+/// any shape; decided per file like [`calib_is_top_last_only`]): its flat AND
+/// top_last rows enter the pairing, first-wins across the legacy sources in
+/// priority order. A source without flat rows belongs to a release whose CSA
+/// module was timed on non-degenerate scores; its top_last rows do not pair
+/// with an earlier release's flat rows, because that difference is no cost
+/// any module row contains. A tree with legacy sources only pairs exactly as
+/// before. The DELTA is consumed by legacy module rows ([`settle_topk_regimes`]
+/// and the query-time site); top_last rows fill the CP grid from every source.
 fn load_topk_calib_parquet(sources: &[PerfSource]) -> Result<Option<TopkCalib>, AicError> {
     let mut by_mode: BTreeMap<u32, BTreeMap<(u32, u32, u32), BTreeMap<String, f64>>> =
         BTreeMap::new();
@@ -987,8 +1210,14 @@ fn load_topk_calib_parquet(sources: &[PerfSource]) -> Result<Option<TopkCalib>, 
         let latency_col = reader.col("latency")?;
         let num_heads_col = reader.col_optional("num_heads");
         let ks_col = reader.col_optional("kernel_source");
+        // This source's usable rows in read order, and whether the file
+        // holds any flat row (its regime; every row counts).
+        let mut rows: Vec<(u32, (u32, u32, u32), String, f64)> = Vec::new();
+        let mut legacy_regime = false;
         for row in reader.rows()? {
             let row = row?;
+            let mode = row.str_owned(score_mode_col)?;
+            legacy_regime |= is_flat_mode(&mode);
             if !kernel_source_ok(source.kernel_sources(), ks_col, &row)? {
                 continue;
             }
@@ -997,7 +1226,6 @@ fn load_topk_calib_parquet(sources: &[PerfSource]) -> Result<Option<TopkCalib>, 
                 row.u32(isl_col)?,
                 row.u32(batch_size_col)?,
             );
-            let mode = row.str_owned(score_mode_col)?;
             let latency = row.f64(latency_col)?;
             // Rows without a native identity are unusable — Python's generic
             // loader (`load_dsv4_sparse_op_data`, now shared by BOTH the
@@ -1007,8 +1235,11 @@ fn load_topk_calib_parquet(sources: &[PerfSource]) -> Result<Option<TopkCalib>, 
             let Some(native) = row.u32_optional(num_heads_col)? else {
                 continue;
             };
+            rows.push((native, (step, isl, bs), mode, latency));
+        }
+        for (native, (step, isl, bs), mode, latency) in rows {
             // The CP composition consumes the context (v1) selector's raw
-            // top_last latencies.
+            // top_last latencies, from every source.
             if mode == "v1_top_last" {
                 top_last
                     .entry(native)
@@ -1018,13 +1249,15 @@ fn load_topk_calib_parquet(sources: &[PerfSource]) -> Result<Option<TopkCalib>, 
                     .entry((isl, step))
                     .or_insert(latency);
             }
-            by_mode
-                .entry(native)
-                .or_default()
-                .entry((step, isl, bs))
-                .or_default()
-                .entry(mode)
-                .or_insert(latency);
+            if legacy_regime {
+                by_mode
+                    .entry(native)
+                    .or_default()
+                    .entry((step, isl, bs))
+                    .or_default()
+                    .entry(mode)
+                    .or_insert(latency);
+            }
         }
     }
     if !any_source {
@@ -1143,7 +1376,7 @@ fn select_resolved<'a>(
     gemm: GemmQuantMode,
     native_heads: u32,
     local_heads: u32,
-) -> Result<&'a PreparedGrid, AicError> {
+) -> Result<ResolvedNode<'a>, AicError> {
     let key = ModuleKey {
         fmha_quant: fmha.map(|f| f.name().to_string()).unwrap_or_default(),
         kv_quant: kv.name().to_string(),
@@ -1167,7 +1400,13 @@ fn select_resolved<'a>(
             by_local.keys().collect::<Vec<_>>()
         ))
     })?;
-    Ok(&by_local[&head])
+    Ok(ResolvedNode {
+        grid: &by_local[&head],
+        topk_settled: grids
+            .topk_settled
+            .get(&key)
+            .is_some_and(|nodes| nodes.contains(&(native, head))),
+    })
 }
 
 fn context_empty_err(local_heads: u32, attn_kind: AttnKind) -> AicError {
@@ -1508,7 +1747,14 @@ pub(crate) fn validate_dsv4_local_head_semantics(
     Ok(())
 }
 
-fn load_module_parquet(sources: &[PerfSource], key_on_fmha: bool) -> Result<ModuleGrids, AicError> {
+/// `track_topk_regime` (the CSA files) records, per node, which winning rows
+/// came from new-regime and which from legacy-regime sources
+/// ([`calib_is_top_last_only`], [`NodeRegime`]) for [`settle_topk_regimes`].
+fn load_module_parquet(
+    sources: &[PerfSource],
+    key_on_fmha: bool,
+    track_topk_regime: bool,
+) -> Result<ModuleGrids, AicError> {
     // Pass 1: parse every row (source order preserved for first-wins) and
     // record the (model, num_heads, tp) pairs the stale-semantics guard needs.
     struct RawRow {
@@ -1519,6 +1765,7 @@ fn load_module_parquet(sources: &[PerfSource], key_on_fmha: bool) -> Result<Modu
         isl: u32,
         batch: u32,
         value: LeafValue,
+        new_regime: bool,
     }
     let mut raw_rows: Vec<RawRow> = Vec::new();
     let mut observed: BTreeMap<(String, String), BTreeSet<(u32, u32)>> = BTreeMap::new();
@@ -1529,6 +1776,7 @@ fn load_module_parquet(sources: &[PerfSource], key_on_fmha: bool) -> Result<Modu
             continue;
         }
         any_source = true;
+        let new_regime = track_topk_regime && calib_is_top_last_only(path)?;
         let reader = PerfReader::open(path)?;
         let mla_dtype_col = if key_on_fmha {
             Some(reader.col("mla_dtype")?)
@@ -1591,6 +1839,7 @@ fn load_module_parquet(sources: &[PerfSource], key_on_fmha: bool) -> Result<Modu
                 isl: row.u32(isl_col)?,
                 batch: row.u32(batch_size_col)?,
                 value: LeafValue::with_power(latency, power),
+                new_regime,
             });
         }
     }
@@ -1611,9 +1860,20 @@ fn load_module_parquet(sources: &[PerfSource], key_on_fmha: bool) -> Result<Modu
     // by the unified #1429 convention; native derives as num_heads * tp_size.
     validate_dsv4_local_head_semantics(&observed)?;
     let mut by_keys: BTreeMap<ModuleKey, ByNative> = BTreeMap::new();
+    let mut regimes: BTreeMap<ModuleKey, BTreeMap<(u32, u32), NodeRegime>> = BTreeMap::new();
     for row in raw_rows {
         let (native_heads, local_heads) = (row.heads * row.tp, row.heads);
-        by_keys
+        let regime = if track_topk_regime {
+            if !regimes.contains_key(&row.key) {
+                regimes.insert(row.key.clone(), BTreeMap::new());
+            }
+            regimes
+                .get_mut(&row.key)
+                .map(|nodes| nodes.entry((native_heads, local_heads)).or_default())
+        } else {
+            None
+        };
+        let leaf = by_keys
             .entry(row.key)
             .or_default()
             .entry(native_heads)
@@ -1624,10 +1884,22 @@ fn load_module_parquet(sources: &[PerfSource], key_on_fmha: bool) -> Result<Modu
             .or_default()
             .entry(row.isl)
             .or_default()
-            .entry(row.batch)
-            .or_insert(row.value);
+            .entry(row.batch);
+        // Only the row that wins the cell counts toward the node's regime.
+        if let std::collections::btree_map::Entry::Vacant(cell) = leaf {
+            cell.insert(row.value);
+            match regime {
+                Some(regime) if row.new_regime => regime.new_rows += 1,
+                Some(regime) => regime.legacy.push((row.step, row.isl, row.batch)),
+                None => {}
+            }
+        }
     }
-    Ok(ModuleGrids { by_keys })
+    Ok(ModuleGrids {
+        by_keys,
+        regimes,
+        topk_settled: BTreeMap::new(),
+    })
 }
 
 fn clone_err(err: &AicError) -> AicError {
@@ -2008,6 +2280,14 @@ mod tests {
     /// Rows are `(num_heads, batch_size, isl, step, latency)` under the fixed
     /// (DeepseekV4ForCausalLM, bfloat16, fp8, fp8_block) key the tests query.
     fn write_module_parquet(path: &Path, rows: &[(i64, i64, i64, i64, f64)]) {
+        let rows: Vec<_> = rows.iter().map(|r| (r.0, 1, r.1, r.2, r.3, r.4)).collect();
+        write_module_parquet_tp(path, &rows);
+    }
+
+    /// Rows are `(num_heads, tp_size, batch_size, isl, step, latency)`;
+    /// `num_heads` is rank-local, so the native head count is
+    /// `num_heads * tp_size`.
+    fn write_module_parquet_tp(path: &Path, rows: &[(i64, i64, i64, i64, i64, f64)]) {
         let schema = Arc::new(
             parse_message_type(
                 "message module {
@@ -2036,11 +2316,11 @@ mod tests {
         write_column::<ByteArrayType>(&mut rg, &vec![ByteArray::from("fp8"); n]);
         write_column::<ByteArrayType>(&mut rg, &vec![ByteArray::from("fp8_block"); n]);
         write_column::<Int64Type>(&mut rg, &rows.iter().map(|r| r.0).collect::<Vec<_>>());
-        write_column::<Int64Type>(&mut rg, &vec![1i64; n]); // tp_size (synthetic rows: tp=1)
         write_column::<Int64Type>(&mut rg, &rows.iter().map(|r| r.1).collect::<Vec<_>>());
         write_column::<Int64Type>(&mut rg, &rows.iter().map(|r| r.2).collect::<Vec<_>>());
         write_column::<Int64Type>(&mut rg, &rows.iter().map(|r| r.3).collect::<Vec<_>>());
-        write_column::<DoubleType>(&mut rg, &rows.iter().map(|r| r.4).collect::<Vec<_>>());
+        write_column::<Int64Type>(&mut rg, &rows.iter().map(|r| r.4).collect::<Vec<_>>());
+        write_column::<DoubleType>(&mut rg, &rows.iter().map(|r| r.5).collect::<Vec<_>>());
         rg.close().unwrap();
         writer.close().unwrap();
     }
@@ -2605,6 +2885,414 @@ mod tests {
         let empty = tempfile::tempdir().unwrap();
         let bare = Dsv4Table::new(empty.path().to_path_buf());
         assert_eq!(bare.csa_topk_top_last(2048, 0, 64, 1).unwrap(), None);
+    }
+
+    /// A calib table with only top_last rows (no flat rows for any shape):
+    /// (a) no DELTA pair forms, so CSA context and generation module rows
+    /// come back uncorrected (the module leaves 1.0 and 0.5 exactly), and
+    /// (b) the raw top_last rows still serve the CP composition lookup.
+    #[test]
+    fn topk_calib_with_only_top_last_rows_has_no_delta_and_serves_cp() {
+        let spec = b200_sxm_spec();
+        let dir = tempfile::tempdir().unwrap();
+        // (num_heads, batch_size, isl, step, latency)
+        write_module_parquet(
+            &dir.path().join("dsv4_csa_context_module_perf.parquet"),
+            &[(64, 8, 512, 0, 1.0)],
+        );
+        write_module_parquet(
+            &dir.path().join("dsv4_csa_generation_module_perf.parquet"),
+            &[(64, 16, 1, 384, 0.5)], // s_total = 385
+        );
+        write_calib_parquet_with_heads(
+            &dir.path().join("dsv4_csa_topk_calib_perf.parquet"),
+            &[
+                ("v1_top_last", 0, 512, 8, 64, 0.18),
+                ("v1_top_last", 0, 4096, 8, 64, 1.5),
+                ("v2_top_last", 384, 1, 16, 64, 0.02),
+            ],
+        );
+        let table = Dsv4Table::new(dir.path().to_path_buf());
+
+        let calib = table.load_topk_calib().unwrap().expect("calib must load");
+        assert!(calib.delta_v1.is_empty());
+        assert!(calib.delta_v2.is_empty());
+
+        let context = table
+            .query_context(
+                &spec,
+                AttnKind::Csa,
+                8,
+                512,
+                64,
+                64,
+                KvCacheQuantMode::Fp8,
+                FmhaQuantMode::Bfloat16,
+                GemmQuantMode::Fp8Block,
+                "DeepseekV4ForCausalLM",
+                0,
+                None,
+            )
+            .unwrap()
+            .latency;
+        assert_eq!(context, 1.0);
+        let generation = table
+            .query_generation(
+                &spec,
+                AttnKind::Csa,
+                16,
+                385,
+                64,
+                64,
+                KvCacheQuantMode::Fp8,
+                GemmQuantMode::Fp8Block,
+                "DeepseekV4ForCausalLM",
+                None,
+            )
+            .unwrap()
+            .latency;
+        assert_eq!(generation, 0.5);
+
+        // The context (v1) top_last rows the CP composition reads.
+        assert_eq!(table.csa_topk_top_last(512, 0, 64, 8).unwrap(), Some(0.18));
+        assert_eq!(table.csa_topk_top_last(4096, 0, 64, 8).unwrap(), Some(1.5));
+    }
+
+    /// Across sources, DELTA pairs form among the legacy-regime calibration
+    /// files (the ones with flat rows) only, and the DELTA is applied to a
+    /// module row by the regime of the release the row belongs to.
+    /// Each case loads calibration `[primary, sibling]` through a `Dsv4Table`
+    /// whose one CSA context module row, 1.0 at (b=8, isl=512, prefix=0),
+    /// sits in the primary directory, so the context query returns 1.0 minus
+    /// the DELTA when the primary release is legacy-regime and 1.0 when it is
+    /// new-regime.
+    #[test]
+    fn topk_delta_pairs_form_among_legacy_sources_and_follow_the_module_row() {
+        if !topk_correction_enabled() {
+            return; // suite launched with AIC_DSV4_TOPK_CORRECTION=0
+        }
+        let spec = b200_sxm_spec();
+        type CalibRow = (&'static str, i64, i64, i64, i64, f64);
+        // An earlier release with both score modes, for native 64 and 128.
+        let sibling_rows: [CalibRow; 7] = [
+            ("v1_flat", 0, 512, 8, 64, 0.30),
+            ("v1_top_last", 0, 512, 8, 64, 0.20), // DELTA = 0.10
+            ("v1_top_last", 0, 4096, 8, 64, 1.5),
+            ("v2_flat", 384, 1, 16, 64, 0.05),
+            ("v2_top_last", 384, 1, 16, 64, 0.02), // DELTA = 0.03
+            ("v1_flat", 0, 512, 8, 128, 0.50),
+            ("v1_top_last", 0, 512, 8, 128, 0.10), // DELTA = 0.40
+        ];
+        // Build `[primary, sibling]`; `None` leaves the primary file absent.
+        let load = |primary_rows: Option<&[CalibRow]>| {
+            let dir = tempfile::tempdir().unwrap();
+            let primary = dir.path().join("primary");
+            let sibling = dir.path().join("sibling");
+            std::fs::create_dir_all(&primary).unwrap();
+            std::fs::create_dir_all(&sibling).unwrap();
+            write_module_parquet(
+                &primary.join("dsv4_csa_context_module_perf.parquet"),
+                &[(64, 8, 512, 0, 1.0)],
+            );
+            let name = "dsv4_csa_topk_calib_perf.parquet";
+            if let Some(rows) = primary_rows {
+                write_calib_parquet_with_heads(&primary.join(name), rows);
+            }
+            write_calib_parquet_with_heads(&sibling.join(name), &sibling_rows);
+            let mut map = PerfDbSources::default();
+            map.insert(
+                name.to_string(),
+                vec![
+                    PerfSource(primary.join(name), None),
+                    PerfSource(sibling.join(name), None),
+                ],
+            );
+            let table = Dsv4Table::with_sources(primary, &SourceResolver::fixed(map)).unwrap();
+            (dir, table)
+        };
+        let context_csa = |table: &Dsv4Table| {
+            table
+                .query_context(
+                    &spec,
+                    AttnKind::Csa,
+                    8,
+                    512,
+                    64,
+                    64,
+                    KvCacheQuantMode::Fp8,
+                    FmhaQuantMode::Bfloat16,
+                    GemmQuantMode::Fp8Block,
+                    "DeepseekV4ForCausalLM",
+                    0,
+                    None,
+                )
+                .unwrap()
+                .latency
+        };
+        let shape = TopkShape {
+            prefix: 0,
+            isl: 512,
+            bs: 8,
+        };
+
+        // Primary with only top_last rows: a new-regime release. Its module
+        // row is uncorrected. The sibling's own pairs still form (0.30 - 0.20
+        // = 0.10; the primary's top_last 0.18 does not pair with the
+        // sibling's flat row), for the legacy rows of other tables. top_last
+        // still serves the CP lookup: the primary wins the shared shape, the
+        // sibling fills 4096.
+        let (_dir, table) = load(Some(&[("v1_top_last", 0, 512, 8, 64, 0.18)]));
+        let calib = table.load_topk_calib().unwrap().expect("calib must load");
+        let got = calib.delta_v1[&64].get(shape).unwrap();
+        assert!((got - 0.10).abs() < 1e-12, "sibling DELTA {got}");
+        assert_eq!(context_csa(&table), 1.0);
+        assert_eq!(table.csa_topk_top_last(512, 0, 64, 8).unwrap(), Some(0.18));
+        assert_eq!(table.csa_topk_top_last(4096, 0, 64, 8).unwrap(), Some(1.5));
+        let got = calib.delta_v1[&128].get(shape).unwrap();
+        assert!((got - 0.40).abs() < 1e-12, "native 128 DELTA {got}");
+
+        // Primary with flat rows: a legacy release, as before. Its own pair
+        // gives 0.30 - 0.18 = 0.12 at the shared shape, and the sibling's
+        // generation pair still fills.
+        let (_dir, table) = load(Some(&[
+            ("v1_flat", 0, 512, 8, 64, 0.30),
+            ("v1_top_last", 0, 512, 8, 64, 0.18),
+        ]));
+        let calib = table.load_topk_calib().unwrap().expect("calib must load");
+        let got = calib.delta_v1[&64].get(shape).unwrap();
+        assert!((got - 0.12).abs() < 1e-12, "primary DELTA {got}");
+        let generation = TopkShape {
+            prefix: 384,
+            isl: 1,
+            bs: 16,
+        };
+        let got = calib.delta_v2[&64].get(generation).unwrap();
+        assert!((got - 0.03).abs() < 1e-12, "sibling generation DELTA {got}");
+        assert!((context_csa(&table) - 0.88).abs() < 1e-12);
+
+        // Primary with a flat row but no top_last partner at the shape:
+        // still a legacy file, so the sibling's top_last pairs with it as
+        // before (0.30 - 0.20 = 0.10).
+        let (_dir, table) = load(Some(&[("v1_flat", 0, 512, 8, 64, 0.30)]));
+        assert!((context_csa(&table) - 0.90).abs() < 1e-12);
+
+        // Primary without a calibration file: a legacy release (the state
+        // of every tree before the regime change), so the sibling's DELTA
+        // 0.10 applies as before.
+        let (_dir, table) = load(None);
+        assert!((context_csa(&table) - 0.90).abs() < 1e-12);
+        // The regime is decided per file: a primary whose calibration holds
+        // top_last rows only, even for another head count, is a new-regime
+        // release and its native-64 module row stays uncorrected.
+        let (_dir, table) = load(Some(&[("v1_top_last", 0, 512, 8, 128, 0.10)]));
+        assert_eq!(context_csa(&table), 1.0);
+        let calib = table.load_topk_calib().unwrap().expect("calib must load");
+        let got = calib.delta_v1[&128].get(shape).unwrap();
+        assert!((got - 0.40).abs() < 1e-12, "native 128 DELTA {got}");
+    }
+
+    /// The fixture of the mixed-regime tests: an earlier release (`old/`,
+    /// calibration with flat rows) next to a new one (`new/`, top_last rows
+    /// only), each with CSA context and generation module rows. Returned
+    /// sources are `[new, old]` per file name, the order a query at the new
+    /// release resolves.
+    ///
+    /// Context rows (b=8, isl=512), native 64:
+    /// - local 64: new 0.9 at prefix 0 (wins over old 1.0) and 2.0 at 2048;
+    ///   old 1.4 at prefix 1024 is retained -> a node of both regimes;
+    /// - local 32 (tp=2): old 0.7 at prefix 0 only -> a legacy-only node.
+    /// Generation rows (b=16, isl=1): local 64 old 0.5 at step 384 retained
+    /// next to new 0.8 at step 1024; local 32 old 0.3 at step 384.
+    /// Old calibration DELTAs (flat - top_last, native 64): context 0.10 at
+    /// (prefix 0, 512, 8) and 0.25 at (1024, 512, 8); generation 0.03 at
+    /// (384, 1, 16).
+    fn mixed_regime_roots() -> (tempfile::TempDir, PerfDbSources) {
+        let dir = tempfile::tempdir().unwrap();
+        let (new, old) = (dir.path().join("new"), dir.path().join("old"));
+        std::fs::create_dir_all(&new).unwrap();
+        std::fs::create_dir_all(&old).unwrap();
+        let context = "dsv4_csa_context_module_perf.parquet";
+        let generation = "dsv4_csa_generation_module_perf.parquet";
+        // (num_heads, tp_size, batch_size, isl, step, latency)
+        write_module_parquet_tp(
+            &old.join(context),
+            &[
+                (64, 1, 8, 512, 0, 1.0),
+                (64, 1, 8, 512, 1024, 1.4),
+                (32, 2, 8, 512, 0, 0.7),
+            ],
+        );
+        write_module_parquet_tp(
+            &new.join(context),
+            &[(64, 1, 8, 512, 0, 0.9), (64, 1, 8, 512, 2048, 2.0)],
+        );
+        write_module_parquet_tp(
+            &old.join(generation),
+            &[(64, 1, 16, 1, 384, 0.5), (32, 2, 16, 1, 384, 0.3)],
+        );
+        write_module_parquet_tp(&new.join(generation), &[(64, 1, 16, 1, 1024, 0.8)]);
+        // (score_mode, step, isl, batch_size, num_heads, latency)
+        write_calib_parquet_with_heads(
+            &old.join(TOPK_CALIB_FILE),
+            &[
+                ("v1_flat", 0, 512, 8, 64, 0.30),
+                ("v1_top_last", 0, 512, 8, 64, 0.20),
+                ("v1_flat", 1024, 512, 8, 64, 0.50),
+                ("v1_top_last", 1024, 512, 8, 64, 0.25),
+                ("v2_flat", 384, 1, 16, 64, 0.05),
+                ("v2_top_last", 384, 1, 16, 64, 0.02),
+            ],
+        );
+        write_calib_parquet_with_heads(
+            &new.join(TOPK_CALIB_FILE),
+            &[
+                ("v1_top_last", 0, 512, 8, 64, 0.15),
+                ("v2_top_last", 1024, 1, 16, 64, 0.01),
+            ],
+        );
+        let mut map = PerfDbSources::default();
+        for name in [context, generation, TOPK_CALIB_FILE] {
+            map.insert(
+                name.to_string(),
+                vec![
+                    PerfSource(new.join(name), None),
+                    PerfSource(old.join(name), None),
+                ],
+            );
+        }
+        (dir, map)
+    }
+
+    /// Review finding on the 2026-11 tables: a module table that merges a
+    /// new-regime release with an earlier one keeps the correction on the
+    /// earlier release's rows. Expected values are the fixture's leaves minus
+    /// the fixture's DELTAs, by hand:
+    /// - a retained old point in a node that also holds new rows: 1.4 - 0.25
+    ///   (context), 0.5 - 0.03 (generation);
+    /// - a new point: its leaf, uncorrected;
+    /// - a node of old rows only: 0.7 - 0.10 and 0.3 - 0.03, the same values
+    ///   a table over the old release alone returns.
+    #[test]
+    fn csa_legacy_rows_keep_their_topk_correction_next_to_new_rows() {
+        if !topk_correction_enabled() {
+            return; // suite launched with AIC_DSV4_TOPK_CORRECTION=0
+        }
+        let spec = b200_sxm_spec();
+        let (dir, map) = mixed_regime_roots();
+        let context = |table: &Dsv4Table, local_heads, prefix| {
+            table
+                .query_context(
+                    &spec,
+                    AttnKind::Csa,
+                    8,
+                    512,
+                    local_heads,
+                    64,
+                    KvCacheQuantMode::Fp8,
+                    FmhaQuantMode::Bfloat16,
+                    GemmQuantMode::Fp8Block,
+                    "DeepseekV4ForCausalLM",
+                    prefix,
+                    None,
+                )
+                .unwrap()
+                .latency
+        };
+        let generation = |table: &Dsv4Table, local_heads, s_total| {
+            table
+                .query_generation(
+                    &spec,
+                    AttnKind::Csa,
+                    16,
+                    s_total,
+                    local_heads,
+                    64,
+                    KvCacheQuantMode::Fp8,
+                    GemmQuantMode::Fp8Block,
+                    "DeepseekV4ForCausalLM",
+                    None,
+                )
+                .unwrap()
+                .latency
+        };
+        let close = |got: f64, want: f64| (got - want).abs() < 1e-12;
+
+        let merged =
+            Dsv4Table::with_sources(dir.path().join("new"), &SourceResolver::fixed(map)).unwrap();
+        // New points stay uncorrected (the new row wins the shared cell).
+        assert_eq!(context(&merged, 64, 0), 0.9);
+        assert_eq!(context(&merged, 64, 2048), 2.0);
+        assert_eq!(generation(&merged, 64, 1025), 0.8);
+        // Retained old points keep the old release's correction.
+        assert!(close(context(&merged, 64, 1024), 1.15));
+        assert!(close(generation(&merged, 64, 385), 0.47));
+        // A node of old rows only is corrected at the query point.
+        assert!(close(context(&merged, 32, 0), 0.60));
+        assert!(close(generation(&merged, 32, 385), 0.27));
+
+        // The DELTA pairs within the old release (0.30 - 0.20), not across
+        // releases (0.30 - 0.15); the CP grid still prefers the new top_last.
+        let calib = merged.load_topk_calib().unwrap().expect("calib must load");
+        let pair = calib.delta_v1[&64]
+            .get(TopkShape {
+                prefix: 0,
+                isl: 512,
+                bs: 8,
+            })
+            .unwrap();
+        assert!(close(pair, 0.10), "DELTA {pair}");
+        assert_eq!(merged.csa_topk_top_last(512, 0, 64, 8).unwrap(), Some(0.15));
+        assert_eq!(
+            merged.csa_topk_top_last(512, 1024, 64, 8).unwrap(),
+            Some(0.25)
+        );
+
+        // The old release alone: every node is corrected at query time, and
+        // its rows return what they return in the merged table.
+        let old_only = Dsv4Table::new(dir.path().join("old"));
+        assert!(close(context(&old_only, 64, 0), 0.90));
+        assert!(close(context(&old_only, 64, 1024), 1.15));
+        assert!(close(context(&old_only, 32, 0), 0.60));
+        assert!(close(generation(&old_only, 64, 385), 0.47));
+        assert!(close(generation(&old_only, 32, 385), 0.27));
+    }
+
+    /// With the correction disabled no calibration is handed to the settle
+    /// step: a retained old leaf stays raw (as the query-time site leaves
+    /// it), and the regime bookkeeping is unchanged — the node of both
+    /// regimes is settled, the legacy-only node is not.
+    #[test]
+    fn csa_topk_settle_without_calibration_leaves_rows_raw() {
+        assert!(!parse_topk_correction_env(Some("0")));
+        let (_dir, map) = mixed_regime_roots();
+        let sources = &map["dsv4_csa_context_module_perf.parquet"];
+        let grids = load_module_parquet(sources, true, true).unwrap();
+        let grids = settle_topk_regimes(grids, None, TopkPhase::Context);
+        let (key, by_native) = grids.by_keys.iter().next().expect("one quant key");
+        assert_eq!(by_native[&64][&64][&1024][&512][&8].latency, 1.4);
+        assert_eq!(by_native[&64][&64][&0][&512][&8].latency, 0.9);
+        assert_eq!(
+            grids.topk_settled[key],
+            BTreeSet::from([(64, 64)]),
+            "only the node with new rows is settled"
+        );
+        // A load that does not track regimes (the HCA files) settles nothing.
+        let untracked = load_module_parquet(sources, true, false).unwrap();
+        let untracked = settle_topk_regimes(untracked, None, TopkPhase::Context);
+        assert!(untracked.topk_settled.is_empty());
+    }
+
+    /// The release regime is read from the calibration file next to the
+    /// module file: top_last rows only -> new; any flat row, or no file ->
+    /// legacy.
+    #[test]
+    fn csa_release_regime_follows_the_sibling_calibration_file() {
+        let (dir, _map) = mixed_regime_roots();
+        let module = "dsv4_csa_context_module_perf.parquet";
+        assert!(calib_is_top_last_only(&dir.path().join("new").join(module)).unwrap());
+        assert!(!calib_is_top_last_only(&dir.path().join("old").join(module)).unwrap());
+        let bare = tempfile::tempdir().unwrap();
+        assert!(!calib_is_top_last_only(&bare.path().join(module)).unwrap());
     }
 
     /// Rows without a `num_heads` key cell never load — for the top_last

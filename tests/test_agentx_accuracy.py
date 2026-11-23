@@ -5,6 +5,7 @@
 import hashlib
 import io
 import json
+import os
 import posixpath
 import sys
 import zipfile
@@ -225,11 +226,15 @@ def test_reviewed_database_pin_overrides_current_slot_and_never_borrows_data(tmp
             resources=SimpleNamespace(files=lambda package: tmp_path),
         ),
     )
+    # predict() runs as its own process; here the opt-in it sets must not outlive the test.
+    monkeypatch.setenv("AIC_ALLOW_UNLISTED_VERSIONS", "0")
     monkeypatch.setattr(agentx_predict, "runtime_module", modules.__getitem__)
     missing = agentx_predict.predict(config, tmp_path)
     assert missing["reason"] == "database_unavailable"
     assert missing["prediction_backend_version"] == version
     assert not captured
+    # The pinned collection stays readable after newer collections take the query slots.
+    assert os.environ["AIC_ALLOW_UNLISTED_VERSIONS"] == "1"
 
     def unavailable_resources(_):
         raise ModuleNotFoundError("Older wheel has no core resources")

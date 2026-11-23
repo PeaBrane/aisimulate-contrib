@@ -60,7 +60,7 @@ const TOLERANCE: f64 = 0.05;
 /// `aisim.sdk.memory` (which transitively imports the maturin-built
 /// `aisim_core`).
 fn python_memory_importable() -> bool {
-    Python::with_gil(|py| match py.import("aisim.sdk.memory") {
+    Python::attach(|py| match py.import("aisim.sdk.memory") {
         Ok(_) => true,
         Err(e) => {
             let exe: String = py

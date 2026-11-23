@@ -58,6 +58,8 @@ pub struct SchedulerRank {
     /// decode speedup is 1, so the shared duration takes one speedup. With
     /// another decode speedup, every rank keeps its own phase pricing.
     group_pricing: bool,
+    phase_priced_forward_ns: u128,
+    tracks_attention_dp_wait: bool,
     /// When the scheduled pass started, until it is resolved.
     scheduled_at_ms: Option<f64>,
     /// vLLM `launch`: outputs the engine loop has not returned yet.
@@ -194,12 +196,16 @@ impl SchedulerRank {
                 capture_kv_events,
             )),
         };
+        let tracks_attention_dp_wait =
+            identity.dp_size.get() > 1 && timing.tracks_attention_dp_wait();
         Ok(Self {
             core,
             handoff_requests: HashMap::new(),
             timing,
             dp_rank: identity.dp_rank,
             group_pricing: config.decode_speedup_ratio == 1.0,
+            phase_priced_forward_ns: 0,
+            tracks_attention_dp_wait,
             scheduled_at_ms: None,
             held_outputs: config.launch.map(|_| HeldOutputs::default()),
         })
@@ -415,6 +421,18 @@ impl RankEngine for SchedulerRank {
             .context("external iteration prediction failed")
     }
 
+    fn tracks_attention_dp_wait(&self) -> bool {
+        self.tracks_attention_dp_wait
+    }
+
+    fn phase_priced_forward_ns(&self) -> u128 {
+        self.phase_priced_forward_ns
+    }
+
+    fn record_phase_priced_wait(&self, wait_ms: f64) -> Result<()> {
+        self.timing.record_phase_priced_wait(wait_ms)
+    }
+
     fn resolve_pass(
         &mut self,
         iteration: Option<&IterationMs>,
@@ -424,6 +442,10 @@ impl RankEngine for SchedulerRank {
             .take()
             .ok_or_else(|| anyhow!("scheduler rank has no scheduled pass to resolve"))?;
         let pass = self.core.resolve_pass(iteration)?;
+        if self.tracks_attention_dp_wait && iteration.is_none() {
+            self.phase_priced_forward_ns =
+                pass.forward_time.prefill.as_nanos() + pass.forward_time.decode.as_nanos();
+        }
         let end_ms = pass.end_ms;
         let end_without_selection_ms = pass.end_without_selection_ms;
         let previous_returned_ms = pass.previous_returned_ms;

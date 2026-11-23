@@ -14,7 +14,7 @@
 //!   `decode_step_latency`) are the surface the Python sweep / Mocker bridge
 //!   calls per point. The agg sweep is orchestrated in Python; there is no
 //!   Rust `run_agg`. Each method
-//!   releases the GIL around the Rust compute via [`Python::allow_threads`],
+//!   releases the GIL around the Rust compute via [`Python::detach`],
 //!   so the Rust compute runs without holding the GIL.
 //! * **Rust → Python → Rust (embedded path).** [`AicEngineBuilder`] is the
 //!   Rust entry point. It crosses into Python once to run
@@ -33,7 +33,7 @@ use std::sync::Arc;
 
 use pyo3::exceptions::{PyNotImplementedError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::sync::GILOnceCell;
+use pyo3::sync::PyOnceLock;
 use pyo3::types::PyType;
 
 use crate::common::error::AicError;
@@ -138,23 +138,23 @@ fn validate_afd_model_shape(
 /// extension never imports the sdk (the sdk imports aisim_core — an
 /// eager import here would be a cycle), and left empty in pure-Rust contexts
 /// where the sdk is not installed (fallback to `PyValueError`).
-static PERF_DATA_NOT_AVAILABLE_ERROR: GILOnceCell<Py<PyType>> = GILOnceCell::new();
-static EMPIRICAL_NOT_IMPLEMENTED_ERROR: GILOnceCell<Py<PyType>> = GILOnceCell::new();
-static MISSING_SYSTEM_FLOPS_ERROR: GILOnceCell<Py<PyType>> = GILOnceCell::new();
-static SOL_NOT_IMPLEMENTED_ERROR: GILOnceCell<Py<PyType>> = GILOnceCell::new();
+static PERF_DATA_NOT_AVAILABLE_ERROR: PyOnceLock<Py<PyType>> = PyOnceLock::new();
+static EMPIRICAL_NOT_IMPLEMENTED_ERROR: PyOnceLock<Py<PyType>> = PyOnceLock::new();
+static MISSING_SYSTEM_FLOPS_ERROR: PyOnceLock<Py<PyType>> = PyOnceLock::new();
+static SOL_NOT_IMPLEMENTED_ERROR: PyOnceLock<Py<PyType>> = PyOnceLock::new();
 
 /// Resolve (and memoize) one sdk error class; `None` when the sdk is not
 /// importable, so the caller falls back to `PyValueError`.
 fn sdk_error_type(
     py: Python<'_>,
-    cell: &'static GILOnceCell<Py<PyType>>,
+    cell: &'static PyOnceLock<Py<PyType>>,
     name: &str,
 ) -> Option<Py<PyType>> {
     cell.get_or_try_init(py, || -> PyResult<Py<PyType>> {
         Ok(py
             .import("aisim_core.sdk.errors")?
             .getattr(name)?
-            .downcast_into::<PyType>()?
+            .cast_into::<PyType>()?
             .unbind())
     })
     .ok()
@@ -205,7 +205,7 @@ pub(crate) fn aic_to_py(e: AicError) -> PyErr {
     if let AicError::NotImplemented(message) = e {
         return PyNotImplementedError::new_err(message);
     }
-    let sdk_class: Option<(&'static GILOnceCell<Py<PyType>>, &str)> = if e.is_missing_perf_data() {
+    let sdk_class: Option<(&'static PyOnceLock<Py<PyType>>, &str)> = if e.is_missing_perf_data() {
         Some((&PERF_DATA_NOT_AVAILABLE_ERROR, "PerfDataNotAvailableError"))
     } else if matches!(e, AicError::EmpiricalNotImplemented(_)) {
         Some((
@@ -221,9 +221,9 @@ pub(crate) fn aic_to_py(e: AicError) -> PyErr {
     };
     let message = e.to_string();
     if let Some((cell, name)) = sdk_class {
-        // `with_gil` is re-entrant, so this is safe whether the caller holds
-        // the GIL (from_spec) or just re-acquired it (post-allow_threads).
-        let typed = Python::with_gil(|py| {
+        // `attach` is re-entrant, so this is safe whether the caller holds
+        // the GIL (from_spec) or just re-acquired it (post-detach).
+        let typed = Python::attach(|py| {
             sdk_error_type(py, cell, name)
                 .map(|ty| PyErr::from_type(ty.into_bound(py), message.clone()))
         });
@@ -250,14 +250,14 @@ pub(crate) fn parse_mode(mode: &str) -> PyResult<StaticMode> {
 
 /// Discover the ordered roots using the same SDK/environment policy as the Python facade.
 pub(crate) fn resolve_forward_pass_systems_roots() -> Result<Vec<PathBuf>, AicError> {
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         py.import("aisim_core.sdk.rust_engine_step")?
             .getattr("_resolve_forward_pass_systems_paths")?
             .call1((Vec::<String>::new(),))?
             .extract::<Vec<PathBuf>>()
     })
     .map_err(|error: PyErr| {
-        if Python::with_gil(|py| error.is_instance_of::<PyValueError>(py)) {
+        if Python::attach(|py| error.is_instance_of::<PyValueError>(py)) {
             AicError::InvalidEngineConfig(format!("resolve systems paths: {error}"))
         } else {
             AicError::DataRoot(format!("resolve systems paths: {error}"))
@@ -280,7 +280,7 @@ pub(crate) fn resolve_systems_root(systems_path: Option<&str>) -> PyResult<PathB
     if let Some(p) = std::env::var_os("AICONFIGURATOR_SYSTEMS_PATH") {
         return Ok(PathBuf::from(p));
     }
-    let installed_root = Python::with_gil(|py| -> PyResult<Option<PathBuf>> {
+    let installed_root = Python::attach(|py| -> PyResult<Option<PathBuf>> {
         let Ok(perf_database) = py.import("aisim_core.sdk.perf_database") else {
             return Ok(None);
         };
@@ -329,7 +329,7 @@ impl AicEngine {
     /// Mocker, `tests/embedded_round_trip.rs`), which cannot reach the private
     /// `inner` [`Engine`] directly. Delegates to
     /// [`Engine::predict_prefill_latency`]. The `#[pymethods]`
-    /// `predict_prefill_latency` wraps this in `allow_threads`; this inherent
+    /// `predict_prefill_latency` wraps this in `detach`; this inherent
     /// form is the same compute with no GIL ever acquired.
     pub fn prefill_latency_ms(&self, bs: u32, isl: u32, prefix: u32) -> Result<f64, AicError> {
         self.inner.predict_prefill_latency(bs, isl, prefix)
@@ -358,10 +358,9 @@ impl AicEngine {
         // Engine::from_spec_bytes does from_bincode + PerfDatabase::load +
         // Engine::build. No GIL is held inside the Rust core; releasing it
         // here lets concurrent Python threads proceed during the DB load.
-        let engine = Python::with_gil(|py| {
-            py.allow_threads(|| Engine::from_spec_bytes(bytes, &systems_root))
-        })
-        .map_err(aic_to_py)?;
+        let engine =
+            Python::attach(|py| py.detach(|| Engine::from_spec_bytes(bytes, &systems_root)))
+                .map_err(aic_to_py)?;
         Ok(AicEngine::new(engine))
     }
 
@@ -398,7 +397,7 @@ impl AicEngine {
         mode: &str,
         stride: u32,
     ) -> PyResult<(f64, f64, f64)> {
-        // Arg extraction / mode parsing happen BEFORE allow_threads.
+        // Arg extraction / mode parsing happen BEFORE detach.
         let rt = RuntimeConfig {
             batch_size,
             beam_width,
@@ -413,7 +412,7 @@ impl AicEngine {
         self.inner.reset_provenance();
         // Rust compute runs with the GIL released.
         let result: StaticResult = py
-            .allow_threads(|| self.inner.run_static(&rt, mode, stride))
+            .detach(|| self.inner.run_static(&rt, mode, stride))
             .map_err(aic_to_py)?;
         Ok((result.context_ms, result.generation_ms, result.total_ms))
     }
@@ -445,7 +444,7 @@ impl AicEngine {
         prefix: u32,
     ) -> PyResult<f64> {
         self.inner.reset_provenance();
-        py.allow_threads(|| self.inner.predict_prefill_latency(bs, isl, prefix))
+        py.detach(|| self.inner.predict_prefill_latency(bs, isl, prefix))
             .map_err(aic_to_py)
     }
 
@@ -455,7 +454,7 @@ impl AicEngine {
     #[pyo3(signature = (bs, isl, osl=2))]
     fn predict_decode_latency(&self, py: Python<'_>, bs: u32, isl: u32, osl: u32) -> PyResult<f64> {
         self.inner.reset_provenance();
-        py.allow_threads(|| self.inner.predict_decode_latency(bs, isl, osl))
+        py.detach(|| self.inner.predict_decode_latency(bs, isl, osl))
             .map_err(aic_to_py)
     }
 
@@ -469,7 +468,7 @@ impl AicEngine {
         total_kv_read_tokens: u32,
     ) -> PyResult<f64> {
         self.inner.reset_provenance();
-        py.allow_threads(|| {
+        py.detach(|| {
             self.inner.predict_prefill_latency_total(
                 batch_size,
                 total_prefill_tokens,
@@ -488,7 +487,7 @@ impl AicEngine {
         total_past_kv_tokens: u32,
     ) -> PyResult<f64> {
         self.inner.reset_provenance();
-        py.allow_threads(|| {
+        py.detach(|| {
             self.inner
                 .predict_decode_latency_total(batch_size, total_past_kv_tokens)
         })
@@ -498,7 +497,7 @@ impl AicEngine {
     /// Highest collected decode KV-read total for an FPM engine, or `None`
     /// for an op-level engine.
     fn fpm_decode_kv_ceiling(&self, py: Python<'_>) -> PyResult<Option<u32>> {
-        py.allow_threads(|| self.inner.fpm_decode_kv_ceiling())
+        py.detach(|| self.inner.fpm_decode_kv_ceiling())
             .map_err(aic_to_py)
     }
 
@@ -523,7 +522,7 @@ impl AicEngine {
         gen_seq_imbalance_correction_scale: f64,
     ) -> PyResult<f64> {
         self.inner.reset_provenance();
-        py.allow_threads(|| {
+        py.detach(|| {
             self.inner.mixed_step_latency(
                 ctx_tokens,
                 gen_tokens,
@@ -553,7 +552,7 @@ impl AicEngine {
         gen_seq_imbalance_correction_scale: f64,
     ) -> PyResult<(f64, f64, f64, f64)> {
         self.inner.reset_provenance();
-        py.allow_threads(|| {
+        py.detach(|| {
             self.inner.mixed_step_breakdown(
                 ctx_tokens,
                 gen_tokens,
@@ -581,7 +580,7 @@ impl AicEngine {
         gen_seq_imbalance_correction_scale: f64,
     ) -> PyResult<f64> {
         self.inner.reset_provenance();
-        py.allow_threads(|| {
+        py.detach(|| {
             self.inner
                 .decode_step_latency(gen_tokens, isl, osl, gen_seq_imbalance_correction_scale)
         })
@@ -631,7 +630,7 @@ impl AicEngine {
         };
         let mode = parse_mode(mode)?;
         self.inner.reset_provenance();
-        py.allow_threads(|| self.inner.run_static_per_op(&rt, mode, stride))
+        py.detach(|| self.inner.run_static_per_op(&rt, mode, stride))
             .map_err(aic_to_py)
     }
 
@@ -674,7 +673,7 @@ impl AicEngine {
         };
         let mode = parse_mode(mode)?;
         self.inner.reset_provenance();
-        py.allow_threads(|| {
+        py.detach(|| {
             self.inner
                 .run_static_per_op_with_metadata(&rt, mode, stride)
         })
@@ -721,7 +720,7 @@ impl AicEngine {
         };
         let mode = parse_mode(mode)?;
         self.inner.reset_provenance();
-        py.allow_threads(|| {
+        py.detach(|| {
             self.inner
                 .run_static_per_op_with_coverage(&rt, mode, stride)
         })
@@ -749,7 +748,7 @@ impl AicEngine {
         gen_seq_imbalance_correction_scale: f64,
     ) -> PyResult<(Vec<PerOpValue>, Vec<PerOpValue>, Vec<PerOpValue>)> {
         self.inner.reset_provenance();
-        py.allow_threads(|| {
+        py.detach(|| {
             self.inner.mixed_step_breakdown_per_op(
                 ctx_tokens,
                 gen_tokens,
@@ -782,7 +781,7 @@ impl AicEngine {
         gen_seq_imbalance_correction_scale: f64,
     ) -> PyResult<(MixedStepPerOpValuesWithMetadata, Option<f64>)> {
         self.inner.reset_provenance();
-        py.allow_threads(|| {
+        py.detach(|| {
             self.inner.mixed_step_breakdown_per_op_with_metadata(
                 ctx_tokens,
                 gen_tokens,
@@ -809,7 +808,7 @@ impl AicEngine {
         gen_seq_imbalance_correction_scale: f64,
     ) -> PyResult<Vec<PerOpValue>> {
         self.inner.reset_provenance();
-        py.allow_threads(|| {
+        py.detach(|| {
             self.inner
                 .decode_step_per_op(gen_tokens, isl, osl, gen_seq_imbalance_correction_scale)
         })
@@ -829,7 +828,7 @@ impl AicEngine {
         gen_seq_imbalance_correction_scale: f64,
     ) -> PyResult<Vec<PerOpValueWithMetadata>> {
         self.inner.reset_provenance();
-        py.allow_threads(|| {
+        py.detach(|| {
             self.inner.decode_step_per_op_with_metadata(
                 gen_tokens,
                 isl,
@@ -862,7 +861,7 @@ impl AicEngine {
         x: Option<u32>,
     ) -> PyResult<Vec<PerOpValue>> {
         self.inner.reset_provenance();
-        py.allow_threads(|| {
+        py.detach(|| {
             self.inner.evaluate_context_ops(
                 &indices,
                 batch_size,
@@ -890,7 +889,7 @@ impl AicEngine {
         x: Option<u32>,
     ) -> PyResult<Vec<PerOpValue>> {
         self.inner.reset_provenance();
-        py.allow_threads(|| {
+        py.detach(|| {
             self.inner.evaluate_generation_ops(
                 &indices,
                 batch_size,
@@ -924,7 +923,7 @@ impl AicEngine {
         x: Option<u32>,
     ) -> PyResult<Vec<PerOpValue>> {
         self.inner.reset_provenance();
-        py.allow_threads(|| {
+        py.detach(|| {
             self.inner.evaluate_ops_json(
                 ops_json,
                 is_context,
@@ -952,7 +951,7 @@ impl AicEngine {
         visual_block_upper_triangle: bool,
     ) -> PyResult<Vec<PerOpValue>> {
         self.inner.reset_provenance();
-        py.allow_threads(|| {
+        py.detach(|| {
             self.inner.evaluate_context_attention_kernels_json(
                 ops_json,
                 batch_size,
@@ -986,7 +985,7 @@ impl AicEngine {
         x: Option<u32>,
     ) -> PyResult<Vec<PerOpSolValue>> {
         self.inner.reset_provenance();
-        py.allow_threads(|| {
+        py.detach(|| {
             self.inner.evaluate_ops_sol_json(
                 ops_json,
                 is_context,
@@ -1013,7 +1012,7 @@ impl AicEngine {
     /// diagnostic/enumeration surface, not the query path, and deliberately
     /// bypass the query grids' load-time normalizations (SOL clamping etc.).
     fn table_view_json(&self, py: Python<'_>, attribute: &str) -> PyResult<Option<String>> {
-        py.allow_threads(|| {
+        py.detach(|| {
             crate::perf_database::table_view::table_view_json(self.inner.database(), attribute)
         })
         .map_err(aic_to_py)
@@ -1037,7 +1036,7 @@ impl AicEngine {
         py: Python<'_>,
         attribute: &str,
     ) -> PyResult<Vec<(String, u32, u32)>> {
-        py.allow_threads(|| {
+        py.detach(|| {
             let db = self.inner.database();
             match attribute {
                 "_context_attention_data" => Ok(db.attention.context_lanes().unwrap_or_default()),
@@ -1158,7 +1157,7 @@ fn resolve_op_sources_report_json(
         strict,
     };
     let report = py
-        .allow_threads(|| {
+        .detach(|| {
             crate::perf_database::resolve_one(
                 &ctx,
                 op_file_basename,
@@ -1676,7 +1675,7 @@ fn compile_engine_from_request(request: EngineBuildRequest) -> Result<Engine, Ai
             systems_root.display()
         ))
     })?;
-    let spec_bytes: Vec<u8> = Python::with_gil(|py| -> PyResult<Vec<u8>> {
+    let spec_bytes: Vec<u8> = Python::attach(|py| -> PyResult<Vec<u8>> {
         let engine_mod = py.import("aisim_core.sdk.engine")?;
         let kwargs = pyo3::types::PyDict::new(py);
         kwargs.set_item("backend_version", request.backend_version.as_deref())?;
@@ -1758,7 +1757,7 @@ fn compile_engine_from_request(request: EngineBuildRequest) -> Result<Engine, Ai
     // fallback-safe. Hard caller/config errors use `InvalidEngineConfig` (which
     // is NOT fallback-safe) so they surface instead of silently degrading.
     .map_err(|error| {
-        let invalid = Python::with_gil(|py| {
+        let invalid = Python::attach(|py| {
             py.import("aisim_core.sdk.engine")
                 .and_then(|module| module.getattr("InvalidEngineConfigurationError"))
                 .is_ok_and(|kind| error.is_instance(py, &kind))
@@ -1798,7 +1797,7 @@ fn compile_engine_from_request(request: EngineBuildRequest) -> Result<Engine, Ai
 pub(crate) fn resolve_speculation_identity(
     config: &crate::ForwardPassSpeculationConfig,
 ) -> Result<crate::ForwardPassSpeculationConfig, AicError> {
-    Python::with_gil(|py| -> PyResult<_> {
+    Python::attach(|py| -> PyResult<_> {
         let json = PyModule::import(py, "json")?;
         let encoded = serde_json::to_string(config)
             .map_err(|error| PyValueError::new_err(error.to_string()))?;
@@ -1806,14 +1805,14 @@ pub(crate) fn resolve_speculation_identity(
         let module = PyModule::import(py, "aisim_core.sdk.speculation.base")?;
         let spec = module
             .getattr("SpeculationConfig")?
-            .call((), Some(fields.downcast()?))?;
+            .call((), Some(fields.cast()?))?;
         let resolved = module.call_method1("resolve_speculation_config", (spec,))?;
         let fields = PyModule::import(py, "dataclasses")?.call_method1("asdict", (resolved,))?;
         let encoded: String = json.call_method1("dumps", (fields,))?.extract()?;
         serde_json::from_str(&encoded).map_err(|error| PyValueError::new_err(error.to_string()))
     })
     .map_err(|error| {
-        let checkpoint_unavailable = Python::with_gil(|py| {
+        let checkpoint_unavailable = Python::attach(|py| {
             py.import("aisim_core.sdk.utils")
                 .and_then(|module| module.getattr("HuggingFaceDownloadError"))
                 .is_ok_and(|kind| error.is_instance(py, &kind))
@@ -1833,7 +1832,7 @@ pub(crate) fn speculation_replay_depth(
     config: &crate::ForwardPassSpeculationConfig,
 ) -> Result<u32, AicError> {
     // The `python` feature also serves extension hosts, which initialize their
-    // own interpreter. Calling with_gil before that would panic. Embedders opt
+    // own interpreter. Calling Python::attach before that would panic. Embedders opt
     // into PyO3's automatic initialization with the separate embed-python feature.
     #[cfg(not(feature = "embed-python"))]
     if unsafe { pyo3::ffi::Py_IsInitialized() } == 0 {
@@ -1843,13 +1842,13 @@ pub(crate) fn speculation_replay_depth(
                 .into(),
         ));
     }
-    Python::with_gil(|py| -> PyResult<_> {
+    Python::attach(|py| -> PyResult<_> {
         let encoded = serde_json::to_string(config)
             .map_err(|error| PyValueError::new_err(error.to_string()))?;
         let fields = PyModule::import(py, "json")?.call_method1("loads", (encoded,))?;
         PyModule::import(py, "aisim_core.sdk.speculation")?
             .getattr("SpeculationConfig")?
-            .call((), Some(fields.downcast()?))?
+            .call((), Some(fields.cast()?))?
             .call_method0("replay_depth")?
             .extract()
     })
@@ -1874,7 +1873,7 @@ pub(crate) fn validate_forward_pass_profile(
 ) -> Result<ForwardPassProfileFacts, AicError> {
     let json = serde_json::to_string(config)
         .map_err(|error| AicError::InvalidEngineConfig(error.to_string()))?;
-    let facts = Python::with_gil(|py| -> PyResult<String> {
+    let facts = Python::attach(|py| -> PyResult<String> {
         py.import("aisim_core.sdk.fpm_profile")?
             .call_method1("_validate_forward_pass_profile", (json,))?
             .extract()
@@ -2024,7 +2023,7 @@ pub(crate) fn compile_engine_to_engine(
             .map(|path| path.to_str().expect("validated UTF-8 path").to_owned());
     }
     if config.extra.contains_key("fpm_profile") {
-        let mut modes = Python::with_gil(|py| fpm_profile_quantization(py, config))
+        let mut modes = Python::attach(|py| fpm_profile_quantization(py, config))
             .map_err(|e| AicError::InvalidEngineConfig(format!("FPM profile quantization: {e}")))?;
         request.gemm_quant_mode = modes.remove("gemm_quant_mode");
         request.moe_quant_mode = modes.remove("moe_quant_mode");
@@ -2177,10 +2176,10 @@ fn kvcache_quant_name(dtype: Option<&DataType>) -> Option<&'static str> {
 ///
 /// The hot path (`estimate_forward_pass_time_ms` / `tune_with_fpms`) is pure
 /// Rust over the embedded [`Engine`] with NO Python re-entry — the GIL is
-/// released via [`Python::allow_threads`] around each compute. Only the
+/// released via [`Python::detach`] around each compute. Only the
 /// constructors (`from_native` / `best_available`) cross into Python once to
 /// compile the model (`compile_engine`); that crossing re-acquires the GIL via
-/// `with_gil`, which is re-entrant, so calling it from inside a `#[pymethod]`
+/// `attach`, which is re-entrant, so calling it from inside a `#[pymethod]`
 /// staticmethod is fine.
 ///
 /// Constructors take the engine config + options as JSON strings. Regression
@@ -2364,7 +2363,7 @@ impl PyForwardPassPerfModel {
         )
         .map_err(aic_to_py)?;
         if legacy.extra.contains_key("fpm_profile") {
-            let mut modes = Python::with_gil(|py| fpm_profile_quantization(py, &legacy))?;
+            let mut modes = Python::attach(|py| fpm_profile_quantization(py, &legacy))?;
             request.gemm_quant_mode = modes.remove("gemm_quant_mode");
             request.moe_quant_mode = modes.remove("moe_quant_mode");
             request.fmha_quant_mode = modes.remove("fmha_quant_mode");
@@ -2457,7 +2456,7 @@ impl PyForwardPassPerfModel {
         isl: u32,
         prefix: u32,
     ) -> PyResult<f64> {
-        py.allow_threads(|| self.inner.predict_prefill_latency(bs, isl, prefix))
+        py.detach(|| self.inner.predict_prefill_latency(bs, isl, prefix))
             .map_err(aic_to_py)
     }
 
@@ -2518,12 +2517,11 @@ impl PyForwardPassPerfModel {
     }
 
     fn flush_updates(&mut self, py: Python<'_>) -> PyResult<()> {
-        py.allow_threads(|| self.inner.flush_updates())
-            .map_err(aic_to_py)
+        py.detach(|| self.inner.flush_updates()).map_err(aic_to_py)
     }
 
     fn append_mixed_learned_checkpoint(&mut self, py: Python<'_>, path: &str) -> PyResult<usize> {
-        py.allow_threads(|| self.inner.append_mixed_learned_checkpoint(path))
+        py.detach(|| self.inner.append_mixed_learned_checkpoint(path))
             .map_err(aic_to_py)
     }
 
@@ -2550,7 +2548,7 @@ impl PyForwardPassPerfModel {
     fn estimate_forward_pass_with_route(&self, py: Python<'_>, fpm_json: &str) -> PyResult<String> {
         let metrics = parse_fpm_iteration(fpm_json)?;
         let value = py
-            .allow_threads(|| self.inner.estimate_forward_pass_with_route(&metrics))
+            .detach(|| self.inner.estimate_forward_pass_with_route(&metrics))
             .map_err(aic_to_py)?;
         serde_json::to_string(&value).map_err(|error| PyValueError::new_err(error.to_string()))
     }
@@ -2583,7 +2581,7 @@ impl PyForwardPassPerfModel {
     }
 
     fn save_online_checkpoint(&self, py: Python<'_>, path: &str) -> PyResult<()> {
-        py.allow_threads(|| self.inner.save_online_checkpoint(path))
+        py.detach(|| self.inner.save_online_checkpoint(path))
             .map_err(aic_to_py)
     }
 
@@ -2598,7 +2596,7 @@ impl PyForwardPassPerfModel {
     ) -> PyResult<String> {
         let options = crate::StateSnapshotOptions { include_perf_db };
         let config = py
-            .allow_threads(|| self.inner.save_state_snapshot(path, &options))
+            .detach(|| self.inner.save_state_snapshot(path, &options))
             .map_err(aic_to_py)?;
         serde_json::to_string(&config).map_err(|error| PyValueError::new_err(error.to_string()))
     }
@@ -2656,7 +2654,7 @@ impl PyForwardPassPerfModel {
     ) -> PyResult<Option<f64>> {
         let metrics = parse_fpm_iteration(fpm_json)?;
         let draft_length = parse_speculative_draft_length(draft_length)?;
-        py.allow_threads(|| match draft_length {
+        py.detach(|| match draft_length {
             Some(depth) => self
                 .inner
                 .estimate_speculative_forward_pass_time_ms(&metrics, depth),
@@ -2675,7 +2673,7 @@ impl PyForwardPassPerfModel {
         let metrics = parse_fpm_iteration(fpm_json)?;
         if let Some(depth) = parse_speculative_draft_length(draft_length)? {
             let result = py
-                .allow_threads(|| {
+                .detach(|| {
                     self.inner
                         .estimate_speculative_forward_pass_detailed(&metrics, depth)
                 })
@@ -2684,7 +2682,7 @@ impl PyForwardPassPerfModel {
                 .map_err(|error| PyValueError::new_err(error.to_string()));
         }
         let result = py
-            .allow_threads(|| self.inner.estimate_forward_pass_detailed(&metrics))
+            .detach(|| self.inner.estimate_forward_pass_detailed(&metrics))
             .map_err(aic_to_py)?;
         serde_json::to_string(&result).map_err(|error| PyValueError::new_err(error.to_string()))
     }
@@ -2695,7 +2693,7 @@ impl PyForwardPassPerfModel {
     fn tune_with_fpms(&mut self, py: Python<'_>, iterations_json: &str) -> PyResult<()> {
         let iterations: Vec<Vec<crate::ForwardPassMetrics>> = serde_json::from_str(iterations_json)
             .map_err(|e| PyValueError::new_err(format!("invalid tuning iterations JSON: {e}")))?;
-        py.allow_threads(|| self.inner.tune_with_fpms(&iterations))
+        py.detach(|| self.inner.tune_with_fpms(&iterations))
             .map_err(aic_to_py)
     }
 
@@ -2708,7 +2706,7 @@ impl PyForwardPassPerfModel {
         output_tokens: u32,
         prefill: bool,
     ) -> PyResult<f64> {
-        py.allow_threads(|| {
+        py.detach(|| {
             self.inner
                 .static_phase_latency(batch_size, input_tokens, output_tokens, prefill)
         })
@@ -2725,7 +2723,7 @@ impl PyForwardPassPerfModel {
         prefill: bool,
     ) -> PyResult<String> {
         let result = py
-            .allow_threads(|| {
+            .detach(|| {
                 self.inner
                     .static_phase_diagnostics(batch_size, context_length, prefix, prefill)
             })
@@ -2744,7 +2742,7 @@ impl PyForwardPassPerfModel {
         let shapes: Vec<crate::EncoderImageShape> = serde_json::from_str(shapes_json)
             .map_err(|e| PyValueError::new_err(format!("invalid encoder shapes JSON: {e}")))?;
         let values = py
-            .allow_threads(|| self.inner.vision_operations(&shapes))
+            .detach(|| self.inner.vision_operations(&shapes))
             .map_err(aic_to_py)?;
         Ok(values
             .into_iter()
@@ -2770,7 +2768,7 @@ impl PyForwardPassPerfModel {
     /// Preparation-only normalization of marked targets in the native FPM profile.
     fn fpm_seed_target_normalization(&self, py: Python<'_>) -> PyResult<String> {
         let result = py
-            .allow_threads(|| self.inner.fpm_seed_target_normalization())
+            .detach(|| self.inner.fpm_seed_target_normalization())
             .map_err(aic_to_py)?;
         serde_json::to_string(&result)
             .map_err(|error| PyValueError::new_err(format!("FPM seed targets serialize: {error}")))
@@ -2783,7 +2781,7 @@ impl PyForwardPassPerfModel {
         total_prefill_tokens: u32,
         total_kv_read_tokens: u32,
     ) -> PyResult<f64> {
-        py.allow_threads(|| {
+        py.detach(|| {
             self.inner.predict_prefill_latency_total(
                 batch_size,
                 total_prefill_tokens,
@@ -2799,7 +2797,7 @@ impl PyForwardPassPerfModel {
         batch_size: u32,
         total_past_kv_tokens: u32,
     ) -> PyResult<f64> {
-        py.allow_threads(|| {
+        py.detach(|| {
             self.inner
                 .predict_decode_latency_total(batch_size, total_past_kv_tokens)
         })
@@ -2807,7 +2805,7 @@ impl PyForwardPassPerfModel {
     }
 
     fn fpm_decode_kv_ceiling(&self, py: Python<'_>) -> PyResult<Option<u32>> {
-        py.allow_threads(|| self.inner.fpm_decode_kv_ceiling())
+        py.detach(|| self.inner.fpm_decode_kv_ceiling())
             .map_err(aic_to_py)
     }
 
@@ -2887,11 +2885,11 @@ mod tests {
     }
 
     /// `cargo test` runs without an embedding host, so the interpreter must
-    /// be initialized before any `Python::with_gil` (pyo3's
+    /// be initialized before any `Python::attach` (pyo3's
     /// `auto-initialize` feature is intentionally off for the extension
     /// build). Idempotent.
     fn py_init() {
-        pyo3::prepare_freethreaded_python();
+        pyo3::Python::initialize();
     }
 
     #[test]
@@ -3031,6 +3029,8 @@ mod tests {
     fn legacy_compilation_with_only_correction_controls_keeps_default_method() {
         py_init();
         let mut config = fixture_engine_config();
+        // This compilation enters the Python SDK, which accepts query-slot versions only.
+        config.backend_version = Some("current".to_string());
         config.extra.insert(
             "estimator_config".into(),
             r#"{"correction":{"enabled":false},"fpm_interpolation":{"text_only":false,"unrecorded_quant_modes":[]}}"#.into(),
@@ -3125,7 +3125,7 @@ mod tests {
             .run_static(&rt, StaticMode::Both, DEFAULT_STATIC_STRIDE)
             .unwrap();
         // Positional order: (bs, beam, isl, osl, prefix, seq_corr, gen_seq_corr, mode, stride).
-        let (ctx, generation, total) = Python::with_gil(|py| {
+        let (ctx, generation, total) = Python::attach(|py| {
             aic.run_static(
                 py,
                 1,
@@ -3159,7 +3159,7 @@ mod tests {
             )
             .unwrap()
             .total_ms;
-        let prefill = Python::with_gil(|py| aic.predict_prefill_latency(py, 2, 1024, 0)).unwrap();
+        let prefill = Python::attach(|py| aic.predict_prefill_latency(py, 2, 1024, 0)).unwrap();
         assert!((prefill - raw_prefill).abs() < 1e-12);
 
         // predict_decode_latency (osl=2) == raw Generation-mode total.
@@ -3176,7 +3176,7 @@ mod tests {
             )
             .unwrap()
             .total_ms;
-        let decode = Python::with_gil(|py| aic.predict_decode_latency(py, 4, 1024, 2)).unwrap();
+        let decode = Python::attach(|py| aic.predict_decode_latency(py, 4, 1024, 2)).unwrap();
         assert!((decode - raw_decode).abs() < 1e-12);
     }
 
@@ -3190,7 +3190,7 @@ mod tests {
         let aic = AicEngine::from_spec(&bytes, root.to_str()).unwrap();
 
         // Positional order: (bs, beam, isl, osl, prefix, seq_corr, gen_seq_corr, mode, stride).
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let ctx_only = aic
                 .run_static(py, 1, 1, 1024, 8, 0, 1.0, 1.0, "static_ctx", 32)
                 .unwrap();
@@ -3222,14 +3222,13 @@ mod tests {
             .mixed_step_latency(1024, 2, 1024, 8, 0, 1.0, 1.0)
             .unwrap();
         let mixed =
-            Python::with_gil(|py| aic.mixed_step_latency(py, 1024, 2, 1024, 8, 0, 1.0, 1.0))
-                .unwrap();
+            Python::attach(|py| aic.mixed_step_latency(py, 1024, 2, 1024, 8, 0, 1.0, 1.0)).unwrap();
         assert!((mixed - raw_mixed).abs() < 1e-12);
         let raw_breakdown = raw
             .mixed_step_breakdown(1024, 2, 1024, 8, 0, 1.0, 1.0)
             .unwrap();
         let breakdown =
-            Python::with_gil(|py| aic.mixed_step_breakdown(py, 1024, 2, 1024, 8, 0, 1.0, 1.0))
+            Python::attach(|py| aic.mixed_step_breakdown(py, 1024, 2, 1024, 8, 0, 1.0, 1.0))
                 .unwrap();
         assert_eq!(
             breakdown,
@@ -3242,7 +3241,7 @@ mod tests {
         );
 
         let raw_decode = raw.decode_step_latency(4, 1024, 8, 1.0).unwrap();
-        let decode = Python::with_gil(|py| aic.decode_step_latency(py, 4, 1024, 8, 1.0)).unwrap();
+        let decode = Python::attach(|py| aic.decode_step_latency(py, 4, 1024, 8, 1.0)).unwrap();
         assert!((decode - raw_decode).abs() < 1e-12);
     }
 
@@ -3288,7 +3287,7 @@ mod tests {
     #[test]
     fn aic_to_py_maps_typed_errors_to_sdk_classes() {
         py_init();
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let sdk_available = py.import("aisim_core.sdk.errors").is_ok();
 
             let check = |err: AicError, sdk_name: &str| {
@@ -3375,7 +3374,7 @@ mod tests {
         assert_eq!(aic.last_provenance(), Some("xop"));
 
         // Positional order: (bs, beam, isl, osl, prefix, seq_corr, gen_seq_corr, mode, stride).
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             aic.run_static(py, 1, 1, 1024, 8, 0, 1.0, 1.0, "static", 32)
                 .unwrap();
         });
@@ -3384,14 +3383,14 @@ mod tests {
         aic.inner
             .database()
             .note_provenance(ProvenanceTier::Empirical);
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             aic.mixed_step_latency(py, 1024, 2, 1024, 8, 0, 1.0, 1.0)
                 .unwrap();
         });
         assert_eq!(aic.last_provenance(), None);
 
         aic.inner.database().note_provenance(ProvenanceTier::XShape);
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             aic.decode_step_latency(py, 4, 1024, 8, 1.0).unwrap();
         });
         assert_eq!(aic.last_provenance(), None);

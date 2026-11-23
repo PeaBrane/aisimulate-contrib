@@ -43,6 +43,7 @@ engine:
 | `workers.<role>.hardware` | `engine.hardware` | fixed | Ordinary workers: `prefill` and `decode` in disaggregated mode only. AFD: fallback for both A/F pools in any role, overridden by explicit pool hardware. One concrete system identifier; `auto` is rejected for ordinary role overrides. |
 | `workers.<role>.context_length` | `engine.context_length` | fixed | Positive token limit. Recommendation accepts it for `prefill` and `decode` and for every AFD role; ordinary aggregated recommendations use `engine.context_length`. See [Context limits](#context-limits). |
 | `workers.<role>.startup_seconds` | `0` | fixed | Nonnegative. Delay before a worker added during the run becomes ready. Initial workers are ready at time zero. |
+| `workers.<role>.wait_power_w` | Unset | predict only | Finite nonnegative watts per GPU for in-pass attention-DP wait. Not accepted on AFD workers. See [attention-DP wait power](#attention-dp-wait-power). |
 | `workers.<role>.parallelism.preset` | Not applicable | `default` | Recommend only. `default` searches the generated parallelism space; a list pins candidate shapes; `false` or `{}` disables presets so the individual fields below define the space. See [search space](../../sweeper/search-space.md). |
 | `workers.<role>.parallelism.replicas` | `1` | Searched | Number of workers in this role. |
 | `workers.<role>.parallelism.tensor` | `1` | Searched | Attention tensor parallelism. |
@@ -81,6 +82,24 @@ SGLang's checkpoint-aware `sglang.mamba_cache` is a separate
 under this Python worker schema. It requires an aggregated worker with
 attention DP, prefill context parallelism and pipeline parallelism all equal
 to one. Python prediction YAML and deployment generation do not enable it.
+
+## Attention-DP wait power
+
+Set `engine.workers.<role>.wait_power_w` to an assumed draw per GPU while
+a rank waits on peers inside a forward pass. For example:
+
+```yaml
+engine:
+  workers:
+    aggregated:
+      wait_power_w: 60
+```
+
+Use `aisim predict --stack engine --detail energy` to see estimated
+`step_power_w` and total `attention_dp_wait_ms`. Prefill and decode roles
+can each use a different assumption. AFD workers (`type: afd`) do not accept
+this field. A role with wait and no configured watts
+makes the step estimate unavailable. See the [power contract](../../perf-model/power.md).
 
 ## Context limits
 

@@ -236,14 +236,39 @@ pub enum KvEventTier {
     /// Device (G1) KV cache. Omitted from serialized events.
     #[default]
     Device,
-    /// The native G2 host cache reachable by the publishing rank: its private
-    /// `dp_rank_local` cache or a `cluster_shared` pool.
+    /// Host memory. In the worker domain, the native G2 host cache reachable
+    /// by the publishing rank: its private `dp_rank_local` cache or a
+    /// `cluster_shared` pool. In the cache-owner domain, the rank's
+    /// KVCR-owned memory (`kvcr.local_g2`).
     HostPinned,
+    /// The rank's KVCR-owned disk cache (`kvcr.g3`), in the cache-owner domain.
+    Disk,
 }
 
 impl KvEventTier {
     fn is_device(&self) -> bool {
         *self == Self::Device
+    }
+}
+
+/// Who owns the cache whose residency a [`KvEvent`] describes, apart from
+/// its [`KvEventTier`]: Dynamo's `ResidencyDomain`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KvEventDomain {
+    /// The engine worker's own cache: G1 or its G2. Omitted from serialized
+    /// events.
+    #[default]
+    Worker,
+    /// A cache owner beside the worker, which serves the publishing rank and
+    /// its peers on its own: the rank's KVCR store (`kvcr.local_g2`,
+    /// `kvcr.g3`).
+    CacheOwner,
+}
+
+impl KvEventDomain {
+    fn is_worker(&self) -> bool {
+        *self == Self::Worker
     }
 }
 
@@ -259,6 +284,9 @@ pub struct KvEvent {
     /// Residency tier; absent means [`KvEventTier::Device`].
     #[serde(default, skip_serializing_if = "KvEventTier::is_device")]
     pub tier: KvEventTier,
+    /// Residency domain; absent means [`KvEventDomain::Worker`].
+    #[serde(default, skip_serializing_if = "KvEventDomain::is_worker")]
+    pub domain: KvEventDomain,
 }
 
 /// First-admission provenance for prompt tokens reused across cache tiers.

@@ -1377,6 +1377,40 @@ fn grouped_prefix_boundary_hit_holds_its_state_blocks_until_the_next_pass() {
 }
 
 #[test]
+fn grouped_prefix_steps_that_the_kv_manager_skips_change_nothing() {
+    // The KV manager skips the block walks of a step below a lease's quiet
+    // position. Debug builds run them and assert that they change nothing.
+    // Each request here takes a step that a wrong position would skip.
+    let glm = |checkpoint, chunk, unit, version| {
+        prefix_core(glm_groups(checkpoint), 64 * GLM_PAGE, chunk, unit, version)
+    };
+    let mut window = group("window", 4, 8, Some(6));
+    window.prefix_cacheable = Some(true);
+    let cases = [
+        // Decode crosses a block boundary: the previous state block of the
+        // last chunk goes, the attention block completes, new blocks come.
+        (glm(false, 8192, 1088, "0.31.0"), 2170, 10),
+        // A prompt of one chunk decodes with its checkpoint block and no
+        // previous state block.
+        (glm(true, 8192, 2176, "0.33.0"), 5000, 4),
+        // A step budget below the block: the prefill advances inside a block
+        // that the request holds, and publishes at its tail, 5,440.
+        (glm(false, 512, 1088, "0.31.0"), 5600, 4),
+        // The prompt ends at its tail, so its running state block is
+        // published and the first decode step takes a fresh one.
+        (glm(false, 8192, 1088, "0.31.0"), 1088, 4),
+        // A window that is no multiple of the block retires a block inside
+        // the next one.
+        (prefix_core(vec![window], 9 * 8, 8, 4, "0.33.0"), 8, 8),
+    ];
+    for (mut core, prompt, output) in cases {
+        let request = submit(&mut core, 1, prompt, output);
+        let admissions = drain(&mut core, &mut TraceCollector::default(), &mut 0);
+        assert_eq!(admissions, vec![(request, 0)], "a {prompt}-token prompt");
+    }
+}
+
+#[test]
 fn grouped_prefix_copy_sources_leave_in_group_order_at_the_end_of_the_pass() {
     // Two consumers with hits inside a block in one pass. vLLM frees their
     // copy sources at the end of `schedule()`, manager by manager in group

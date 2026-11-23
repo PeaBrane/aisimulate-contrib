@@ -239,8 +239,19 @@ separate Fast run; this preserves validation in both admission contexts.
 The Dynamo README profile uses fixed AISim/Dynamo RC source revisions. Its
 three-wheel bundle is built on a miss and reused through Artifactory on matching
 subsequent runs. The key includes both source revisions, the build recipe and
-storage tooling, locked harness dependencies, Python/Rust/uv versions, and the
-job image reference, effective OS/package inventory, and storage endpoint/repository. A changed key or expired manifest rebuilds
+storage tooling, locked harness dependencies, Python/Rust/uv versions, the job
+image reference, the OS ID and version, the native build packages, and storage
+endpoint/repository. The native build packages are the job's `apt-get`
+prerequisites except `gh`, plus every installed package they depend on: the
+compilers, linker, glibc, kernel headers, libclang, protoc, CMake, and linked
+libraries. Each is keyed by its full installed version, including epochs and
+Ubuntu packaging revisions: security and stable updates can change headers,
+compilers, or libraries without changing the upstream version. For example,
+`linux-libc-dev` `6.8.0-149.149` and `6.8.0-151.151` ship different public
+headers and must use different keys. Packages the build cannot reach keep the
+key. The full `dpkg` inventory and its hash are recorded outside
+the key in `rc-build-environment.json` in the job's `readme-rc-build-inputs`
+artifact. A changed key or expired manifest rebuilds
 the bundle. Cross-run reuse accepts successful Full CI producers from this
 repository's `main`, or the exact same admitted PR head; another PR cannot
 populate the cache for this PR or for `main`.
@@ -362,6 +373,9 @@ explicit exception and its workflow contract test.
 16 frozen queries on B200: eight vLLM 0.24.0 queries for dense Qwen3-32B and
 MoE MiniMax-M2.5, plus four Qwen3-32B queries each for TRT-LLM 1.3.0rc20 and
 SGLang 0.5.14. Every backend covers prefill/decode and short/long sequences.
+These collections are frozen data coordinates outside the queryable version
+slots; the script admits them for its own queries, so promoting a newer
+collection does not move the expected values or the baseline commit.
 The [manifest](../../.github/prediction-numerical-sentinels.json)
 records a full baseline commit that must resolve in the checkout. Fast CI and
 the numerical-check job explicitly fetch that SHA from `origin` if missing;
@@ -616,8 +630,8 @@ components; a documentation-only run and a complete matrix measure different
 workloads. Use job timestamps rather than the overall workflow completion time
 when staging is waiting.
 
-The application wheel-build job allows ten minutes on AMD64 and fifteen on
-ARM64. The ARM64 build budget includes cold release compilation, manylinux
+The application wheel-build job allows fifteen minutes on both AMD64 and
+ARM64. The build budget includes cold release compilation, manylinux
 repair, provenance checks, and wheel handoff; compilation can consume most of
 ten minutes before those final steps run. Application test shards retain their
 separate fifteen-minute job budget and all per-test timeouts.

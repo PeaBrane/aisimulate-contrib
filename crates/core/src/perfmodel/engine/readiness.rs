@@ -622,8 +622,13 @@ impl Availability<'_> {
             Gemm(gemm) => {
                 self.any(&["gemm_perf.parquet"])?;
                 if gemm.quant_mode == GemmQuantMode::Fp8Static {
-                    self.any(&["computescale_perf.parquet"])?;
+                    // Direct `fp8_static` rows need no compute_scale subtraction.
+                    if !self.db.gemm.has_direct_fp8_static()? {
+                        self.any(&["computescale_perf.parquet"])?;
+                    }
                     if gemm.low_precision_input {
+                        // Like other GEMM tables, check availability here;
+                        // the query validates the normalized fp8 slice.
                         self.any(&["scale_matrix_perf.parquet"])?;
                     }
                 }
@@ -1675,6 +1680,106 @@ mod tests {
                 mode == DatabaseMode::Sol
             );
         }
+    }
+
+    /// A GEMM table with `fp8_static` rows prices `fp8_static` directly, so
+    /// readiness asks for no `computescale` table. A low-precision input still
+    /// needs `scale_matrix`. A table with only `fp8` rows keeps the derived
+    /// path, which still needs `computescale`.
+    #[test]
+    fn fp8_static_direct_rows_drop_only_the_compute_scale_requirement() {
+        fn gemm_root(dtype: &'static str) -> tempfile::TempDir {
+            let root = systems();
+            // No computescale file and no scale_matrix file.
+            write_parquet(
+                &root
+                    .path()
+                    .join("data/b200_sxm/vllm/0.24.0/gemm_perf.parquet"),
+                &[
+                    Col::Str("gemm_dtype", vec![dtype, dtype]),
+                    Col::I64("m", vec![128, 256]),
+                    Col::I64("n", vec![1024, 1024]),
+                    Col::I64("k", vec![1024, 1024]),
+                    Col::F64("latency", vec![0.5, 1.5]),
+                ],
+            );
+            root
+        }
+        let plain = Op::Gemm(GemmOp::new("gemm", 1024, 1024, GemmQuantMode::Fp8Static));
+        let low = Op::Gemm(GemmOp {
+            low_precision_input: true,
+            ..GemmOp::new("gemm", 1024, 1024, GemmQuantMode::Fp8Static)
+        });
+        let root = gemm_root("fp8_static");
+        for mode in [
+            DatabaseMode::Silicon,
+            DatabaseMode::Hybrid,
+            DatabaseMode::Empirical,
+        ] {
+            let db = PerfDatabase::load(root.path(), "b200_sxm", "vllm", "0.24.0")
+                .unwrap()
+                .with_mode(mode, TransferPolicy::ALL);
+            validate(&db, [&plain].into_iter()).unwrap();
+            let err = validate(&db, [&low].into_iter()).unwrap_err();
+            assert!(
+                err.is_missing_perf_data() && err.to_string().contains("scale_matrix_perf.parquet"),
+                "{mode:?}: {err}"
+            );
+        }
+        // Readiness guarantees table availability, not quant-slice coverage
+        // (the module contract; changing it is tracked by AISIM-2453). A
+        // non-fp8 scale table is available but must fail loudly at query time.
+        // Reopen the database for each immutable table snapshot.
+        for dtype in ["fp8", "bfloat16"] {
+            write_parquet(
+                &root
+                    .path()
+                    .join("data/b200_sxm/vllm/0.24.0/scale_matrix_perf.parquet"),
+                &[
+                    Col::Str("quant_dtype", vec![dtype, dtype]),
+                    Col::I64("m", vec![128, 256]),
+                    Col::I64("k", vec![1024, 1024]),
+                    Col::F64("latency", vec![0.1, 0.2]),
+                ],
+            );
+            let db = PerfDatabase::load(root.path(), "b200_sxm", "vllm", "0.24.0")
+                .unwrap()
+                .with_mode(DatabaseMode::Silicon, TransferPolicy::ALL);
+            validate(&db, [&low].into_iter()).unwrap();
+            let Op::Gemm(gemm) = &low else { unreachable!() };
+            let result = gemm.query(&db, 192, None);
+            if dtype == "fp8" {
+                result.unwrap();
+            } else {
+                let err = result.unwrap_err();
+                assert!(err.is_missing_perf_data(), "{err}");
+                assert!(err.to_string().contains("quant 'fp8'"), "{err}");
+            }
+        }
+        // Second root, same rows with gemm_dtype "fp8", checked in SILICON
+        // only: the derived path still needs compute_scale, as before.
+        let root_fp8 = gemm_root("fp8");
+        let db_fp8 = PerfDatabase::load(root_fp8.path(), "b200_sxm", "vllm", "0.24.0")
+            .unwrap()
+            .with_mode(DatabaseMode::Silicon, TransferPolicy::ALL);
+        let err = validate(&db_fp8, [&plain].into_iter()).unwrap_err();
+        assert!(
+            err.to_string().contains("computescale_perf.parquet"),
+            "{err}"
+        );
+        // With a computescale table on that root, the plain op passes and a
+        // low-precision input still needs scale_matrix, as before.
+        table(
+            &root_fp8
+                .path()
+                .join("data/b200_sxm/vllm/0.24.0/computescale_perf.parquet"),
+        );
+        validate(&db_fp8, [&plain].into_iter()).unwrap();
+        let err = validate(&db_fp8, [&low].into_iter()).unwrap_err();
+        assert!(
+            err.is_missing_perf_data() && err.to_string().contains("scale_matrix_perf.parquet"),
+            "{err}"
+        );
     }
 
     /// Shape columns of `load_mamba2_parquet`.

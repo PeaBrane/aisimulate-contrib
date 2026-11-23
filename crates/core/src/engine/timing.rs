@@ -619,6 +619,8 @@ impl ValidatedTimingPhase {
 #[cfg(any(feature = "python", test))]
 pub(crate) struct TimingEvidenceAccumulator {
     summary: TimingEvidenceSummary,
+    pub(crate) iteration_wait_ms: f64,
+    pub(crate) phase_priced_wait_ms: f64,
     pending: Vec<OperationUpdate>,
     /// Accumulated operation index of each operation of a named update.
     indices: Vec<usize>,
@@ -1421,6 +1423,22 @@ pub trait TimingModel: Send + Sync {
     /// not fabricate energy or coverage values.
     fn evidence_summary(&self) -> Option<TimingEvidenceSummary> {
         None
+    }
+
+    /// Operation-energy evidence and uncovered attention-DP wait. Iteration
+    /// wait is in provider time and phase-priced wait includes replay speedups.
+    fn power_evidence_summary(&self) -> Option<(TimingEvidenceSummary, f64, f64)> {
+        self.evidence_summary().map(|summary| (summary, 0.0, 0.0))
+    }
+
+    /// Whether the scheduler should supply wait for phase-priced group passes.
+    fn tracks_attention_dp_wait(&self) -> bool {
+        false
+    }
+
+    /// Record uncovered attention-DP wait in modeled milliseconds.
+    fn record_phase_priced_wait(&self, _wait_ms: f64) -> Result<()> {
+        Ok(())
     }
 
     /// Return whole-model FPM query history for time and source diagnostics.

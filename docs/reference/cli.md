@@ -30,6 +30,136 @@ and writes additional artifacts after recommendation.
 Unless labeled as captured output, metric values in example results are hypothetical and
 illustrate the output format. Captured detail examples are simulation results, not hardware measurements.
 
+### Fetch dataset files
+
+`aisim data fetch` downloads selected dataset files into a local cache ahead of use, so
+later runs need no network. It prints one JSON object on stdout; failures print a message and a
+typed JSON error (`{"error": code, "message": ...}`) on stderr.
+
+```bash
+aisim data fetch --repo OWNER/NAME --category fpm --model Qwen/Qwen3-32B --hardware h200_sxm --dry-run
+aisim data fetch --repo OWNER/NAME --category fpm --model Qwen/Qwen3-32B --hardware h200_sxm
+```
+
+| Flag | Meaning |
+|---|---|
+| `--category` | Required. `op-latency`, `fpm`, `e2e` or `eval`. Any other category exits `2` with an unsupported message. |
+| `--model`, `--hardware`, `--framework`, `--framework-version`, `--operation-family` | Catalog identity filters. |
+| `--configuration ID` | Select by configuration ID; repeat or comma-separate for several. |
+| `--purpose` | `prediction` (default) selects the data a predictor reads (`op-latency` and `fpm` only); `full-evidence` applies no purpose filter. `validation` and `results` are reserved and exit `2` as unsupported. |
+| `--repo` | Required. Hugging Face dataset repository, `owner/name`. |
+| `--revision` | Branch, tag or commit SHA (default `main`). A ref resolves once to a full SHA, reported as `plan.revision`; the cache is keyed by that SHA. |
+| `--cache-dir` | Cache root. Defaults to `$AISIM_DATA_CACHE`, then the user cache directory. |
+| `--dry-run` | Print the plan (`files`, `total_bytes`, `uncached_bytes`) and download no artifacts. The small catalog and manifest files needed to expand the plan are still cached. |
+| `--offline` | Make no network requests. A missing file fails with `offline-missing` and the list of files; with `--dry-run` the list is reported in `missing` and the exit status is `0`. A non-SHA revision cannot be resolved offline. |
+
+A selection needs `--configuration` or `--hardware`, plus `--model` for `fpm`, `e2e` and `eval`,
+and must match at least one catalog entry; an empty selection is an error, never a whole-repository
+download. Repeating a fetch reuses verified cache entries and downloads nothing. Exit status is `0`
+on success, `2` for an invalid or unsupported selection, and `1` for revision, transfer, integrity
+or offline failures.
+
+<a id="check-canonical-names"></a>
+
+### Check canonical names
+
+`aisim data check-names PATH` checks a dataset directory (or one `manifest.json`) for stored names that are not
+the canonical spelling, for every category: the identity of each configuration manifest (hardware, framework,
+precision, deployment) and, for e2e, every table value (metric, statistic, phase, status, observer). It
+rewrites nothing and prints one JSON object:
+
+```bash
+aisim data check-names ./my-contribution
+# {"ok": false, "findings": [{"path": "...", "kind": "hardware", "location": "identity.hardware",
+#                              "value": "B300", "canonical": "b300_sxm"}], "errors": []}
+```
+
+Exit status is `0` when clean and `1` when there are findings or unreadable manifests. A `canonical` of `null`
+means the registry does not know the name. See [e2e schema](e2e-schema.md#canonical-names) for the naming rule.
+
+### Air-gapped and offline use
+
+Prepare on a connected machine, then move the cache; the disconnected machine makes no
+network request. Pin the dataset to a full commit SHA, because a branch or tag cannot be
+resolved offline.
+
+```bash
+# 1. Connected: check the size of the selected version, then prepare the whole closure of the real run.
+aisim data fetch --repo OWNER/NAME --revision <40-hex-sha> --category op-latency \
+  --hardware b200_sxm --framework vllm --framework-version 0.24.0 --dry-run --cache-dir ./aisim-cache
+export AISIM_DATASET=OWNER/NAME@<40-hex-sha> AISIM_DATA_CACHE=./aisim-cache AISIM_DATA_CATEGORIES=op-latency
+python - <<'PY'
+from aisim_core.data.ensure import ensure_data, pin_from_environment
+
+# The configuration you will predict with: it decides the version, donors, collectives and shared-layer sources.
+ensure_data({"system": "b200_sxm", "backend": "vllm", "backend_version": "0.24.0"}, pin_from_environment())
+PY
+
+# 2. Copy ./aisim-cache to the air-gapped host (any file transfer).
+# 3. Disconnected: pin offline and run.
+export AISIM_DATASET=OWNER/NAME@<40-hex-sha> AISIM_DATA_CACHE=./aisim-cache AISIM_DATA_CATEGORIES=op-latency \
+  AISIM_DATA_OFFLINE=1
+```
+
+`aisim data fetch ... --offline --dry-run` (an empty `missing` list) only shows that the files of the one selected
+version are cached. The runtime closure also holds donor versions, collective libraries and shared-layer sources
+that `ensure_data` (or `materialize_systems_root`, below) fetches for the real configuration, so run it connected
+before moving the cache. `AISIM_DATA_CATEGORIES` defaults to `fpm`; name `op-latency` for operation tables.
+
+`AISIM_DATASET` (with `AISIM_DATA_CACHE` and `AISIM_DATA_OFFLINE`) pins model construction through
+`RustForwardPassPerfModel.best_available`: the data a configuration needs is taken from the cached revision,
+a missing or corrupt file is a precise error, and there is no fallback to other data. A run that builds its
+operation tables from `systems_paths` or `AICONFIGURATOR_SYSTEMS_PATH` (an explicit `backend_version` in
+`aisim predict`, `recommend` or `replay`) does not read the pin; prepare a root for it as described below. Other pin variables: `AISIM_DATA_CATEGORIES` (default `fpm`),
+`AISIM_DATA_CONFIGURATION` (choose among several matches; with several categories it constrains only the category that lists the ID), `AISIM_DATA_MAX_BYTES` (auto-download
+threshold, default 256 MiB) and `AISIM_DATA_LOCAL` (a dataset-layout directory used instead of Hugging Face).
+Private datasets use the standard `HF_TOKEN` only while connected; the cache needs none.
+
+An `op-latency` pin composes all matching operation families with the packaged system specs and support
+files into one systems root. That root replaces `systems_paths` for construction: a missing operation
+table fails instead of falling through to packaged or user-supplied operation tables. Packaged
+operation tables are never copied into the pinned root. The root also holds the other versions that a selected
+entry's `reuse.yaml` declares as donors, the `nccl`/`oneccl` entries the system spec names, and, unless
+`enable_shared_layer` is false, the sources the native shared-layer resolver may read: earlier versions of the
+same backend and the other backends the pinned `perf_data_reuse_manifest` allows. A donor or source the dataset
+does not publish is skipped. The root is rebuilt whenever the entries' artifact digests or the packaged specs
+change. An omitted `backend_version` or a slot alias (`current`, `previous`, `next`) is resolved from the pinned
+dataset's `query_versions` lookup, and the whole pin shares one `AISIM_DATA_MAX_BYTES` allowance.
+
+<a id="non-python-consumers"></a>
+
+### Operation data for consumers without the Python data library
+
+Rust `perf_database` users, sweeper and planner embeddings and Rust tests read a `systems/` directory
+(`systems_paths`, `AICONFIGURATOR_SYSTEMS_PATH`) and never run the data library. Today that directory is the
+packaged `aisim_core/systems`. Once production operation data leaves the wheel, prepare a root in Python
+once and point the consumer at it:
+
+```python
+from aisim_core.data.ensure import DataPin
+from aisim_core.data.materialize import materialize_systems_root
+
+root = materialize_systems_root(
+    {"system": "b200_sxm", "backend": "vllm", "backend_version": "0.24.0"},
+    DataPin(repo="OWNER/NAME", revision="<40-hex-sha>", offline=True, cache_dir="./aisim-cache"),
+    "./systems-root",
+)
+# root.env == {"AICONFIGURATOR_SYSTEMS_PATH": "./systems-root"}; pass root.root as `systems_paths` / `systems_path`.
+```
+
+The root holds the packaged specs and support files plus copies of the verified pinned `data/` tables (never hard links,
+so editing the root cannot change the cache); it never mixes in packaged tables. The call fails if the destination exists.
+
+| Consumer | Preparation |
+|---|---|
+| Python code that builds the model with `best_available` | Automatic through the pin; `data fetch` only prefetches. |
+| `aisim predict`, `recommend` and `replay` runs | Read `systems_paths` / `AICONFIGURATOR_SYSTEMS_PATH`, not the pin: pass a prepared root. |
+| Sweeper, planner, Python embedding of the Rust engine | Pass `systems_paths` or set `AICONFIGURATOR_SYSTEMS_PATH` to the prepared root. |
+| Rust `perf_database` crate users | Same root as `systems_paths`/`DataRoots`; no Python at run time. |
+| Rust tests (about 38 files resolve the in-tree `systems/` directory) | Prepare a root before `cargo test` and route the sites through one resolver; a Phase 6 task. |
+| Air-gapped hosts | Prefetch with a full-SHA pin, copy the cache, run with `AISIM_DATA_OFFLINE=1`. |
+| `pip install` users | A wheel without op data needs one `data fetch` (or the automatic first-use download below the size threshold) per system and framework. |
+
 <a id="common-options"></a>
 
 ## Common Options

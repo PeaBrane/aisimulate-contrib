@@ -12,11 +12,29 @@ the only GLM-specific measured table. Every other GLM operator uses the generic
 GEMM/MoE/KDA/mHC/collective tables. The flow follows the DeepSeek-V4.1
 precedent in `sglang/README.dsv41.md`.
 
+## Exception: one GPU per TP rank
+
+Every other op collector times its module alone on one GPU, with the TP shard
+as a logical slice. This one runs the complete deployment, so a TP*N* table
+needs *N* GPUs of one node and the full checkpoint. The measured layer runs on
+one rank, but its input is the residual stream, and under TP every layer's
+output is a sum over ranks. The collector is kept this way as a recorded
+exception. Do not copy the design: collect a new model's attention on one GPU.
+
+A one-GPU collector for a sparse attention must show that its synthetic weights
+and inputs reproduce a real checkpoint's timing before its table is used. In a
+B300 trial with vLLM's dummy weights (every tensor U(-1e-3, 1e-3)), decode
+matched this collector's table, while prefill steps that score the index
+(context above `index_topk` tokens) took 1.1-2.1x its time. With N(0, 0.02)
+matrices and unit norm weights the same steps took 0.97-1.14x. vLLM's prefill
+top-k (`csrc/sampler.cu` `top_k_per_row_prefill`) is a histogram select whose
+number of passes depends on the score values.
+
 ## Pinned runtimes
 
 | Backend | Version directory | Runtime |
 | --- | --- | --- |
-| vLLM | `0.31.0` | stock `vllm/vllm-openai:v0.31.0` (tag commit `db9527a4`) |
+| vLLM | `0.32.0` | stock `vllm/vllm-openai:v0.32.0` (tag commit `5df63a72`) |
 | SGLang | `0.5.20` | stock `lmsysorg/sglang:v0.5.20` (tag commit `94602c9c`) |
 
 Each backend is pinned to the arm64 and amd64 child images of one multi-arch
@@ -37,7 +55,7 @@ only BF16 KV, so Hopper rows are a BF16-KV identity:
 
 - SGLang 0.5.20: its IndexPool DSA backends (fa3/tilelang/trtllm) cannot read
   FP8 KV on SM90, and its own default there is BF16.
-- vLLM 0.31.0: `FLASHINFER_MLA_SPARSE_SM90` passes an FP8 cache to FlashInfer
+- vLLM 0.32.0: `FLASHINFER_MLA_SPARSE_SM90` passes an FP8 cache to FlashInfer
   0.7.0.post1 `plan()` as `kv_data_type=torch.uint8` storage, which the fa3 MLA
   planner rejects (`MLA kv_data_type torch.uint8 is not supported`). Stock
   vLLM therefore serves GLM-5.3-Flash on H100/H200 only with BF16 KV; no patch
@@ -72,7 +90,7 @@ torch profiler; each repetition's latency is the union of its CUPTI GPU-busy
 intervals; the row latency is the median over repetitions of the maximum
 across TP ranks.
 
-Stock vLLM 0.31.0 mishandles prefill chunks that start off the 4-token
+Stock vLLM 0.32.0 mishandles prefill chunks that start off the 4-token
 IndexPool grid (`models/glm5next/nvidia/sparse_indexer.py`
 `_kpool_compress_insert`). Every planned vLLM prefill chunk therefore starts on
 a multiple of 4. The launcher refuses an unaligned plan and the runner raises
@@ -121,8 +139,10 @@ exported serving environment.
 
 `--system` selects the system YAML: its `num_gpus_per_node` sets
 `--gres=gpu:N` (override with `--gpus-per-node`). The vLLM environment keeps
-`NCCL_NVLS_ENABLE` and `VLLM_USE_NCCL_SYMM_MEM` on every system and exports
-`NCCL_MNNVL_ENABLE` only when `num_gpus_per_rack` spans several nodes.
+`NCCL_NVLS_ENABLE` and `VLLM_USE_NCCL_SYMM_MEM` on every system. Where
+`num_gpus_per_rack` spans several nodes (GB200/GB300 NVL72) it also exports
+`NCCL_MNNVL_ENABLE=0`: an attempt is one node, and with multi-node NVLink on
+NCCL fails communicator init in a container without an IMEX channel.
 
 ```bash
 python -m collector.glm53flash_attention_launch --backend vllm --checkpoint nvfp4 --tp 1 \
@@ -136,11 +156,25 @@ python -m collector.glm53flash_attention_contract finalize <attempt>... \
   --output .../glm53_attention_module_perf.parquet
 ```
 
+### In a collection job
+
+Where only `collect.py` can be started (no checkpoint mount, no Slurm script),
+`collector/vllm/collect_glm53_attention.py` runs the same attempts in-process:
+`fetch_checkpoint` downloads the pinned revision from the Hub into the job
+volume (or takes a pre-staged `GLM53_ATTN_CHECKPOINT_ROOT`), `run_attempt`
+freezes the manifest (`glm53flash_attention_launch.freeze`) and starts the
+runner with the serving environment, and `run_deployment` repeats with the
+request sets that are still open: a set that fails is skipped for the rest of
+its `gpu_memory_utilization` and retried at the next value of
+`UTILIZATION_LADDER`. The attempt directories carry the state, so a resumed
+job continues, and `finalize` admits them as above (`--partial` for an attempt
+without a completion receipt).
+
 Sources: vLLM `models/glm5next/common/{attention,model}.py`,
 `models/glm5next/nvidia/sparse_indexer.py`, `model_executor/layers/mla.py`,
 `model_executor/layers/attention/mla_attention.py`,
 `v1/worker/gpu/{model_runner,cudagraph_utils}.py`,
-`compilation/breakable_cudagraph.py` (v0.31.0); SGLang `models/glm5_next.py`,
+`compilation/breakable_cudagraph.py` (v0.32.0); SGLang `models/glm5_next.py`,
 `models/deepseek_v2.py`, `layers/attention/dsa/dsa_indexer_kpool.py`,
 `benchmark/one_batch.py`, `model_executor/runner/decode_cuda_graph_runner.py`
 (v0.5.20). The adapters are original code that call these Apache-2.0 sources;

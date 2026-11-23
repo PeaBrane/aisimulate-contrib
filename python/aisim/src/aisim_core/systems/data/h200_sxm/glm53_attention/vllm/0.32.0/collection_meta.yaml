@@ -1,0 +1,1067 @@
+schema_version: 1
+runtime:
+  framework: vllm
+  version: 0.32.0
+  image: vllm/vllm-openai
+  image_digest: sha256:6ee133356d49ed24cee03dd0cda3d3980279a11c107ce3e752c89e76540f41c9
+  image_arch: amd64
+tables:
+  glm53_attention_module_perf:
+    status: complete
+    rows: 459
+    data_sha256: f7c67912e449d1a4e9158d5b08f9306c64ebbd665238ab61b5c529f58c9f68d9
+    collector: collector.vllm.glm53flash_attention_runner
+    measurement: one real sparse-MLA layer (3); output all-reduce excluded; GPU kernel
+      time only
+    timing_method:
+      context:
+      - cupti_gpu_busy_union_framework_breakable_module_graph_replay
+      generation:
+      - cupti_gpu_busy_union_captured_module_graph_replay
+    notes:
+    - 'IndexPool alignment: every prefill chunk starts on a multiple of 4 (stock vLLM
+      0.32.0 assumes pool-aligned chunk starts); decode rows keep their true sequence
+      length L (prompt L-1, whose last seeding chunk may end off the pool grid and
+      completes in the tail as in serving).'
+    - Regular rows are collected at the serving context limit 131079; long-context
+      rows (prefill prefix >= 262144, decode x >= 262144, B=1) at the model limit
+      1048576 are table-extrapolation coverage. Each attempt's limit is its max_model_len.
+    kv_cache_dtype: bfloat16
+    input_tokens:
+      source: seeded_random_tokens
+      count: 1179743
+      generator: sha256_counter_rejection
+      generator_version: 1
+      seed: 53
+      tokenizer_json_sha256: 19e773648cb4e65de8660ea6365e10acca112d42a854923df93db4a6f333a82d
+      vocab_high_exclusive: 154820
+      vocab_low: 0
+      vocab_source: pinned tokenizer.json ordinary BPE vocabulary; added/special tokens
+        excluded
+    execution_mode:
+      fp8-tp4-context: cuda_graph
+      fp8-tp4-generation: cuda_graph
+    attempts:
+    - attempt: fp8-tp4-long-00-u85
+      manifest_sha256: 00f666c9c278f304ae779f8a7864c9df8ba1a9e5437320e78e4215a6f59e3fd6
+      plan_sha256: 409dd861ce4523e497f8c7404b138306b04705eb7d71e2cce7d2e3f95d8627cb
+      deployment: fp8-tp4
+      source_commit: a6ecd5a9a
+      max_model_len: 1048576
+      system: h200_sxm
+      runtime_arch: amd64
+      gpus_per_node: 8
+      serving_env:
+        NCCL_CUMEM_ENABLE: '1'
+        NCCL_NVLS_ENABLE: '1'
+        NCCL_P2P_LEVEL: NVL
+        VLLM_USE_NCCL_SYMM_MEM: '1'
+      vllm_gpu_memory_utilization: 0.85
+      only_sets:
+      - long-decode-b1
+      - long-prefill-b1-q1024-c0
+      - long-prefill-b1-q8192-c0
+    - attempt: fp8-tp4-regular-00-u85
+      manifest_sha256: 3cb69d21ad80c98b522b5966386254fdfbc65131b55d34bb66d9d91862ef706d
+      plan_sha256: 409dd861ce4523e497f8c7404b138306b04705eb7d71e2cce7d2e3f95d8627cb
+      deployment: fp8-tp4
+      source_commit: a6ecd5a9a
+      max_model_len: 131079
+      system: h200_sxm
+      runtime_arch: amd64
+      gpus_per_node: 8
+      serving_env:
+        NCCL_CUMEM_ENABLE: '1'
+        NCCL_NVLS_ENABLE: '1'
+        NCCL_P2P_LEVEL: NVL
+        VLLM_USE_NCCL_SYMM_MEM: '1'
+      vllm_gpu_memory_utilization: 0.85
+      only_sets:
+      - decode-b1
+      - decode-b12
+      - decode-b16
+      - decode-b2
+      - decode-b24
+      - decode-b3
+      - decode-b32
+      - decode-b4
+      - decode-b6
+      - decode-b8
+      - prefill-b1-q1024-c0
+      - prefill-b1-q1024-c1
+      - prefill-b1-q16-c0
+      - prefill-b1-q2048-c0
+      - prefill-b1-q2048-c1
+      - prefill-b1-q2048-c2
+      - prefill-b1-q2052-c0
+      - prefill-b1-q2052-c1
+      - prefill-b1-q2052-c2
+      - prefill-b1-q2052-c3
+      - prefill-b1-q256-c0
+      - prefill-b1-q256-c1
+      - prefill-b1-q4096-c0
+      - prefill-b1-q4096-c1
+      - prefill-b1-q4096-c2
+      - prefill-b1-q4096-c3
+      - prefill-b1-q64-c0
+      - prefill-b1-q8192-c0
+      - prefill-b1-q8192-c1
+      - prefill-b1-q8192-c2
+      - prefill-b1-q8192-c3
+      - prefill-b1-q8192-c4
+      - prefill-b16-q16-c0
+      - prefill-b16-q256-c0
+      - prefill-b16-q256-c1
+      - prefill-b16-q512-c0
+      - prefill-b16-q512-c1
+      - prefill-b16-q64-c0
+      - prefill-b2-q1024-c0
+      - prefill-b2-q1024-c1
+      - prefill-b2-q16-c0
+      - prefill-b2-q2048-c0
+      - prefill-b2-q2048-c1
+      - prefill-b2-q2048-c2
+      - prefill-b2-q2052-c0
+      - prefill-b2-q2052-c1
+      - prefill-b2-q2052-c2
+      - prefill-b2-q2052-c3
+      - prefill-b2-q256-c0
+      - prefill-b2-q256-c1
+      - prefill-b2-q4096-c0
+      - prefill-b2-q4096-c1
+      - prefill-b2-q4096-c2
+      - prefill-b2-q4096-c3
+      - prefill-b2-q64-c0
+      - prefill-b32-q128-c0
+      - prefill-b32-q256-c0
+      - prefill-b32-q256-c1
+      - prefill-b32-q32-c0
+      - prefill-b32-q64-c0
+      - prefill-b32-q8-c0
+      - prefill-b4-q1024-c0
+      - prefill-b4-q1024-c1
+      - prefill-b4-q16-c0
+      - prefill-b4-q2048-c0
+      - prefill-b4-q2048-c1
+      - prefill-b4-q2048-c2
+      - prefill-b4-q256-c0
+      - prefill-b4-q256-c1
+      - prefill-b4-q512-c0
+      - prefill-b4-q512-c1
+      - prefill-b4-q64-c0
+      - prefill-b8-q1024-c0
+      - prefill-b8-q1024-c1
+      - prefill-b8-q16-c0
+      - prefill-b8-q256-c0
+      - prefill-b8-q256-c1
+      - prefill-b8-q512-c0
+      - prefill-b8-q512-c1
+      - prefill-b8-q64-c0
+      partial:
+        admitted_sets:
+        - prefill-b1-q16-c0
+        - prefill-b1-q64-c0
+        - prefill-b1-q256-c0
+        - prefill-b1-q256-c1
+        - prefill-b1-q1024-c0
+        - prefill-b1-q1024-c1
+        - prefill-b1-q2048-c0
+        - prefill-b1-q2048-c1
+        - prefill-b1-q2048-c2
+        - prefill-b1-q2052-c0
+        - prefill-b1-q2052-c1
+        - prefill-b1-q2052-c2
+        - prefill-b1-q2052-c3
+        - prefill-b1-q4096-c0
+        - prefill-b1-q4096-c1
+        - prefill-b1-q4096-c2
+        - prefill-b1-q4096-c3
+        - prefill-b1-q8192-c0:3/6
+        failed_sets:
+        - prefill-b1-q8192-c0
+        superseded_by_complete_attempts: 0
+    - attempt: fp8-tp4-regular-01-u85
+      manifest_sha256: 0e74887afa35643b24c416f34808e246382de882b4478211815ae64f82570a14
+      plan_sha256: 409dd861ce4523e497f8c7404b138306b04705eb7d71e2cce7d2e3f95d8627cb
+      deployment: fp8-tp4
+      source_commit: a6ecd5a9a
+      max_model_len: 131079
+      system: h200_sxm
+      runtime_arch: amd64
+      gpus_per_node: 8
+      serving_env:
+        NCCL_CUMEM_ENABLE: '1'
+        NCCL_NVLS_ENABLE: '1'
+        NCCL_P2P_LEVEL: NVL
+        VLLM_USE_NCCL_SYMM_MEM: '1'
+      vllm_gpu_memory_utilization: 0.85
+      only_sets:
+      - decode-b1
+      - decode-b12
+      - decode-b16
+      - decode-b2
+      - decode-b24
+      - decode-b3
+      - decode-b32
+      - decode-b4
+      - decode-b6
+      - decode-b8
+      - prefill-b1-q8192-c1
+      - prefill-b1-q8192-c2
+      - prefill-b1-q8192-c3
+      - prefill-b1-q8192-c4
+      - prefill-b16-q16-c0
+      - prefill-b16-q256-c0
+      - prefill-b16-q256-c1
+      - prefill-b16-q512-c0
+      - prefill-b16-q512-c1
+      - prefill-b16-q64-c0
+      - prefill-b2-q1024-c0
+      - prefill-b2-q1024-c1
+      - prefill-b2-q16-c0
+      - prefill-b2-q2048-c0
+      - prefill-b2-q2048-c1
+      - prefill-b2-q2048-c2
+      - prefill-b2-q2052-c0
+      - prefill-b2-q2052-c1
+      - prefill-b2-q2052-c2
+      - prefill-b2-q2052-c3
+      - prefill-b2-q256-c0
+      - prefill-b2-q256-c1
+      - prefill-b2-q4096-c0
+      - prefill-b2-q4096-c1
+      - prefill-b2-q4096-c2
+      - prefill-b2-q4096-c3
+      - prefill-b2-q64-c0
+      - prefill-b32-q128-c0
+      - prefill-b32-q256-c0
+      - prefill-b32-q256-c1
+      - prefill-b32-q32-c0
+      - prefill-b32-q64-c0
+      - prefill-b32-q8-c0
+      - prefill-b4-q1024-c0
+      - prefill-b4-q1024-c1
+      - prefill-b4-q16-c0
+      - prefill-b4-q2048-c0
+      - prefill-b4-q2048-c1
+      - prefill-b4-q2048-c2
+      - prefill-b4-q256-c0
+      - prefill-b4-q256-c1
+      - prefill-b4-q512-c0
+      - prefill-b4-q512-c1
+      - prefill-b4-q64-c0
+      - prefill-b8-q1024-c0
+      - prefill-b8-q1024-c1
+      - prefill-b8-q16-c0
+      - prefill-b8-q256-c0
+      - prefill-b8-q256-c1
+      - prefill-b8-q512-c0
+      - prefill-b8-q512-c1
+      - prefill-b8-q64-c0
+      partial:
+        admitted_sets:
+        - prefill-b1-q8192-c1
+        - prefill-b1-q8192-c2
+        - prefill-b1-q8192-c3
+        - prefill-b1-q8192-c4
+        - prefill-b2-q16-c0
+        - prefill-b2-q64-c0
+        - prefill-b2-q256-c0
+        - prefill-b2-q256-c1
+        - prefill-b2-q1024-c0
+        - prefill-b2-q1024-c1
+        - prefill-b2-q2048-c0
+        - prefill-b2-q2048-c1
+        - prefill-b2-q2048-c2
+        - prefill-b2-q2052-c0:4/7
+        failed_sets:
+        - prefill-b2-q2052-c0
+        superseded_by_complete_attempts: 0
+    - attempt: fp8-tp4-regular-02-u85
+      manifest_sha256: aab2f32b7bcc64144fd5642461c0e3496b283a20b2572cd89c69bc64460cd47d
+      plan_sha256: 409dd861ce4523e497f8c7404b138306b04705eb7d71e2cce7d2e3f95d8627cb
+      deployment: fp8-tp4
+      source_commit: a6ecd5a9a
+      max_model_len: 131079
+      system: h200_sxm
+      runtime_arch: amd64
+      gpus_per_node: 8
+      serving_env:
+        NCCL_CUMEM_ENABLE: '1'
+        NCCL_NVLS_ENABLE: '1'
+        NCCL_P2P_LEVEL: NVL
+        VLLM_USE_NCCL_SYMM_MEM: '1'
+      vllm_gpu_memory_utilization: 0.85
+      only_sets:
+      - decode-b1
+      - decode-b12
+      - decode-b16
+      - decode-b2
+      - decode-b24
+      - decode-b3
+      - decode-b32
+      - decode-b4
+      - decode-b6
+      - decode-b8
+      - prefill-b16-q16-c0
+      - prefill-b16-q256-c0
+      - prefill-b16-q256-c1
+      - prefill-b16-q512-c0
+      - prefill-b16-q512-c1
+      - prefill-b16-q64-c0
+      - prefill-b2-q2052-c1
+      - prefill-b2-q2052-c2
+      - prefill-b2-q2052-c3
+      - prefill-b2-q4096-c0
+      - prefill-b2-q4096-c1
+      - prefill-b2-q4096-c2
+      - prefill-b2-q4096-c3
+      - prefill-b32-q128-c0
+      - prefill-b32-q256-c0
+      - prefill-b32-q256-c1
+      - prefill-b32-q32-c0
+      - prefill-b32-q64-c0
+      - prefill-b32-q8-c0
+      - prefill-b4-q1024-c0
+      - prefill-b4-q1024-c1
+      - prefill-b4-q16-c0
+      - prefill-b4-q2048-c0
+      - prefill-b4-q2048-c1
+      - prefill-b4-q2048-c2
+      - prefill-b4-q256-c0
+      - prefill-b4-q256-c1
+      - prefill-b4-q512-c0
+      - prefill-b4-q512-c1
+      - prefill-b4-q64-c0
+      - prefill-b8-q1024-c0
+      - prefill-b8-q1024-c1
+      - prefill-b8-q16-c0
+      - prefill-b8-q256-c0
+      - prefill-b8-q256-c1
+      - prefill-b8-q512-c0
+      - prefill-b8-q512-c1
+      - prefill-b8-q64-c0
+      partial:
+        admitted_sets:
+        - prefill-b2-q2052-c1
+        - prefill-b2-q2052-c2
+        - prefill-b2-q2052-c3
+        - prefill-b2-q4096-c0
+        - prefill-b2-q4096-c1
+        - prefill-b2-q4096-c2
+        - prefill-b2-q4096-c3
+        - prefill-b4-q16-c0
+        - prefill-b4-q64-c0
+        - prefill-b4-q256-c0
+        - prefill-b4-q256-c1
+        - prefill-b4-q512-c0
+        - prefill-b4-q512-c1
+        - prefill-b4-q1024-c0
+        failed_sets:
+        - prefill-b4-q1024-c1
+        superseded_by_complete_attempts: 0
+    - attempt: fp8-tp4-regular-03-u85
+      manifest_sha256: e92da20e115b184220e6784e5b31f55f1315f763a6c8b57b171a537b2f875294
+      plan_sha256: 409dd861ce4523e497f8c7404b138306b04705eb7d71e2cce7d2e3f95d8627cb
+      deployment: fp8-tp4
+      source_commit: a6ecd5a9a
+      max_model_len: 131079
+      system: h200_sxm
+      runtime_arch: amd64
+      gpus_per_node: 8
+      serving_env:
+        NCCL_CUMEM_ENABLE: '1'
+        NCCL_NVLS_ENABLE: '1'
+        NCCL_P2P_LEVEL: NVL
+        VLLM_USE_NCCL_SYMM_MEM: '1'
+      vllm_gpu_memory_utilization: 0.85
+      only_sets:
+      - decode-b1
+      - decode-b12
+      - decode-b16
+      - decode-b2
+      - decode-b24
+      - decode-b3
+      - decode-b32
+      - decode-b4
+      - decode-b6
+      - decode-b8
+      - prefill-b16-q16-c0
+      - prefill-b16-q256-c0
+      - prefill-b16-q256-c1
+      - prefill-b16-q512-c0
+      - prefill-b16-q512-c1
+      - prefill-b16-q64-c0
+      - prefill-b32-q128-c0
+      - prefill-b32-q256-c0
+      - prefill-b32-q256-c1
+      - prefill-b32-q32-c0
+      - prefill-b32-q64-c0
+      - prefill-b32-q8-c0
+      - prefill-b4-q2048-c0
+      - prefill-b4-q2048-c1
+      - prefill-b4-q2048-c2
+      - prefill-b8-q1024-c0
+      - prefill-b8-q1024-c1
+      - prefill-b8-q16-c0
+      - prefill-b8-q256-c0
+      - prefill-b8-q256-c1
+      - prefill-b8-q512-c0
+      - prefill-b8-q512-c1
+      - prefill-b8-q64-c0
+      partial:
+        admitted_sets:
+        - prefill-b4-q2048-c0
+        - prefill-b4-q2048-c1
+        - prefill-b4-q2048-c2
+        - prefill-b8-q16-c0
+        - prefill-b8-q64-c0
+        - prefill-b8-q256-c0
+        - prefill-b8-q256-c1
+        - prefill-b8-q512-c0
+        failed_sets:
+        - prefill-b8-q512-c1
+        superseded_by_complete_attempts: 0
+    - attempt: fp8-tp4-regular-04-u85
+      manifest_sha256: cccf8b11d766f412fc27e3d48ac2cc9faf996f6338e2dfa9bc1f78bf1206469f
+      plan_sha256: 409dd861ce4523e497f8c7404b138306b04705eb7d71e2cce7d2e3f95d8627cb
+      deployment: fp8-tp4
+      source_commit: a6ecd5a9a
+      max_model_len: 131079
+      system: h200_sxm
+      runtime_arch: amd64
+      gpus_per_node: 8
+      serving_env:
+        NCCL_CUMEM_ENABLE: '1'
+        NCCL_NVLS_ENABLE: '1'
+        NCCL_P2P_LEVEL: NVL
+        VLLM_USE_NCCL_SYMM_MEM: '1'
+      vllm_gpu_memory_utilization: 0.85
+      only_sets:
+      - decode-b1
+      - decode-b12
+      - decode-b16
+      - decode-b2
+      - decode-b24
+      - decode-b3
+      - decode-b32
+      - decode-b4
+      - decode-b6
+      - decode-b8
+      - prefill-b16-q16-c0
+      - prefill-b16-q256-c0
+      - prefill-b16-q256-c1
+      - prefill-b16-q512-c0
+      - prefill-b16-q512-c1
+      - prefill-b16-q64-c0
+      - prefill-b32-q128-c0
+      - prefill-b32-q256-c0
+      - prefill-b32-q256-c1
+      - prefill-b32-q32-c0
+      - prefill-b32-q64-c0
+      - prefill-b32-q8-c0
+      - prefill-b8-q1024-c0
+      - prefill-b8-q1024-c1
+      partial:
+        admitted_sets:
+        - prefill-b8-q1024-c0
+        - prefill-b8-q1024-c1
+        - prefill-b16-q16-c0
+        - prefill-b16-q64-c0
+        - prefill-b16-q256-c0:8/9
+        failed_sets:
+        - prefill-b16-q256-c0
+        superseded_by_complete_attempts: 0
+    - attempt: fp8-tp4-regular-05-u85
+      manifest_sha256: ff0c259a19a20790fa635958160b0b57485e87b49c02eed2edd4675eb21fc030
+      plan_sha256: 409dd861ce4523e497f8c7404b138306b04705eb7d71e2cce7d2e3f95d8627cb
+      deployment: fp8-tp4
+      source_commit: a6ecd5a9a
+      max_model_len: 131079
+      system: h200_sxm
+      runtime_arch: amd64
+      gpus_per_node: 8
+      serving_env:
+        NCCL_CUMEM_ENABLE: '1'
+        NCCL_NVLS_ENABLE: '1'
+        NCCL_P2P_LEVEL: NVL
+        VLLM_USE_NCCL_SYMM_MEM: '1'
+      vllm_gpu_memory_utilization: 0.85
+      only_sets:
+      - decode-b1
+      - decode-b12
+      - decode-b16
+      - decode-b2
+      - decode-b24
+      - decode-b3
+      - decode-b32
+      - decode-b4
+      - decode-b6
+      - decode-b8
+      - prefill-b16-q256-c1
+      - prefill-b16-q512-c0
+      - prefill-b16-q512-c1
+      - prefill-b32-q128-c0
+      - prefill-b32-q256-c0
+      - prefill-b32-q256-c1
+      - prefill-b32-q32-c0
+      - prefill-b32-q64-c0
+      - prefill-b32-q8-c0
+      partial:
+        admitted_sets:
+        - prefill-b16-q256-c1
+        - prefill-b16-q512-c0
+        - prefill-b16-q512-c1
+        - prefill-b32-q8-c0:9/10
+        failed_sets:
+        - prefill-b32-q8-c0
+        superseded_by_complete_attempts: 0
+    - attempt: fp8-tp4-regular-06-u85
+      manifest_sha256: 187f1da92d9ee6aaadce96db1df7960e7537626c704211b4d3aea0f48b5ab8e5
+      plan_sha256: 409dd861ce4523e497f8c7404b138306b04705eb7d71e2cce7d2e3f95d8627cb
+      deployment: fp8-tp4
+      source_commit: a6ecd5a9a
+      max_model_len: 131079
+      system: h200_sxm
+      runtime_arch: amd64
+      gpus_per_node: 8
+      serving_env:
+        NCCL_CUMEM_ENABLE: '1'
+        NCCL_NVLS_ENABLE: '1'
+        NCCL_P2P_LEVEL: NVL
+        VLLM_USE_NCCL_SYMM_MEM: '1'
+      vllm_gpu_memory_utilization: 0.85
+      only_sets:
+      - decode-b1
+      - decode-b12
+      - decode-b16
+      - decode-b2
+      - decode-b24
+      - decode-b3
+      - decode-b32
+      - decode-b4
+      - decode-b6
+      - decode-b8
+      - prefill-b32-q128-c0
+      - prefill-b32-q256-c0
+      - prefill-b32-q256-c1
+      - prefill-b32-q32-c0
+      - prefill-b32-q64-c0
+      partial:
+        admitted_sets:
+        - prefill-b32-q32-c0:9/10
+        failed_sets:
+        - prefill-b32-q32-c0
+        superseded_by_complete_attempts: 0
+    - attempt: fp8-tp4-regular-07-u85
+      manifest_sha256: 6bd8581f9d3aebf75f3c47c1307d72b19ffd218a71de71a7b91a859540a08765
+      plan_sha256: 409dd861ce4523e497f8c7404b138306b04705eb7d71e2cce7d2e3f95d8627cb
+      deployment: fp8-tp4
+      source_commit: a6ecd5a9a
+      max_model_len: 131079
+      system: h200_sxm
+      runtime_arch: amd64
+      gpus_per_node: 8
+      serving_env:
+        NCCL_CUMEM_ENABLE: '1'
+        NCCL_NVLS_ENABLE: '1'
+        NCCL_P2P_LEVEL: NVL
+        VLLM_USE_NCCL_SYMM_MEM: '1'
+      vllm_gpu_memory_utilization: 0.85
+      only_sets:
+      - decode-b1
+      - decode-b12
+      - decode-b16
+      - decode-b2
+      - decode-b24
+      - decode-b3
+      - decode-b32
+      - decode-b4
+      - decode-b6
+      - decode-b8
+      - prefill-b32-q128-c0
+      - prefill-b32-q256-c0
+      - prefill-b32-q256-c1
+      - prefill-b32-q64-c0
+      partial:
+        admitted_sets:
+        - prefill-b32-q64-c0:9/10
+        failed_sets:
+        - prefill-b32-q64-c0
+        superseded_by_complete_attempts: 0
+    - attempt: fp8-tp4-regular-08-u85
+      manifest_sha256: 55075d5eef6a2f6f194112041405eab4772e8a5ce62e1fd56b86f1c6fb85a891
+      plan_sha256: 409dd861ce4523e497f8c7404b138306b04705eb7d71e2cce7d2e3f95d8627cb
+      deployment: fp8-tp4
+      source_commit: a6ecd5a9a
+      max_model_len: 131079
+      system: h200_sxm
+      runtime_arch: amd64
+      gpus_per_node: 8
+      serving_env:
+        NCCL_CUMEM_ENABLE: '1'
+        NCCL_NVLS_ENABLE: '1'
+        NCCL_P2P_LEVEL: NVL
+        VLLM_USE_NCCL_SYMM_MEM: '1'
+      vllm_gpu_memory_utilization: 0.85
+      only_sets:
+      - decode-b1
+      - decode-b12
+      - decode-b16
+      - decode-b2
+      - decode-b24
+      - decode-b3
+      - decode-b32
+      - decode-b4
+      - decode-b6
+      - decode-b8
+      - prefill-b32-q128-c0
+      - prefill-b32-q256-c0
+      - prefill-b32-q256-c1
+      partial:
+        admitted_sets:
+        - prefill-b32-q128-c0:9/10
+        failed_sets:
+        - prefill-b32-q128-c0
+        superseded_by_complete_attempts: 0
+    - attempt: fp8-tp4-regular-09-u85
+      manifest_sha256: a89b10ec31c692c51601e44a6641ccdd12d9e4e4d7a7e4765fcc14896ed38579
+      plan_sha256: 409dd861ce4523e497f8c7404b138306b04705eb7d71e2cce7d2e3f95d8627cb
+      deployment: fp8-tp4
+      source_commit: a6ecd5a9a
+      max_model_len: 131079
+      system: h200_sxm
+      runtime_arch: amd64
+      gpus_per_node: 8
+      serving_env:
+        NCCL_CUMEM_ENABLE: '1'
+        NCCL_NVLS_ENABLE: '1'
+        NCCL_P2P_LEVEL: NVL
+        VLLM_USE_NCCL_SYMM_MEM: '1'
+      vllm_gpu_memory_utilization: 0.85
+      only_sets:
+      - decode-b1
+      - decode-b12
+      - decode-b16
+      - decode-b2
+      - decode-b24
+      - decode-b3
+      - decode-b32
+      - decode-b4
+      - decode-b6
+      - decode-b8
+      - prefill-b32-q256-c0
+      - prefill-b32-q256-c1
+      partial:
+        admitted_sets:
+        - prefill-b32-q256-c0:8/9
+        failed_sets:
+        - prefill-b32-q256-c0
+        superseded_by_complete_attempts: 0
+    - attempt: fp8-tp4-regular-10-u85
+      manifest_sha256: 0ba703ca455601ad5e4de87646829a95388166983192dbcf9d0d23ba3811ba1c
+      plan_sha256: 409dd861ce4523e497f8c7404b138306b04705eb7d71e2cce7d2e3f95d8627cb
+      deployment: fp8-tp4
+      source_commit: a6ecd5a9a
+      max_model_len: 131079
+      system: h200_sxm
+      runtime_arch: amd64
+      gpus_per_node: 8
+      serving_env:
+        NCCL_CUMEM_ENABLE: '1'
+        NCCL_NVLS_ENABLE: '1'
+        NCCL_P2P_LEVEL: NVL
+        VLLM_USE_NCCL_SYMM_MEM: '1'
+      vllm_gpu_memory_utilization: 0.85
+      only_sets:
+      - decode-b1
+      - decode-b12
+      - decode-b16
+      - decode-b2
+      - decode-b24
+      - decode-b3
+      - decode-b32
+      - decode-b4
+      - decode-b6
+      - decode-b8
+      - prefill-b32-q256-c1
+      partial:
+        admitted_sets:
+        - prefill-b32-q256-c1
+        - decode-b1
+        - decode-b2
+        - decode-b3
+        - decode-b4
+        - decode-b6
+        - decode-b8
+        - decode-b12
+        - decode-b16
+        - decode-b24
+        - decode-b32:10/12
+        failed_sets:
+        - decode-b32
+        superseded_by_complete_attempts: 0
+    - attempt: fp8-tp4-regular-11-u70
+      manifest_sha256: 8cac7528d70581bc0f4ffc0db88e79d8a50624dd40f9d9656f5edacc57b348bd
+      plan_sha256: 409dd861ce4523e497f8c7404b138306b04705eb7d71e2cce7d2e3f95d8627cb
+      deployment: fp8-tp4
+      source_commit: a6ecd5a9a
+      max_model_len: 131079
+      system: h200_sxm
+      runtime_arch: amd64
+      gpus_per_node: 8
+      serving_env:
+        NCCL_CUMEM_ENABLE: '1'
+        NCCL_NVLS_ENABLE: '1'
+        NCCL_P2P_LEVEL: NVL
+        VLLM_USE_NCCL_SYMM_MEM: '1'
+      vllm_gpu_memory_utilization: 0.7
+      only_sets:
+      - decode-b32
+      - prefill-b1-q8192-c0
+      - prefill-b16-q256-c0
+      - prefill-b2-q2052-c0
+      - prefill-b32-q128-c0
+      - prefill-b32-q256-c0
+      - prefill-b32-q32-c0
+      - prefill-b32-q64-c0
+      - prefill-b32-q8-c0
+      - prefill-b4-q1024-c1
+      - prefill-b8-q512-c1
+      partial:
+        admitted_sets:
+        - prefill-b1-q8192-c0
+        - prefill-b2-q2052-c0
+        - prefill-b4-q1024-c1
+        - prefill-b8-q512-c1
+        - prefill-b16-q256-c0:7/9
+        failed_sets:
+        - prefill-b16-q256-c0
+        superseded_by_complete_attempts: 14
+    - attempt: fp8-tp4-regular-12-u70
+      manifest_sha256: 778f8d372c3a5d9ed1e94e54a4ca2a9493e758d238c9f6c5a8a9576137478c9a
+      plan_sha256: 409dd861ce4523e497f8c7404b138306b04705eb7d71e2cce7d2e3f95d8627cb
+      deployment: fp8-tp4
+      source_commit: a6ecd5a9a
+      max_model_len: 131079
+      system: h200_sxm
+      runtime_arch: amd64
+      gpus_per_node: 8
+      serving_env:
+        NCCL_CUMEM_ENABLE: '1'
+        NCCL_NVLS_ENABLE: '1'
+        NCCL_P2P_LEVEL: NVL
+        VLLM_USE_NCCL_SYMM_MEM: '1'
+      vllm_gpu_memory_utilization: 0.7
+      only_sets:
+      - decode-b32
+      - prefill-b32-q128-c0
+      - prefill-b32-q256-c0
+      - prefill-b32-q32-c0
+      - prefill-b32-q64-c0
+      - prefill-b32-q8-c0
+      partial:
+        admitted_sets:
+        - prefill-b32-q8-c0:7/10
+        failed_sets:
+        - prefill-b32-q8-c0
+        superseded_by_complete_attempts: 7
+    - attempt: fp8-tp4-regular-13-u70
+      manifest_sha256: 10b98642f8be94afade1c0c814a271d4964057fa9e406ecb6ba7988812b8d0c0
+      plan_sha256: 409dd861ce4523e497f8c7404b138306b04705eb7d71e2cce7d2e3f95d8627cb
+      deployment: fp8-tp4
+      source_commit: a6ecd5a9a
+      max_model_len: 131079
+      system: h200_sxm
+      runtime_arch: amd64
+      gpus_per_node: 8
+      serving_env:
+        NCCL_CUMEM_ENABLE: '1'
+        NCCL_NVLS_ENABLE: '1'
+        NCCL_P2P_LEVEL: NVL
+        VLLM_USE_NCCL_SYMM_MEM: '1'
+      vllm_gpu_memory_utilization: 0.7
+      only_sets:
+      - decode-b32
+      - prefill-b32-q128-c0
+      - prefill-b32-q256-c0
+      - prefill-b32-q32-c0
+      - prefill-b32-q64-c0
+      partial:
+        admitted_sets:
+        - prefill-b32-q32-c0:7/10
+        failed_sets:
+        - prefill-b32-q32-c0
+        superseded_by_complete_attempts: 7
+    - attempt: fp8-tp4-regular-14-u70
+      manifest_sha256: 7dccf07d9ef39cc4cfc3e1b3e00ecb9b6ace4b7a6c809bb642a38c9cb1c202dd
+      plan_sha256: 409dd861ce4523e497f8c7404b138306b04705eb7d71e2cce7d2e3f95d8627cb
+      deployment: fp8-tp4
+      source_commit: a6ecd5a9a
+      max_model_len: 131079
+      system: h200_sxm
+      runtime_arch: amd64
+      gpus_per_node: 8
+      serving_env:
+        NCCL_CUMEM_ENABLE: '1'
+        NCCL_NVLS_ENABLE: '1'
+        NCCL_P2P_LEVEL: NVL
+        VLLM_USE_NCCL_SYMM_MEM: '1'
+      vllm_gpu_memory_utilization: 0.7
+      only_sets:
+      - decode-b32
+      - prefill-b32-q128-c0
+      - prefill-b32-q256-c0
+      - prefill-b32-q64-c0
+      partial:
+        admitted_sets:
+        - prefill-b32-q64-c0:7/10
+        failed_sets:
+        - prefill-b32-q64-c0
+        superseded_by_complete_attempts: 7
+    - attempt: fp8-tp4-regular-15-u70
+      manifest_sha256: ba3f49db60a09508abf1a00c57a4d80d9e62011b54c3edb88cc087b81eee411d
+      plan_sha256: 409dd861ce4523e497f8c7404b138306b04705eb7d71e2cce7d2e3f95d8627cb
+      deployment: fp8-tp4
+      source_commit: a6ecd5a9a
+      max_model_len: 131079
+      system: h200_sxm
+      runtime_arch: amd64
+      gpus_per_node: 8
+      serving_env:
+        NCCL_CUMEM_ENABLE: '1'
+        NCCL_NVLS_ENABLE: '1'
+        NCCL_P2P_LEVEL: NVL
+        VLLM_USE_NCCL_SYMM_MEM: '1'
+      vllm_gpu_memory_utilization: 0.7
+      only_sets:
+      - decode-b32
+      - prefill-b32-q128-c0
+      - prefill-b32-q256-c0
+      partial:
+        admitted_sets:
+        - prefill-b32-q128-c0:7/10
+        failed_sets:
+        - prefill-b32-q128-c0
+        superseded_by_complete_attempts: 7
+    - attempt: fp8-tp4-regular-16-u70
+      manifest_sha256: ef04703fcf5007ef55699e7747f223978e31586c768fecfcbc1d4245ce29e43a
+      plan_sha256: 409dd861ce4523e497f8c7404b138306b04705eb7d71e2cce7d2e3f95d8627cb
+      deployment: fp8-tp4
+      source_commit: a6ecd5a9a
+      max_model_len: 131079
+      system: h200_sxm
+      runtime_arch: amd64
+      gpus_per_node: 8
+      serving_env:
+        NCCL_CUMEM_ENABLE: '1'
+        NCCL_NVLS_ENABLE: '1'
+        NCCL_P2P_LEVEL: NVL
+        VLLM_USE_NCCL_SYMM_MEM: '1'
+      vllm_gpu_memory_utilization: 0.7
+      only_sets:
+      - decode-b32
+      - prefill-b32-q256-c0
+      partial:
+        admitted_sets:
+        - prefill-b32-q256-c0:6/9
+        failed_sets:
+        - prefill-b32-q256-c0
+        superseded_by_complete_attempts: 6
+    - attempt: fp8-tp4-regular-17-u70
+      manifest_sha256: 7427dc3ab84872001793afd49c031a938a2cb92a130a4cb90bb3bbf5ac1c2eb7
+      plan_sha256: 409dd861ce4523e497f8c7404b138306b04705eb7d71e2cce7d2e3f95d8627cb
+      deployment: fp8-tp4
+      source_commit: a6ecd5a9a
+      max_model_len: 131079
+      system: h200_sxm
+      runtime_arch: amd64
+      gpus_per_node: 8
+      serving_env:
+        NCCL_CUMEM_ENABLE: '1'
+        NCCL_NVLS_ENABLE: '1'
+        NCCL_P2P_LEVEL: NVL
+        VLLM_USE_NCCL_SYMM_MEM: '1'
+      vllm_gpu_memory_utilization: 0.7
+      only_sets:
+      - decode-b32
+      partial:
+        admitted_sets:
+        - decode-b32:8/12
+        failed_sets:
+        - decode-b32
+        superseded_by_complete_attempts: 8
+    - attempt: fp8-tp4-regular-18-u92
+      manifest_sha256: c164b972259a1f0a249719540284b0f24f43a6b4d48efb939f7361e749cb2421
+      plan_sha256: 409dd861ce4523e497f8c7404b138306b04705eb7d71e2cce7d2e3f95d8627cb
+      deployment: fp8-tp4
+      source_commit: a6ecd5a9a
+      max_model_len: 131079
+      system: h200_sxm
+      runtime_arch: amd64
+      gpus_per_node: 8
+      serving_env:
+        NCCL_CUMEM_ENABLE: '1'
+        NCCL_NVLS_ENABLE: '1'
+        NCCL_P2P_LEVEL: NVL
+        VLLM_USE_NCCL_SYMM_MEM: '1'
+      vllm_gpu_memory_utilization: 0.92
+      only_sets:
+      - decode-b32
+      - prefill-b16-q256-c0
+      - prefill-b32-q128-c0
+      - prefill-b32-q256-c0
+      - prefill-b32-q32-c0
+      - prefill-b32-q64-c0
+      - prefill-b32-q8-c0
+      partial:
+        admitted_sets:
+        - prefill-b16-q256-c0:4/9
+        failed_sets:
+        - prefill-b16-q256-c0
+        superseded_by_complete_attempts: 4
+    - attempt: fp8-tp4-regular-19-u92
+      manifest_sha256: b57393a605cd98f8ddea06fa1ed90d95b7fab242c9daff3c76aa70a006184fb9
+      plan_sha256: 409dd861ce4523e497f8c7404b138306b04705eb7d71e2cce7d2e3f95d8627cb
+      deployment: fp8-tp4
+      source_commit: a6ecd5a9a
+      max_model_len: 131079
+      system: h200_sxm
+      runtime_arch: amd64
+      gpus_per_node: 8
+      serving_env:
+        NCCL_CUMEM_ENABLE: '1'
+        NCCL_NVLS_ENABLE: '1'
+        NCCL_P2P_LEVEL: NVL
+        VLLM_USE_NCCL_SYMM_MEM: '1'
+      vllm_gpu_memory_utilization: 0.92
+      only_sets:
+      - decode-b32
+      - prefill-b32-q128-c0
+      - prefill-b32-q256-c0
+      - prefill-b32-q32-c0
+      - prefill-b32-q64-c0
+      - prefill-b32-q8-c0
+      partial:
+        admitted_sets:
+        - prefill-b32-q8-c0
+        - prefill-b32-q32-c0
+        - prefill-b32-q64-c0:8/10
+        failed_sets:
+        - prefill-b32-q64-c0
+        superseded_by_complete_attempts: 26
+    - attempt: fp8-tp4-regular-20-u92
+      manifest_sha256: aebb2e70c3e3c05d36915400e0ef0f8cb98f483bc3d9110b705eece71f5d4148
+      plan_sha256: 409dd861ce4523e497f8c7404b138306b04705eb7d71e2cce7d2e3f95d8627cb
+      deployment: fp8-tp4
+      source_commit: a6ecd5a9a
+      max_model_len: 131079
+      system: h200_sxm
+      runtime_arch: amd64
+      gpus_per_node: 8
+      serving_env:
+        NCCL_CUMEM_ENABLE: '1'
+        NCCL_NVLS_ENABLE: '1'
+        NCCL_P2P_LEVEL: NVL
+        VLLM_USE_NCCL_SYMM_MEM: '1'
+      vllm_gpu_memory_utilization: 0.92
+      only_sets:
+      - decode-b32
+      - prefill-b32-q128-c0
+      - prefill-b32-q256-c0
+      partial:
+        admitted_sets:
+        - prefill-b32-q128-c0:9/10
+        failed_sets:
+        - prefill-b32-q128-c0
+        superseded_by_complete_attempts: 9
+    - attempt: fp8-tp4-regular-21-u92
+      manifest_sha256: d93beb9700b9e842edd1265952c991410fb01bf1a5dceffb374267cb0442e58f
+      plan_sha256: 409dd861ce4523e497f8c7404b138306b04705eb7d71e2cce7d2e3f95d8627cb
+      deployment: fp8-tp4
+      source_commit: a6ecd5a9a
+      max_model_len: 131079
+      system: h200_sxm
+      runtime_arch: amd64
+      gpus_per_node: 8
+      serving_env:
+        NCCL_CUMEM_ENABLE: '1'
+        NCCL_NVLS_ENABLE: '1'
+        NCCL_P2P_LEVEL: NVL
+        VLLM_USE_NCCL_SYMM_MEM: '1'
+      vllm_gpu_memory_utilization: 0.92
+      only_sets:
+      - decode-b32
+      - prefill-b32-q256-c0
+      partial:
+        admitted_sets:
+        - prefill-b32-q256-c0
+        - decode-b32:11/12
+        failed_sets:
+        - decode-b32
+        superseded_by_complete_attempts: 18
+    classified_failures:
+    - deployment: fp8-tp4
+      key:
+      - context
+      - 16
+      - 98304
+      - 256
+      reason: failed_at_every_utilization
+      evidence: 'set prefill-b16-q256-c0 failed at every gpu_memory_utilization of
+        the ladder: 0.85: RuntimeError: Worker failed with error ''Triton Error [CUDA]:
+        unspecified launch failure'', please check the stack trace above for the root
+        cause; 0.7: RuntimeError: requests computed [64768, 64768, 64768, 64768, 64768,
+        64768, 64768, 64768, 64768, 64768, 64768, 64768, 64768, 64768, 64768, 0],
+        planned 64768; 0.92: RuntimeError: Worker failed with error ''CUDA out of
+        memory. Tried to allocate 64.00 MiB. GPU 0 has a total capacity of 139.80
+        GiB of which 63.00 MiB is free. In; 0.55: RunnerExit: the runner ended with
+        exit code 1 before naming a set; see runner.log'
+    - deployment: fp8-tp4
+      key:
+      - context
+      - 32
+      - 98304
+      - 64
+      reason: failed_at_every_utilization
+      evidence: 'set prefill-b32-q64-c0 failed at every gpu_memory_utilization of
+        the ladder: 0.85: RuntimeError: requests computed [89920, 89920, 89920, 89920,
+        89920, 89920, 89920, 89920, 89920, 89920, 89920, 89920, 89920, 89920, 89920,
+        89920, 89920, 89920, 8; 0.7: RuntimeError: requests computed [28992, 28992,
+        28992, 28992, 28992, 28992, 28992, 28992, 28992, 28992, 28992, 28992, 28992,
+        28992, 28992, 28992, 28992, 28992, 2; 0.92: RuntimeError: Worker failed with
+        error ''CUDA out of memory. Tried to allocate 32.00 MiB. GPU 0 has a total
+        capacity of 139.80 GiB of which 13.00 MiB is free. In; 0.55: RunnerExit: the
+        runner ended with exit code 1 before naming a set; see runner.log'
+    - deployment: fp8-tp4
+      key:
+      - context
+      - 32
+      - 98304
+      - 128
+      reason: failed_at_every_utilization
+      evidence: 'set prefill-b32-q128-c0 failed at every gpu_memory_utilization of
+        the ladder: 0.85: RuntimeError: requests computed [89984, 89984, 89984, 89984,
+        89984, 89984, 89984, 89984, 89984, 89984, 89984, 89984, 89984, 89984, 89984,
+        89984, 89984, 89984, 8; 0.7: RuntimeError: requests computed [29056, 29056,
+        29056, 29056, 29056, 29056, 29056, 29056, 29056, 29056, 29056, 29056, 29056,
+        29056, 29056, 29056, 29056, 29056, 2; 0.92: RuntimeError: Worker failed with
+        error ''CUDA out of memory. Tried to allocate 32.00 MiB. GPU 0 has a total
+        capacity of 139.80 GiB of which 17.00 MiB is free. In; 0.55: RunnerExit: the
+        runner ended with exit code 1 before naming a set; see runner.log'
+    - deployment: fp8-tp4
+      key:
+      - generation
+      - 32
+      - 0
+      - 131072
+      reason: failed_at_every_utilization
+      evidence: 'set decode-b32 failed at every gpu_memory_utilization of the ladder:
+        0.85: RuntimeError: requests computed [90112, 90112, 90112, 90112, 90112,
+        90112, 90112, 90112, 90112, 90112, 90112, 90112, 90112, 90112, 90112, 90112,
+        90112, 90112, 9; 0.7: RuntimeError: requests computed [28928, 28928, 28928,
+        28928, 28928, 28928, 28928, 28928, 28928, 28928, 28928, 28928, 28928, 28928,
+        28928, 28928, 28928, 28928, 2; 0.92: RuntimeError: requests computed [117760,
+        117760, 117760, 117760, 117760, 117760, 117760, 117760, 117760, 117760, 117760,
+        117760, 117760, 117760, 117760, 117760,; 0.55: RunnerExit: the runner ended
+        with exit code 1 before naming a set; see runner.log'

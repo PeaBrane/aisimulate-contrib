@@ -200,6 +200,7 @@ def test_mamba2_kernels_ask_for_the_per_shard_shape(tp, nheads, n_groups):
     ("field", "value"),
     [("mamba_num_heads", 126), ("n_groups", 6)],
 )
+@pytest.mark.usefixtures("raw_data_coordinates")
 def test_mamba2_rejects_uneven_shards_before_building_pipelines(monkeypatch, field, value):
     import aisim_core.sdk.models as models
 
@@ -269,6 +270,7 @@ def _trtllm_hybrid_56b(tp):
 
 
 @pytest.mark.parametrize(("tp", "conv_source"), [(1, "silicon"), (8, "sol")])
+@pytest.mark.usefixtures("raw_data_coordinates")
 def test_trtllm_hybrid_prices_the_mamba2_conv_kernels_at_the_per_shard_shape(tp, conv_source):
     # The packaged TRT-LLM rc20 table holds the TP 1 geometry (256 heads, 8 groups) of the conv kernels only:
     # it has no scan or state-update rows, so the SSM kernels report sol at every TP and do not discriminate.
@@ -311,6 +313,7 @@ def _sources(model, *, prefill):
     return {op["name"]: op["source"] for op in ops}
 
 
+@pytest.mark.usefixtures("raw_data_coordinates")
 def test_sglang_hybrid_reads_the_packaged_moe_and_attention_tables():
     model = RustForwardPassPerfModel.best_available(_explicit("sglang", "0.5.14", "HYBRID"))
     try:
@@ -332,6 +335,7 @@ def test_sglang_hybrid_reads_the_packaged_moe_and_attention_tables():
     assert {decode["generation_mamba_conv1d"], decode["generation_mamba_ssm"]} == {"sol"}
 
 
+@pytest.mark.usefixtures("raw_data_coordinates")
 def test_sglang_silicon_reports_the_missing_mamba2_table():
     with pytest.raises(
         PerfDataNotAvailableError,
@@ -340,6 +344,7 @@ def test_sglang_silicon_reports_the_missing_mamba2_table():
         RustForwardPassPerfModel.best_available(_explicit("sglang", "0.5.14"))
 
 
+@pytest.mark.usefixtures("raw_data_coordinates")
 def test_vllm_silicon_has_no_nvfp4_moe_rows_at_top_k_22():
     # The engine handle skips readiness, so the SILICON query reaches the MoE table despite the missing Mamba2 table.
     handle = EngineHandle(

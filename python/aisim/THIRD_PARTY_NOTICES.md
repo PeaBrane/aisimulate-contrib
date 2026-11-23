@@ -737,6 +737,21 @@ https://github.com/vllm-project/vllm/tree/dd10e03f95f94edbea1975c67ace3a35ec9a8a
 Copyright contributors to the vLLM project. Licensed under Apache-2.0;
 modifications adapt the serving contracts to synthetic collector batches.
 
+The capture-dependent DSA choices of `_dsa_serving_capture_parity` in
+`collector/vllm/collect_mla_module.py` are adapted (modified) from vLLM
+`v0.32.0` at commit `5df63a7203cdb9328d824a27b682e77c7b9928be`:
+
+- [`vllm/models/deepseek_v32/attention.py`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/models/deepseek_v32/attention.py)
+  (`_should_prepare_mqa_query`: when the W_UK BMM and the MQA query quantization run).
+- [`vllm/model_executor/layers/sparse_attn_indexer.py`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/model_executor/layers/sparse_attn_indexer.py)
+  (the dense-MHA early return of `sparse_attn_indexer`).
+
+Copyright contributors to the vLLM project. Licensed under Apache-2.0:
+https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/LICENSE
+
+Both predicates are modified: the CUDA-stream capture term is replaced by
+whether serving captures a step of that size. No upstream file is vendored.
+
 
 The independently written Rust deferred-queue and post-lookup-touch behavior in
 `crates/core/src/engine/scheduler/vllm/{core,host_offload}.rs`
@@ -754,6 +769,7 @@ modified Rust simulation adaptation of behavioral contracts of vLLM and KVCR:
 
 - `crates/core/src/engine/kvcr.rs`
 - `crates/core/src/engine/scheduler/vllm/kvcr.rs`
+- `crates/core/src/engine/scheduler/vllm/kvcr_g3.rs`
 - the KVCR call sites in `crates/core/src/engine/scheduler/vllm/host_offload.rs`
 - their tests in those files and in `crates/core/tests/kvcr_replay.rs`
 - the KVCR sections of `docs/replay/engine/kv-cache.md`
@@ -778,6 +794,7 @@ KVCR at commit `ca61ea0cb1cdbaa86dc6b33ab9007be3e9276f71`:
 - https://github.com/ai-dynamo/kvcr/blob/ca61ea0cb1cdbaa86dc6b33ab9007be3e9276f71/src/kvcr/policy.py
 - https://github.com/ai-dynamo/kvcr/blob/ca61ea0cb1cdbaa86dc6b33ab9007be3e9276f71/src/kvcr/backends/local_dram.py
 - https://github.com/ai-dynamo/kvcr/blob/ca61ea0cb1cdbaa86dc6b33ab9007be3e9276f71/src/kvcr/backends/local_dram_pools.py
+- https://github.com/ai-dynamo/kvcr/blob/ca61ea0cb1cdbaa86dc6b33ab9007be3e9276f71/src/kvcr/backends/local_disk.py
 - https://github.com/ai-dynamo/kvcr/blob/ca61ea0cb1cdbaa86dc6b33ab9007be3e9276f71/src/kvcr/backends/remote_fw_dram.py
 - https://github.com/ai-dynamo/kvcr/blob/ca61ea0cb1cdbaa86dc6b33ab9007be3e9276f71/src/kvcr/backends/remote_sources.py
 
@@ -788,7 +805,9 @@ No upstream method bodies or test fixtures are copied. The adaptation models
 which blocks a rank pulls from a hinted peer and when the pull starts and
 lands, which blocks KVCR-owned memory stores, evicts and promotes, the order
 its LRU and FIFO policies keep, and how long each operation protects the
-blocks it reads.
+blocks it reads. With `kvcr.g3` it also models which blocks that
+memory writes to KVCR's disk tier and reads back, what a write and a read hold
+meanwhile, and the order the disk tier keeps.
 
 The `offloading_v0_32` and `simple_cpu_v0_32` G2 connector profiles in
 repository-root files `crates/core/src/engine/host_offload/tier.rs` and
@@ -1819,6 +1838,11 @@ model weights or collection implementation are bundled in these directories.
 
 - Source: https://huggingface.co/datasets/nvidia/aisimulate-fpm-dataset/tree/dbfcdd9eb62ea733efbc3f0cbd78277f2960061a
 - Immutable revision: `dbfcdd9eb62ea733efbc3f0cbd78277f2960061a`.
+- Current location: https://huggingface.co/datasets/ai-dynamo/aisim-data. The
+  files moved there byte-identically (same SHA-256) from `data/<rest>` to
+  `data/fpm/<rest>`; each `hf_dataset.json` pins the `ai-dynamo/aisim-data`
+  commit and the `data/fpm/` paths. The source revision above and its old
+  paths remain resolvable in `nvidia/aisimulate-fpm-dataset`.
 - Original paths: configuration `manifest.json` files and `fpm/*.metadata.json`
   under `data/MiniMaxAI--MiniMax-M2.7/`, `data/deepseek-ai--DeepSeek-V4-Pro/`,
   `data/deepseek-ai--DeepSeek-V4-Flash-0731/`, `data/nvidia--GLM-5.2-NVFP4/`,
@@ -2341,6 +2365,25 @@ https://github.com/ai-dynamo/dynamo/blob/def3b79b15c266805540a678dd400aeb6ccada1
 These files carry the same NVIDIA copyright and Apache-2.0 license above.
 The harness modifies their module placement to test the callback independently
 of the Dynamo scheduler; it does not replace callback or estimator behavior.
+
+## NVIDIA Dynamo CI pyo3 compatibility
+
+The exact-source rewrites in `scripts/performance/build_simulation_dynamo.py`
+(`patch_pyo3_bindings`) and their regression fixtures in
+`tests/test_ci_workflow_contracts.py` are adapted and modified from NVIDIA
+Dynamo's Python bindings, `lib/bindings/python/Cargo.toml` and the Rust
+sources under `lib/bindings/python/rust/`, at commit
+`def3b79b15c266805540a678dd400aeb6ccada1d`:
+https://github.com/ai-dynamo/dynamo/tree/def3b79b15c266805540a678dd400aeb6ccada1d/lib/bindings/python
+
+Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+Licensed under Apache-2.0; the full license is reproduced in `LICENSE`.
+Upstream license: https://github.com/ai-dynamo/dynamo/blob/def3b79b15c266805540a678dd400aeb6ccada1d/LICENSE
+The adaptation runs only when the selected AISim core uses pyo3 0.30. It moves
+the CI-built bindings from the pyo3 0.23 API to the pyo3 0.30 API, keeps the
+module's GIL requirement, and keeps the two path return values as `str`. It
+does not change scheduling or estimator behavior. It marks each rewritten file
+with a modification notice below its upstream header.
 
 ## SGLang simulator and HiSim feature definitions
 

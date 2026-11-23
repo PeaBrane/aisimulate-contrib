@@ -78,7 +78,7 @@ pub struct GemmTable {
     compute_scale: OnceLock<Result<TwoDGrids, AicError>>,
     scale_matrix: OnceLock<Result<TwoDGrids, AicError>>,
     /// Successful finite GEMM query leaves (`{latency, power, energy}`),
-    /// keyed by normalized quant and shape and bounded independently for
+    /// keyed by the resolved lookup quant and shape and bounded independently for
     /// each shard.
     query_memo: OnceLock<Memo<GemmQueryKey, LeafValue>>,
 }
@@ -140,6 +140,9 @@ impl SiteWalkOrder {
 struct GemmEngineGrids {
     by_quant: BTreeMap<String, (Node, SiteIndex)>,
     quant_order: Vec<String>,
+    /// Whether `by_quant` has rows under `fp8_static`, fixed at load so the
+    /// per-query presence check does not search the map.
+    has_fp8_static: bool,
 }
 
 /// 2-D scale tables keyed by quant name -> m -> k -> measured leaf
@@ -235,17 +238,18 @@ impl GemmTable {
         n: u32,
         k: u32,
     ) -> Result<LeafValue, AicError> {
-        // `fp8_static` is a behavioral mode that reuses `fp8` perf tables,
-        // mirroring Python `GEMM._normalize_for_lookup`. The
-        // compute_scale / scale_matrix tables apply the same
-        // normalization in their respective query methods.
-        let lookup_quant = normalize_fp8_static_quant(quant);
         // Resolve flops BEFORE any perf-data lookup: Python resolves at
         // `_query_gemm_table` entry in every mode, so a missing dtype entry
         // must classify as MissingSystemFlops on both engines — not as a
         // data miss when the quant's table also happens to be uncollected.
+        // `fp8` and `fp8_static` share one compute profile, so the
+        // normalized quant gives the same FLOPS as the resolved one below.
         let spec = &self.system_spec;
-        let tc_flops = quant_tc_flops(spec, lookup_quant.mapping())?;
+        let tc_flops = quant_tc_flops(spec, normalize_fp8_static_quant(quant).mapping())?;
+        // `fp8_static` reads its own rows when the merged table has them and
+        // the `fp8` rows otherwise (`gemm_lookup_quant`). The compute_scale /
+        // scale_matrix tables stay keyed by `fp8` in their query methods.
+        let lookup_quant = self.gemm_lookup_quant(quant)?;
         // Keep the cache probe below FLOPS resolution, even on hits. Hoisting
         // it would change MissingSystemFlops-over-PerfDatabase error precedence.
         let key = GemmQueryKey {
@@ -273,17 +277,57 @@ impl GemmTable {
         })
     }
 
-    /// Whether the quant mode (after `fp8_static` normalization) has a
+    /// Whether the merged GEMM table (all `gemm_sources`, after each
+    /// source's `kernel_source` filter) has rows under `fp8_static`.
+    ///
+    /// Every load error of the GEMM table reads as `Ok(false)` ("no rows"):
+    /// `load_gemm` returns each cached load error as `AicError::PerfDatabase`,
+    /// which is a missing-data error. A corrupt or schema-broken table
+    /// therefore also gives `false`. Do not use this function to report a
+    /// broken table. The callers in this file (`query`, `has_quant`,
+    /// `gemm_points`) load the table again and return the error. The callers
+    /// outside this file, `GemmOp::query` (`operators/gemm.rs`) and the
+    /// readiness check (`engine/readiness.rs`), use it only to choose the
+    /// direct or the derived path; the GEMM query of the operator then
+    /// returns the load error. The last match arm cannot run today. It stays
+    /// as a guard in case `load_gemm` keeps the error kind in the future.
+    pub(crate) fn has_direct_fp8_static(&self) -> Result<bool, AicError> {
+        match self.load_gemm() {
+            Ok(grids) => Ok(grids.has_fp8_static),
+            Err(err) if err.is_missing_perf_data() => Ok(false),
+            Err(err) => Err(err),
+        }
+    }
+
+    /// The quant whose GEMM rows a `quant` query reads. `fp8_static` reads
+    /// its own rows when the merged table has them, and the `fp8` rows
+    /// otherwise. Every other mode reads its own rows and does not load the
+    /// table here.
+    pub(crate) fn gemm_lookup_quant(
+        &self,
+        quant: GemmQuantMode,
+    ) -> Result<GemmQuantMode, AicError> {
+        if quant != GemmQuantMode::Fp8Static {
+            return Ok(quant);
+        }
+        Ok(if self.has_direct_fp8_static()? {
+            GemmQuantMode::Fp8Static
+        } else {
+            GemmQuantMode::Fp8
+        })
+    }
+
+    /// Whether the quant mode (resolved by `gemm_lookup_quant`) has a
     /// loaded GEMM table. Lets `GemmOp`'s below-grid SOL degrade stay
     /// scoped to shape misses — a quant-mode miss keeps the strict error.
     pub fn has_quant(&self, quant: GemmQuantMode) -> Result<bool, AicError> {
-        let lookup_quant = normalize_fp8_static_quant(quant);
+        let lookup_quant = self.gemm_lookup_quant(quant)?;
         Ok(self.load_gemm()?.by_quant.contains_key(lookup_quant.name()))
     }
 
     /// Query compute-scale measured value — used by `fp8_static` GEMM only.
     ///
-    /// Like the main GEMM table, the compute_scale data is keyed by `fp8`
+    /// The compute_scale data is keyed by `fp8`
     /// (not `fp8_static`) in the perf-DB; normalize before lookup to mirror
     /// Python's `GEMM._normalize_for_lookup`.
     ///
@@ -313,8 +357,8 @@ impl GemmTable {
     }
 
     /// Query scale-matrix measured value — used by `fp8_static` GEMM only.
-    /// Same `fp8_static -> fp8` normalization as the GEMM and
-    /// compute_scale lookups.
+    /// Same `fp8_static -> fp8` normalization as the compute_scale
+    /// lookup.
     ///
     /// scale_matrix is a real memory kernel: outside the grid the boundary
     /// utilization is frozen and SOL(q)/SOL(boundary) carries the growth
@@ -347,7 +391,7 @@ impl GemmTable {
     /// Missing quant / empty table is a typed `PerfDatabase` miss.
     pub fn gemm_points(&self, quant: GemmQuantMode) -> Result<Vec<(Vec<f64>, f64)>, AicError> {
         let grids = self.load_gemm()?;
-        let quant_name = normalize_fp8_static_quant(quant).name();
+        let quant_name = self.gemm_lookup_quant(quant)?.name();
         let (node, _) = grids.by_quant.get(quant_name).ok_or_else(|| {
             AicError::PerfDatabase(format!(
                 "GEMM perf data missing for quant '{quant_name}' at {}",
@@ -459,10 +503,12 @@ impl GemmTable {
                     let index = SiteIndex::build_with_site_order(&[1, 2], 0, &node, &site_order);
                     (quant_name, (node, index))
                 })
-                .collect();
+                .collect::<BTreeMap<_, _>>();
+            let has_fp8_static = by_quant.contains_key(GemmQuantMode::Fp8Static.name());
             Ok(GemmEngineGrids {
                 by_quant,
                 quant_order,
+                has_fp8_static,
             })
         });
         cell.as_ref().map_err(|err| clone_err(err))
@@ -571,12 +617,11 @@ pub(crate) fn gemm_quant_by_name(name: &str) -> Option<GemmQuantMode> {
     })
 }
 
-/// Normalize the `fp8_static` quant mode to `fp8` for perf-table lookups.
-/// Mirrors Python `GEMM._normalize_for_lookup`: the `fp8_static` mode is
-/// behavioral (subtracts compute_scale + scale_matrix latency) but reuses
-/// the fp8 perf tables — the perf-DB never stores rows under
-/// `fp8_static`. Applied uniformly to the GEMM, compute_scale, and
-/// scale_matrix table queries.
+/// Normalize the `fp8_static` quant mode to `fp8` for the scale-table
+/// lookups. Mirrors Python `GEMM._normalize_for_lookup`: the compute_scale
+/// and scale_matrix tables are keyed by `fp8`. Applied to the compute_scale
+/// and scale_matrix queries and to the operator's scale-table cache keys.
+/// The GEMM table resolves its key with `GemmTable::gemm_lookup_quant`.
 pub(crate) fn normalize_fp8_static_quant(quant: GemmQuantMode) -> GemmQuantMode {
     if quant == GemmQuantMode::Fp8Static {
         GemmQuantMode::Fp8
@@ -1020,6 +1065,7 @@ mod tests {
     #[test]
     fn gemm_query_cache_normalizes_quant_and_separates_shape_fields() {
         let table = GemmTable::new(b200_vllm_data_root(), b200_sxm_spec());
+        assert!(!table.has_direct_fp8_static().unwrap());
 
         let fp8 = table.query(GemmQuantMode::Fp8, 256, 32, 32).unwrap();
         let fp8_static = table.query(GemmQuantMode::Fp8Static, 256, 32, 32).unwrap();
@@ -1473,5 +1519,271 @@ mod tests {
             v.energy
         );
         assert!((v.power - 150.0).abs() < 1e-9 * 150.0, "power {}", v.power);
+    }
+
+    /// Synthetic GEMM rows "S", `(gemm_dtype, m, latency ms, power W)`, all
+    /// at `n = 1024, k = 1024`. The m-curve lerps latency and power, and
+    /// energy = power x latency (`gemm_energy_blend_matches_python_oracle`).
+    /// Hand oracle at m=192: fp8_static -> latency 1.0, power 140, energy
+    /// 140; fp8 -> latency 2.0, power 150, energy 300. The SOL of
+    /// `energy_test_spec` at these shapes is below 1e-3 ms, so the load
+    /// clamp does not touch the rows.
+    const ROWS_S_GEMM: [(&str, i64, f64, f64); 4] = [
+        ("fp8", 128, 1.0, 100.0),
+        ("fp8", 256, 3.0, 200.0),
+        ("fp8_static", 128, 0.5, 120.0),
+        ("fp8_static", 256, 1.5, 160.0),
+    ];
+
+    /// Write the rows of S whose quant is in `quants`, tagged with
+    /// `kernel_source`.
+    fn write_rows_s_gemm(path: &Path, quants: &[&str], kernel_source: &'static str) {
+        use crate::perf_database::energy_test_fixtures::{Col, write_parquet};
+        let rows: Vec<_> = ROWS_S_GEMM
+            .iter()
+            .filter(|row| quants.contains(&row.0))
+            .collect();
+        write_parquet(
+            path,
+            &[
+                Col::Str("gemm_dtype", rows.iter().map(|r| r.0).collect()),
+                Col::I64("m", rows.iter().map(|r| r.1).collect()),
+                Col::I64("n", vec![1024; rows.len()]),
+                Col::I64("k", vec![1024; rows.len()]),
+                Col::Str("kernel_source", vec![kernel_source; rows.len()]),
+                Col::F64("latency", rows.iter().map(|r| r.2).collect()),
+                Col::F64("power", rows.iter().map(|r| r.3).collect()),
+            ],
+        );
+    }
+
+    /// The fp8 scale tables of S, `(m, latency ms, power W)` at k = 1024.
+    fn write_rows_s_scale_table(path: &Path, rows: [(i64, f64, f64); 2]) {
+        use crate::perf_database::energy_test_fixtures::{Col, write_parquet};
+        write_parquet(
+            path,
+            &[
+                Col::Str("quant_dtype", vec!["fp8"; 2]),
+                Col::I64("m", rows.iter().map(|r| r.0).collect()),
+                Col::I64("k", vec![1024; 2]),
+                Col::F64("latency", rows.iter().map(|r| r.1).collect()),
+                Col::F64("power", rows.iter().map(|r| r.2).collect()),
+            ],
+        );
+    }
+
+    fn assert_leaf_close(actual: LeafValue, (latency, power, energy): (f64, f64, f64), at: &str) {
+        for (name, got, want) in [
+            ("latency", actual.latency, latency),
+            ("power", actual.power, power),
+            ("energy", actual.energy, energy),
+        ] {
+            assert!(
+                (got - want).abs() <= 1e-9 * want.abs(),
+                "{at}: {name} {got} != {want}"
+            );
+        }
+    }
+
+    fn sorted_point_latencies(points: Vec<(Vec<f64>, f64)>) -> Vec<f64> {
+        let mut latencies: Vec<f64> = points.into_iter().map(|(_, latency)| latency).collect();
+        latencies.sort_by(f64::total_cmp);
+        latencies
+    }
+
+    #[test]
+    fn gemm_query_reads_fp8_static_rows_when_the_table_has_them() {
+        use crate::perf_database::energy_test_fixtures::energy_test_spec;
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        write_rows_s_gemm(
+            &tmp.path().join("gemm_perf.parquet"),
+            &["fp8", "fp8_static"],
+            "kernel",
+        );
+        write_rows_s_scale_table(
+            &tmp.path().join("computescale_perf.parquet"),
+            [(128, 0.25, 40.0), (256, 0.75, 80.0)],
+        );
+        write_rows_s_scale_table(
+            &tmp.path().join("scale_matrix_perf.parquet"),
+            [(128, 0.125, 20.0), (256, 0.375, 60.0)],
+        );
+        let table = GemmTable::new(tmp.path().to_path_buf(), energy_test_spec());
+
+        assert!(table.has_direct_fp8_static().unwrap());
+        // Hand oracle of ROWS_S_GEMM at m=192.
+        let s = table
+            .query(GemmQuantMode::Fp8Static, 192, 1024, 1024)
+            .unwrap();
+        assert_leaf_close(s, (1.0, 140.0, 140.0), "fp8_static m=192");
+        let d = table.query(GemmQuantMode::Fp8, 192, 1024, 1024).unwrap();
+        assert_leaf_close(d, (2.0, 150.0, 300.0), "fp8 m=192 (price unchanged)");
+        // Separate memo entries for the two modes.
+        assert_eq!(query_cache_len(&table), 2);
+
+        // Off-grid shape: one site at (1024, 1024), n=2048 is one octave
+        // away. Both modes share one SOL, so the util transfer keeps the
+        // site ratio 1.0 / 2.0 = 0.5 (no per-shape fallback to the fp8
+        // price).
+        let ratio = table
+            .query(GemmQuantMode::Fp8Static, 192, 2048, 1024)
+            .unwrap()
+            .latency
+            / table
+                .query(GemmQuantMode::Fp8, 192, 2048, 1024)
+                .unwrap()
+                .latency;
+        assert!((ratio - 0.5).abs() < 1e-12, "ratio {ratio}");
+
+        assert!(table.has_quant(GemmQuantMode::Fp8Static).unwrap());
+        // gemm_points reads the rows of each mode: S has two m points each.
+        assert_eq!(
+            sorted_point_latencies(table.gemm_points(GemmQuantMode::Fp8Static).unwrap()),
+            vec![0.5, 1.5]
+        );
+        assert_eq!(
+            sorted_point_latencies(table.gemm_points(GemmQuantMode::Fp8).unwrap()),
+            vec![1.0, 3.0]
+        );
+
+        // The scale tables stay keyed by fp8 (exact grid points of S).
+        assert_eq!(
+            table
+                .query_compute_scale(GemmQuantMode::Fp8Static, 128, 1024)
+                .unwrap()
+                .latency,
+            0.25
+        );
+        assert_eq!(
+            table
+                .query_scale_matrix(GemmQuantMode::Fp8Static, 128, 1024)
+                .unwrap()
+                .latency,
+            0.125
+        );
+    }
+
+    /// Detection reads the merged table of all `gemm_sources`, after the
+    /// `kernel_source` filter: fp8_static rows that come only from a
+    /// shared-layer sibling switch the path, and a sibling that the filter
+    /// rejects does not.
+    #[test]
+    fn fp8_static_detection_uses_the_merged_shared_layer_table() {
+        use crate::perf_database::energy_test_fixtures::energy_test_spec;
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let primary = tmp.path().join("primary_gemm_perf.parquet");
+        let sibling = tmp.path().join("sibling_gemm_perf.parquet");
+        write_rows_s_gemm(&primary, &["fp8"], "prim_kernel");
+        write_rows_s_gemm(&sibling, &["fp8_static"], "sib_kernel");
+        let table_with_sibling_filter = |filter: Option<Vec<String>>| {
+            GemmTable::with_sources(
+                tmp.path().to_path_buf(),
+                energy_test_spec(),
+                &SourceResolver::fixed(BTreeMap::from([(
+                    "gemm_perf.parquet".to_string(),
+                    vec![
+                        PerfSource(primary.clone(), None),
+                        PerfSource(sibling.clone(), filter),
+                    ],
+                )])),
+            )
+            .unwrap()
+        };
+
+        let a = table_with_sibling_filter(None);
+        assert!(a.has_direct_fp8_static().unwrap());
+        // Hand oracle of ROWS_S_GEMM: fp8_static at m=192 is 1.0.
+        let latency = a
+            .query(GemmQuantMode::Fp8Static, 192, 1024, 1024)
+            .unwrap()
+            .latency;
+        assert!((latency - 1.0).abs() < 1e-9, "latency {latency}");
+
+        let b = table_with_sibling_filter(Some(vec!["__no_such_kernel_source__".to_string()]));
+        assert!(!b.has_direct_fp8_static().unwrap());
+        assert_eq!(
+            leaf_bits(b.query(GemmQuantMode::Fp8Static, 192, 1024, 1024).unwrap()),
+            leaf_bits(b.query(GemmQuantMode::Fp8, 192, 1024, 1024).unwrap()),
+        );
+    }
+
+    /// A table with ONLY the fp8_static rows of S: `has_quant` resolves
+    /// `fp8_static` to its own rows (present) and keeps `fp8` as `fp8`
+    /// (absent). The old `fp8_static -> fp8` normalization gives `false`
+    /// for `fp8_static` here.
+    #[test]
+    fn has_quant_resolves_fp8_static_on_a_table_with_only_fp8_static_rows() {
+        use crate::perf_database::energy_test_fixtures::energy_test_spec;
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        write_rows_s_gemm(
+            &tmp.path().join("gemm_perf.parquet"),
+            &["fp8_static"],
+            "kernel",
+        );
+        let table = GemmTable::new(tmp.path().to_path_buf(), energy_test_spec());
+        assert!(table.has_quant(GemmQuantMode::Fp8Static).unwrap());
+        assert!(!table.has_quant(GemmQuantMode::Fp8).unwrap());
+    }
+
+    #[test]
+    fn has_direct_fp8_static_is_false_for_a_missing_table() {
+        let table = GemmTable::new(PathBuf::from("/nonexistent/aic/data/root"), b200_sxm_spec());
+        assert!(!table.has_direct_fp8_static().unwrap());
+        assert!(matches!(
+            table.query(GemmQuantMode::Fp8Static, 1, 1, 1),
+            Err(AicError::PerfDatabase(_))
+        ));
+        assert_eq!(query_cache_len(&table), 0);
+    }
+
+    // Pin the existing cached-error contract (AISIM-2454): the presence
+    // probe returns false, but pricing must still surface the broken GEMM
+    // file rather than produce a price or hide its original diagnostic.
+    #[test]
+    fn has_direct_fp8_static_schema_error_remains_a_query_error() {
+        use crate::perf_database::energy_test_fixtures::{Col, write_parquet};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("gemm_perf.parquet");
+        write_parquet(
+            &path,
+            &[
+                Col::I64("m", vec![128]),
+                Col::I64("n", vec![1024]),
+                Col::I64("k", vec![1024]),
+                Col::F64("latency", vec![0.5]),
+            ],
+        );
+        let table = GemmTable::new(tmp.path().to_path_buf(), b200_sxm_spec());
+        for _ in 0..2 {
+            assert!(!table.has_direct_fp8_static().unwrap());
+            let err = table
+                .query(GemmQuantMode::Fp8Static, 128, 1024, 1024)
+                .unwrap_err();
+            assert!(err.is_missing_perf_data(), "{err}");
+            assert!(err.to_string().contains("gemm_dtype"), "{err}");
+            assert!(err.to_string().contains(path.to_str().unwrap()), "{err}");
+            assert_eq!(query_cache_len(&table), 0);
+        }
+    }
+
+    #[test]
+    fn has_direct_fp8_static_unreadable_parquet_remains_a_query_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("gemm_perf.parquet");
+        // Invalid Parquet bytes exercise a deterministic read failure without
+        // depending on filesystem permissions (CI may run as root).
+        std::fs::write(&path, b"not a parquet file").unwrap();
+        let table = GemmTable::new(tmp.path().to_path_buf(), b200_sxm_spec());
+        for _ in 0..2 {
+            assert!(!table.has_direct_fp8_static().unwrap());
+            let err = table
+                .query(GemmQuantMode::Fp8Static, 128, 1024, 1024)
+                .unwrap_err();
+            assert!(err.is_missing_perf_data(), "{err}");
+            assert!(err.to_string().contains(path.to_str().unwrap()), "{err}");
+            assert!(err.to_string().contains("Parquet"), "{err}");
+            assert_eq!(query_cache_len(&table), 0);
+        }
     }
 }

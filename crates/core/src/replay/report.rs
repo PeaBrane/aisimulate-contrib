@@ -194,6 +194,11 @@ pub struct ReplayPowerDiagnostics {
     pub covered_latency_ms: Option<f64>,
     pub power_w: Option<f64>,
     pub power_coverage: Option<f64>,
+    /// Modeled in-pass wait summed over attention-DP ranks, in rank-ms.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attention_dp_wait_ms: Option<f64>,
+    /// Modeled watts per GPU including wait at the configured watts.
+    pub step_power_w: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unavailable_reason: Option<&'static str>,
     pub phases: Vec<ReplayPhasePowerDiagnostics>,
@@ -2981,6 +2986,8 @@ mod tests {
             latency_unit: "ms",
             coverage_gate: POWER_DATA_COVERAGE_THRESHOLD,
             publication_status: "unsupported",
+            attention_dp_wait_ms: None,
+            step_power_w: None,
             energy_wms: None,
             latency_ms: None,
             covered_latency_ms: None,

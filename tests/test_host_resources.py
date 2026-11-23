@@ -228,6 +228,7 @@ def test_session_estimate_charges_each_turn_once_and_history_per_active_session(
     retained, carried = 6144 * 10 * (4096 + 32 * turn), 32 * history + 4 * (history + 4096)
     assert estimate.allocation_model == "engine-session-metadata-v2"
     assert estimate.input_token_bytes == 32 * (history + 4096) * 4
+    assert estimate.lower_bound_bytes == 4 * 256  # One request's output IDs, drawn at dispatch.
     assert estimate.estimated_peak_bytes == resources.WORKER_BASELINE_BYTES + retained + 32 * carried
     # Without a session cap, every session may carry its history at once.
     uncapped = estimate_workload({**workload, "concurrency": None}, stack="engine")
@@ -1220,7 +1221,7 @@ def test_trace_inspection_streams_large_documents_and_records(tmp_path, host, mo
     monkeypatch.setattr(resources.json, "loads", lambda _: pytest.fail("must not materialize entire JSON records"))
     estimate = estimate_workload({"trace_path": str(trace), "trace_format": "mooncake"}, stack="engine")
     assert estimate.request_count == 60
-    assert estimate.lower_bound_bytes == 4 * 60  # Sixty planned u32 outputs; ignored arrays add nothing.
+    assert estimate.lower_bound_bytes == 4 * 2  # One expanded two-token prompt; ignored arrays add nothing.
 
 
 @pytest.mark.parametrize("trace_format", ["mooncake", "mooncake-delta"])
@@ -1236,8 +1237,22 @@ def test_mooncake_traces_bound_compact_arrays_and_observe_their_peak(tmp_path, t
     assert estimate.estimated_peak_bytes is None  # Measured from a completed replay instead.
     assert estimate.request_count == 5
     # Rows convert u64 source hashes one at a time, so only the compact
-    # hashes, planned outputs and one expanded prompt are unavoidable.
-    assert estimate.lower_bound_bytes == max(4 * (11 + 50), 4 * 192)
+    # hashes, one request's drawn outputs and one expanded prompt are unavoidable.
+    assert estimate.lower_bound_bytes == max(4 * 11, 4 * 10, 4 * 192)
+
+
+@pytest.mark.parametrize("trace_format", ["mooncake", "mooncake-delta"])
+def test_session_traces_bound_outputs_by_authored_ids_and_the_largest_draw(tmp_path, trace_format):
+    trace = tmp_path / "trace.jsonl"
+    workload = {"trace_path": str(trace), "trace_block_size": 1, "trace_format": trace_format}
+    row = {"input_length": 1, "output_length": 30, "hash_ids": [1]}
+    trace.write_text((json.dumps(row) + "\n") * 5)
+    # The driver draws a request's output IDs when it dispatches that request,
+    # so one request's 30 outputs are unavoidable, not all 150.
+    assert estimate_workload(workload, stack="engine").lower_bound_bytes == 4 * 30
+    trace.write_text((json.dumps({**row, "output_token_ids": list(range(30))}) + "\n") * 5)
+    # Authored IDs load with the trace and stay beside the compact hashes.
+    assert estimate_workload(workload, stack="engine").lower_bound_bytes == 4 * (5 + 150)
 
 
 def test_applied_compute_counts_turns_and_responses(tmp_path):
@@ -1248,14 +1263,15 @@ def test_applied_compute_counts_turns_and_responses(tmp_path):
         "assistant_response_length": [5, 7],
         "tool_call_output_length": [11, 13],
         "tool_call_latency": [0.1, 0.2],
-        "final_assistant_response_length": 9,
+        "final_assistant_response_length": 400,
     }
     trace.write_text((json.dumps(row) + "\n") * 2)
     estimate = estimate_workload({"trace_path": str(trace), "trace_format": "applied_compute_agentic"}, stack="engine")
     assert estimate.allocation_model == resources.OBSERVED_TRACE_MODEL
     assert estimate.request_count == 6  # Each session replays num_turns + 1 requests.
-    # The final prompt adds both responses and tool outputs to the initial prompt.
-    assert estimate.lower_bound_bytes == max(4 * 2 * (5 + 7 + 9), 4 * (300 + 5 + 7 + 11 + 13))
+    # The final response is drawn at dispatch. It exceeds the final prompt, which
+    # adds both responses and tool outputs to the initial prompt.
+    assert estimate.lower_bound_bytes == max(4 * 400, 4 * (300 + 5 + 7 + 11 + 13))
 
 
 def test_applied_compute_tool_output_grows_the_final_prompt(tmp_path, host, monkeypatch):
@@ -1652,16 +1668,17 @@ def test_agentic_dynamo_counts_only_loaded_request_events(tmp_path, compressed):
 
 def test_standard_dynamo_observes_its_peak_and_rejects_mixed_context(tmp_path):
     path = tmp_path / "requests.jsonl"
-    row = _dynamo_row(contextual=False)
-    path.write_text(json.dumps(row) + "\n")
+    row = _dynamo_row(contextual=False, output_tokens=40)
+    path.write_text((json.dumps(row) + "\n") * 2)
     # Neither the configured block size nor file bytes expand the bound.
     workload = {"trace_path": str(path), "trace_format": "dynamo", "trace_block_size": 512}
     estimate = estimate_workload(workload, stack="engine")
     assert estimate.allocation_model == resources.OBSERVED_TRACE_MODEL
     assert estimate.estimated_peak_bytes is None
-    assert estimate.request_count == 1
-    # Two retained u64 hashes, compact hashes plus three outputs, or one 8-token prompt.
-    assert estimate.lower_bound_bytes == max(8 * 2, 4 * (2 + 3), 4 * 8)
+    assert estimate.request_count == 2
+    # A standard trace replays as sessions: one request's 40 drawn outputs
+    # outweigh four retained u64 hashes and an 8-token prompt.
+    assert estimate.lower_bound_bytes == 4 * 40
     for rows in ([row, _dynamo_row("agent")], [_dynamo_row("agent"), row]):
         path.write_text("\n".join(map(json.dumps, rows)))
         with pytest.raises(ResourceLimitError, match="cannot mix requests with and without agent_context"):

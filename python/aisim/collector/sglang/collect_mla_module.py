@@ -25,7 +25,7 @@ Usage:
 # 0.5.21 (H20/sm90 collector port: op_smoke + path gates in the v0.5.21 image;
 # findings hopper_sglang_collector_port_0514_to_0521_2026_10_01).
 # One release per file; earlier code is `git log -- <this file>` away.
-__compat__ = "sglang==0.5.21"
+__compat__ = "sglang==0.5.23"
 
 import argparse
 import gc
@@ -82,13 +82,11 @@ except ModuleNotFoundError:
 
 try:
     from collector.sglang.runtime_limits import (
-        alloc_prefix_indices as _alloc_prefix_indices,
-    )
-    from collector.sglang.runtime_limits import (
         kv_pool_capacity_tokens as _kv_pool_capacity_tokens,
     )
     from collector.sglang.runtime_limits import (
         kv_pool_page_size,
+        request_slots,
         required_kv_alloc_tokens,
         required_kv_tokens,
         required_prefill_extend_tokens,
@@ -102,13 +100,11 @@ try:
     )
 except ModuleNotFoundError:
     from runtime_limits import (
-        alloc_prefix_indices as _alloc_prefix_indices,
-    )
-    from runtime_limits import (
         kv_pool_capacity_tokens as _kv_pool_capacity_tokens,
     )
     from runtime_limits import (
         kv_pool_page_size,
+        request_slots,
         required_kv_alloc_tokens,
         required_kv_tokens,
         required_prefill_extend_tokens,
@@ -142,7 +138,16 @@ _MODEL_CONFIG_DIR = os.path.join(
     "model_configs",
 )
 _GLM5_DSA_ARCHITECTURE = "GlmMoeDsaForCausalLM"
-_NATIVE_NVFP4_SMS = {100, 103, 120}
+# SGLang's Blackwell capability majors are 10, 11 and 12 (utils/common.py, is_blackwell_supported).
+# Its FP4 GEMM selection (layers/quantization/fp4_utils.py, initialize_fp4_gemm_config) takes Marlin
+# by default only below capability 10.0. On SM80 to SM90 it serves an NVFP4 checkpoint through Marlin,
+# a weight-only W4A16 path (layers/quantization/modelopt_quant.py, ModelOptNvFp4FusedMoEMethod). The
+# collector does not collect that path.
+_NATIVE_NVFP4_SM_MAJORS = (10, 11, 12)
+
+
+def _has_native_nvfp4(sm_version: int) -> bool:
+    return sm_version // 10 in _NATIVE_NVFP4_SM_MAJORS
 
 
 # Per-subprocess sum of the point phase times printed by run_mla_module.
@@ -254,11 +259,12 @@ def _initialize_dsa_history(model_runner, attention_module, forward_batch, histo
     including partial pages, rather than exposing zeros or an earlier case's
     contents. These inputs represent no particular checkpoint distribution.
 
-    Native contracts at SGLang 0.5.21 (ported's 0.5.14 @49e384ce):
-    dsa/dsa_indexer.py:1498-1578 owns index-K quantization and opaque layout
-    (its pool comes from ForwardContext, :1519); dsa_backend.py:1997-2010 writes
-    latent/rotary KV using the attention layer; memory_pool.py:4570-4642 owns
-    BF16/FP8 MLA layouts and their scale fields. Paths above are relative to
+    Native contracts at SGLang v0.5.23: dsa/dsa_indexer.py:1806-1885
+    (Indexer._store_index_k_cache) owns index-K quantization and opaque layout
+    (its pool comes from ForwardContext, :1827); dsa_backend.py:3879 writes
+    latent/rotary KV through set_mla_kv_buffer with the attention layer;
+    memory_pool.py:5026-5051 and :5279+ (DSATokenToKVPool) own BF16/FP8 MLA
+    layouts and their scale fields. Paths above are relative to
     python/sglang/srt/layers/attention except memory_pool.py, which is in
     python/sglang/srt/mem_cache.
     """
@@ -267,8 +273,9 @@ def _initialize_dsa_history(model_runner, attention_module, forward_batch, histo
     if not history_length:
         return
 
-    # 0.5.21 moved the DSA Triton kernels out of srt (kernels/ops/attention/dsa/triton_kernel.py:86)
-    from sglang.kernels.ops.attention.dsa.triton_kernel import act_quant
+    # The act_quant serving hands the index-K writer on CUDA
+    # (dsa/dsa_indexer.py:1936-1938, kernels/ops/quantization/act_quant_triton.py:88 @v0.5.23).
+    from sglang.kernels.ops.quantization.act_quant_triton import act_quant
 
     forward_context_type, forward_context = _import_sglang_forward_context()
     pool = model_runner.token_to_kv_pool
@@ -299,7 +306,7 @@ def _initialize_dsa_history(model_runner, attention_module, forward_batch, histo
             random_activations(slots.numel(), 1, attention_module.qk_rope_head_dim),
         )
         # The native fused store obtains its pool from ForwardContext, just
-        # as it does during serving Indexer.forward (dsa_indexer.py:1286).
+        # as it does during serving Indexer.forward (dsa_indexer.py:1827 @v0.5.23).
         with forward_context(forward_context_type(attn_backend=model_runner.attn_backend)):
             attention_module.indexer._store_index_k_cache(
                 forward_batch,
@@ -313,13 +320,13 @@ def _initialize_dsa_history(model_runner, attention_module, forward_batch, histo
 def _dsa_forward_input_relay(model_runner, batch):
     """Own the native scheduler relay needed by SGLang input staging.
 
-    At 0.5.21 prepare_for_extend leaves input_ids None and stages
-    prefill_input_ids_cpu (schedule_batch.py:2943-2944); resolve_forward_inputs
-    materializes them (managers/overlap_utils.py:87-120), and the scheduler runs
-    it and FutureMap.stash even without overlap (scheduler.py:4588-4597,
-    4674-4696). Attention-only execution skips embeddings, but ForwardBatch still
-    needs these IDs to derive the actual token count (forward_batch_info.py:1064-1071).
-    The relay is built as the scheduler builds it (scheduler.py:1622-1637).
+    At v0.5.23 prepare_for_extend leaves input_ids None and stages
+    prefill_input_ids_cpu (schedule_batch.py:3069-3070); resolve_forward_inputs
+    materializes them (managers/overlap_utils.py:113-153), and the scheduler runs
+    it and FutureMap.stash even without overlap (scheduler.py:3858-3860,
+    4681-4916). Attention-only execution skips embeddings, but ForwardBatch still
+    needs these IDs to derive the actual token count (forward_batch_info.py:1364-1382).
+    The relay is built as the scheduler builds it (scheduler.py:1667-1686).
     """
     from sglang.srt.managers.overlap_utils import decide_needs_confidence_relay, decide_needs_cpu_seq_lens
 
@@ -333,6 +340,47 @@ def _dsa_forward_input_relay(model_runner, batch):
     return model_runner._aic_dsa_input_relay
 
 
+def _radix_disabled_tree_cache(model_runner):
+    """The prefix cache serving runs with --disable-radix-cache (load_model_runner sets it).
+
+    v0.5.23 deleted ChunkCache (sglang #43201). A disabled cache on a model with
+    full attention only is a UnifiedRadixCache with ``disable=True`` and the FULL
+    component (mem_cache/registry.py:91-99 -> create_unified_radix_cache :149-191;
+    CacheInitParams from mem_cache/kv_cache_builder.py:389-402 @v0.5.23, page_size
+    the allocator's without DCP). It matches and inserts nothing, and evicts nothing
+    (unified_radix_cache.py:619-665).
+    """
+    from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+    from sglang.srt.mem_cache.unified_cache.components import ComponentType
+    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+    return UnifiedRadixCache(
+        CacheInitParams(
+            disable=True,
+            req_to_token_pool=model_runner.req_to_token_pool,
+            token_to_kv_pool_allocator=model_runner.token_to_kv_pool_allocator,
+            page_size=model_runner.token_to_kv_pool_allocator.page_size,
+            tree_components=(ComponentType.FULL,),
+        )
+    )
+
+
+def _new_schedule_batch(model_runner, reqs, tree_cache):
+    """A non-overlap, non-speculative batch, as the scheduler builds one (ScheduleBatch.init_new)."""
+    from sglang.srt.managers.schedule_batch import ScheduleBatch
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+    return ScheduleBatch.init_new(
+        reqs=reqs,
+        req_to_token_pool=model_runner.req_to_token_pool,
+        token_to_kv_pool_allocator=model_runner.token_to_kv_pool_allocator,
+        tree_cache=tree_cache,
+        model_config=model_runner.model_config,
+        enable_overlap=False,
+        spec_algorithm=SpeculativeAlgorithm.NONE,
+    )
+
+
 def _validate_dsa_forward_tokens(forward_batch, expected_tokens: int) -> None:
     """Reject missing scheduler inputs before they alter native dispatch."""
     for name in ("input_ids", "positions", "out_cache_loc"):
@@ -340,7 +388,7 @@ def _validate_dsa_forward_tokens(forward_batch, expected_tokens: int) -> None:
         if value is None or value.numel() != expected_tokens:
             actual = None if value is None else value.numel()
             raise ValueError(f"DSA {name} has {actual} tokens; expected {expected_tokens}")
-    # 0.5.21 renamed the host count (forward_batch_info.py:673, set at :1071)
+    # The host token count (forward_batch_info.py:707, set at :1382 @v0.5.23)
     if forward_batch.global_num_token_non_padded_cpu != expected_tokens:
         raise ValueError(
             f"DSA global_num_token_non_padded_cpu={forward_batch.global_num_token_non_padded_cpu}; "
@@ -425,7 +473,7 @@ def _get_precision_combos(phase: str):
 def _get_backends(attn_type: str):
     """Return the attention backend string to use for a given attention type.
 
-    For DSA: returns the SGLang 0.5.14 "dsa" backend.
+    For DSA: returns SGLang's "dsa" attention backend (sub-backends resolve in load_model_runner).
     For MLA: returns the best available backend based on SM version.
     Aligns with sglang's _get_default_attn_backend() in server_args.py.
     """
@@ -592,105 +640,87 @@ def _model_native_gemm_quant(model_id: str) -> str | None:
     remain BF16 and are logged as ``bfloat16``.
 
     Reads the same AIC cached config files :func:`_resolve_local_model_path`
-    loads:
+    loads, and resolves one section as SGLang does: ``quantization_config`` in
+    ``*_config.json``, then ``compression_config``, then ``quantization`` in
+    ``*_hf_quant_config.json``, which is read only when both are absent:
 
-    * ModelOpt ``*_hf_quant_config.json`` → ``quantization.quant_algo``
-      (``NVFP4`` → ``"nvfp4"``, ``FP8`` → ``"fp8_block"``)
-    * HF ``*_config.json`` ``quantization_config`` → ``quant_method`` +
-      ``weight_block_size`` (block-fp8 → ``"fp8_block"``)
+    * ``quantization_config`` with ``quant_method`` absent or ``modelopt`` →
+      ``quant_algo`` (``NVFP4`` → ``"nvfp4"``, ``FP8`` → ``"fp8_block"``)
+    * ``quantization_config`` with another ``quant_method`` → ``quant_method`` +
+      ``weight_block_size`` (block-fp8 → ``"fp8_block"``, an FP4 method → ``"nvfp4"``)
+    * ``compression_config`` → ``None``
+    * ``*_hf_quant_config.json`` with a pure algorithm, with any ``quant_method`` →
+      ``quantization.quant_algo`` (``NVFP4`` → ``"nvfp4"``, ``FP8`` → ``"fp8_block"``)
     * ModelOpt ``MIXED_PRECISION`` export (one lane per module in
-      ``quantized_layers``), checked after the two above → ``"nvfp4"`` when a
+      ``quantized_layers``) in either ModelOpt section → ``"nvfp4"`` when a
       lane is NVFP4 or W4A16_NVFP4
 
     Returns one of ``"nvfp4"`` / ``"fp8_block"`` / ``None``. Raises
     ``ValueError`` for a ``MIXED_PRECISION`` export without an NVFP4 lane:
     SGLang resolves it to ``w4afp8``, which this collector has no path for.
     It also raises when a ``self_attn`` lane is listed: the ``bfloat16`` DSA label assumes BF16 attention.
-    For the mixed recipe a ``compression_config`` in ``*_config.json`` takes precedence over the sidecar, as
-    in SGLang, and a ``quantization_config``, ``compression_config`` or ``quantization`` section that is not
-    an object raises.
+    A ``quantization_config``, ``compression_config`` or ``quantization`` section that is not an object
+    raises, and a parse error of an existing file propagates.
     """
     base = os.path.join(_MODEL_CONFIG_DIR, model_id.replace("/", "--"))
-    quant_file = f"{base}_hf_quant_config.json"
-    if os.path.exists(quant_file):
-        try:
-            with open(quant_file) as f:
-                algo = (json.load(f).get("quantization") or {}).get("quant_algo")
-            if algo:
-                algo = str(algo).upper()
-                if "FP4" in algo:
-                    return "nvfp4"
-                if "FP8" in algo:
-                    return "fp8_block"
-        except Exception:
-            pass
     config_file = f"{base}_config.json"
-    if os.path.exists(config_file):
-        try:
-            with open(config_file) as f:
-                quant_cfg = json.load(f).get("quantization_config") or {}
-            method = str(quant_cfg.get("quant_method", "")).lower()
-            if method == "fp8" and quant_cfg.get("weight_block_size"):
-                return "fp8_block"
-            if "fp4" in method:
-                return "nvfp4"
-        except Exception:
-            pass
-    # ModelOpt MIXED_PRECISION export: one quantization lane per module in ``quantized_layers``.
-    # Citations are file:line@release-tag under python/sglang/srt/. SGLang gates the ``config.json``
-    # ``quantization_config`` on ``quant_method`` (configs/model_config.py:1034-1044), reads
-    # ``compression_config`` next (:1044-1046), and parses ``hf_quant_config.json`` as ModelOpt unconditionally
-    # (:1117-1123). The gate is applied to both sections here because ModelOpt writes no other ``quant_method``
-    # into that file.
-    # * 0.5.14, the pin: every MIXED_PRECISION export except NemotronH parses as ``w4afp8``
-    #   (configs/model_config.py:1145-1151). ``modelopt_fp4`` is then rejected inside ServerArgs, so a
-    #   targeted case fails loudly: the compatibility map allows only ``modelopt`` and the check raises
-    #   (configs/model_config.py:1299-1302, 1346-1375, reached from server_args.py:2533, 3497).
-    #   ``None`` would run W4AFp8Config, whose Fp8LinearMethod makes the BF16 attention projections block-FP8
-    #   (layers/quantization/w4afp8.py:99-104, layers/quantization/fp8.py:354-355), and those rows
-    #   would be labelled ``bfloat16``.
-    # * From v0.5.15: an export with an NVFP4 or W4A16_NVFP4 lane parses as ``modelopt_mixed``
-    #   (configs/model_config.py:1153-1163) and an explicit ``modelopt_fp4`` is overridden to it
-    #   (layers/quantization/modelopt_quant.py:649-654, configs/model_config.py:1466-1475).
-    # So SGLang's lane test decides here: an NVFP4 lane returns "nvfp4" (the SM guard and the ``modelopt_fp4``
-    # loader mapping apply). Without one SGLang resolves the export to ``w4afp8`` (NemotronH aside at 0.5.14), a
-    # path this collector lacks, so the helper raises.
-    # Past 0.5.14 SGLang stops rejecting ``modelopt_fp4`` and
-    # overrides it to ``modelopt_mixed``, so this path goes from a loud failure to live data: re-derive the
-    # ``bfloat16`` label premise (no attention lane), the ``ModelOptMixedPrecisionConfig`` methods for unlisted
-    # modules and the KV cache, the section precedence including ``compression_config``, the ``quant_method`` gate,
-    # the exact match and the lane tuple, the NemotronH exception and the ``w4afp8`` fallback.
-    # A parse error of an existing file propagates and a section that is not an object raises: ``None`` would
-    # become the ``bfloat16`` DSA label.
-    quant_cfg = None
-    compression_cfg = None
-    section = "config.json quantization_config"
+    quant_file = f"{base}_hf_quant_config.json"
+    # SGLang resolves one quantization section per checkpoint (configs/model_config.py,
+    # ModelConfig._parse_quant_hf_config): ``quantization_config`` in config.json, then
+    # ``compression_config``, then the ``hf_quant_config.json`` sidecar, which it reads only when both
+    # are absent. A ``quantization_config`` is ModelOpt when it has no ``quant_method`` or the value
+    # ``modelopt``. SGLang parses the sidecar as ModelOpt without that gate, and this helper reads a pure
+    # sidecar algorithm the same way. For a sidecar ``MIXED_PRECISION`` export the helper keeps the gate:
+    # ModelOpt writes no other ``quant_method`` into that file, so the gate changes no real export.
+    #
+    # A ModelOpt section with ``quant_algo`` exactly ``MIXED_PRECISION`` names one lane per module in
+    # ``quantized_layers`` (ModelConfig._parse_modelopt_quant_config):
+    # * A lane with ``NVFP4`` or ``W4A16_NVFP4`` resolves to ``modelopt_mixed``. This helper returns
+    #   "nvfp4", so load_model_runner asks for ``modelopt_fp4``, and SGLang replaces that request with
+    #   ``modelopt_mixed`` (ModelOptMixedPrecisionConfig.override_quantization_method in
+    #   layers/quantization/modelopt_quant.py, applied by ModelConfig._verify_quantization).
+    # * Without such a lane SGLang resolves the export to ``w4afp8``. ``_verify_quantization`` then
+    #   rejects ``modelopt_fp4``, and ``None`` would run W4AFp8Config (layers/quantization/w4afp8.py),
+    #   which loads the BF16 attention projections as block-FP8 under a ``bfloat16`` label. The
+    #   collector has no path for it, so the helper raises.
+    # The parser has no architecture exception. NemotronH is rerouted later
+    # (arg_groups/model_overrides/nemotron_h.py), and no MLA or DSA model is NemotronH.
+    #
+    # Premises of the rows that a mixed export writes:
+    # * ``bfloat16`` projection label: a linear module without a lane gets UnquantizedLinearMethod
+    #   (ModelOptMixedPrecisionConfig.get_quant_method), and the helper raises on a ``self_attn`` lane.
+    # * KV cache: ``kv_cache_quant_algo`` only attaches ModelOptFp8KVCacheMethod to the attention
+    #   layer. The KV dtype of a row is the ``kv_cache_dtype`` that load_model_runner passes.
+    # benchmarks/evidence/collector/sglang-modelopt-mixed-glm53/README.md holds the source lines at
+    # each qualified release and the load probe.
+    # A parse error of an existing file propagates and a section that is not an object raises: ``None``
+    # would become the ``bfloat16`` DSA label.
+    config = {}
     if os.path.exists(config_file):
         with open(config_file) as f:
             config = json.load(f)
-        quant_cfg = config.get("quantization_config")
-        compression_cfg = config.get("compression_config")
+    quant_cfg = config.get("quantization_config")
+    compression_cfg = config.get("compression_config")
+    section = "config.json quantization_config"
     if quant_cfg is not None and not isinstance(quant_cfg, dict):
         raise ValueError(f"{model_id}: {section} must be an object, got {type(quant_cfg).__name__}")
     if compression_cfg is not None and not isinstance(compression_cfg, dict):
         raise ValueError(
             f"{model_id}: config.json compression_config must be an object, got {type(compression_cfg).__name__}"
         )
-    # SGLang resolves ``quantization_config``, then ``compression_config``, then the sidecar
-    # (configs/model_config.py:1029, 1046 and 1117): a checkpoint that declares
-    # ``compression_config`` reaches the mixed recipe only through its own ``quantization_config``,
-    # never through the sidecar.
-    if quant_cfg is None and compression_cfg is None and os.path.exists(quant_file):
+    if quant_cfg is None:
+        if compression_cfg is not None or not os.path.exists(quant_file):
+            return None
         section = "hf_quant_config.json quantization"
         with open(quant_file) as f:
             quant_cfg = json.load(f).get("quantization")
-        if quant_cfg is not None and not isinstance(quant_cfg, dict):
+        if quant_cfg is None:
+            return None
+        if not isinstance(quant_cfg, dict):
             raise ValueError(f"{model_id}: {section} must be an object, got {type(quant_cfg).__name__}")
-    if (
-        isinstance(quant_cfg, dict)
-        and quant_cfg.get("quant_method", "modelopt") == "modelopt"
-        and quant_cfg.get("quant_algo") == "MIXED_PRECISION"
-    ):
+
+    is_modelopt = quant_cfg.get("quant_method", "modelopt") == "modelopt"
+    if is_modelopt and quant_cfg.get("quant_algo") == "MIXED_PRECISION":
         lanes_map = quant_cfg.get("quantized_layers")
         if lanes_map is None:
             lanes_map = {}
@@ -718,6 +748,19 @@ def _model_native_gemm_quant(model_id: str) -> str | None:
             f"{model_id} is a ModelOpt MIXED_PRECISION export with no NVFP4 lane in its {section}: "
             "SGLang resolves such an export to w4afp8, which this collector has no path for"
         )
+    # A pure algorithm of a ModelOpt section. The sidecar counts as ModelOpt here (see the gate note above).
+    if is_modelopt or section == "hf_quant_config.json quantization":
+        algo = str(quant_cfg.get("quant_algo") or "").upper()
+        if "FP4" in algo:
+            return "nvfp4"
+        if "FP8" in algo:
+            return "fp8_block"
+        return None
+    method = str(quant_cfg.get("quant_method", "")).lower()
+    if method == "fp8" and quant_cfg.get("weight_block_size"):
+        return "fp8_block"
+    if "fp4" in method:
+        return "nvfp4"
     return None
 
 
@@ -739,8 +782,16 @@ def _build_wideep_mla_test_cases(mode: str):
     if _skip_sm120_deepgemm_attention_modules():
         return []
     model_specs = get_mla_module_model_specs(attention_type="mla", wideep_mla=True)
-    if get_sm_version() not in _NATIVE_NVFP4_SMS:
-        model_specs = [spec for spec in model_specs if _model_native_gemm_quant(spec.model_path) != "nvfp4"]
+    sm_version = get_sm_version()
+    if not _has_native_nvfp4(sm_version):
+        kept_specs = [spec for spec in model_specs if _model_native_gemm_quant(spec.model_path) != "nvfp4"]
+        removed_paths = sorted({spec.model_path for spec in model_specs if spec not in kept_specs})
+        if removed_paths:
+            print(
+                f"[MLA] wideep {mode}: left out {len(removed_paths)} NVFP4 checkpoint(s) on SM{sm_version} "
+                f"({removed_paths}): the collector records NVFP4 only on capability majors 10, 11 and 12"
+            )
+        model_specs = kept_specs
     sweep = get_mla_module_sweep_spec("sglang")
     backends = _get_mla_backend_list()
     cases = []
@@ -1053,6 +1104,7 @@ def load_model_runner(
     enable_piecewise_cuda_graph: bool = False,
     max_total_tokens: int | None = None,
     chunked_prefill_size: int | None = None,
+    max_running_requests: int | None = None,
 ):
     """Load SGLang ModelRunner with dummy weights.
 
@@ -1072,10 +1124,11 @@ def load_model_runner(
     """
     native_quant = _model_native_gemm_quant(model_path)
     sm_version = get_sm_version()
-    if native_quant == "nvfp4" and sm_version not in _NATIVE_NVFP4_SMS:
+    if native_quant == "nvfp4" and not _has_native_nvfp4(sm_version):
         raise ValueError(
-            f"SGLang has no collector-supported native NVFP4 model-loader backend on SM{sm_version}; "
-            "Marlin is valid only for INT4-WO"
+            f"SGLang has no collector-supported native NVFP4 model-loader backend on SM{sm_version}: "
+            "SGLang serves NVFP4 there through Marlin (weight-only W4A16), and the collector records "
+            "NVFP4 only from the FP4 kernels of capability majors 10, 11 and 12"
         )
 
     from sglang.srt.configs.model_config import ModelConfig
@@ -1114,13 +1167,25 @@ def load_model_runner(
         tp_size=1,
         trust_remote_code=True,
         disable_radix_cache=True,
-        # FIXME(re-verify): 0.5.21 serves DSA prefill under the "breakable" prefill graph
-        # (cuda_graph_config.py:122-131,160-162; buckets 4..2048, cuda_graph_hook.py:622-639),
-        # not the 0.5.14 tc_piecewise runner dsa_prefill_graph.py adapts, so the collector keeps
-        # prefill graphs off and times DSA prefill eagerly, as the 0.5.21 tables were measured.
+        # Deviation (DSA prefill rows, every SM): v0.5.23 serves DSA prefill under the
+        # breakable prefill CUDA graph on CUDA (model_executor/cuda_graph_config.py:119-123),
+        # capturing passes up to min(8192, chunked_prefill_size) tokens for an MLA backend
+        # (arg_groups/memory_hook.py:233-238; no DSA rule in cuda_graph_hook.py:170-255), i.e.
+        # every one-shot point this collector times. Attention runs eagerly between the graph
+        # segments (dsa_backend.py:3258-3261), but the dispatch differs from this eager timing:
+        # inside BCG set_dsa_prefill_impl forces use_mha=False (dsa_backend.py:4050-4053), so
+        # serving never takes MHA_ONE_SHOT, while eager takes it for max_kv_len <=
+        # SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD=2048 (:4057-4078; rows labelled
+        # sglang_dsa_dense_mha_*); the indexer runs as one split op and computes the logits it
+        # skips eagerly (dsa/dsa_indexer.py:1966-1970, 2030-2072). The 0.5.21 tables were timed
+        # the same way. Retire by porting dsa_prefill_graph.py to the breakable runner (its
+        # module docstring) once the measurement method for prefill graphs is decided.
         disable_prefill_cuda_graph=True,
         kv_cache_dtype=sglang_kv_dtype,
         max_total_tokens=max_total_tokens,
+        # The request slots of the timed batches, not the count SGLang derives from the
+        # dummy's token capacity (runtime_limits.request_slots).
+        max_running_requests=max_running_requests,
         chunked_prefill_size=chunked_prefill_size,
         quantization=load_quantization,
     )
@@ -1132,12 +1197,11 @@ def load_model_runner(
     # (run_mla_module, under `with autotune(True)`), so it is part of the module
     # init we actually measure -- not a global init phase.
     server_args.disable_flashinfer_autotune = True
-    # Match SGLang 0.5.14's configured FP8-KV dispatch. Hopper uses
-    # flashmla_kv; the exact image has a runnable TRTLLM-GEN path on SM100.
-    # SGLang's major-based selector also names TRT-LLM on SM103, but the
-    # bundled capability test rejects that target. Registry maturity markers
-    # park SM103/SM120 before this worker is queued. BF16 KV stays on the
-    # runtime default because flashmla_kv rejects BF16.
+    # Match serving's FP8-KV dispatch: trtllm on capability major >= 10, flashmla_kv on
+    # Hopper, for both phases (arg_groups/overrides.py:714-720 @v0.5.23). The GLM SM12x FP8
+    # branch (flashinfer_sparse_mla, :637-642, 665-675) is not collected: the registry parks
+    # SM120. BF16 KV stays on the runtime default (flashmla_sparse prefill, trtllm/fa3
+    # decode, :721-726) because flashmla_kv rejects BF16.
     if attention_backend == "dsa" and sglang_kv_dtype == "fp8_e4m3":
         if dsa_prefill_backend is None:
             dsa_prefill_backend = "trtllm" if get_sm_version() >= 100 else "flashmla_kv"
@@ -1146,7 +1210,8 @@ def load_model_runner(
     print(
         f"Using attention backend: {attention_backend}, kv_cache_dtype: {sglang_kv_dtype}, "
         f"gpu_id: {gpu_id}, chunked_prefill_size={server_args.chunked_prefill_size}, "
-        f"max_prefill_tokens={server_args.max_prefill_tokens}, max_total_tokens={max_total_tokens}"
+        f"max_prefill_tokens={server_args.max_prefill_tokens}, max_total_tokens={max_total_tokens}, "
+        f"max_running_requests={max_running_requests}"
     )
 
     if num_layers > 0 and load_format == "dummy":
@@ -1295,7 +1360,7 @@ def run_attention_torch(
         log_mla_dtype = "fp8" if backend_name == "trtllm_mla" and kv_cache_dtype == "fp8" else "bfloat16"
 
     if ordinary_mla or attn_type == "dsa":
-        # SGLang 0.5.21 deepseek_v2.py:2462-2487,2622-2626 supplies the
+        # SGLang deepseek_v2.py:2525-2550,2690 @v0.5.23 supplies the
         # native projection to AttentionInputs for both MLA and DSA. Keep its fused/quantized
         # dispatch; the module perf row includes this down-projection.
         dummy_qkv_latent_func = attention_module.prepare_qkv_latent
@@ -1417,16 +1482,12 @@ def _run_prefill(
     from array import array
 
     is_wideep_mla = attn_type == "mla" and not ordinary_mla
-    try:  # sglang>=0.5.21: layers/layer_boundary/adapters/attention.py:45,167
-        from sglang.srt.layers.layer_boundary.adapters.attention import AttentionInputs, get_attn_tp_context
-    except ImportError:
-        from sglang.srt.layers.communicator import AttentionInputs, get_attn_tp_context
-    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
-    from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-    from sglang.srt.mem_cache.chunk_cache import ChunkCache
+    # layers/layer_boundary/adapters/attention.py:44-70,113-114,140-141 @v0.5.23
+    from sglang.srt.layers.layer_boundary.adapters.attention import AttentionInputs, get_attn_tp_context
+    from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.mem_cache.common import checkpoint_kv_cache
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.sampling.sampling_params import SamplingParams
-    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
     from sglang.srt.utils import BumpAllocator
 
     forward_context_type, forward_context = _import_sglang_forward_context()
@@ -1439,7 +1500,6 @@ def _run_prefill(
         model_runner.req_to_token_pool.clear()
         model_runner.token_to_kv_pool_allocator.clear()
 
-        prefix_indices = _alloc_prefix_indices(model_runner, batch_size, prefix_len)
         full_length = prefix_len + seq_length
 
         reqs = []
@@ -1450,39 +1510,31 @@ def _run_prefill(
                 origin_input_ids=list(torch.randint(0, 10000, (full_length,)).tolist()),
                 sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
             )
-            req.prefix_indices = prefix_indices[i]
             req.full_untruncated_fill_ids = array("q", req.origin_input_ids)
-            req.fill_len = full_length
-            # sglang 0.5.16 replaced Req.set_extend_input_len(n) with
-            # set_extend_range(start, end) (schedule_batch.py:1153: the extend
-            # window is the last n of fill_len tokens); keep the old call on
-            # pins that still have it.
-            _n = seq_length if prefix_len else full_length
-            if hasattr(req, "set_extend_input_len"):
-                req.set_extend_input_len(_n)
-            else:
-                req.set_extend_range(full_length - _n, full_length)
             req.logprob_start_len = 0
             reqs.append(req)
         point_clock.mark("reqs")
 
-        cache_params = CacheInitParams(
-            disable=True,
-            req_to_token_pool=model_runner.req_to_token_pool,
-            token_to_kv_pool_allocator=model_runner.token_to_kv_pool_allocator,
-            page_size=model_runner.token_to_kv_pool_allocator.page_size,
-        )
-        tree_cache = ChunkCache(cache_params)
-
-        batch = ScheduleBatch.init_new(
-            reqs=reqs,
-            req_to_token_pool=model_runner.req_to_token_pool,
-            token_to_kv_pool_allocator=model_runner.token_to_kv_pool_allocator,
-            tree_cache=tree_cache,
-            model_config=model_runner.model_config,
-            enable_overlap=False,
-            spec_algorithm=SpeculativeAlgorithm.NONE,
-        )
+        tree_cache = _radix_disabled_tree_cache(model_runner)
+        if prefix_len:
+            # The cached context is the KV of the chunks before this one. With the
+            # radix cache disabled serving matches nothing, so a prefix lives only in
+            # the request's own row from its previous chunk (mem_cache/allocation.py:
+            # 363-371 @v0.5.23). Build that row as serving does: an extend over
+            # [0, prefix_len) allocates it (schedule_batch.py:2847-2919), then the
+            # scheduler's checkpoint advances prefix_len to its end (mem_cache/common.py:
+            # 271-280); the next round extends [prefix_len, extend_end)
+            # (schedule_batch.py:1105-1106, 1218-1220).
+            for req in reqs:
+                req.extend_end = prefix_len
+            prefix_batch = _new_schedule_batch(model_runner, reqs, tree_cache)
+            with _temporarily_chunked_alloc_extend(model_runner, batch_size * prefix_len):
+                prefix_batch.prepare_for_extend()
+            for req in reqs:
+                checkpoint_kv_cache(req, tree_cache)
+        for req in reqs:
+            req.extend_end = full_length
+        batch = _new_schedule_batch(model_runner, reqs, tree_cache)
         with _temporarily_chunked_alloc_extend(model_runner, batch_size * seq_length):
             batch.prepare_for_extend()
         point_clock.mark("batch")
@@ -1491,8 +1543,7 @@ def _run_prefill(
 
             resolve_forward_inputs(batch, _dsa_forward_input_relay(model_runner, batch))
         # sglang 0.5.16 made return_hidden_states_before_norm a required
-        # keyword (ForwardBatch.init_new); older pins do not accept it —
-        # same dispatch collect_msa_module.py:1015 uses.
+        # keyword (ForwardBatch.init_new); older pins do not accept it.
         import inspect as _inspect
 
         _fb_kw = (
@@ -1907,9 +1958,9 @@ def _run_prefill(
 
         def call_attention_module():
             if ordinary_mla or attn_type == "dsa":
-                # AttentionInputs caches QKV (layer_boundary/adapters/attention.py:69-80);
+                # AttentionInputs caches QKV (layer_boundary/adapters/attention.py:61-70);
                 # serving builds fresh inputs per layer/forward
-                # (layer_boundary/prepare.py:179-189).
+                # (layer_boundary/prepare.py:254-264 @v0.5.23).
                 # Reset inside EVERY timed iteration, including warmup, so the
                 # down-projection is measured rather than reused from warmup.
                 get_attn_tp_context().set_attn_inputs(
@@ -1949,7 +2000,7 @@ def _run_prefill(
                     # is built in init_forward_metadata, not via the forward context).
                     # Metadata was planned once for this batch above. Serving
                     # does this before model.forward, not once per layer:
-                    # model_executor/runner/eager_runner.py:293-321 then :370-376 @0.5.21.
+                    # model_executor/runner/eager_runner.py:296-339 then :352-366 @v0.5.23.
                     # Retain the native ForwardContext while timing the layer.
                     return attention_module(
                         positions=positions,
@@ -1996,8 +2047,8 @@ def _run_prefill(
                 call_target = graph_context.__enter__()
                 native_graph_context = graph_context
                 # Native piecewise metadata disables MHA_ONE_SHOT even for
-                # small inputs (dsa_backend.py:2436-2444 @ 49e384ce; at 0.5.21
-                # tc_piecewise or breakable, dsa_backend.py:3603-3606).
+                # small inputs (under a breakable prefill graph,
+                # dsa_backend.py:4050-4053 @v0.5.23).
                 # Label the path selected after native load_batch, not the
                 # earlier eager preparation or the requested backend.
                 if model_runner.attn_backend.use_mha:
@@ -2213,17 +2264,12 @@ def _run_decode(
     from array import array
 
     is_wideep_mla = attn_type == "mla"
-    try:  # sglang>=0.5.21: layers/layer_boundary/adapters/attention.py:45,167
-        from sglang.srt.layers.layer_boundary.adapters.attention import AttentionInputs, get_attn_tp_context
-    except ImportError:
-        from sglang.srt.layers.communicator import AttentionInputs, get_attn_tp_context
-    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
-    from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-    from sglang.srt.mem_cache.chunk_cache import ChunkCache
+    # layers/layer_boundary/adapters/attention.py:44-70,113-114,140-141 @v0.5.23
+    from sglang.srt.layers.layer_boundary.adapters.attention import AttentionInputs, get_attn_tp_context
+    from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.model_executor.runner import model_capture_mode
     from sglang.srt.sampling.sampling_params import SamplingParams
-    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
     from sglang.srt.utils import BumpAllocator
 
     forward_context_type, forward_context = _import_sglang_forward_context()
@@ -2243,36 +2289,16 @@ def _run_decode(
                 origin_input_ids=list(torch.randint(0, 10000, (seq_length,)).tolist()),
                 sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
             )
-            req.prefix_indices = torch.empty((0,), dtype=torch.int64)
             req.full_untruncated_fill_ids = array("q", req.origin_input_ids)
-            req.fill_len = len(req.origin_input_ids)
-            if hasattr(req, "set_extend_input_len"):
-                req.set_extend_input_len(req.fill_len)
-            else:  # sglang 0.5.16: schedule_batch.py:1153 set_extend_range(start, end)
-                req.set_extend_range(0, req.fill_len)
+            # The prompt is one extend over [prefix_len=0, extend_end) (schedule_batch.py:1105-1106 @v0.5.23).
+            req.extend_end = len(req.origin_input_ids)
             req.logprob_start_len = 0
             req.cached_tokens = 0
             req.already_computed = 0
             reqs.append(req)
         point_clock.mark("reqs")
 
-        cache_params = CacheInitParams(
-            disable=True,
-            req_to_token_pool=model_runner.req_to_token_pool,
-            token_to_kv_pool_allocator=model_runner.token_to_kv_pool_allocator,
-            page_size=model_runner.token_to_kv_pool_allocator.page_size,
-        )
-        tree_cache = ChunkCache(cache_params)
-
-        batch = ScheduleBatch.init_new(
-            reqs=reqs,
-            req_to_token_pool=model_runner.req_to_token_pool,
-            token_to_kv_pool_allocator=model_runner.token_to_kv_pool_allocator,
-            tree_cache=tree_cache,
-            model_config=model_runner.model_config,
-            enable_overlap=False,
-            spec_algorithm=SpeculativeAlgorithm.NONE,
-        )
+        batch = _new_schedule_batch(model_runner, reqs, _radix_disabled_tree_cache(model_runner))
         # Allocate KV cache slots, then switch to decode
         batch.prepare_for_extend()
         if attn_type == "dsa":
@@ -2319,6 +2345,21 @@ def _run_decode(
         if graph_batch_size is not None and graph_batch_size != batch_size:
             forward_batch_decode = _padded_dsa_decode_batch(model_runner, forward_batch_decode, graph_batch_size)
             model_runner.attn_backend.init_forward_metadata(forward_batch_decode)
+        if attn_type == "dsa" and graph_batch_size is not None:
+            # A graph-covered decode step runs on the backend's CUDA-graph metadata:
+            # DecodeCudaGraphRunner allocates it (init_cuda_graph_state,
+            # model_executor/runner/decode_cuda_graph_runner.py:429), builds it at capture
+            # (init_forward_metadata_out_graph(in_capture=True), :1400) and refills it before
+            # every replay (init_forward_metadata_out_graph, :1812). Its page tables span
+            # req_to_token's full width (DSABackend.init_cuda_graph_state,
+            # layers/attention/dsa_backend.py), which the indexer passes to top-k as the
+            # max sequence length (dsa/dsa_indexer_kpool.py _get_topk_paged): past the
+            # cluster floor (topk_v2.cuh get_static_cluster_floor) serving runs
+            # topk_small_batch_cluster_kernel, where batch-sized eager metadata ran
+            # topk_main_kernel.
+            model_runner.attn_backend.init_cuda_graph_state(graph_batch_size, graph_batch_size)
+            model_runner.attn_backend.init_forward_metadata_out_graph(forward_batch_decode, in_capture=True)
+            model_runner.attn_backend.init_forward_metadata_out_graph(forward_batch_decode)
         execution_batch_size = forward_batch_decode.batch_size
 
         decode_hidden = torch.randn(
@@ -2377,8 +2418,8 @@ def _run_decode(
             capture_context = model_capture_mode() if use_benchmark_cuda_graph else nullcontext()
             with capture_context, forward_context(forward_context_type(attn_backend=model_runner.attn_backend)):
                 if attn_type == "dsa":
-                    # SGLang 0.5.21 layer_boundary/adapters/attention.py:69-80,
-                    # prepare.py:179-189: QKV is cached within one AttentionInputs only.
+                    # SGLang layer_boundary/adapters/attention.py:61-70,
+                    # prepare.py:254-264 @v0.5.23: QKV is cached within one AttentionInputs only.
                     # Refresh for every forward so capture includes the native
                     # projection instead of reusing the warmup's latent.
                     get_attn_tp_context().set_attn_inputs(
@@ -2717,6 +2758,7 @@ def run_mla_module(
             enable_piecewise_cuda_graph=enable_runner_piecewise_cuda_graph,
             max_total_tokens=max_total_tokens,
             chunked_prefill_size=chunked_prefill_size,
+            max_running_requests=request_slots(bs for bs, _seq_len, _ip, _prefix_len in runnable),
         )
 
         if attn_type == "dsa":
@@ -2725,6 +2767,7 @@ def run_mla_module(
                 print(f"[DSA] SGLang runtime chunked_prefill_size={runtime_chunk}")
                 _refuse(cases, refused, lambda case: _over_chunk(case, runtime_chunk))
             kv_capacity = _kv_pool_capacity_tokens(model_runner)
+            print(f"[DSA] SGLang KV pool holds {kv_capacity} tokens")
             if kv_capacity is not None:
                 page_size = kv_pool_page_size(model_runner)
                 _refuse(cases, refused, lambda case: _over_kv_pool(case, page_size, kv_capacity))

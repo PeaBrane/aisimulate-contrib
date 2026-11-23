@@ -616,19 +616,23 @@ class _TraceCounters:
     # Dynamo, Agentic Mooncake and Weka loaders hold every u64 source hash
     # array at once. Mooncake-family loaders convert each row as it is read.
     retains_source_hashes: bool
+    # An agentic graph plans every request's output IDs before its first dispatch.
+    # A session trace holds only authored IDs and draws the rest at each dispatch.
+    plans_every_output: bool
     # A snapshot expands prompts only for selected plays after their cuts.
     expands_every_input: bool = True
     hashes: int = 0
     authored_outputs: int = 0
     outputs: int = 0
     largest_input: int = 0
+    largest_output: int = 0
     requests: int = 0
 
     @property
     def lower_bound(self) -> int:
         loaded = 8 * self.hashes + 4 * self.authored_outputs if self.retains_source_hashes else 0
-        prepared = 4 * (self.hashes + self.outputs)
-        return max(loaded, prepared, 4 * self.largest_input if self.expands_every_input else 0)
+        prepared = 4 * (self.hashes + (self.outputs if self.plans_every_output else self.authored_outputs))
+        return max(loaded, prepared, 4 * self.largest_output, 4 * self.largest_input if self.expands_every_input else 0)
 
 
 class _InspectionStopped(Exception):
@@ -692,7 +696,9 @@ def _scan_mooncake(events: Any, counters: _TraceCounters, state: dict[str, Any],
             row_input = _token_length(value)
             row = True
         elif prefix in _MOONCAKE_OUTPUTS:
-            counters.outputs += _token_length(value)
+            output = _token_length(value)
+            counters.outputs += output
+            counters.largest_output = max(counters.largest_output, output)
             row = True
 
 
@@ -706,12 +712,12 @@ def _scan_applied_compute(events: Any, counters: _TraceCounters, state: dict[str
     for prefix, event, value in events:
         if prefix == "assistant_response_length.item":
             length = _token_length(value)
-            counters.outputs += length
+            counters.largest_output = max(counters.largest_output, length)
             prompt += length
         elif prefix == "tool_call_output_length.item" or prefix == "input_prompt_length":
             prompt += _token_length(value)
         elif prefix == "final_assistant_response_length":
-            counters.outputs += _token_length(value)
+            counters.largest_output = max(counters.largest_output, _token_length(value))
         elif prefix == "num_turns":
             counters.requests += _token_length(value) + 1
         elif prefix == "":
@@ -758,9 +764,11 @@ def _scan_dynamo(events: Any, counters: _TraceCounters, state: dict[str, Any], l
                 contextual = row.get("agent_context", False)
                 if agentic is not None and contextual != agentic:
                     raise ResourceLimitError("Dynamo request trace cannot mix requests with and without agent_context")
-                agentic = state["agentic"] = contextual
+                agentic = state["agentic"] = counters.plans_every_output = contextual
+                output = _token_length(row.get("request.output_tokens"))
                 counters.hashes += row_hashes
-                counters.outputs += _token_length(row.get("request.output_tokens"))
+                counters.outputs += output
+                counters.largest_output = max(counters.largest_output, output)
                 counters.largest_input = max(
                     counters.largest_input, _token_length(row.get("request.replay.input_length"))
                 )
@@ -845,6 +853,8 @@ def _scan_finite_trace(
 ) -> _TraceCounters:
     counters = _TraceCounters(
         retains_source_hashes=format_name in {"agentic_mooncake", "dynamo", "weka"},
+        # A Dynamo trace's first request selects standard or agentic mode.
+        plans_every_output=format_name in {"agentic_mooncake", "weka"},
         expands_every_input=not snapshot,
     )
     limit = None if inspection_budget_bytes is None else inspection_budget_bytes - WORKER_BASELINE_BYTES
@@ -978,8 +988,8 @@ def estimate_workload(
         model = "dynamo-eager-u32-v1"
         peak = WORKER_BASELINE_BYTES + 2 * tokens + count * (4096 + 16 * osl)
     elif stack == "engine":
-        # Every turn retains only its own hash IDs, planned
-        # output IDs and transcript share, which a one-token block prefix cache
+        # Every turn retains only its own hash IDs
+        # and transcript share, which a one-token block prefix cache
         # can index. Completed sessions' prefixes can remain in every cache a
         # turn visited, even after they leave the active concurrency window.
         # Producers cap each pool separately before summing its copies. The
@@ -990,7 +1000,7 @@ def estimate_workload(
             raise ValueError("session cache copies must be positive")
         history = (turns - 1) * (isl + osl)
         tokens = active * (history + isl) * 4
-        lower = count * turns * osl * 4
+        lower = osl * 4  # One request's output IDs, drawn at dispatch.
         model = "engine-session-metadata-v2"
         peak = (
             WORKER_BASELINE_BYTES + count * turns * (4096 + copies * 32 * (isl + osl)) + active * 32 * history + tokens

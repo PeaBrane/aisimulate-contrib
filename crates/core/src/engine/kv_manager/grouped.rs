@@ -12,7 +12,7 @@
 //! block pool, so that cached blocks stay until eviction.
 
 use crate::engine::cache::vllm_block_pool::{
-    BlockCopyId, BlockReservation, CacheKey, PrefixHit, VllmBlockPool,
+    BlockCopyId, BlockReservation, CacheKey, KeyInBlock, PrefixHit, VllmBlockPool,
 };
 use crate::engine::common::hashing::SequenceHash;
 use crate::perfmodel::{FpmCacheGroup, FpmCacheKind};
@@ -65,6 +65,11 @@ pub(crate) struct GroupedBlockLease {
     /// Whether the request has allocated once. The copy blocks of a partial
     /// hit come with the first allocation only.
     pub(crate) allocated: bool,
+    /// The token count below which a step of the request finds nothing to
+    /// allocate, publish or release, so that its `allocate` and `finalize`
+    /// can be skipped (see `GroupedPrefixRules::quiet_until`). 0 when the
+    /// next step has to run both.
+    pub(crate) quiet_until: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -90,7 +95,7 @@ pub(crate) enum GroupLease {
 }
 
 impl GroupLease {
-    fn live_copies(&self) -> usize {
+    pub(super) fn live_copies(&self) -> usize {
         match self {
             // The `None` copies lie exactly below `first_live`, so a count per
             // step does not scan the whole context.
@@ -215,6 +220,26 @@ impl GroupedBlockPool {
             "a grouped pool caches grouped keys only"
         );
         self.pool.cache_private_key(id, key)
+    }
+
+    /// [`Self::cache`] for a key that can lie inside a block of its group, at
+    /// `at`. A hit search finds such a key through [`Self::keys_in_block`] only.
+    pub(crate) fn cache_at(
+        &mut self,
+        id: BlockCopyId,
+        key: CacheKey,
+        at: Option<KeyInBlock>,
+    ) -> bool {
+        self.pool.cache_private_key_at(id, key, at)
+    }
+
+    /// See [`VllmBlockPool::grouped_keys_in_block`].
+    pub(crate) fn keys_in_block(
+        &self,
+        group: u16,
+        first: SequenceHash,
+    ) -> impl DoubleEndedIterator<Item = u32> + '_ {
+        self.pool.grouped_keys_in_block(group, first)
     }
 
     pub(crate) fn release(&mut self, id: BlockCopyId) {
@@ -739,6 +764,7 @@ mod tests {
                     }),
                 ],
                 allocated: true,
+                quiet_until: 0,
             }),
             ..GroupedLease::default()
         };

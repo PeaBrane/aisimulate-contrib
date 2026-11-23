@@ -41,7 +41,7 @@
 
 use super::grouped::{GroupLease, GroupStateLease, GroupedBlockLease, GroupedBlockPool};
 use super::vllm_backend::BlockRequestLease;
-use crate::engine::cache::vllm_block_pool::{BlockCopyId, CacheKey};
+use crate::engine::cache::vllm_block_pool::{BlockCopyId, CacheKey, KeyInBlock};
 use crate::perfmodel::{FpmCacheGroup, FpmCacheKind};
 use anyhow::{bail, ensure};
 use rustc_hash::FxHashSet;
@@ -460,6 +460,64 @@ impl GroupedPrefixRules {
         tokens / self.alignment * self.alignment / block * block
     }
 
+    /// The token count below which the steps after a finalization at
+    /// `computed_after` change nothing: an `allocate` from a count of at
+    /// least `computed_after` to a target below the result, and a `finalize`
+    /// at a count from `computed_after` up to the result, leave the lease and
+    /// the pool as they are. 0 when the next step can change them.
+    ///
+    /// `settled` is the larger of the prompt and the junction. Every position
+    /// that `finalize` publishes at (replay boundary, partial tail, prompt
+    /// checkpoint and junction) lies at or below it, so past it `finalize`
+    /// only counts the blocks that a step completes. `allocate` takes a
+    /// block when the target leaves the blocks that the request holds,
+    /// retires a window block every `block` tokens, and releases the blocks
+    /// that a state group holds beside a private running block. A checkpoint
+    /// block needs a chunk that spans two state blocks.
+    fn quiet_until(
+        &self,
+        pool: &GroupedBlockPool,
+        lease: &GroupedBlockLease,
+        settled: usize,
+        computed_after: usize,
+    ) -> usize {
+        if !lease.allocated || computed_after < settled {
+            return 0;
+        }
+        let mut until = usize::MAX;
+        for (rule, group) in self.groups.iter().zip(&lease.groups) {
+            let block = rule.block;
+            let end = match (rule.kind, group) {
+                (
+                    GroupRuleKind::FullAttention | GroupRuleKind::SlidingWindow { .. },
+                    GroupLease::Attention {
+                        copies, first_live, ..
+                    },
+                ) => {
+                    let mut end =
+                        ((computed_after / block + 1) * block).min(copies.len() * block + 1);
+                    if let GroupRuleKind::SlidingWindow { window } = rule.kind {
+                        end = end.min((first_live + 1) * block + window - 1);
+                    }
+                    end
+                }
+                (GroupRuleKind::State, GroupLease::State(state)) => {
+                    let running_alone = group.live_copies() == 1
+                        && state.running.is_some_and(|id| pool.is_private(id));
+                    if !running_alone {
+                        return 0;
+                    }
+                    computed_after.div_ceil(block) * block + 1
+                }
+                // An allocated lease holds its ring block until its release.
+                (GroupRuleKind::Ring, GroupLease::Ring { .. }) => usize::MAX,
+                (kind, group) => unreachable!("rule {kind:?} with lease {group:?}"),
+            };
+            until = until.min(end);
+        }
+        until
+    }
+
     /// Modified simulation of the align split (v0.31 `sched:414-527`, v0.32
     /// `sched:443-556`, v0.33 `sched:546-662`). `known` is the request's token
     /// count and `budget` the step budget. Without a State rule the split is
@@ -691,6 +749,22 @@ fn grouped_key(
     })
 }
 
+/// The place of the key at `tokens` inside a block of `block` tokens of its
+/// group, or `None` for a key at a block end.
+fn key_in_block(
+    lease: &BlockRequestLease,
+    hash_block: usize,
+    block: usize,
+    tokens: usize,
+) -> Option<KeyInBlock> {
+    let offset = (tokens % block) as u32;
+    if offset == 0 {
+        return None;
+    }
+    let first = lease.prefix_hash_at(tokens / block * block + hash_block)?;
+    Some(KeyInBlock { first, offset })
+}
+
 fn key_is_inactive(pool: &GroupedBlockPool, key: CacheKey) -> bool {
     let CacheKey::Grouped { group, hash } = key else {
         return false;
@@ -756,8 +830,9 @@ impl GroupedPrefixCoordinator {
     /// this step and the request's token count. The other inputs, the rules
     /// and the request's prefix hashes, are fixed once the lease has its
     /// prefix hashes. The search reads the pool only through
-    /// `key_hit(..).is_some()`. So two searches of one lease with equal
-    /// stamps give equal hits.
+    /// `key_hit(..).is_some()` and `keys_in_block`, which only narrows where
+    /// it looks. So two searches of one lease with equal stamps give equal
+    /// hits.
     pub(crate) fn hit_stamp(&self, pool: &GroupedBlockPool, num_tokens: usize) -> GroupedHitStamp {
         GroupedHitStamp {
             residency: pool.residency(),
@@ -786,6 +861,7 @@ impl GroupedPrefixCoordinator {
                 })
                 .collect(),
             allocated: false,
+            quiet_until: 0,
         }
     }
 
@@ -901,6 +977,37 @@ impl GroupedPrefixCoordinator {
         })
     }
 
+    /// The highest position in `floor + 1..=top` at which `hits` holds, inside
+    /// the block that starts at `floor`. A position inside a block hits only
+    /// with a cached key there, and the pool lists those of the spec's first
+    /// group under the block's first hash, so the search probes the listed
+    /// positions and no other.
+    fn hit_in_block(
+        &self,
+        pool: &GroupedBlockPool,
+        lease: &BlockRequestLease,
+        spec: &SpecGroup,
+        floor: usize,
+        top: usize,
+        hits: impl Fn(usize) -> bool,
+    ) -> Option<usize> {
+        // A request that ends before the block's first hash has no key in it.
+        let first = lease.prefix_hash_at(floor + self.rules.hash_block)?;
+        let mut ends = pool
+            .keys_in_block(spec.groups[0] as u16, first)
+            .rev()
+            .map(|offset| floor + offset as usize);
+        let found = ends.find(|&end| end <= top && hits(end));
+        let alignment = self.rules.alignment;
+        debug_assert!(
+            (found.unwrap_or(floor) + alignment..=top)
+                .step_by(alignment)
+                .all(|end| !hits(end)),
+            "a cached position inside a block is not listed under its block"
+        );
+        found
+    }
+
     /// Leading cached blocks, then the fine-grained probe of the first partial
     /// block (`single:747-843`), for every group of `spec` at once. Returns
     /// the token end of each hit block and the hit length.
@@ -920,15 +1027,10 @@ impl GroupedPrefixCoordinator {
             .collect();
         let mut tokens = ends.len() * block;
         if alignment < block {
-            let scale = block / alignment;
-            let first_partial = ends.len() * scale;
-            let max_partial = (first_partial + scale - 1).min(max / alignment);
-            for fine in (first_partial..max_partial).rev() {
-                if hits((fine + 1) * alignment) {
-                    tokens = (fine + 1) * alignment;
-                    ends.push(tokens);
-                    break;
-                }
+            let top = (tokens + block - alignment).min(max / alignment * alignment);
+            if let Some(end) = self.hit_in_block(pool, lease, spec, tokens, top, hits) {
+                tokens = end;
+                ends.push(end);
             }
         }
         tokens -= tokens % alignment;
@@ -970,17 +1072,29 @@ impl GroupedPrefixCoordinator {
         spec: &SpecGroup,
         max: usize,
     ) -> usize {
+        let block = spec.block;
         let alignment = self.rules.alignment;
-        let mut end = max / alignment * alignment;
-        while end > 0 {
-            if spec.groups.iter().all(|&g| {
+        let hits = |end: usize| {
+            spec.groups.iter().all(|&g| {
                 grouped_key(g, lease.prefix_hash_at(end)).is_some_and(|key| {
                     key_is_resident(pool, key) && !self.published_this_step.contains(&key)
                 })
-            }) {
+            })
+        };
+        let mut end = max / alignment * alignment;
+        while end > 0 {
+            if alignment < block && !end.is_multiple_of(block) {
+                // Inside a block, down to its start.
+                let floor = end / block * block;
+                if let Some(found) = self.hit_in_block(pool, lease, spec, floor, end, hits) {
+                    return found;
+                }
+                end = floor;
+            } else if hits(end) {
                 return end;
+            } else {
+                end -= alignment;
             }
-            end -= alignment;
         }
         0
     }
@@ -1213,6 +1327,8 @@ impl GroupedPrefixCoordinator {
     ) -> bool {
         let rules = &self.rules;
         let first = !lease.allocated;
+        // The blocks can change here, so the step's `finalize` has to run.
+        lease.quiet_until = 0;
         let mut fresh = 0;
         let releases = &mut self.releases;
         releases.clear();
@@ -1440,6 +1556,7 @@ impl GroupedPrefixCoordinator {
             }
             let block = rule.block;
             let key_at = |tokens: usize| grouped_key(g, request.prefix_hash_at(tokens));
+            let in_block = |tokens: usize| key_in_block(request, rules.hash_block, block, tokens);
             match (rule.kind, &mut lease.groups[g]) {
                 (
                     GroupRuleKind::FullAttention,
@@ -1472,7 +1589,7 @@ impl GroupedPrefixCoordinator {
                         && pool.is_private(*id)
                         && let Some(key) = key_at(tail)
                     {
-                        pool.cache(*id, key);
+                        pool.cache_at(*id, key, in_block(tail));
                     }
                 }
                 (
@@ -1530,7 +1647,7 @@ impl GroupedPrefixCoordinator {
                         && pool.is_private(id)
                         && let Some(key) = key_at(computed_after)
                     {
-                        pool.cache(id, key);
+                        pool.cache_at(id, key, in_block(computed_after));
                         self.published_epoch += u64::from(self.published_this_step.insert(key));
                         if !computed_after.is_multiple_of(block) {
                             state.published = Some(key);
@@ -1546,7 +1663,7 @@ impl GroupedPrefixCoordinator {
                         && pool.is_private(id)
                         && let Some(key) = key_at(pos)
                     {
-                        pool.cache(id, key);
+                        pool.cache_at(id, key, in_block(pos));
                         self.published_epoch += u64::from(self.published_this_step.insert(key));
                     }
                     // The previous block goes after one pass, as on the linear
@@ -1564,6 +1681,12 @@ impl GroupedPrefixCoordinator {
                 (kind, group) => unreachable!("rule {kind:?} with lease {group:?}"),
             }
         }
+        lease.quiet_until = rules.quiet_until(
+            pool,
+            lease,
+            prompt.max(junction.unwrap_or(0)),
+            computed_after,
+        );
     }
 
     /// Release every block in group order, each group tail first, as vLLM
@@ -1605,6 +1728,7 @@ impl GroupedPrefixCoordinator {
         }
         pool.release_all(released);
         lease.allocated = false;
+        lease.quiet_until = 0;
     }
 }
 

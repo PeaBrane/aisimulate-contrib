@@ -267,6 +267,15 @@ impl<C: RankEngine> GeneralizedMockerEngine<C> {
         let iteration = self
             .price_group_pass(&mut scheduled)
             .map_err(|error| self.poison(error))?;
+        // Canonical whole-iteration pricing already accounts for rank wait.
+        // For phase pricing, take the forward maximum after phase speedups.
+        let wait_provider = scheduled.first().map(|&(rank, _)| rank).filter(|&rank| {
+            iteration.is_none()
+                && self.ranks.len() > 1
+                && self.ranks[rank].tracks_attention_dp_wait()
+        });
+        let mut max_forward_ns = 0;
+        let mut active_rank_ns = 0;
         for (dp_rank, pass) in scheduled {
             let pass = match pass {
                 ScheduledPass::Priced(pass) => Ok(pass),
@@ -286,6 +295,11 @@ impl<C: RankEngine> GeneralizedMockerEngine<C> {
             end_ms = end_ms.max(pass.end_ms);
             idle_telemetry_end_ms = idle_telemetry_end_ms
                 .max(self.ranks[dp_rank].idle_telemetry_end_ms(&pass.pending, pass.end_ms));
+            if wait_provider.is_some() {
+                let forward_ns = self.ranks[dp_rank].phase_priced_forward_ns();
+                max_forward_ns = max_forward_ns.max(forward_ns);
+                active_rank_ns += forward_ns;
+            }
             same_timestamp_retry = match (same_timestamp_retry, pass.same_timestamp_retry) {
                 (
                     SameTimestampRetry::Countdown { remaining: a },
@@ -309,6 +323,15 @@ impl<C: RankEngine> GeneralizedMockerEngine<C> {
                 dp_rank: dp_rank as u32,
                 pending: pass.pending,
             });
+        }
+
+        if let Some(rank) = wait_provider {
+            let wait_ns = max_forward_ns * self.ranks.len() as u128 - active_rank_ns;
+            if wait_ns > 0 {
+                self.ranks[rank]
+                    .record_phase_priced_wait(wait_ns as f64 / 1_000_000.0)
+                    .map_err(|error| self.poison(error))?;
+            }
         }
 
         let any_rank_prefilled = self.ranks.iter().any(RankEngine::prefill_in_pass);

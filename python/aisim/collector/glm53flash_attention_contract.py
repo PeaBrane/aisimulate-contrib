@@ -44,23 +44,24 @@ CHECKPOINT_CONFIG_SHA256 = {
     "fp8": "971457b1bd1079cdeecd67a27194357f87e598045282e4dffee5a981de95688f",
     "nvfp4": "6f0ec374c7f3273461e1cadbee8d682bb21ad822427ab5a3a986611f5247fdee",
 }
-# Exact runtimes the collectors are pinned to: stock vLLM v0.31.0 (upstream
-# tag commit db9527a46873454610df6dbedf79a36d6bf1a7f6) and SGLang 0.5.20, each
+# Exact runtimes the collectors are pinned to: stock vLLM v0.32.0 (upstream
+# tag commit 5df63a7203cdb9328d824a27b682e77c7b9928be, the runtime
+# framework_manifest.yaml resolves for both checkpoints) and SGLang 0.5.20, each
 # as the per-architecture child image of one pinned multi-arch index (vLLM
-# index sha256:c1c9f6fd5c109ba7f0546a59f5b2f15fb87f64c77782e90a27b648b42a8e67c3,
+# index sha256:befccf0e7e4089aa23926bb6f887a85c0d46c2a99e6de5c5ffdf5cb7957c5b34,
 # SGLang index sha256:06e4f2ed21afde4ff513cda65070124e727ba23ccaeff7712b8c40e1097d611f).
-# Stock v0.31.0 still corrupts the boundary pool of
-# a prefill chunk whose start is not a multiple of index_kpool (4)
-# (vllm/models/glm5next/nvidia/sparse_indexer.py:47-90 _kpool_compress_insert,
+# Stock v0.32.0 still writes the boundary pool of a prefill chunk as if the
+# chunk started on a multiple of index_kpool (4)
+# (vllm/models/glm5next/nvidia/sparse_indexer.py:54-98 _kpool_compress_insert,
 # "Assumes pool-aligned chunk starts"); every planned vLLM chunk therefore
 # starts on a multiple of KPOOL_ALIGN (see build_plan and the vLLM runner).
-RUNTIME_VERSIONS = {"vllm": "0.31.0", "sglang": "0.5.20"}
+RUNTIME_VERSIONS = {"vllm": "0.32.0", "sglang": "0.5.20"}
 ARCHES = ("arm64", "amd64")
 # platform.machine() of the container -> image architecture.
 MACHINE_ARCH = {"aarch64": "arm64", "arm64": "arm64", "x86_64": "amd64", "amd64": "amd64"}
 RUNTIME_IMAGES = {
-    ("vllm", "arm64"): "sha256:3f7dd5b777d34d1724456ce71f87385dca288c3bb23029ab27dee358f5d2b971",
-    ("vllm", "amd64"): "sha256:a4a4c0437bf7240089da5f08aa370c4aee17ae5290f7a3b468825ee26c4c3a6b",
+    ("vllm", "arm64"): "sha256:6ff5ff0ddf3658d2c2d677dac5ca2d4726ce0156b4371166d918181b210bd4bc",
+    ("vllm", "amd64"): "sha256:6ee133356d49ed24cee03dd0cda3d3980279a11c107ce3e752c89e76540f41c9",
     ("sglang", "arm64"): "sha256:b0d8718a4424bb22e448e04407ab3ce5f7399a4c5fc702d6fbe36c3772ec8862",
     ("sglang", "amd64"): "sha256:b27fce60bc5494c118c4910702812bcfa8cee67abcdd1ff8b0902f21647552f4",
 }
@@ -75,9 +76,11 @@ RUNTIME_IMAGES = {
 #   (dsa_backend_kpool.py:41-68 admits only fa3/tilelang/trtllm; tilelang
 #   rejects FP8 KV, arg_groups/overrides.py:639-647); its default is BF16
 #   (:603-605).
-# - vLLM 0.31.0: FLASHINFER_MLA_SPARSE_SM90 hands an FP8 cache to FlashInfer
-#   0.7.0.post1 ``plan()`` as ``kv_data_type=torch.uint8`` storage, which the
-#   fa3 MLA planner rejects ("MLA kv_data_type torch.uint8 is not supported").
+# - vLLM 0.32.0: FLASHINFER_MLA_SPARSE_SM90 hands an FP8 cache to FlashInfer
+#   0.7.0.post1 ``plan()`` as ``kv_data_type=torch.uint8`` storage
+#   (v1/attention/backends/mla/flashinfer_mla_sparse_sm90.py:375), which the
+#   fa3 MLA planner rejects ("MLA kv_data_type torch.uint8 is not supported";
+#   observed at 0.31.0, same FlashInfer pin and call at 0.32.0).
 KV_CACHE_DTYPES = {"vllm": ("fp8", "bfloat16"), "sglang": ("fp8", "bfloat16")}
 SERVING_KV_CACHE_DTYPE = {"fp8": "fp8_e4m3", "bfloat16": "bfloat16"}
 KPOOL_ALIGN = 4
@@ -141,8 +144,8 @@ TIMING_METHODS = {
 }
 # Documented properties of the published tables (collection_meta.yaml notes).
 TABLE_NOTES = [
-    "IndexPool alignment: every prefill chunk starts on a multiple of 4 (the stock vLLM 0.31.0 "
-    "defect's trigger); decode rows keep their true sequence length L (prompt L-1, whose last seeding "
+    "IndexPool alignment: every prefill chunk starts on a multiple of 4 (stock vLLM 0.32.0 assumes "
+    "pool-aligned chunk starts); decode rows keep their true sequence length L (prompt L-1, whose last seeding "
     "chunk may end off the pool grid and completes in the tail as in serving).",
     "Regular rows are collected at the serving context limit 131079; long-context rows (prefill "
     "prefix >= 262144, decode x >= 262144, B=1) at the model limit 1048576 are table-extrapolation "
@@ -176,7 +179,7 @@ def mla_layers(config: dict) -> list[int]:
 def projection_quant_mode(backend: str, checkpoint_format: str) -> str:
     """Actual MLA projection precision in the pinned framework model builders.
 
-    vLLM 0.31.0 ``models/glm5next/common/model.py:318-334`` builds
+    vLLM 0.32.0 ``models/glm5next/common/model.py:385-401`` builds
     ``Glm5NextMLAAttention(quant_config=None)`` and dequantizes FP8 q_a/kv_a/o
     weights to BF16 on load, so every vLLM projection is BF16. SGLang 0.5.20
     ``models/glm5_next.py`` passes the checkpoint quant_config to
@@ -318,7 +321,7 @@ def geometry_key(body: dict) -> str:
 def seed_chunk(budget: int, batch: int) -> int:
     """Per-request seeding chunk: the batch's share of the step budget, floored
     to the IndexPool size so every seeding chunk of every request starts on a
-    multiple of KPOOL_ALIGN (stock vLLM 0.31.0 corrupts the boundary pool of an
+    multiple of KPOOL_ALIGN (stock vLLM 0.32.0 corrupts the boundary pool of an
     unaligned chunk start; SGLang only seeds state with it)."""
     chunk = budget // batch // KPOOL_ALIGN * KPOOL_ALIGN
     if chunk < KPOOL_ALIGN:
@@ -344,7 +347,7 @@ def _prefix_grid(spec, batch: int, query: int) -> list[int]:
 def unaligned_targets(plan: dict) -> list[str]:
     """Prefill targets whose chunk start or length is off the IndexPool grid.
 
-    Stock vLLM 0.31.0 must never run such a chunk (``_kpool_compress_insert``);
+    Stock vLLM 0.32.0 must never run such a chunk (``_kpool_compress_insert``);
     SGLang is unaffected and keeps its own geometry.
     """
     bad = []
